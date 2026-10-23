@@ -519,6 +519,11 @@ encoding in Windows). Whole desktop only, no RemoteApp windows.
   did (Edge: seconds, big apps longer), so apps got clicked again. The viewer prints `window-shown` on stdout when it
   shows an app's window (and `seamless-unavailable` when it shows the whole desktop instead); until then, or for a
   minute at most, the app's entry shows "Starting…" with a spinner, and clicking it again doesn't start it twice.
+- **FL Studio's main window wasn't a window of its own** (fixed in WinBoat 0.9.2-gpu.81): seamless mode took it for
+  a popup (no Linux window decoration of its own, no taskbar entry) while Notepad's was fine. Its main window
+  (`TFruityLoopsMainForm`, a VCL form drawing its own title bar) is `WS_POPUP` without the caption bits, which the
+  tracker's popup rule (menus, tooltips) matched, but it has `WS_EX_APPWINDOW`, which asks Windows for a taskbar
+  button. Windows with `WS_EX_APPWINDOW` are app windows now, whatever their style; tooltips and menus don't set it.
 - **Windows' stacking follows KDE's** (WinBoat 0.9.2-gpu.22): every Linux window shows its part of Windows' one
   screen, so where two app windows overlap in Windows, both Linux windows showed whichever was on top there, e.g.
   after raising a window in KDE without clicking into it, or two apps on different virtual desktops at the same

@@ -115,6 +115,7 @@ const (
 	wsThickFrame           = 0x00040000
 	wsExTopmost            = 0x00000008
 	wsExToolWindow         = 0x00000080
+	wsExAppWindow          = 0x00040000
 	swMaximize             = 3
 	swMinimize             = 6
 	swRestore              = 9
@@ -972,7 +973,10 @@ func (t *windowTracker) windowLine(hwnd uintptr, pid uint32, foreground uintptr)
 	// have a border, which is one of them)
 	exIndex := gwlExStyle
 	exStyle, _, _ := procGetWindowLongPtrW.Call(hwnd, uintptr(exIndex))
-	popup := (style&wsPopup != 0 || exStyle&wsExToolWindow != 0) && style&wsCaption != wsCaption
+	// An app's main window drawn without Windows' title bar (FL Studio's, any VCL/Delphi form, many audio apps) is a
+	// WS_POPUP too, but WS_EX_APPWINDOW asks for a taskbar button: an app window then, like Windows takes it
+	popup := (style&wsPopup != 0 || exStyle&wsExToolWindow != 0) && style&wsCaption != wsCaption &&
+		exStyle&wsExAppWindow == 0
 	// Full screen: no title bar and exactly Windows' screen (borderless full screen, how most games do it; a
 	// maximized window keeps its title bar). Not a popup then, whatever its style
 	if iconic == 0 && style&wsCaption != wsCaption && rect.Left == 0 && rect.Top == 0 {
