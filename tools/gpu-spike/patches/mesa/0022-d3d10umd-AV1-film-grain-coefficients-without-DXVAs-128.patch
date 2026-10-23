@@ -1,0 +1,29 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: AV1 film grain coefficients without DXVA's +128
+
+DXVA's AV1 auto-regressive grain coefficients are the bitstream's ar_coeffs_*_plus_128; VA's (the picture
+description virgl passes on) are the values. They were cast to int8_t, so every grained picture had the wrong
+grain: structured, far stronger noise (31 dB from the reference). Subtract the 128; with nvidia-vaapi-driver
+keeping the grain-free reference apart, d3d11va AV1 film grain is bit-exact.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index 871c1c6..f1805a5 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -1990,12 +1990,13 @@ AV1Picture(VideoDecoder *dec)
+          fg.point_cr_value[i] = dfg.scaling_points_cr[i][0];
+          fg.point_cr_scaling[i] = dfg.scaling_points_cr[i][1];
+       }
++      /* DXVA's coefficients are the bitstream's ar_coeffs_*_plus_128, VA's the values */
+       for (unsigned i = 0; i < 24; i++) {
+-         fg.ar_coeffs_y[i] = (int8_t)dfg.ar_coeffs_y[i];
++         fg.ar_coeffs_y[i] = (int8_t)(dfg.ar_coeffs_y[i] - 128);
+       }
+       for (unsigned i = 0; i < 25; i++) {
+-         fg.ar_coeffs_cb[i] = (int8_t)dfg.ar_coeffs_cb[i];
+-         fg.ar_coeffs_cr[i] = (int8_t)dfg.ar_coeffs_cr[i];
++         fg.ar_coeffs_cb[i] = (int8_t)(dfg.ar_coeffs_cb[i] - 128);
++         fg.ar_coeffs_cr[i] = (int8_t)(dfg.ar_coeffs_cr[i] - 128);
+       }
+       fg.cb_mult = dfg.cb_mult;
+       fg.cb_luma_mult = dfg.cb_luma_mult;

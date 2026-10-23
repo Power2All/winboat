@@ -1,0 +1,319 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: enhanced barriers and relaxed format casting
+
+vkd3d-proton has both; the driver now reports them. Microsoft's runtime
+only enables enhanced barriers with relaxed format casting, and then
+sends every barrier that way, legacy ones too (its own translation, with
+its legacy layouts).
+
+- pfnBarrier (0094's arguments) into ID3D12GraphicsCommandList7::Barrier:
+  the barriers of one call take effect together, so one group per type;
+  the DDI's syncs, accesses and layouts have the API's values but for the
+  runtime's legacy layouts; buffer barriers cover the whole buffer; the
+  runtime's ranged barriers (atomic copies, tile mapping acquire/release)
+  carry no scopes and become a full global barrier.
+- The video lists' pfnBarrier does nothing, as their ResourceBarrier: the
+  decode and encode commands order themselves.
+- Castable format lists (0090 on) through ID3D12Device10's resource
+  creation, which takes the initial layout, and ID3D12Device12's
+  allocation info for placed resources.
+---
+diff --git a/libs/viogpu_umd/umd_command.cpp b/libs/viogpu_umd/umd_command.cpp
+index 1515a515..b62d9ee4 100644
+--- a/libs/viogpu_umd/umd_command.cpp
++++ b/libs/viogpu_umd/umd_command.cpp
+@@ -476,6 +476,76 @@ resource_barrier(D3D12DDI_HCOMMANDLIST h, UINT count, const D3D12DDIARG_RESOURCE
+       L(h)->ResourceBarrier((UINT)api.size(), api.data());
+ }
+ 
++/* The barriers of one call take effect together, so one group per type keeps their meaning. The runtime's ranged
++ * barriers (atomic copies, tile mapping acquire/release) carry no scopes: a full global barrier. 0094's arguments: the
++ * driver offers no DDI between 0082 (no enhanced barriers) and 0100 */
++static VOID APIENTRY
++barrier(D3D12DDI_HCOMMANDLIST h, UINT32 count, const D3D12DDIARG_BARRIER_0094 *barriers)
++{
++   std::vector<D3D12_GLOBAL_BARRIER> globals;
++   std::vector<D3D12_TEXTURE_BARRIER> textures;
++   std::vector<D3D12_BUFFER_BARRIER> buffers;
++   for (UINT32 i = 0; i < count; i++) {
++      const D3D12DDIARG_BARRIER_0094 &b = barriers[i];
++      switch (b.Type) {
++      case D3D12DDI_BARRIER_TYPE_GLOBAL: {
++         const D3D12DDI_GLOBAL_BARRIER_0088 &g = b.GlobalBarrier;
++         globals.push_back({(D3D12_BARRIER_SYNC)g.SyncBefore, (D3D12_BARRIER_SYNC)g.SyncAfter,
++                            (D3D12_BARRIER_ACCESS)g.AccessBefore, (D3D12_BARRIER_ACCESS)g.AccessAfter});
++         break;
++      }
++      case D3D12DDI_BARRIER_TYPE_TEXTURE: {
++         const D3D12DDI_TEXTURE_BARRIER_0088 &t = b.TextureBarrier;
++         D3D12_TEXTURE_BARRIER a = {};
++         a.SyncBefore = (D3D12_BARRIER_SYNC)t.SyncBefore;
++         a.SyncAfter = (D3D12_BARRIER_SYNC)t.SyncAfter;
++         a.AccessBefore = (D3D12_BARRIER_ACCESS)t.AccessBefore;
++         a.AccessAfter = (D3D12_BARRIER_ACCESS)t.AccessAfter;
++         a.LayoutBefore = barrier_layout(t.LayoutBefore);
++         a.LayoutAfter = barrier_layout(t.LayoutAfter);
++         a.pResource = resource_of(t.hResource);
++         a.Subresources = {t.Subresources.IndexOrFirstMipLevel, t.Subresources.NumMipLevels,
++                           t.Subresources.FirstArraySlice, t.Subresources.NumArraySlices, t.Subresources.FirstPlane,
++                           t.Subresources.NumPlanes};
++         a.Flags = (D3D12_TEXTURE_BARRIER_FLAGS)t.Flags;
++         textures.push_back(a);
++         break;
++      }
++      case D3D12DDI_BARRIER_TYPE_BUFFER: {
++         const D3D12DDI_BUFFER_BARRIER_0088 &u = b.BufferBarrier;
++         /* the whole buffer, as the API's are */
++         buffers.push_back({(D3D12_BARRIER_SYNC)u.SyncBefore, (D3D12_BARRIER_SYNC)u.SyncAfter,
++                            (D3D12_BARRIER_ACCESS)u.AccessBefore, (D3D12_BARRIER_ACCESS)u.AccessAfter,
++                            resource_of(u.hResource), 0, UINT64_MAX});
++         break;
++      }
++      case D3D12DDI_BARRIER_TYPE_RANGED:
++         globals.push_back({D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON,
++                            D3D12_BARRIER_ACCESS_COMMON});
++         break;
++      }
++   }
++   D3D12_BARRIER_GROUP groups[3];
++   UINT32 n = 0;
++   if (!globals.empty()) {
++      groups[n].Type = D3D12_BARRIER_TYPE_GLOBAL;
++      groups[n].NumBarriers = (UINT32)globals.size();
++      groups[n++].pGlobalBarriers = globals.data();
++   }
++   if (!textures.empty()) {
++      groups[n].Type = D3D12_BARRIER_TYPE_TEXTURE;
++      groups[n].NumBarriers = (UINT32)textures.size();
++      groups[n++].pTextureBarriers = textures.data();
++   }
++   if (!buffers.empty()) {
++      groups[n].Type = D3D12_BARRIER_TYPE_BUFFER;
++      groups[n].NumBarriers = (UINT32)buffers.size();
++      groups[n++].pBufferBarriers = buffers.data();
++   }
++   if (n && list_from(h)->list9)
++      list_from(h)->list9->Barrier(n, groups);
++}
++
+ static VOID APIENTRY
+ begin_query(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HQUERYHEAP heap, D3D12DDI_QUERY_TYPE type, UINT index)
+ {
+@@ -939,6 +1009,8 @@ viogpu_fill_command_list_table(void *table, SIZE_T size, UINT number, D3D12DDI_H
+    f->pfnExecuteBundle = execute_bundle;
+    f->pfnExecuteIndirect = execute_indirect;
+    f->pfnResourceBarrier = resource_barrier;
++   if (size >= offsetof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0094, pfnBarrier) + sizeof(void *))
++      f->pfnBarrier = barrier;
+    f->pfnBeginQuery = begin_query;
+    f->pfnEndQuery = end_query;
+    f->pfnResolveQueryData = resolve_query_data;
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+index e87b0307..019ae595 100644
+--- a/libs/viogpu_umd/umd_ddi.cpp
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -320,6 +320,7 @@ struct viogpu_caps {
+    D3D12DDI_SHADER_CAPS_0084 shader;
+    D3D12DDI_D3D12_OPTIONS_DATA_0089 options;
+    /* the caps of DDI 0090 on, one struct per build */
++   D3D12DDI_OPTIONS_DATA_0090 options0090;
+    D3D12DDI_OPTIONS_DATA_0091 options0091;
+    D3D12DDI_OPTIONS_DATA_0093 options0093;
+    D3D12DDI_OPTIONS_DATA_0102 options0102;
+@@ -437,6 +438,10 @@ caps_from_vkd3d(ID3D12Device *device, viogpu_caps *caps)
+    device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &o12, sizeof(o12));
+    options.MSPrimitivesPipelineStatisticIncludesCulledPrimitives =
+       o12.MSPrimitivesPipelineStatisticIncludesCulledPrimitives == D3D12_TRI_STATE_TRUE;
++   /* enhanced barriers (umd_command.cpp's barrier: the runtime then sends legacy ones that way too), which the
++    * runtime only enables with relaxed format casting (0090: castable format lists, umd_resource.cpp) */
++   options.EnhancedBarriersSupported = o12.EnhancedBarriersSupported;
++   caps->options0090.RelaxedFormatCastingSupported = o12.RelaxedFormatCastingSupported;
+    /* 0091: copies with any pitch, vertex elements at any offset, viewports flipped by their sign */
+    D3D12_FEATURE_DATA_D3D12_OPTIONS13 o13 = {};
+    device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS13, &o13, sizeof(o13));
+@@ -567,6 +572,8 @@ adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps
+ 
+    case D3D12DDICAPS_TYPE_OPTIONS_0091:
+       return answer(caps, dev->options0091);
++   case D3D12DDICAPS_TYPE_OPTIONS_0090:
++      return answer(caps, dev->options0090);
+    case D3D12DDICAPS_TYPE_OPTIONS_0102:
+       return answer(caps, dev->options0102);
+    case D3D12DDICAPS_TYPE_OPTIONS_0093:
+@@ -646,11 +653,10 @@ adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps
+    case D3D12DDICAPS_TYPE_0050_HARDWARE_SCHEDULING_CAPS:
+    case D3D12DDICAPS_TYPE_EXECUTECOMMANDLISTS_PARALLELISM:
+    case D3D12DDICAPS_TYPE_0073_SUPPORT_BATCHED_MARKERS:
+-   case D3D12DDICAPS_TYPE_OPTIONS_0090:
+    case D3D12DDICAPS_TYPE_OPTIONS_0098:
+    case D3D12DDICAPS_TYPE_OPTIONS_0101:
+-      /* none of it: queue flags 0, not compute-only, no hardware scheduling, FALSE; no relaxed format casting (the
+-       * castable format lists aren't passed on), fully CPU-accessible L1 memory or compute-only custom heaps */
++      /* none of it: queue flags 0, not compute-only, no hardware scheduling, FALSE; no fully CPU-accessible L1 memory
++       * or compute-only custom heaps */
+       if (!caps->pData)
+          return E_INVALIDARG;
+       memset(caps->pData, 0, caps->DataSize);
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+index f9712811..3f8ea671 100644
+--- a/libs/viogpu_umd/umd_private.h
++++ b/libs/viogpu_umd/umd_private.h
+@@ -68,6 +68,26 @@ device_ddi(const viogpu_device *device, UINT build)
+    return (device->version >> 16) >= build;
+ }
+ 
++/* Enhanced barriers (umd_command.cpp) and resources made in a layout (umd_resource.cpp): the DDI's layouts, syncs and
++ * accesses have the API's values but for the runtime's legacy layouts (its translation of legacy states) */
++static inline D3D12_BARRIER_LAYOUT
++barrier_layout(D3D12DDI_BARRIER_LAYOUT layout)
++{
++   switch (layout) {
++   case D3D12DDI_BARRIER_LAYOUT_LEGACY_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE:
++      return D3D12_BARRIER_LAYOUT_GENERIC_READ;
++   case D3D12DDI_BARRIER_LAYOUT_LEGACY_COPY_SOURCE:
++      return D3D12_BARRIER_LAYOUT_COPY_SOURCE;
++   case D3D12DDI_BARRIER_LAYOUT_LEGACY_COPY_DEST:
++      return D3D12_BARRIER_LAYOUT_COPY_DEST;
++   case D3D12DDI_BARRIER_LAYOUT_LEGACY_SHADER_RESOURCE:
++   case D3D12DDI_BARRIER_LAYOUT_LEGACY_PIXEL_SHADER_RESOURCE:
++      return D3D12_BARRIER_LAYOUT_SHADER_RESOURCE;
++   default:
++      return (D3D12_BARRIER_LAYOUT)layout;
++   }
++}
++
+ /* Device-level errors from DDIs without a return value */
+ void viogpu_device_error(viogpu_device *device, HRESULT hr);
+ 
+diff --git a/libs/viogpu_umd/umd_resource.cpp b/libs/viogpu_umd/umd_resource.cpp
+index c57558d1..1e160855 100644
+--- a/libs/viogpu_umd/umd_resource.cpp
++++ b/libs/viogpu_umd/umd_resource.cpp
+@@ -262,11 +262,25 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+    ID3D12Device8 *device8 = NULL;
+    if (res && feedback_map(desc.Format))
+       device->vkd3d->QueryInterface(IID_PPV_ARGS(&device8));
++   /* the formats its views may also have (relaxed format casting, 0090 on): through ID3D12Device10, which takes the
++    * initial layout */
++   ID3D12Device10 *device10 = NULL;
++   D3D12_BARRIER_LAYOUT layout = D3D12_BARRIER_LAYOUT_UNDEFINED;
++   if (res && device_ddi(device, D3D12DDI_BUILD_VERSION_0090) && resDesc->NumCastableFormats &&
++       SUCCEEDED(device->vkd3d->QueryInterface(IID_PPV_ARGS(&device10))))
++      layout = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_BARRIER_LAYOUT_UNDEFINED
++                                                                 : barrier_layout(resDesc->InitialBarrierLayout);
++   UINT32 castCount = device10 ? resDesc->NumCastableFormats : 0;
++   DXGI_FORMAT *castFormats = device10 ? (DXGI_FORMAT *)resDesc->pCastableFormats : NULL;
+ 
+    if (heapDesc && resDesc) {
+       viogpu_heap *heap = new (hHeap.pDrvPrivate) viogpu_heap();
+       D3D12_HEAP_PROPERTIES props = heap_properties(heapDesc);
+-      if (device8) {
++      if (device10) {
++         D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
++         hr = device10->CreateCommittedResource3(&props, D3D12_HEAP_FLAG_NONE, &d, layout, clearValue, NULL, castCount,
++                                                 castFormats, IID_PPV_ARGS(&res->resource));
++      } else if (device8) {
+          D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
+          hr = device8->CreateCommittedResource2(&props, D3D12_HEAP_FLAG_NONE, &d, state, clearValue, NULL,
+                                                 IID_PPV_ARGS(&res->resource));
+@@ -306,7 +320,11 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+    } else if (resDesc && hHeap.pDrvPrivate) {
+       viogpu_heap *heap = (viogpu_heap *)hHeap.pDrvPrivate;
+       UINT64 offset = resDesc->ReuseBufferGPUVA.BaseAddress.UMD.Offset;
+-      if (device8) {
++      if (device10) {
++         D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
++         hr = device10->CreatePlacedResource2(heap->heap, offset, &d, layout, clearValue, castCount, castFormats,
++                                              IID_PPV_ARGS(&res->resource));
++      } else if (device8) {
+          D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
+          hr = device8->CreatePlacedResource1(heap->heap, offset, &d, state, clearValue, IID_PPV_ARGS(&res->resource));
+       } else {
+@@ -314,9 +332,15 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+                                                   IID_PPV_ARGS(&res->resource));
+       }
+    } else if (resDesc) {
+-      hr = device->vkd3d->CreateReservedResource(&desc, state, clearValue, IID_PPV_ARGS(&res->resource));
++      if (device10)
++         hr = device10->CreateReservedResource2(&desc, layout, clearValue, NULL, castCount, castFormats,
++                                                IID_PPV_ARGS(&res->resource));
++      else
++         hr = device->vkd3d->CreateReservedResource(&desc, state, clearValue, IID_PPV_ARGS(&res->resource));
+    }
+ 
++   if (device10)
++      device10->Release();
+    if (device8)
+       device8->Release();
+    if (res && res->resource)
+@@ -405,11 +429,18 @@ check_resource_virtual_address(D3D12DDI_HDEVICE, D3D12DDI_HRESOURCE hResource)
+ 
+ static void
+ allocation_info(viogpu_device *device, const D3D12_RESOURCE_DESC &desc, UINT visibleNodeMask,
+-                D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info, const D3D12_MIP_REGION *region = NULL)
++                D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info, const D3D12_MIP_REGION *region = NULL,
++                UINT32 castCount = 0, const DXGI_FORMAT *castFormats = NULL)
+ {
+    D3D12_RESOURCE_ALLOCATION_INFO a;
+    ID3D12Device8 *device8 = NULL;
+-   if (feedback_map(desc.Format) && region && SUCCEEDED(device->vkd3d->QueryInterface(IID_PPV_ARGS(&device8)))) {
++   ID3D12Device12 *device12 = NULL;
++   if (castCount && SUCCEEDED(device->vkd3d->QueryInterface(IID_PPV_ARGS(&device12)))) {
++      /* with the formats its views may also have (they can change the image's layout) */
++      D3D12_RESOURCE_DESC1 d = desc1(desc, region ? *region : D3D12_MIP_REGION{});
++      a = device12->GetResourceAllocationInfo3(visibleNodeMask, 1, &d, &castCount, &castFormats, NULL);
++      device12->Release();
++   } else if (feedback_map(desc.Format) && region && SUCCEEDED(device->vkd3d->QueryInterface(IID_PPV_ARGS(&device8)))) {
+       D3D12_RESOURCE_DESC1 d = desc1(desc, *region);
+       a = device8->GetResourceAllocationInfo2(visibleNodeMask, 1, &d, NULL);
+       device8->Release();
+@@ -430,10 +461,12 @@ check_resource_allocation_info(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREAT
+                                D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS, UINT32 alignmentRestriction,
+                                UINT visibleNodeMask, D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
+ {
++   viogpu_device *device = device_from(hDevice);
+    D3D12_RESOURCE_DESC desc = resource_desc(resDesc);
+    desc.Alignment = alignmentRestriction;
+-   allocation_info(device_from(hDevice), desc, visibleNodeMask, info,
+-                   (const D3D12_MIP_REGION *)&resDesc->SamplerFeedbackMipRegion);
++   bool castable = device_ddi(device, D3D12DDI_BUILD_VERSION_0090);
++   allocation_info(device, desc, visibleNodeMask, info, (const D3D12_MIP_REGION *)&resDesc->SamplerFeedbackMipRegion,
++                   castable ? resDesc->NumCastableFormats : 0, castable ? resDesc->pCastableFormats : NULL);
+ }
+ 
+ static VOID APIENTRY
+diff --git a/libs/viogpu_umd/umd_video.cpp b/libs/viogpu_umd/umd_video.cpp
+index 6f984933..67353874 100644
+--- a/libs/viogpu_umd/umd_video.cpp
++++ b/libs/viogpu_umd/umd_video.cpp
+@@ -2121,6 +2121,12 @@ video_barrier(D3D12DDI_HCOMMANDLIST h, UINT, const D3D12DDIARG_RESOURCE_BARRIER_
+    /* everything on the encode queue is ordered by EncodeFrame's own barriers; transitions are its too */
+ }
+ 
++/* the same for enhanced barriers (the runtime's for legacy ones too, once they're reported) */
++static VOID APIENTRY
++video_enhanced_barrier(D3D12DDI_HCOMMANDLIST, UINT32, const D3D12DDIARG_BARRIER_0094 *)
++{
++}
++
+ static VOID APIENTRY
+ video_discard(D3D12DDI_HCOMMANDLIST, D3D12DDI_HRESOURCE, const D3D12DDIARG_DISCARD_RESOURCE_0003 *)
+ {
+@@ -2303,6 +2309,8 @@ viogpu_fill_video_table(D3D12DDI_TABLE_TYPE type, void *table, SIZE_T size, D3D1
+       f->pfnSetMarker = video_set_marker;
+       f->pfnSetPredication = video_set_predication;
+       f->pfnResourceBarrier = video_barrier;
++      if (size >= sizeof(D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_DECODE_0094))
++         ((D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_DECODE_0094 *)table)->pfnBarrier = video_enhanced_barrier;
+       decode_fill_list_table(f);
+       return S_OK;
+    }
+@@ -2320,6 +2328,8 @@ viogpu_fill_video_table(D3D12DDI_TABLE_TYPE type, void *table, SIZE_T size, D3D1
+       f->pfnSetMarker = video_set_marker;
+       f->pfnSetPredication = video_set_predication;
+       f->pfnResourceBarrier = video_barrier;
++      if (size >= sizeof(D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_ENCODE_0094))
++         ((D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_ENCODE_0094 *)table)->pfnBarrier = video_enhanced_barrier;
+       f->pfnResolveEncoderOutputMetadata = resolve_metadata;
+       f->pfnEncodeFrame = encode_frame;
+       return S_OK;

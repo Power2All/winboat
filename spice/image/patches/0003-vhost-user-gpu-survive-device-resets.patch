@@ -1,0 +1,106 @@
+contrib/vhost-user-gpu: survive device resets
+
+When the guest reboots (or reloads its GPU driver) the device is reset: QEMU
+closes the GPU socket while the guest's last commands (disabling the scanout)
+are still being processed, and sets a new socket when it starts the device
+again. The backend died of SIGPIPE writing to the closed socket, or asserted
+on the second socket, and the guest was left without a GPU (QEMU then crashed
+in the VGA fallback).
+
+Ignore SIGPIPE (a failed write already closes the socket), and treat every
+socket QEMU sets as a fresh start: drop the old socket and any wait on it, the
+guest's resources (virglrenderer's contexts and resources with
+virgl_renderer_reset, pending fences) and the scanouts.
+
+--- a/contrib/vhost-user-gpu/vhost-user-gpu.c
++++ b/contrib/vhost-user-gpu/vhost-user-gpu.c
+@@ -1128,6 +1128,33 @@
+                                protocol_features_cb, g);
+ }
+ 
++/*
++ * The frontend sets the socket when the device starts, and again after a
++ * reset (the guest rebooted, or its driver was reloaded): what the guest had
++ * is gone, and so is the old socket (often closed already: the frontend
++ * closes it while the guest's last commands, such as disabling the scanout,
++ * are still being processed)
++ */
++static void
++vg_reset(VuGpu *g)
++{
++    struct virtio_gpu_simple_resource *res, *tmp;
++
++    if (g->wait_in) {
++        g_source_remove(g->wait_in);
++        g->wait_in = 0;
++    }
++    vg_sock_fd_close(g);
++
++    if (g->virgl_inited) {
++        vg_virgl_reset(g);
++    }
++    QTAILQ_FOREACH_SAFE(res, &g->reslist, next, tmp) {
++        vg_resource_destroy(g, res);
++    }
++    memset(g->scanout, 0, sizeof(g->scanout));
++}
++
+ static int
+ vg_process_msg(VuDev *dev, VhostUserMsg *msg, int *do_reply)
+ {
+@@ -1136,7 +1163,7 @@
+     switch (msg->request) {
+     case VHOST_USER_GPU_SET_SOCKET: {
+         g_return_val_if_fail(msg->fd_num == 1, 1);
+-        g_return_val_if_fail(g->sock_fd == -1, 1);
++        vg_reset(g);
+         g->sock_fd = msg->fds[0];
+         set_gpu_protocol_features(g);
+         return 1;
+@@ -1316,6 +1343,13 @@
+         exit(EXIT_FAILURE);
+     }
+ 
++    /*
++     * The frontend closes the GPU socket when it stops the device, possibly
++     * while a message is being sent: that write fails (and closes the
++     * socket), it mustn't kill the process
++     */
++    signal(SIGPIPE, SIG_IGN);
++
+     loop = g_main_loop_new(NULL, FALSE);
+     g_main_loop_run(loop);
+     g_main_loop_unref(loop);
+--- a/contrib/vhost-user-gpu/virgl.c
++++ b/contrib/vhost-user-gpu/virgl.c
+@@ -577,6 +577,20 @@
+     virgl_renderer_create_fence(cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
+ }
+ 
++/* A device reset: the guest's contexts, resources and pending fences go away */
++void
++vg_virgl_reset(VuGpu *g)
++{
++    struct virtio_gpu_ctrl_command *cmd, *tmp;
++
++    QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
++        QTAILQ_REMOVE(&g->fenceq, cmd, next);
++        free(cmd);
++        g->inflight--;
++    }
++    virgl_renderer_reset();
++}
++
+ static void
+ virgl_write_fence(void *opaque, uint32_t fence)
+ {
+--- a/contrib/vhost-user-gpu/virgl.h
++++ b/contrib/vhost-user-gpu/virgl.h
+@@ -18,6 +18,7 @@
+ #include "vugpu.h"
+ 
+ bool vg_virgl_init(VuGpu *g);
++void vg_virgl_reset(VuGpu *g);
+ uint32_t vg_virgl_get_num_capsets(void);
+ void vg_virgl_process_cmd(VuGpu *vg, struct virtio_gpu_ctrl_command *cmd);
+ void vg_virgl_update_cursor_data(VuGpu *g, uint32_t resource_id,

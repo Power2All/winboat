@@ -1,0 +1,29 @@
+From: WinBoat
+Subject: [PATCH] vl/compositor: the color conversion as constant data
+
+The compositor's shaders read the color conversion matrix as CONST[n], which
+drivers like virgl take from constant data, not from a buffer bound in its
+place (a uniform buffer to them): the shaders read zeros and drew black. Pass
+it as constant data (a user buffer, which every driver takes).
+---
+diff --git a/src/gallium/auxiliary/vl/vl_compositor_gfx.c b/src/gallium/auxiliary/vl/vl_compositor_gfx.c
+index ed598c2..4789ad5 100644
+--- a/src/gallium/auxiliary/vl/vl_compositor_gfx.c
++++ b/src/gallium/auxiliary/vl/vl_compositor_gfx.c
+@@ -741,7 +741,15 @@ vl_compositor_gfx_render(struct vl_compositor_state *s,
+    c->pipe->bind_vs_state(c->pipe, c->vs);
+    c->pipe->bind_vertex_elements_state(c->pipe, c->vertex_elems_state);
+    util_set_vertex_buffers(c->pipe, 1, false, &c->vertex_buf);
+-   pipe_set_constant_buffer(c->pipe, PIPE_SHADER_FRAGMENT, 0, s->shader_params);
++   /* The color conversion as constants in the command stream: shaders read them as CONST[n], which drivers like
++    * virgl take from the constant data, not from a buffer bound in their place (a uniform buffer to them: the
++    * shaders read zeros and drew black) (WinBoat) */
++   float params[16] = {0};
++   memcpy(params, &s->csc_matrix, sizeof(vl_csc_matrix));
++   params[sizeof(vl_csc_matrix) / sizeof(float)] = s->luma_min;
++   params[sizeof(vl_csc_matrix) / sizeof(float) + 1] = s->luma_max;
++   struct pipe_constant_buffer cb = {.buffer_size = sizeof(params), .user_buffer = params};
++   c->pipe->set_constant_buffer(c->pipe, PIPE_SHADER_FRAGMENT, 0, false, &cb);
+    c->pipe->bind_rasterizer_state(c->pipe, c->rast);
+ 
+    draw_layers(c, s, dirty_area);

@@ -1,0 +1,1204 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: Windows 7 (the WDDM 1.1 build)
+
+The Windows 7 build (VIOGPU_WIN7 with VIOGPU_WDDM1_3, build-driver.ps1 -Win7): Windows 7's display driver interface,
+DXGKDDI_INTERFACE_VERSION 0x2005 (vcxproj, VIOGPU_WIN7=1), so any later field or callback is a compile error; the
+Windows 8 DDIs and callbacks gated with VIOGPU_WIN8_DDI. Found with the driver's trace on COM1, Windows 7's dxgkrnl
+and dxgmms1 through QEMU's gdbstub (hardware breakpoints on their return points, their public symbols):
+- Windows 7's loader doesn't set the /GS cookie and the current WDK's GsDriverEntry fast-fails (bugcheck 0x7E):
+  VioGpuWin7Entry sets it first
+- the driver caps say WDDM 1.0 (DXGKDDI_WDDMv1) and end where Windows 7's do; the segments come from
+  DXGKQAITYPE_QUERYSEGMENT (type 2). Windows 7's VidMm puts primaries only in CPU-visible segments
+  (VerifySegmentSet: CDD's primary failed with 0xC000000D and no mode was ever committed) and maps their CPU views at
+  the segment's CpuTranslatedAddress: a second, CPU-visible aperture segment for primaries (CDD's shared primary,
+  VIOGPU_RESOURCE_FLAG_PRIMARY) over device memory: the top 64 MB of the host-visible window (hostmem=), taken from
+  the blob resources, else virtio-vga's VGA memory BAR (8 MB). Views of RAM get locked (CDD's), and moving a locked
+  view off a primary at a mode change (MmRotatePhysicalView in SuspendPrimaryCpuAccess) fails with
+  STATUS_WAS_LOCKED, retried forever with the adapter's core lock held: the first boot after an install hung (the
+  new monitor's PnP restart waited for that lock, and logon for the restart). That was so with the aperture itself
+  CPU-visible at address 0 (the views were whatever RAM was there, which CDD wrote to) and with memory of the
+  driver's own alike
+- DXGKARG_OPENALLOCATION ends before SubresourceOffset and Pitch: writing them corrupted dxgkrnl's stack (0x7E)
+- no StopDeviceAndReleasePostDisplayOwnership: the vsync thread is stopped in StopDevice's path too (0xCE without)
+- no high-resolution timers (ExAllocateTimer), no KeQuerySystemTimePrecise: ExSetTimerResolution, KeQueryInterruptTime
+- one node (no D3D12/Venus queue), SubmitCommand without NodeOrdinal
+- target modes the size of the pinned source mode (Windows 8 and later scale mode 0); KMDOD's rotation offer
+Shared with Windows 8.1-11: a blit present appends VIOGPU_CMD_FLUSH_SCANOUT, after which the vsync thread flushes the
+scanout if the blit drew on it (Windows 7 without DWM draws the desktop with blits, which never reached the screen);
+its transfers take the box's offset and stride in the surface (offset 0 drew the desktop's top-left corner over the
+taskbar), and the cover rectangle of the sub-rectangles was their intersection (min), now their union. The vsync
+thread keeps the scanout's resource id and size instead of its allocation (a Direct3D 9Ex full-screen test destroyed
+the primary and the flush then used it: bugcheck 0x7E in CtrlQueue::AllocCmd); the allocation's destructor clears the
+id. VioGpuLog's lines go to COM1 too in the serial-trace build (COM_DEBUG).
+---
+diff --git a/viogpu/common/helper.h b/viogpu/common/helper.h
+index 322fb9c..5ef7651 100644
+--- a/viogpu/common/helper.h
++++ b/viogpu/common/helper.h
+@@ -108,6 +108,17 @@ extern "C"
+ #define VIOGPU_WDDM2 0
+ #endif
+ 
++// Windows 7 (VIOGPU_WIN7, with VIOGPU_WDDM1_3): the WDDM 1.3 driver offering WDDM 1.1's interface. Windows 7's
++// dxgkrnl has no Windows 8 boot display hand-over (DxgkCbAcquirePostDisplayOwnership): the driver starts at its
++// default mode
++// The Windows 8 DDIs (DxgkDdiSystemDisplayEnable, engine reset, node metadata...): not in the WDDM 1.1 headers of
++// the Windows 7 build
++#define VIOGPU_WIN8_DDI (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN8)
++
++#ifndef VIOGPU_WIN7
++#define VIOGPU_WIN7 0
++#endif
++
+ // GPU page tables (VIOGPU_WDDM2): 4 levels of 512 entries (DXGK_PTE, 16 bytes: 8 KB a table) over 4 KB pages, a
+ // 48-bit GPU virtual address space (Direct3D feature level 12_2 wants at least 40 bits a process). The CPU updates them (DXGK_PAGETABLEUPDATE_CPU_VIRTUAL) and the virtual
+ // GPU never reads them: its commands name host resources, not addresses
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+index ccfb3ee..c14c0c6 100644
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -287,6 +287,8 @@ typedef struct _VIOGPU_CREATE_RESOURCE_EXCHANGE
+ #pragma pack(1)
+ // Kernel driver only, never sent to the host: a GDI surface (GetStandardAllocationDriverData), drawn by GDI with the CPU
+ #define VIOGPU_RESOURCE_FLAG_GDI_SURFACE 0x80000000
++// Kernel driver only, never sent to the host: a primary (Windows 7 keeps these in its CPU-visible segment)
++#define VIOGPU_RESOURCE_FLAG_PRIMARY 0x40000000
+ 
+ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
+ {
+@@ -300,6 +302,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
+ #define VIOGPU_CMD_SUBMIT             0x1 // Submit Command to virgl
+ #define VIOGPU_CMD_TRANSFER_TO_HOST   0x2 // Transfer resource to host
+ #define VIOGPU_CMD_TRANSFER_FROM_HOST 0x3 // Transfer resource to host
++#define VIOGPU_CMD_FLUSH_SCANOUT      0x4 // The kernel's blit presents: the display shows the resource (a UINT) again
+ 
+ #pragma pack(1)
+ typedef struct _VIOGPU_COMMAND_HDR
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index 1b24965..486f714 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -74,6 +74,22 @@ void InitializeDebugPrints(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Re
+ #include <ntddk.h>
+ #include "viogpu_device.h"
+ 
++#if VIOGPU_WIN7
++// Windows 7's loader leaves the /GS cookie at its default value, and this WDK's GsDriverEntry then fails fast (int 29h,
++// which Windows 7 doesn't know: bugcheck 0x7E at boot). The entry point of the Windows 7 build (viogpu3d.vcxproj) sets
++// one first; it has no buffers of its own to check
++extern "C" ULONG_PTR __security_cookie;
++extern "C" DRIVER_INITIALIZE GsDriverEntry;
++extern "C" __declspec(safebuffers) NTSTATUS VioGpuWin7Entry(_In_ DRIVER_OBJECT *pDriverObject,
++                                                            _In_ UNICODE_STRING *pRegistryPath)
++{
++    LARGE_INTEGER counter = KeQueryPerformanceCounter(NULL);
++    ULONG_PTR cookie = (counter.QuadPart ^ KeQueryInterruptTime() ^ (ULONG_PTR)&counter) & 0x0000FFFFFFFFFFFFULL;
++    __security_cookie = (cookie == 0 || cookie == 0x2B992DDFA232ULL) ? cookie + 1 : cookie;
++    return GsDriverEntry(pDriverObject, pRegistryPath);
++}
++#endif
++
+ #pragma code_seg(push)
+ #pragma code_seg("PAGE")
+ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_STRING *pRegistryPath)
+@@ -85,6 +101,8 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
+ 
+ #if VIOGPU_WDDM2
+     InitialData.Version = DXGKDDI_INTERFACE_VERSION_WDDM2_0;
++#elif VIOGPU_WIN7
++    InitialData.Version = DXGKDDI_INTERFACE_VERSION_WIN7;
+ #else
+     InitialData.Version = DXGKDDI_INTERFACE_VERSION_WDDM1_3;
+ #endif
+@@ -134,10 +152,16 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
+     InitialData.DxgkDdiSetVidPnSourceAddress = VioGpu3DSetVidPnSourceAddress;
+     InitialData.DxgkDdiRecommendMonitorModes = VioGpu3DRecommendMonitorModes;
+     InitialData.DxgkDdiQueryVidPnHWCapability = VioGpu3DQueryVidPnHWCapability;
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiSystemDisplayEnable = VioGpu3DSystemDisplayEnable;
++#endif // VIOGPU_WIN8_DDI
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiSystemDisplayWrite = VioGpu3DSystemDisplayWrite;
++#endif // VIOGPU_WIN8_DDI
+ 
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiStopDeviceAndReleasePostDisplayOwnership = VioGpu3DStopDeviceAndReleasePostDisplayOwnership;
++#endif // VIOGPU_WIN8_DDI
+ 
+     InitialData.DxgkDdiCreateDevice = VioGpu3DCreateDevice;
+     InitialData.DxgkDdiDestroyDevice = VioGpu3DDestroyDevice;
+@@ -148,19 +172,31 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
+     InitialData.DxgkDdiCollectDbgInfo = VioGpu3DDdiCollectDbgInfo;
+     InitialData.DxgkDdiQueryCurrentFence = VioGpu3DDdiQueryCurrentFence;
+ 
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiQueryEngineStatus = VioGpu3DDdiQueryEngineStatus;
++#endif // VIOGPU_WIN8_DDI
+     // Windows 8.1 doesn't start a display driver with engine reset (ResetEngine) without it
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiQueryDependentEngineGroup = VioGpu3DDdiQueryDependentEngineGroup;
++#endif // VIOGPU_WIN8_DDI
+     // nor without SetPalette (dxgkrnl's ADAPTER_DISPLAY::CreateDisplayCore; no palettized modes here)
+     InitialData.DxgkDdiSetPalette = VioGpu3DDdiSetPalette;
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiResetEngine = VioGpu3DDdiResetEngine;
++#endif // VIOGPU_WIN8_DDI
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiCancelCommand = VioGpu3DDdiCancelCommand;
++#endif // VIOGPU_WIN8_DDI
+ 
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiGetNodeMetadata = VioGpu3DDdiGetNodeMetadata;
++#endif // VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiControlInterrupt = VioGpu3DDdiControlInterrupt;
+ #if !VIOGPU_WDDM2
+     // Windows 8.1's dxgkrnl calls it unchecked (DXGADAPTER::DdiControlInterrupt2): a null pointer bugchecked (0x3B)
++#if VIOGPU_WIN8_DDI
+     InitialData.DxgkDdiControlInterrupt2 = VioGpu3DDdiControlInterrupt2;
++#endif // VIOGPU_WIN8_DDI
+ #endif
+     InitialData.DxgkDdiGetScanLine = VioGpu3DDdiGetScanLine;
+ 
+@@ -364,6 +400,7 @@ VioGpu3DQueryAdapterInfo(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_QUERYADA
+     return pAdapter->QueryAdapterInfo(pQueryAdapterInfo);
+ }
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiGetNodeMetadata(_In_ CONST HANDLE hAdapter,
+@@ -389,6 +426,7 @@ VioGpu3DDdiGetNodeMetadata(_In_ CONST HANDLE hAdapter,
+ 
+     return STATUS_SUCCESS;
+ };
++#endif // VIOGPU_WIN8_DDI
+ 
+ #if VIOGPU_WDDM2
+ // WDDM 2.0: GPU virtual addresses. Windows keeps the page tables (VIOGPU_PAGE_TABLE_*); the virtual GPU has no MMU,
+@@ -725,8 +763,12 @@ VioGpu3DSubmitCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SUBMITCOMMA
+         // pAdapter));
+         return STATUS_UNSUCCESSFUL;
+     }
++#if VIOGPU_WIN8_DDI
+     VioGpuCommander &commander =
+         pSubmitCommand->NodeOrdinal == VIOGPU_VENUS_NODE ? pAdapter->venusCommander : pAdapter->commander;
++#else
++    VioGpuCommander &commander = pAdapter->commander; // (one node: Windows 7's submissions name none)
++#endif
+     return commander.SubmitCommand(pSubmitCommand);
+ };
+ 
+@@ -876,6 +918,7 @@ VioGpu3DRender(_In_ CONST HANDLE hDevice, _Inout_ DXGKARG_RENDER *pRender)
+     return pDxContext->Render(pRender);
+ }
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DStopDeviceAndReleasePostDisplayOwnership(_In_ VOID *pDeviceContext,
+@@ -894,6 +937,7 @@ VioGpu3DStopDeviceAndReleasePostDisplayOwnership(_In_ VOID *pDeviceContext,
+     }
+     return status;
+ }
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+@@ -1072,6 +1116,7 @@ VioGpu3DDdiControlInterrupt(_In_ CONST HANDLE hAdapter,
+ 
+ #if !VIOGPU_WDDM2
+ // Like ControlInterrupt: the vsync interrupts come from a timer whether asked for or not
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiControlInterrupt2(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CONTROLINTERRUPT2 InterruptControl)
+@@ -1081,6 +1126,7 @@ VioGpu3DDdiControlInterrupt2(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CONT
+     UNREFERENCED_PARAMETER(InterruptControl);
+     return STATUS_SUCCESS;
+ }
++#endif // VIOGPU_WIN8_DDI
+ #endif
+ 
+ NTSTATUS
+@@ -1149,6 +1195,7 @@ VOID VioGpu3DResetDevice(_In_ VOID *pDeviceContext)
+     pAdapter->ResetDevice();
+ }
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DSystemDisplayEnable(_In_ VOID *pDeviceContext,
+@@ -1164,7 +1211,9 @@ VioGpu3DSystemDisplayEnable(_In_ VOID *pDeviceContext,
+     VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(pDeviceContext);
+     return pAdapter->vidpn.SystemDisplayEnable(TargetId, Flags, Width, Height, ColorFormat);
+ }
++#endif // VIOGPU_WIN8_DDI
+ 
++#if VIOGPU_WIN8_DDI
+ VOID APIENTRY VioGpu3DSystemDisplayWrite(_In_ VOID *pDeviceContext,
+                                          _In_ VOID *Source,
+                                          _In_ UINT SourceWidth,
+@@ -1179,6 +1228,7 @@ VOID APIENTRY VioGpu3DSystemDisplayWrite(_In_ VOID *pDeviceContext,
+     VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(pDeviceContext);
+     pAdapter->vidpn.SystemDisplayWrite(Source, SourceWidth, SourceHeight, SourceStride, PositionX, PositionY);
+ }
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+@@ -1199,6 +1249,7 @@ VioGpu3DDdiRestartFromTimeout(_In_ CONST HANDLE hAdapter)
+     return STATUS_SUCCESS;
+ };
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiCancelCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CANCELCOMMAND *pCancelCommand)
+@@ -1210,6 +1261,7 @@ VioGpu3DDdiCancelCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CANCELCO
+ 
+     return STATUS_SUCCESS;
+ };
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+@@ -1225,6 +1277,7 @@ VioGpu3DDdiQueryCurrentFence(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYCU
+     return STATUS_SUCCESS;
+ };
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiResetEngine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_RESETENGINE *pResetEngine)
+@@ -1236,7 +1289,9 @@ VioGpu3DDdiResetEngine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_RESETENGINE *
+ 
+     return STATUS_SUCCESS;
+ };
++#endif // VIOGPU_WIN8_DDI
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiQueryEngineStatus(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYENGINESTATUS *pQueryEngineStatus)
+@@ -1248,6 +1303,7 @@ VioGpu3DDdiQueryEngineStatus(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYEN
+ 
+     return STATUS_SUCCESS;
+ };
++#endif // VIOGPU_WIN8_DDI
+ 
+ // No palettized (8-bit) modes: nothing to set
+ NTSTATUS
+@@ -1260,6 +1316,7 @@ VioGpu3DDdiSetPalette(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPALETTE
+ }
+ 
+ // The engines reset on their own: no node depends on another's
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiQueryDependentEngineGroup(_In_ CONST HANDLE hAdapter,
+@@ -1269,6 +1326,7 @@ VioGpu3DDdiQueryDependentEngineGroup(_In_ CONST HANDLE hAdapter,
+     pQueryDependentEngineGroup->DependentNodeOrdinalMask = 0;
+     return STATUS_SUCCESS;
+ }
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+diff --git a/viogpu/viogpu3d/driver.h b/viogpu/viogpu3d/driver.h
+index d4c1529..b052a2b 100644
+--- a/viogpu/viogpu3d/driver.h
++++ b/viogpu/viogpu3d/driver.h
+@@ -87,11 +87,13 @@ NTSTATUS
+ APIENTRY
+ VioGpu3DQueryAdapterInfo(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo);
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiGetNodeMetadata(_In_ CONST HANDLE hAdapter,
+                            UINT NodeOrdinal,
+                            _Out_ DXGKARG_GETNODEMETADATA *pGetNodeMetadata);
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+@@ -217,20 +219,25 @@ VioGpu3DDdiControlInterrupt(_In_ CONST HANDLE hAdapter,
+                             _In_ CONST DXGK_INTERRUPT_TYPE InterruptType,
+                             _In_ BOOLEAN EnableInterrupt);
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiControlInterrupt2(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CONTROLINTERRUPT2 InterruptControl);
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiGetScanLine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETSCANLINE *pGetScanLine);
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DStopDeviceAndReleasePostDisplayOwnership(_In_ VOID *pDeviceContext,
+                                                  _In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                                  _Out_ DXGK_DISPLAY_INFORMATION *DisplayInfo);
++#endif // VIOGPU_WIN8_DDI
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DSystemDisplayEnable(_In_ VOID *pDeviceContext,
+@@ -239,7 +246,9 @@ VioGpu3DSystemDisplayEnable(_In_ VOID *pDeviceContext,
+                             _Out_ UINT *Width,
+                             _Out_ UINT *Height,
+                             _Out_ D3DDDIFORMAT *ColorFormat);
++#endif // VIOGPU_WIN8_DDI
+ 
++#if VIOGPU_WIN8_DDI
+ VOID APIENTRY VioGpu3DSystemDisplayWrite(_In_ VOID *pDeviceContext,
+                                          _In_ VOID *Source,
+                                          _In_ UINT SourceWidth,
+@@ -247,6 +256,7 @@ VOID APIENTRY VioGpu3DSystemDisplayWrite(_In_ VOID *pDeviceContext,
+                                          _In_ UINT SourceStride,
+                                          _In_ UINT PositionX,
+                                          _In_ UINT PositionY);
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+@@ -256,9 +266,11 @@ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiRestartFromTimeout(_In_ CONST HANDLE hAdapter);
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiCancelCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CANCELCOMMAND *pCancelCommand);
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+@@ -293,22 +305,28 @@ VioGpu3DCalibrateGpuClock(_In_ CONST HANDLE hAdapter,
+                           _Out_ DXGKARG_CALIBRATEGPUCLOCK *pClockCalibration);
+ #endif
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiResetEngine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_RESETENGINE *pResetEngine);
++#endif // VIOGPU_WIN8_DDI
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiQueryEngineStatus(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYENGINESTATUS *pQueryEngineStatus);
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiSetPalette(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPALETTE *pSetPalette);
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiQueryDependentEngineGroup(_In_ CONST HANDLE hAdapter,
+                                      _Inout_ DXGKARG_QUERYDEPENDENTENGINEGROUP *pQueryDependentEngineGroup);
++#endif // VIOGPU_WIN8_DDI
+ 
+ NTSTATUS
+ APIENTRY
+diff --git a/viogpu/viogpu3d/viogpu3d.vcxproj b/viogpu/viogpu3d/viogpu3d.vcxproj
+index 69a16e7..eeb9daa 100644
+--- a/viogpu/viogpu3d/viogpu3d.vcxproj
++++ b/viogpu/viogpu3d/viogpu3d.vcxproj
+@@ -139,12 +139,16 @@
+     <ClCompile>
+       <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <!-- Windows 7 (build-driver.ps1 -Win7): the headers at WDDM 1.1, so nothing of Windows 8's interface compiles -->
++      <PreprocessorDefinitions Condition="'$(VIOGPU_WIN7)'=='1'">DXGKDDI_INTERFACE_VERSION=0x2005;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <WppEnabled>true</WppEnabled>
+       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
+     </ClCompile>
+     <Link>
+       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
+       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
++      <!-- Windows 7 (build-driver.ps1 -Win7): driver.cpp's VioGpuWin7Entry sets the /GS cookie first -->
++      <EntryPointSymbol Condition="'$(VIOGPU_WIN7)'=='1'">VioGpuWin7Entry</EntryPointSymbol>
+     </Link>
+     <PostBuildEvent>
+     </PostBuildEvent>
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 5d7ec48..30fee70 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -72,6 +72,9 @@ void VioGpuLog(_In_z_ _Printf_format_string_ const char *format, ...)
+ 
+     // also to the kernel debugger / DebugView (kernel capture), which still works when escapes are stuck
+     DbgPrintEx(DPFLTR_IHVVIDEO_ID, DPFLTR_ERROR_LEVEL, "viogpu: %s", line);
++#ifdef COM_DEBUG
++    DbgPrint(TRACE_LEVEL_FATAL, ("log: %s", line)); // (and to COM1 in the serial-trace build)
++#endif
+ 
+     KIRQL irql;
+     KeAcquireSpinLock(&g_LogLock, &irql);
+@@ -473,7 +476,9 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
+     {
+         if (DevicePowerState == PowerDeviceD0)
+         {
++#if VIOGPU_WIN8_DDI
+             vidpn.AcquirePostDisplayOwnership();
++#endif
+ 
+             if (m_AdapterPowerState == PowerDeviceD3)
+             {
+@@ -624,6 +629,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 info->SupportedCapsetIDs = m_supportedCapsetIDs;
+                 return STATUS_SUCCESS;
+             }
++#if VIOGPU_WIN8_DDI
+         case DXGKQAITYPE_HISTORYBUFFERPRECISION:
+             {
+                 // WDDM 1.3 asks (Windows 8.1 removed the device when it wasn't answered), one entry per node, each 0 or
+@@ -640,6 +646,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 }
+                 return STATUS_SUCCESS;
+             }
++#endif // VIOGPU_WIN8_DDI
+         case DXGKQAITYPE_DRIVERCAPS:
+             {
+                 if (!pQueryAdapterInfo->OutputDataSize)
+@@ -663,6 +670,10 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 pDriverCaps->WDDMVersion = DXGKDDI_WDDMv2;
+                 pDriverCaps->MemoryManagementCaps.VirtualAddressingSupported = TRUE;
+                 pDriverCaps->MemoryManagementCaps.GpuMmuSupported = TRUE;
++#elif VIOGPU_WIN7
++                // Windows 7's caps end at WDDMVersion (the Windows 8 fields below would be past its buffer), and its
++                // dxgkrnl knows WDDMv1 only
++                pDriverCaps->WDDMVersion = DXGKDDI_WDDMv1;
+ #else
+                 pDriverCaps->WDDMVersion = DXGKDDI_WDDMv1_3;
+ #endif
+@@ -674,22 +685,31 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+ 
+                 pDriverCaps->MemoryManagementCaps.SectionBackedPrimary = TRUE;
+ 
++#if !VIOGPU_WIN7
+                 pDriverCaps->SupportDirectFlip = 1;
++#endif
+                 // GDI device bitmaps drawn by GDI with the CPU (CDD), on GDI surfaces and on GDI-compatible D3D
+                 // surfaces: without it NtGdiCreateBitmapFromDxSurface2 fails (IDXGISurface1::GetDC draws nothing,
+                 // so the caption buttons of packaged apps, which UxTheme draws that way, stayed empty)
++#if VIOGPU_WIN8_DDI
+                 pDriverCaps->PresentationCaps.SupportSoftwareDeviceBitmaps = 1;
++#endif
+                 pDriverCaps->PresentationCaps.AlignmentShift = 2;        // pitch = width * 4
+                 pDriverCaps->PresentationCaps.MaxTextureWidthShift = 3;  // 16384
+                 pDriverCaps->PresentationCaps.MaxTextureHeightShift = 3;
+                 pDriverCaps->SchedulingCaps.MultiEngineAware = 1;
++#if VIOGPU_WIN8_DDI
+                 pDriverCaps->SchedulingCaps.PreemptionAware = 1;
++#endif
+ 
+                 // virgl, and the D3D12 driver's queues (VIOGPU_VENUS_NODE)
+-                pDriverCaps->GpuEngineTopology.NbAsymetricProcessingNodes = 2;
++                // (Windows 7: virgl alone, its submissions have no node)
++                pDriverCaps->GpuEngineTopology.NbAsymetricProcessingNodes = VIOGPU_WIN7 ? 1 : 2;
+ 
++#if !VIOGPU_WIN7
+                 pDriverCaps->SupportSmoothRotation = FALSE;
+                 pDriverCaps->SupportNonVGA = IsVgaDevice();
++#endif
+ 
+                 // A hardware cursor: the host draws it (a SPICE client on its own side), instead of Windows
+                 // drawing it into every frame. Masked color shapes stay software cursors.
+@@ -705,6 +725,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Driver caps return\n", __FUNCTION__));
+                 return STATUS_SUCCESS;
+             }
++#if VIOGPU_WIN8_DDI
+         case DXGKQAITYPE_QUERYSEGMENT3:
+             {
+                 if (pQueryAdapterInfo->OutputDataSize < sizeof(DXGK_QUERYSEGMENTOUT3))
+@@ -754,6 +775,76 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments\n", __FUNCTION__));
+                 return STATUS_SUCCESS;
+             }
++#endif // VIOGPU_WIN8_DDI
++#if VIOGPU_WIN7
++        case DXGKQAITYPE_QUERYSEGMENT:
++            {
++                // Windows 7's segment query (QUERYSEGMENT3 is Windows 8's): the same aperture segment, without
++                // Windows 8's DirectFlip. Windows 7's video memory manager puts primaries only in CPU-visible
++                // segments (VerifySegmentSet; CDD's failed with an invalid parameter and no mode was set), and maps
++                // their CPU views at the segment's CpuTranslatedAddress: a second, CPU-visible segment for them, over
++                // device memory. Views of RAM get locked (by CDD), and moving a locked view off a primary at a mode
++                // change (MmRotatePhysicalView) fails for good: STATUS_WAS_LOCKED, retried forever with the
++                // adapter's lock held, which hung the first boot after an install at its new monitor (with the
++                // aperture itself CPU-visible, at 0, and over memory of the driver's own alike)
++                if (pQueryAdapterInfo->OutputDataSize < sizeof(DXGK_QUERYSEGMENTOUT))
++                {
++                    return STATUS_BUFFER_TOO_SMALL;
++                }
++                if (!m_PrimarySegmentSize)
++                {
++                    // The top of the host-visible window (hostmem=), out of the blob resources' reach, else the VGA
++                    // memory BAR (virtio-vga's, 8 MB: primaries up to about 1680x1050)
++                    const ULONGLONG size = 64 * 1024 * 1024; // a 4096x2160 primary, and room
++                    CPciBar *vram = m_PciResources.GetPciBar(0);
++                    if (m_HostmemSize >= 4 * size)
++                    {
++                        m_HostmemSize -= size;
++                        m_PrimarySegmentPA.QuadPart = m_HostmemPA.QuadPart + m_HostmemSize;
++                        m_PrimarySegmentSize = (SIZE_T)size;
++                    }
++                    else if (vram && vram->GetPA().QuadPart && vram->GetSize() >= 4 * 1024 * 1024)
++                    {
++                        m_PrimarySegmentPA = vram->GetPA();
++                        m_PrimarySegmentSize = (SIZE_T)vram->GetSize();
++                    }
++                    else
++                    {
++                        VioGpuLog("no device memory for primaries (hostmem=, virtio-vga): the aperture is CPU-visible\n");
++                    }
++                }
++                DXGK_QUERYSEGMENTOUT *pSegmentInfo = (DXGK_QUERYSEGMENTOUT *)pQueryAdapterInfo->pOutputData;
++                if (!pSegmentInfo->pSegmentDescriptor)
++                {
++                    pSegmentInfo->NbSegment = m_PrimarySegmentSize ? 2 : 1;
++                }
++                else
++                {
++                    DXGK_SEGMENTDESCRIPTOR *pSegmentDesc = pSegmentInfo->pSegmentDescriptor;
++                    memset(pSegmentDesc, 0, sizeof(pSegmentDesc[0]) * (m_PrimarySegmentSize ? 2 : 1));
++                    pSegmentInfo->PagingBufferPrivateDataSize = 0;
++                    pSegmentInfo->PagingBufferSegmentId = 1;
++                    pSegmentInfo->PagingBufferSize = 10 * PAGE_SIZE;
++                    pSegmentDesc[0].BaseAddress.QuadPart = 0xC0000000;
++                    pSegmentDesc[0].Flags.Aperture = TRUE;
++                    pSegmentDesc[0].Flags.CacheCoherent = TRUE;
++                    pSegmentDesc[0].Flags.CpuVisible = !m_PrimarySegmentSize;
++                    pSegmentDesc[0].Size = 256 * 1024 * 4096;
++                    pSegmentDesc[0].CommitLimit = 256 * 1024 * 4096;
++                    if (m_PrimarySegmentSize)
++                    {
++                        pSegmentDesc[1].BaseAddress.QuadPart = 0x100000000; // after the aperture's GPU addresses
++                        pSegmentDesc[1].CpuTranslatedAddress = m_PrimarySegmentPA;
++                        pSegmentDesc[1].Flags.Aperture = TRUE;
++                        pSegmentDesc[1].Flags.CacheCoherent = TRUE;
++                        pSegmentDesc[1].Flags.CpuVisible = TRUE;
++                        pSegmentDesc[1].Size = m_PrimarySegmentSize;
++                        pSegmentDesc[1].CommitLimit = m_PrimarySegmentSize;
++                    }
++                }
++                return STATUS_SUCCESS;
++            }
++#endif
+ 
+ #if VIOGPU_WDDM2
+         case DXGKQAITYPE_QUERYSEGMENT4:
+@@ -1169,6 +1260,7 @@ NTSTATUS VioGpuAdapter::QueryInterface(_In_ CONST PQUERY_INTERFACE pQueryInterfa
+     return STATUS_NOT_SUPPORTED;
+ }
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS VioGpuAdapter::StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                                                  _Out_ DXGK_DISPLAY_INFORMATION *pDisplayInfo)
+ {
+@@ -1183,6 +1275,7 @@ NTSTATUS VioGpuAdapter::StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VID
+     vidpn.ReleasePostDisplayOwnership(TargetId, pDisplayInfo);
+     return StopDevice();
+ }
++#endif // VIOGPU_WIN8_DDI
+ 
+ PAGED_CODE_SEG_END
+ 
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 9be94f8..ab6de1a 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -112,6 +112,16 @@ class VioGpuAdapter : IVioGpuPCI
+     // HOSTMEM_RANGEs, sorted by offset
+     PHYSICAL_ADDRESS m_HostmemPA;
+     ULONGLONG m_HostmemSize;
++
++  public:
++#if VIOGPU_WIN7
++    // Windows 7's CPU-visible segment for primaries: device memory, where the CPU views Windows maps can't be locked
++    // (QUERYSEGMENT). 0: none, the one segment is CPU-visible instead
++    PHYSICAL_ADDRESS m_PrimarySegmentPA = {};
++    SIZE_T m_PrimarySegmentSize = 0;
++#endif
++
++  private:
+     // The local memory segment over the window (QUERYSEGMENT4): Windows 11 only. Windows 10's video memory manager
+     // (19041) faults (bugcheck 0x7E in dxgmms2 InitPagingProcessVaSpace) setting up the paging process with it there
+     bool m_LocalSegment = false;
+@@ -262,8 +272,10 @@ class VioGpuAdapter : IVioGpuPCI
+     NTSTATUS QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo);
+     NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE *pEscape);
+     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
++#if VIOGPU_WIN8_DDI
+     NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                                       _Out_ DXGK_DISPLAY_INFORMATION *pDisplayInfo);
++#endif // VIOGPU_WIN8_DDI
+     PDXGKRNL_INTERFACE GetDxgkInterface(void)
+     {
+         return &m_DxgkInterface;
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index 389076d..110d4b6 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -34,6 +34,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIO
+ VioGpuAllocation::~VioGpuAllocation(void)
+ {
+     DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s res_id=%d\n", __FUNCTION__, m_Id));
++    m_adapter->vidpn.ForgetScanout(m_Id);
+     if (m_options.bind & VIRGL_BIND_VK_SHARED)
+     {
+         m_adapter->RemoveSharedResource(m_Id);
+@@ -183,6 +184,8 @@ NTSTATUS VioGpuAllocation::GetStandardAllocationDriverData(DXGKARG_GETSTANDARDAL
+                 allocationExchange->ResourceOptions.format = ColorFormat(surfaceData->Format);
+                 allocationExchange->Size = (ULONGLONG)surfaceData->Width * (ULONGLONG)surfaceData->Height * 4;
+ 
++                allocationExchange->ResourceOptions.flags |= VIOGPU_RESOURCE_FLAG_PRIMARY;
++
+                 DbgPrint(TRACE_LEVEL_ERROR,
+                          ("<--- %s shared primary surface: width=%d, height=%d, format=%d\n",
+                           __FUNCTION__,
+@@ -334,7 +337,8 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+ 
+     VIOGPU_RESOURCE_OPTIONS options = resourceExchange->ResourceOptions;
+     bool gdiSurface = (options.flags & VIOGPU_RESOURCE_FLAG_GDI_SURFACE) != 0;
+-    options.flags &= ~VIOGPU_RESOURCE_FLAG_GDI_SURFACE;
++    bool primary = (options.flags & VIOGPU_RESOURCE_FLAG_PRIMARY) != 0;
++    options.flags &= ~(VIOGPU_RESOURCE_FLAG_GDI_SURFACE | VIOGPU_RESOURCE_FLAG_PRIMARY);
+     VioGpuAllocation *allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &options);
+     allocation->m_ChargedSize = charge;
+     allocationInfo->hAllocation = allocation;
+@@ -379,6 +383,18 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+ 
+     allocationInfo->SupportedReadSegmentSet = 0b1;
+     allocationInfo->SupportedWriteSegmentSet = 0b1;
++#if VIOGPU_WIN7
++    // Windows 7 puts primaries only in CPU-visible segments: the second one (QUERYSEGMENT)
++    if (primary && adapter->m_PrimarySegmentSize)
++    {
++        allocationInfo->PreferredSegment.SegmentId0 = 2;
++        allocationInfo->SupportedReadSegmentSet = 0b10;
++        allocationInfo->SupportedWriteSegmentSet = 0b10;
++        allocationInfo->EvictionSegmentSet = 0;
++    }
++#else
++    UNREFERENCED_PARAMETER(primary);
++#endif
+ 
+     DbgPrint(TRACE_LEVEL_INFORMATION,
+              ("<--- %s res_id=%d size=%d\n", __FUNCTION__, allocation->GetId(), allocationInfo->Size));
+@@ -450,17 +466,14 @@ NTSTATUS VioGpuAllocation::EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy)
+ 
+     // Bounded: a command buffer Windows dropped after Render (WDDM 2.0 does when an allocation isn't resident) never
+     // completes, and an endless wait here blocked every later escape of the adapter
+-    LARGE_INTEGER start;
+-    KeQuerySystemTimePrecise(&start);
++    ULONGLONG start = KeQueryInterruptTime();
+     while (resBusy->Wait && m_busy != 0)
+     {
+         LARGE_INTEGER timeout;
+         timeout.QuadPart = -10000000LL; // 1 s
+         KeWaitForSingleObject(&m_busyNotification, UserRequest, KernelMode, FALSE, &timeout);
+ 
+-        LARGE_INTEGER now;
+-        KeQuerySystemTimePrecise(&now);
+-        if (m_busy != 0 && now.QuadPart - start.QuadPart > 10 * 10000000LL)
++        if (m_busy != 0 && KeQueryInterruptTime() - start > 10 * 10000000ULL)
+         {
+             VioGpuLog("RES_BUSY: resource %u still busy after 10 s (busy %d), giving up", m_Id, m_busy);
+             break;
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index 79aadd9..589fbd2 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -126,6 +126,12 @@ void VioGpuCommand::Run()
+                     return;
+                 }
+ 
++            case VIOGPU_CMD_FLUSH_SCANOUT:
++                {
++                    m_pAdapter->vidpn.FlushScanout(*(UINT *)cmdBody);
++                    break;
++                }
++
+             case VIOGPU_CMD_NOP:
+             default:
+                 {
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index f6165cd..29c592d 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -416,8 +416,8 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuAlloc
+     {
+         coverRect.top = min(coverRect.top, pPresent->pDstSubRects[i].top);
+         coverRect.left = min(coverRect.left, pPresent->pDstSubRects[i].left);
+-        coverRect.right = min(coverRect.right, pPresent->pDstSubRects[i].right);
+-        coverRect.bottom = min(coverRect.bottom, pPresent->pDstSubRects[i].bottom);
++        coverRect.right = max(coverRect.right, pPresent->pDstSubRects[i].right);
++        coverRect.bottom = max(coverRect.bottom, pPresent->pDstSubRects[i].bottom);
+     }
+ 
+     INT dx = pPresent->SrcRect.left - pPresent->DstRect.left;
+@@ -443,10 +443,12 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuAlloc
+         cmdBody->box.height = coverRect.bottom - coverRect.top;
+         cmdBody->box.depth = 1;
+ 
++        // The box's pixels where they are in the surface's linear pages (offset 0 took them from its top left: the
++        // desktop's corner drawn over the taskbar on Windows 7)
+         cmdBody->layer_stride = 0;
+-        cmdBody->stride = 0;
++        cmdBody->stride = src->GetOptions().width * 4;
+         cmdBody->level = 0;
+-        cmdBody->offset = 0;
++        cmdBody->offset = (ULONGLONG)cmdBody->box.y * cmdBody->stride + cmdBody->box.x * 4;
+     }
+ 
+     {
+@@ -467,6 +469,7 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuAlloc
+ 
+             RECT rect = pPresent->pDstSubRects[i];
+ 
++
+             cmdBody[0] = VIRGL_CMD0(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, VIRGL_CMD_RESOURCE_COPY_REGION_SIZE);
+             cmdBody[1] = dst->GetId();
+             cmdBody[2] = 0;
+@@ -505,9 +508,20 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuAlloc
+         cmdBody->box.depth = 1;
+ 
+         cmdBody->layer_stride = 0;
+-        cmdBody->stride = 0;
++        cmdBody->stride = dst->GetOptions().width * 4;
+         cmdBody->level = 0;
+-        cmdBody->offset = 0;
++        cmdBody->offset = (ULONGLONG)cmdBody->box.y * cmdBody->stride + cmdBody->box.x * 4;
++    }
++
++    // A blit to the primary being scanned out (Windows 7 without DWM draws the desktop so, Windows 8 and later flip
++    // DWM's frames): the display updated once it's done, as a flip does
++    {
++        VIOGPU_COMMAND_HDR *cmd_hdr = (VIOGPU_COMMAND_HDR *)dmaBuf;
++        cmd_hdr->type = VIOGPU_CMD_FLUSH_SCANOUT;
++        cmd_hdr->size = sizeof(UINT);
++        dmaBuf += sizeof(VIOGPU_COMMAND_HDR);
++        *(UINT *)dmaBuf = dst->GetId();
++        dmaBuf += sizeof(UINT);
+     }
+ 
+     pPresent->pDmaBuffer = dmaBuf;
+@@ -709,6 +723,7 @@ NTSTATUS VioGpuDevice::OpenAllocation(_In_ CONST DXGKARG_OPENALLOCATION *pOpenAl
+         {
+             continue;
+         }
++#if VIOGPU_WIN8_DDI // (Windows 7's arguments end before SubresourceOffset and Pitch: Windows 8's GDI device bitmaps)
+         const VIOGPU_RESOURCE_OPTIONS &options = allocation->GetOptions();
+         if ((m_flags & 2 /* GdiDevice */) && options.target == 2 /* PIPE_TEXTURE_2D */ && options.last_level == 0 &&
+             options.array_size <= 1 && options.nr_samples <= 1 &&
+@@ -724,6 +739,7 @@ NTSTATUS VioGpuDevice::OpenAllocation(_In_ CONST DXGKARG_OPENALLOCATION *pOpenAl
+             deviceAllocation->SetGdiMapped();
+             InterlockedIncrement(&allocation->m_gdiOpen);
+         }
++#endif
+     }
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index e77f0ac..7647578 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -36,6 +36,8 @@ VioGpuVidPN::~VioGpuVidPN()
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ 
++    // (Windows 7 stops the device without StopDeviceAndReleasePostDisplayOwnership)
++    StopFlipThread();
+     DestroyFrameBufferObj(TRUE);
+ 
+     delete[] m_ModeInfo;
+@@ -65,6 +67,7 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
+         VioGpuDbgBreak();
+     }
+ 
++#if VIOGPU_WIN8_DDI
+     if (m_pAdapter->IsVgaDevice())
+     {
+         Status = AcquirePostDisplayOwnership();
+@@ -73,6 +76,9 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
+             return STATUS_UNSUCCESSFUL;
+         }
+     }
++#else
++    RtlZeroMemory(&m_SystemDisplayInfo, sizeof(m_SystemDisplayInfo)); // Windows 7: no boot display, the defaults below
++#endif
+ 
+     DbgPrint(TRACE_LEVEL_FATAL,
+              ("DxgkCbAcquirePostDisplayOwnership Width = %d Height = %d Pitch = %d ColorFormat = %d\n",
+@@ -123,6 +129,7 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
+     return Status;
+ }
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS VioGpuVidPN::AcquirePostDisplayOwnership()
+ {
+     NTSTATUS Status = m_pDxgkInterface->DxgkCbAcquirePostDisplayOwnership(m_pDxgkInterface->DeviceHandle,
+@@ -138,13 +145,15 @@ NTSTATUS VioGpuVidPN::AcquirePostDisplayOwnership()
+ 
+     return Status;
+ }
++#endif // VIOGPU_WIN8_DDI
+ 
+-void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+-                                              DXGK_DISPLAY_INFORMATION *pDisplayInfo)
++// Ends the vsync thread: a thread left running in an unloaded driver bugchecks (0xCE)
++void VioGpuVidPN::StopFlipThread()
+ {
+-    D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId = FindSourceForTarget(TargetId, TRUE);
+-    m_sourceAddress.QuadPart = 0;
+-
++    if (m_pFlipThread == NULL)
++    {
++        return;
++    }
+     LARGE_INTEGER timeout = {0};
+     timeout.QuadPart = Int32x32To64(1000, -10000);
+ 
+@@ -157,6 +166,16 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
+     }
+ 
+     ObDereferenceObject(m_pFlipThread);
++    m_pFlipThread = NULL;
++}
++
++void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
++                                              DXGK_DISPLAY_INFORMATION *pDisplayInfo)
++{
++    D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId = FindSourceForTarget(TargetId, TRUE);
++    m_sourceAddress.QuadPart = 0;
++
++    StopFlipThread();
+ 
+     BlackOutScreen(&m_CurrentModes[SourceId]);
+     DestroyFrameBufferObj(TRUE);
+@@ -1045,11 +1064,41 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
+     PAGED_CODE();
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+-    UNREFERENCED_PARAMETER(pVidPnPinnedSourceModeInfo);
+-
+     D3DKMDT_VIDPN_TARGET_MODE *pVidPnTargetModeInfo = NULL;
+     NTSTATUS Status = STATUS_SUCCESS;
+ 
++#if VIOGPU_WIN7
++    UNREFERENCED_PARAMETER(SourceId);
++    // Windows 7's target modes are the source's size (Windows 8 and later get mode 0 and scale it): the pinned source
++    // mode's, or before one is pinned every mode at 60 Hz, the current one preferred
++    for (ULONG i = 0; i < m_ModeCount; i++)
++    {
++        PVIDEO_MODE_INFORMATION pModeInfo = &m_ModeInfo[i];
++        if (pVidPnPinnedSourceModeInfo != NULL &&
++            (pModeInfo->VisScreenWidth != (ULONG)pVidPnPinnedSourceModeInfo->Format.Graphics.PrimSurfSize.cx ||
++             pModeInfo->VisScreenHeight != (ULONG)pVidPnPinnedSourceModeInfo->Format.Graphics.PrimSurfSize.cy))
++        {
++            continue;
++        }
++        Status = pVidPnTargetModeSetInterface->pfnCreateNewModeInfo(hVidPnTargetModeSet, &pVidPnTargetModeInfo);
++        if (!NT_SUCCESS(Status))
++        {
++            return Status;
++        }
++        BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo, DEFAULT_REFRESH_RATE);
++        pVidPnTargetModeInfo->VideoSignalInfo.ActiveSize = pVidPnTargetModeInfo->VideoSignalInfo.TotalSize;
++        pVidPnTargetModeInfo->Preference = (pVidPnPinnedSourceModeInfo != NULL || i == m_CurrentModeIndex)
++                                               ? D3DKMDT_MP_PREFERRED
++                                               : D3DKMDT_MP_NOTPREFERRED;
++        Status = pVidPnTargetModeSetInterface->pfnAddMode(hVidPnTargetModeSet, pVidPnTargetModeInfo);
++        if (!NT_SUCCESS(Status))
++        {
++            pVidPnTargetModeSetInterface->pfnReleaseModeInfo(hVidPnTargetModeSet, pVidPnTargetModeInfo);
++        }
++    }
++#else
++    UNREFERENCED_PARAMETER(pVidPnPinnedSourceModeInfo);
++
+     for (UINT RateIndex = 0; RateIndex < ARRAYSIZE(g_RefreshRates); ++RateIndex)
+     {
+         PVIDEO_MODE_INFORMATION pModeInfo = &m_ModeInfo[SourceId];
+@@ -1087,6 +1136,7 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
+             NT_ASSERT(NT_SUCCESS(Status));
+         }
+     }
++#endif
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+     return STATUS_SUCCESS;
+ }
+@@ -1529,14 +1579,16 @@ NTSTATUS VioGpuVidPN::EnumVidPnCofuncModality(_In_ CONST DXGKARG_ENUMVIDPNCOFUNC
+             }
+         }
+ 
+-        if (!((pEnumCofuncModality->EnumPivotType != D3DKMDT_EPT_ROTATION) &&
++        // (KMDOD offers the rotations unless rotation is the pivot, as Windows 7 gets; Windows 8 and later keep this
++        // driver's reverse they have run with)
++        if (!(((pEnumCofuncModality->EnumPivotType == D3DKMDT_EPT_ROTATION) == (bool)VIOGPU_WIN7) &&
+               (pEnumCofuncModality->EnumPivot.VidPnSourceId == pVidPnPresentPath->VidPnSourceId) &&
+               (pEnumCofuncModality->EnumPivot.VidPnTargetId == pVidPnPresentPath->VidPnTargetId)))
+         {
+             if (pVidPnPresentPath->ContentTransformation.Rotation == D3DKMDT_VPPR_UNPINNED)
+             {
+                 LocalVidPnPresentPath.ContentTransformation.RotationSupport.Identity = 1;
+-                LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate90 = 1;
++                LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate90 = !VIOGPU_WIN7; // (none done here)
+                 LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate180 = 0;
+                 LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate270 = 0;
+                 SupportFieldsModified = TRUE;
+@@ -2062,18 +2114,28 @@ void VioGpuVidPN::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
+     SetVideoModeInfo(m_CustomModeIndex, &tmpModeInfo);
+ }
+ 
++// The scanout allocation to the screen, if there is one
++bool VioGpuVidPN::ShowScanout()
++{
++    UINT resId = (UINT)m_sourceResId;
++    if (m_sourceAddress.QuadPart == 0 || resId == 0)
++    {
++        return false;
++    }
++    m_pAdapter->ctrlQueue.SetScanout(0, resId, m_sourceWidth, m_sourceHeight, 0, 0);
++    m_pAdapter->ctrlQueue.ResFlush(resId, m_sourceWidth, m_sourceHeight, 0, 0);
++    return true;
++}
++
+ void VioGpuVidPN::Flip(bool vsync)
+ {
+     PAGED_CODE();
+ 
++    bool flush = InterlockedExchange(&m_shouldFlush, 0) != 0;
+     if (InterlockedExchange(&m_shouldFlip, 0))
+     {
+         ULONGLONG start = KeQueryInterruptTime();
+-        if (m_sourceAddress.QuadPart != 0 && m_sourceRes != NULL)
+-        {
+-            m_sourceRes->FlushToScreen(0);
+-        }
+-        else
++        if (!ShowScanout())
+         {
+             m_pAdapter->ctrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
+         }
+@@ -2085,6 +2147,10 @@ void VioGpuVidPN::Flip(bool vsync)
+             VioGpuLog("flip to %I64x took %I64u ms", m_sourceAddress.QuadPart, (m_lastFlip - start) / 10000);
+         }
+     }
++    else if (flush)
++    {
++        ShowScanout();
++    }
+     if (!vsync)
+     {
+         return;
+@@ -2112,7 +2178,13 @@ void VioGpuVidPN::FlipThread(void *ctx)
+     // default), so at 60 Hz it lasted two ticks: 32 Hz, and DWM composed at that rate. A high-resolution periodic
+     // timer keeps the rate; it is set again when a mode with another rate is committed.
+     KeInitializeEvent(&vidpn->m_flipEvent, SynchronizationEvent, FALSE);
++#if VIOGPU_WIN7
++    // Windows 7 has no high-resolution timers (8.1's): the delay below, with the system timer at 1 ms meanwhile
++    PEX_TIMER timer = NULL;
++    ExSetTimerResolution(10000, TRUE);
++#else
+     PEX_TIMER timer = ExAllocateTimer(VioGpuVidPN::FlipTimerCallback, vidpn, EX_TIMER_HIGH_RESOLUTION);
++#endif
+     // A new frame goes to the host as soon as Windows flips to it, not at the next vblank: that saved up to a frame
+     // of latency. Windows still learns at the vblank that the flip completed, so it composes once per vblank.
+     PVOID events[] = {&vidpn->m_flipNowEvent, &vidpn->m_flipEvent};
+@@ -2122,10 +2194,12 @@ void VioGpuVidPN::FlipThread(void *ctx)
+         {
+             rate = vidpn->m_RefreshRate;
+             interval.QuadPart = -10000000LL / rate;
++#if !VIOGPU_WIN7
+             if (timer != NULL)
+             {
+                 ExSetTimer(timer, interval.QuadPart, -interval.QuadPart, NULL);
+             }
++#endif
+         }
+         bool vsync = true;
+         if (timer != NULL)
+@@ -2139,10 +2213,14 @@ void VioGpuVidPN::FlipThread(void *ctx)
+         }
+         if (vidpn->m_shouldFlipStop)
+         {
++#if VIOGPU_WIN7
++            ExSetTimerResolution(0, FALSE);
++#else
+             if (timer != NULL)
+             {
+                 ExDeleteTimer(timer, TRUE, TRUE, NULL);
+             }
++#endif
+             return;
+         }
+         vidpn->Flip(vsync);
+@@ -2189,7 +2267,10 @@ void VioGpuVidPN::FlipNowDpc(PKDPC Dpc, PVOID ctx, PVOID SystemArgument1, PVOID
+ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
+ {
+     m_sourceAddress = pSetVidPnSourceAddress->PrimaryAddress;
+-    m_sourceRes = reinterpret_cast<VioGpuAllocation *>(pSetVidPnSourceAddress->hAllocation);
++    VioGpuAllocation *source = reinterpret_cast<VioGpuAllocation *>(pSetVidPnSourceAddress->hAllocation);
++    m_sourceWidth = source ? source->GetOptions().width : 0;
++    m_sourceHeight = source ? source->GetOptions().height : 0;
++    InterlockedExchange(&m_sourceResId, source ? (LONG)source->GetId() : 0);
+     InterlockedOr(&m_shouldFlip, 1);
+     // May run at a raised IRQL: a DPC can be queued at any IRQL, an event set only up to DISPATCH_LEVEL
+     KeInsertQueueDpc(&m_flipNowDpc, NULL, NULL);
+@@ -2197,6 +2278,20 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS
+     return STATUS_SUCCESS;
+ };
+ 
++void VioGpuVidPN::ForgetScanout(UINT resId)
++{
++    InterlockedCompareExchange(&m_sourceResId, 0, (LONG)resId);
++}
++
++void VioGpuVidPN::FlushScanout(UINT resId)
++{
++    if (m_sourceAddress.QuadPart != 0 && resId != 0 && (UINT)m_sourceResId == resId)
++    {
++        InterlockedOr(&m_shouldFlush, 1);
++        KeInsertQueueDpc(&m_flipNowDpc, NULL, NULL);
++    }
++}
++
+ D3DDDI_VIDEO_PRESENT_SOURCE_ID VioGpuVidPN::FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                                                 BOOLEAN DefaultToZero)
+ {
+@@ -2212,6 +2307,7 @@ D3DDDI_VIDEO_PRESENT_SOURCE_ID VioGpuVidPN::FindSourceForTarget(D3DDDI_VIDEO_PRE
+     return DefaultToZero ? 0 : D3DDDI_ID_UNINITIALIZED;
+ }
+ 
++#if VIOGPU_WIN8_DDI
+ NTSTATUS VioGpuVidPN::SystemDisplayEnable(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                           _In_ PDXGKARG_SYSTEM_DISPLAY_ENABLE_FLAGS Flags,
+                                           _Out_ UINT *pWidth,
+@@ -2268,7 +2364,9 @@ NTSTATUS VioGpuVidPN::SystemDisplayEnable(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID Ta
+ 
+     return STATUS_SUCCESS;
+ }
++#endif // VIOGPU_WIN8_DDI
+ 
++#if VIOGPU_WIN8_DDI
+ VOID VioGpuVidPN::SystemDisplayWrite(_In_reads_bytes_(SourceHeight *SourceStride) VOID *pSource,
+                                      _In_ UINT SourceWidth,
+                                      _In_ UINT SourceHeight,
+@@ -2308,5 +2406,6 @@ VOID VioGpuVidPN::SystemDisplayWrite(_In_reads_bytes_(SourceHeight *SourceStride
+ 
+     BltBits(&DstBltInfo, &SrcBltInfo, &Rect);
+ }
++#endif // VIOGPU_WIN8_DDI
+ 
+ #pragma code_seg(pop) // End Non-Paged Code
+\ No newline at end of file
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index a0a1eb6..faa5f0b 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -40,8 +40,11 @@ class VioGpuVidPN
+     ~VioGpuVidPN();
+ 
+     NTSTATUS Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren);
++#if VIOGPU_WIN8_DDI
+     NTSTATUS AcquirePostDisplayOwnership();
++#endif
+     void ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId, DXGK_DISPLAY_INFORMATION *pDisplayInfo);
++    void StopFlipThread();
+     void Powerdown();
+ 
+     NTSTATUS IsVidPnSourceModeFieldsValid(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode) const;
+@@ -87,24 +90,33 @@ class VioGpuVidPN
+     NTSTATUS SetVidPnSourceVisibility(_In_ CONST DXGKARG_SETVIDPNSOURCEVISIBILITY *pSetVidPnSourceVisibility);
+     NTSTATUS QueryVidPnHWCapability(_Inout_ DXGKARG_QUERYVIDPNHWCAPABILITY *pVidPnHWCaps);
+ 
++#if VIOGPU_WIN8_DDI
+     NTSTATUS SystemDisplayEnable(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                  _In_ PDXGKARG_SYSTEM_DISPLAY_ENABLE_FLAGS Flags,
+                                  _Out_ UINT *pWidth,
+                                  _Out_ UINT *pHeight,
+                                  _Out_ D3DDDIFORMAT *pColorFormat);
++#endif // VIOGPU_WIN8_DDI
++#if VIOGPU_WIN8_DDI
+     VOID SystemDisplayWrite(_In_reads_bytes_(SourceHeight *SourceStride) VOID *pSource,
+                             _In_ UINT SourceWidth,
+                             _In_ UINT SourceHeight,
+                             _In_ UINT SourceStride,
+                             _In_ INT PositionX,
+                             _In_ INT PositionY);
++#endif // VIOGPU_WIN8_DDI
+ 
+     void Flip(bool vsync);
++    bool ShowScanout();
+     static void FlipThread(void *ctx);
+     static EXT_CALLBACK FlipTimerCallback;
+     static KDEFERRED_ROUTINE FlipNowDpc;
+ 
+     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
++    // A present drew on resource resId: if it's the one scanned out, the display shows it again (by the flip thread)
++    void FlushScanout(UINT resId);
++    // An allocation is destroyed: no longer the one to show
++    void ForgetScanout(UINT resId);
+     UINT GetRefreshRate() const
+     {
+         return (UINT)m_RefreshRate;
+@@ -150,10 +162,14 @@ class VioGpuVidPN
+     VioGpuObj *m_pFrameBuf;
+ 
+     PHYSICAL_ADDRESS m_sourceAddress = {0};
+-    VioGpuAllocation *m_sourceRes = NULL;
++    // The scanned-out allocation's resource and size (copied: the vsync thread mustn't touch an allocation Windows
++    // may destroy meanwhile; its destructor clears the id, ForgetScanout)
++    volatile LONG m_sourceResId = 0;
++    UINT m_sourceWidth = 0, m_sourceHeight = 0;
+     volatile LONG m_shouldFlip = 0;
++    volatile LONG m_shouldFlush = 0;
+ 
+-    PETHREAD m_pFlipThread;
++    PETHREAD m_pFlipThread = NULL;
+     BOOL m_shouldFlipStop = false;
+     KEVENT m_flipEvent;
+     // A new source address: the flip thread shows it right away (SetVidPnSourceAddress can't wait), the vsync
+diff --git a/viogpu/viogpudo/viogpudo.h b/viogpu/viogpudo/viogpudo.h
+index 56c3ce4..b766f6a 100644
+--- a/viogpu/viogpudo/viogpudo.h
++++ b/viogpu/viogpudo/viogpudo.h
+@@ -305,7 +305,9 @@ class VioGpuDod
+     NTSTATUS SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition);
+     NTSTATUS SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape);
+     NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE *pEscape);
++#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN8)
+     NTSTATUS PresentDisplayOnly(_In_ CONST DXGKARG_PRESENT_DISPLAYONLY *pPresentDisplayOnly);
++#endif
+     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
+     NTSTATUS IsSupportedVidPn(_Inout_ DXGKARG_ISSUPPORTEDVIDPN *pIsSupportedVidPn);
+     NTSTATUS RecommendFunctionalVidPn(_In_ CONST DXGKARG_RECOMMENDFUNCTIONALVIDPN *CONST pRecommendFunctionalVidPn);
+@@ -317,13 +319,17 @@ class VioGpuDod
+     NTSTATUS
+     UpdateActiveVidPnPresentPath(_In_ CONST DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH *CONST pUpdateActiveVidPnPresentPath);
+     NTSTATUS QueryVidPnHWCapability(_Inout_ DXGKARG_QUERYVIDPNHWCAPABILITY *pVidPnHWCaps);
++#if VIOGPU_WIN8_DDI
+     NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                                       _Out_ DXGK_DISPLAY_INFORMATION *pDisplayInfo);
++#endif // VIOGPU_WIN8_DDI
++#if VIOGPU_WIN8_DDI
+     NTSTATUS SystemDisplayEnable(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                  _In_ PDXGKARG_SYSTEM_DISPLAY_ENABLE_FLAGS Flags,
+                                  _Out_ UINT *pWidth,
+                                  _Out_ UINT *pHeight,
+                                  _Out_ D3DDDIFORMAT *pColorFormat);
++#endif // VIOGPU_WIN8_DDI
+     VOID SystemDisplayWrite(_In_reads_bytes_(SourceHeight *SourceStride) VOID *pSource,
+                             _In_ UINT SourceWidth,
+                             _In_ UINT SourceHeight,

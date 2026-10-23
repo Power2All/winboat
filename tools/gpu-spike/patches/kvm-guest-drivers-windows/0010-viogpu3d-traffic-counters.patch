@@ -1,0 +1,170 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: counters of what the driver sends the host
+
+WinBoat shows the virtual GPU's traffic among the VM's metrics. The control queue counts its commands and their
+bytes with the data they carry (3D command streams, which also carry most texture data inline, and backing page
+lists); transfers to and from the host count the bytes the host copies (estimated from the box and its strides).
+The new VIOGPU_GET_STATS escape returns the totals since the driver started; it needs no device, so a service
+can read them (the guest server, via D3DKMTEscape on the adapter that reports VIOGPU_IAM).
+---
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+index d4756e9..75aa179 100644
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -61,6 +61,7 @@ typedef struct _VIOGPU_ADAPTERINFO
+ #define VIOGPU_GET_DEVICE_ID         0x000
+ #define VIOGPU_GET_CUSTOM_RESOLUTION 0x001
+ #define VIOGPU_GET_CAPS              0x002
++#define VIOGPU_GET_STATS             0x003
+ 
+ #define VIOGPU_RES_INFO              0x100
+ #define VIOGPU_RES_BUSY              0x101
+@@ -117,6 +118,17 @@ typedef struct _VIOGPU_CTX_INIT_REQ
+ } VIOGPU_CTX_INIT_REQ;
+ #pragma pack()
+ 
++// What the driver sent the host since it started (VIOGPU_GET_STATS)
++#pragma pack(1)
++typedef struct _VIOGPU_STATS_REQ
++{
++    UINT64 Commands;      // commands on the control queue
++    UINT64 CommandBytes;  // their bytes, with the data they carry (3D command streams, backing page lists)
++    UINT64 UploadBytes;   // texture and buffer data the host copied from Windows' memory (transfers to the host)
++    UINT64 DownloadBytes; // and into it (transfers from the host)
++} VIOGPU_STATS_REQ;
++#pragma pack()
++
+ #pragma pack(1)
+ typedef struct _VIOGPU_ESCAPE
+ {
+@@ -132,6 +144,8 @@ typedef struct _VIOGPU_ESCAPE
+         VIOGPU_RES_BUSY_REQ ResourceBusy;
+ 
+         VIOGPU_CTX_INIT_REQ CtxInit;
++
++        VIOGPU_STATS_REQ Stats;
+     } DUMMYUNIONNAME;
+ } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
+ #pragma pack()
+diff --git a/viogpu/common/viogpu_queue.h b/viogpu/common/viogpu_queue.h
+index 4b5fba4..857ebb2 100644
+--- a/viogpu/common/viogpu_queue.h
++++ b/viogpu/common/viogpu_queue.h
+@@ -228,8 +228,15 @@ class CtrlQueue : public VioGpuQueue
+     CtrlQueue() : VioGpuQueue()
+     {
+         m_FenceIdr = 0;
++        m_Commands = 0;
++        m_CommandBytes = 0;
++        m_UploadBytes = 0;
++        m_DownloadBytes = 0;
+     };
+ 
++    // What was sent to the host so far (VIOGPU_GET_STATS)
++    void GetStats(VIOGPU_STATS_REQ *stats);
++
+     PVOID AllocCmd(PGPU_VBUFFER *buf, int sz);
+     PVOID AllocCmdResp(PGPU_VBUFFER *buf, int cmd_sz, PVOID resp_buf, int resp_sz);
+ 
+@@ -268,6 +275,10 @@ class CtrlQueue : public VioGpuQueue
+ 
+   private:
+     volatile LONG m_FenceIdr;
++    volatile LONG64 m_Commands;
++    volatile LONG64 m_CommandBytes;
++    volatile LONG64 m_UploadBytes;
++    volatile LONG64 m_DownloadBytes;
+ };
+ 
+ class CrsrQueue : public VioGpuQueue
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index 2372d78..d4b34d3 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -550,6 +550,8 @@ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT hei
+     cmd->r.x = x;
+     cmd->r.y = y;
+ 
++    // The driver's own 2D resources have 32-bit pixels
++    InterlockedAdd64(&m_UploadBytes, (LONG64)width * height * 4);
+     QueueBuffer(vbuf);
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+@@ -573,6 +575,8 @@ void CtrlQueue::TransferToHost3D(UINT res_id, GPU_BOX *box)
+     cmd->layer_stride = 0;
+ 
+     memcpy(&cmd->box, box, sizeof(GPU_BOX));
++    // The driver's own resources (cursor, frame buffer) have 32-bit pixels
++    InterlockedAdd64(&m_UploadBytes, (LONG64)box->width * box->height * max(box->depth, 1) * 4);
+     QueueBuffer(vbuf);
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+@@ -689,11 +693,28 @@ void CtrlQueue::TransferHostCmd(bool to_host,
+     vbuf->complete_cb = complete_cb;
+     vbuf->complete_ctx = complete_ctx;
+ 
++    // What the host copies: the box's rows (stride bytes each) and layers, or its bytes for buffers (no stride)
++    ULONG64 height = max(options->box.height, 1), depth = max(options->box.depth, 1);
++    ULONG64 bytes = options->layer_stride && depth > 1 ? options->layer_stride * depth
++                    : options->stride                ? options->stride * height * depth
++                                                     : options->box.width * height * depth;
++    InterlockedAdd64(to_host ? &m_UploadBytes : &m_DownloadBytes, (LONG64)bytes);
+     QueueBuffer(vbuf);
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ }
+ 
++void CtrlQueue::GetStats(VIOGPU_STATS_REQ *stats)
++{
++    PAGED_CODE();
++
++    // 64-bit reads are atomic on x64
++    stats->Commands = (UINT64)m_Commands;
++    stats->CommandBytes = (UINT64)m_CommandBytes;
++    stats->UploadBytes = (UINT64)m_UploadBytes;
++    stats->DownloadBytes = (UINT64)m_DownloadBytes;
++}
++
+ PAGED_CODE_SEG_END
+ 
+ void CtrlQueue::DestroyResource(UINT res_id)
+@@ -866,6 +887,11 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
+     {
+         DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s failed to queue the command: %d\n", __FUNCTION__, ret));
+     }
++    else
++    {
++        InterlockedIncrement64(&m_Commands);
++        InterlockedAdd64(&m_CommandBytes, (LONG64)buf->size + buf->data_size);
++    }
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s ret = %d\n", __FUNCTION__, ret));
+ 
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index c7ad387..4c15173 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -683,6 +683,23 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                 }
+                 ctrlQueue.ReleaseBuffer(vbuf);
+ 
++                break;
++            }
++        case VIOGPU_GET_STATS:
++            {
++                // What the driver sent the host (WinBoat's metrics): no device needed
++                size = sizeof(VIOGPU_STATS_REQ);
++                if (pVioGpuEscape->DataLength < size ||
++                    pEscape->PrivateDriverDataSize < FIELD_OFFSET(VIOGPU_ESCAPE, Stats) + size)
++                {
++                    DbgPrint(TRACE_LEVEL_ERROR,
++                             ("%s buffer too small %d, should be at least %d\n",
++                              __FUNCTION__,
++                              pVioGpuEscape->DataLength,
++                              size));
++                    return STATUS_INVALID_BUFFER_SIZE;
++                }
++                ctrlQueue.GetStats(&pVioGpuEscape->Stats);
+                 break;
+             }
+         case VIOGPU_RES_INFO:

@@ -1,0 +1,691 @@
+vhost-user-gpu: Venus (Vulkan), blob resources and host-visible memory
+
+Venus needs blob resources the guest maps (the host's Vulkan memory and the
+shared memory of its command ring), contexts of the Venus capset and fences on
+a context's timelines. QEMU's own virtio-gpu-gl has them, but runs virgl on
+QEMU's main loop; vhost-user-gpu keeps the GPU off it and had none of them.
+
+Frontend: a "hostmem" property like virtio-gpu's. The PCI device puts that
+window in BAR 4 (virtio's shared memory capability, VIRTIO_GPU_SHM_ID_HOST_VISIBLE);
+it becomes a virtio shared memory region (created after virtio_init(), which
+sets up the list), so the backend can map files into it with vhost-user's
+SHMEM_MAP. RESOURCE_BLOB and CONTEXT_INIT are offered when the backend has them.
+
+vhost: files mapped with SHMEM_MAP stay out of the backend's memory table. The
+backend has them already, and the table update after each mapping waited for
+the backend while the backend waited for the reply to its next SHMEM_MAP
+(deadlock on the second blob). SHMEM_MAP then commits the mapping before it
+replies: the backend tells the guest the memory is there once it has the reply,
+and the guest's first writes (Venus' ring) otherwise went nowhere.
+
+Backend: --venus starts virglrenderer with Venus and its render server,
+offers RESOURCE_BLOB, CONTEXT_INIT and vhost-user's SHMEM protocol feature,
+lists the Venus capset, creates contexts with context_init, creates blobs
+(with the guest's pages when they have some), maps a blob by exporting it
+(a dma-buf for Vulkan memory, a memfd for shared memory) and asking the frontend
+to map that fd, and answers fences on a context's rings
+(write_context_fence). It starts virgl when the guest first reads the config:
+the guest reads the number of capsets before it starts the device, and Venus'
+capset only exists once the render server runs.
+
+Tested with a Debian 13 guest (Mesa 25.0 Venus): vulkaninfo shows
+"Virtio-GPU Venus (NVIDIA GeForce RTX 3080 Laptop GPU)", a GPU fill + copy into
+host-visible memory reads back correctly, 20 runs in a row.
+
+diff --git a/contrib/vhost-user-gpu/vhost-user-gpu.c b/contrib/vhost-user-gpu/vhost-user-gpu.c
+index a7746bb62..b495313fb 100644
+--- a/contrib/vhost-user-gpu/vhost-user-gpu.c
++++ b/contrib/vhost-user-gpu/vhost-user-gpu.c
+@@ -47,6 +47,7 @@ static int opt_fdnum = -1;
+ static char *opt_socket_path;
+ static char *opt_render_node;
+ static gboolean opt_virgl;
++static gboolean opt_venus;
+ 
+ static void vg_handle_ctrl(VuDev *dev, int qidx);
+ static void vg_cleanup_mapping(VuGpu *g,
+@@ -503,21 +504,32 @@ vg_create_mapping_iov(VuGpu *g,
+                       struct virtio_gpu_resource_attach_backing *ab,
+                       struct virtio_gpu_ctrl_command *cmd,
+                       struct iovec **iov)
++{
++    return vg_create_mapping_iov_at(g, ab->resource_id, ab->nr_entries,
++                                    sizeof(*ab), cmd, iov);
++}
++
++/* The guest pages a command lists after its first offset bytes */
++int
++vg_create_mapping_iov_at(VuGpu *g, uint32_t resource_id,
++                         uint32_t nr_entries, size_t offset,
++                         struct virtio_gpu_ctrl_command *cmd,
++                         struct iovec **iov)
+ {
+     struct virtio_gpu_mem_entry *ents;
+     size_t esize, s;
+     int i;
+ 
+-    if (ab->nr_entries > 16384) {
++    if (nr_entries > 16384) {
+         g_critical("%s: nr_entries is too big (%d > 16384)",
+-                   __func__, ab->nr_entries);
++                   __func__, nr_entries);
+         return -1;
+     }
+ 
+-    esize = sizeof(*ents) * ab->nr_entries;
++    esize = sizeof(*ents) * nr_entries;
+     ents = g_malloc(esize);
+     s = iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num,
+-                   sizeof(*ab), ents, esize);
++                   offset, ents, esize);
+     if (s != esize) {
+         g_critical("%s: command data size incorrect %zu vs %zu",
+                    __func__, s, esize);
+@@ -525,14 +537,14 @@ vg_create_mapping_iov(VuGpu *g,
+         return -1;
+     }
+ 
+-    *iov = g_new0(struct iovec, ab->nr_entries);
+-    for (i = 0; i < ab->nr_entries; i++) {
++    *iov = g_new0(struct iovec, nr_entries);
++    for (i = 0; i < nr_entries; i++) {
+         uint64_t len = ents[i].length;
+         (*iov)[i].iov_len = ents[i].length;
+         (*iov)[i].iov_base = vu_gpa_to_va(&g->dev.parent, &len, ents[i].addr);
+         if (!(*iov)[i].iov_base || len != ents[i].length) {
+             g_critical("%s: resource %d element %d",
+-                       __func__, ab->resource_id, i);
++                       __func__, resource_id, i);
+             g_free(*iov);
+             g_free(ents);
+             *iov = NULL;
+@@ -1200,11 +1212,22 @@ vg_get_features(VuDev *dev)
+     if (opt_virgl) {
+         features |= 1 << VIRTIO_GPU_F_VIRGL;
+     }
++    if (opt_venus) {
++        features |= 1 << VIRTIO_GPU_F_RESOURCE_BLOB;
++        features |= 1 << VIRTIO_GPU_F_CONTEXT_INIT;
++    }
+     features |= 1 << VIRTIO_GPU_F_EDID;
+ 
+     return features;
+ }
+ 
++/* Venus' blobs are mapped into the frontend's host-visible memory window */
++static uint64_t
++vg_get_protocol_features(VuDev *dev)
++{
++    return opt_venus ? 1ULL << VHOST_USER_PROTOCOL_F_SHMEM : 0;
++}
++
+ static void
+ vg_set_features(VuDev *dev, uint64_t features)
+ {
+@@ -1233,7 +1256,17 @@ vg_get_config(VuDev *dev, uint8_t *config, uint32_t len)
+     }
+ 
+     if (opt_virgl) {
+-        g->virtio_config.num_capsets = vg_virgl_get_num_capsets();
++        /*
++         * The guest reads the number of capsets before it starts the device;
++         * Venus' capset is only known once virgl runs its render server
++         */
++        if (opt_venus && !g->virgl_inited) {
++            if (!vg_virgl_init(g)) {
++                vg_panic(dev, "Failed to initialize virgl");
++            }
++            g->virgl_inited = true;
++        }
++        g->virtio_config.num_capsets = vg_virgl_get_num_capsets(g);
+     }
+ 
+     memcpy(config, &g->virtio_config, len);
+@@ -1259,6 +1292,7 @@ vg_set_config(VuDev *dev, const uint8_t *data,
+ static const VuDevIface vuiface = {
+     .set_features = vg_set_features,
+     .get_features = vg_get_features,
++    .get_protocol_features = vg_get_protocol_features,
+     .queue_set_started = vg_queue_set_started,
+     .process_msg = vg_process_msg,
+     .get_config = vg_get_config,
+@@ -1292,6 +1326,9 @@ static GOptionEntry entries[] = {
+       "Specify DRM render node", "PATH" },
+     { "virgl", 'v', 0, G_OPTION_ARG_NONE, &opt_virgl,
+       "Turn virgl rendering on", NULL },
++    { "venus", 0, 0, G_OPTION_ARG_NONE, &opt_venus,
++      "Turn Venus (Vulkan) on, with blob resources (needs --virgl and "
++      "the frontend's hostmem)", NULL },
+     { NULL, }
+ };
+ 
+@@ -1315,6 +1352,12 @@ main(int argc, char *argv[])
+     }
+     g_option_context_free(context);
+ 
++    if (opt_venus && !opt_virgl) {
++        g_printerr("--venus needs --virgl\n");
++        exit(EXIT_FAILURE);
++    }
++    g.venus = opt_venus;
++
+     if (opt_print_caps) {
+         g_print("{\n");
+         g_print("  \"type\": \"gpu\",\n");
+diff --git a/contrib/vhost-user-gpu/virgl.c b/contrib/vhost-user-gpu/virgl.c
+index 7995e59e5..a5d96e733 100644
+--- a/contrib/vhost-user-gpu/virgl.c
++++ b/contrib/vhost-user-gpu/virgl.c
+@@ -42,6 +42,18 @@ virgl_cmd_context_create(VuGpu *g,
+ 
+     VUGPU_FILL_CMD(cc);
+ 
++    /* A context of another capset than virgl's (Venus) */
++    if (cc.context_init) {
++        if (!g->venus) {
++            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++            return;
++        }
++        virgl_renderer_context_create_with_flags(cc.hdr.ctx_id,
++                                                 cc.context_init,
++                                                 cc.nlen, cc.debug_name);
++        return;
++    }
++
+     virgl_renderer_context_create(cc.hdr.ctx_id, cc.nlen,
+                                   cc.debug_name);
+ }
+@@ -103,6 +115,30 @@ virgl_cmd_create_resource_3d(VuGpu *g,
+     virgl_renderer_resource_create(&args, NULL, 0);
+ }
+ 
++/* A blob resource, and where it is mapped in the host-visible memory window */
++struct vg_blob {
++    uint64_t size;
++    uint64_t offset;
++    bool mapped;
++};
++
++static void
++vg_blob_forget(VuGpu *g, uint32_t resource_id)
++{
++    struct vg_blob *blob;
++
++    blob = g_hash_table_lookup(g->blobs, GUINT_TO_POINTER(resource_id));
++    if (!blob) {
++        return;
++    }
++    if (blob->mapped &&
++        !vu_shmem_unmap(&g->dev.parent, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
++                        blob->offset, blob->size)) {
++        g_warning("%s: unmapping resource %u failed", __func__, resource_id);
++    }
++    g_hash_table_remove(g->blobs, GUINT_TO_POINTER(resource_id));
++}
++
+ static void
+ virgl_cmd_resource_unref(VuGpu *g,
+                          struct virtio_gpu_ctrl_command *cmd)
+@@ -113,6 +149,7 @@ virgl_cmd_resource_unref(VuGpu *g,
+ 
+     VUGPU_FILL_CMD(unref);
+ 
++    vg_blob_forget(g, unref.resource_id);
+     virgl_renderer_resource_detach_iov(unref.resource_id,
+                                        &res_iovs,
+                                        &num_iovs);
+@@ -127,23 +164,45 @@ virgl_cmd_resource_unref(VuGpu *g,
+ #define VIRTIO_GPU_CAPSET_VIRGL2 2
+ #endif
+ 
++#ifndef VIRTIO_GPU_CAPSET_VENUS
++#define VIRTIO_GPU_CAPSET_VENUS 4
++#endif
++
++/* The capsets the guest can use, in the order it enumerates them */
++static uint32_t
++vg_virgl_capsets(VuGpu *g, uint32_t *ids)
++{
++    uint32_t n = 0, max_ver, max_size;
++
++    ids[n++] = VIRTIO_GPU_CAPSET_VIRGL;
++    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2, &max_ver, &max_size);
++    if (max_ver) {
++        ids[n++] = VIRTIO_GPU_CAPSET_VIRGL2;
++    }
++    if (g->venus) {
++        virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VENUS, &max_ver,
++                                   &max_size);
++        if (max_size) {
++            ids[n++] = VIRTIO_GPU_CAPSET_VENUS;
++        }
++    }
++    return n;
++}
++
+ static void
+ virgl_cmd_get_capset_info(VuGpu *g,
+                           struct virtio_gpu_ctrl_command *cmd)
+ {
+     struct virtio_gpu_get_capset_info info;
+     struct virtio_gpu_resp_capset_info resp;
++    uint32_t ids[3], n;
+ 
+     VUGPU_FILL_CMD(info);
+ 
+     memset(&resp, 0, sizeof(resp));
+-    if (info.capset_index == 0) {
+-        resp.capset_id = VIRTIO_GPU_CAPSET_VIRGL;
+-        virgl_renderer_get_cap_set(resp.capset_id,
+-                                   &resp.capset_max_version,
+-                                   &resp.capset_max_size);
+-    } else if (info.capset_index == 1) {
+-        resp.capset_id = VIRTIO_GPU_CAPSET_VIRGL2;
++    n = vg_virgl_capsets(g, ids);
++    if (info.capset_index < n) {
++        resp.capset_id = ids[info.capset_index];
+         virgl_renderer_get_cap_set(resp.capset_id,
+                                    &resp.capset_max_version,
+                                    &resp.capset_max_size);
+@@ -156,14 +215,11 @@ virgl_cmd_get_capset_info(VuGpu *g,
+ }
+ 
+ uint32_t
+-vg_virgl_get_num_capsets(void)
++vg_virgl_get_num_capsets(VuGpu *g)
+ {
+-    uint32_t capset2_max_ver, capset2_max_size;
+-    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2,
+-                               &capset2_max_ver,
+-                               &capset2_max_size);
++    uint32_t ids[3];
+ 
+-    return capset2_max_ver ? 2 : 1;
++    return vg_virgl_capsets(g, ids);
+ }
+ 
+ static void
+@@ -487,6 +543,141 @@ virgl_cmd_ctx_detach_resource(VuGpu *g,
+     virgl_renderer_ctx_detach_resource(det_res.hdr.ctx_id, det_res.resource_id);
+ }
+ 
++static void
++virgl_cmd_resource_create_blob(VuGpu *g,
++                               struct virtio_gpu_ctrl_command *cmd)
++{
++    struct virgl_renderer_resource_create_blob_args args = { 0 };
++    struct virtio_gpu_resource_create_blob cblob;
++    struct iovec *iovs = NULL;
++    struct vg_blob *blob;
++    int ret;
++
++    if (!g->venus) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++        return;
++    }
++
++    VUGPU_FILL_CMD(cblob);
++
++    if (cblob.resource_id == 0 ||
++        g_hash_table_contains(g->blobs, GUINT_TO_POINTER(cblob.resource_id))) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
++    /* Blobs in (or mirrored to) the guest's memory come with its pages */
++    if (cblob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D && cblob.nr_entries) {
++        if (vg_create_mapping_iov_at(g, cblob.resource_id, cblob.nr_entries,
++                                     sizeof(cblob), cmd, &iovs) != 0) {
++            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++            return;
++        }
++    }
++
++    args.res_handle = cblob.resource_id;
++    args.ctx_id = cblob.hdr.ctx_id;
++    args.blob_mem = cblob.blob_mem;
++    args.blob_id = cblob.blob_id;
++    args.blob_flags = cblob.blob_flags;
++    args.size = cblob.size;
++    args.iovecs = iovs;
++    args.num_iovs = iovs ? cblob.nr_entries : 0;
++
++    ret = virgl_renderer_resource_create_blob(&args);
++    if (ret) {
++        g_warning("%s: resource %u: %s", __func__, cblob.resource_id,
++                  strerror(-ret));
++        if (iovs) {
++            vg_cleanup_mapping_iov(g, iovs, cblob.nr_entries);
++        }
++        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++        return;
++    }
++
++    blob = g_new0(struct vg_blob, 1);
++    blob->size = cblob.size;
++    g_hash_table_insert(g->blobs, GUINT_TO_POINTER(cblob.resource_id), blob);
++}
++
++/*
++ * The frontend maps the blob's memory (a dma-buf or shared memory file) into
++ * the device's host-visible memory window at the offset the guest chose
++ */
++static void
++virgl_cmd_resource_map_blob(VuGpu *g,
++                            struct virtio_gpu_ctrl_command *cmd)
++{
++    struct virtio_gpu_resource_map_blob mblob;
++    struct virtio_gpu_resp_map_info resp;
++    struct vg_blob *blob;
++    uint32_t fd_type;
++    int fd = -1;
++
++    VUGPU_FILL_CMD(mblob);
++
++    blob = g_hash_table_lookup(g->blobs, GUINT_TO_POINTER(mblob.resource_id));
++    if (!blob || blob->mapped) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
++    if (virgl_renderer_resource_export_blob(mblob.resource_id, &fd_type, &fd)
++        || fd < 0) {
++        g_warning("%s: resource %u can't be exported", __func__,
++                  mblob.resource_id);
++        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++        return;
++    }
++    if (fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF &&
++        fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_SHM) {
++        g_warning("%s: resource %u: fd type %u can't be mapped", __func__,
++                  mblob.resource_id, fd_type);
++        close(fd);
++        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++        return;
++    }
++
++    if (!vu_shmem_map(&g->dev.parent, VIRTIO_GPU_SHM_ID_HOST_VISIBLE, 0,
++                      mblob.offset, blob->size, VHOST_USER_FLAG_MAP_RW, fd)) {
++        g_warning("%s: mapping resource %u at 0x%" PRIx64 " failed", __func__,
++                  mblob.resource_id, mblob.offset);
++        close(fd);
++        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++        return;
++    }
++    close(fd);
++    blob->offset = mblob.offset;
++    blob->mapped = true;
++
++    memset(&resp, 0, sizeof(resp));
++    resp.hdr.type = VIRTIO_GPU_RESP_OK_MAP_INFO;
++    virgl_renderer_resource_get_map_info(mblob.resource_id, &resp.map_info);
++    vg_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
++}
++
++static void
++virgl_cmd_resource_unmap_blob(VuGpu *g,
++                              struct virtio_gpu_ctrl_command *cmd)
++{
++    struct virtio_gpu_resource_unmap_blob ublob;
++    struct vg_blob *blob;
++
++    VUGPU_FILL_CMD(ublob);
++
++    blob = g_hash_table_lookup(g->blobs, GUINT_TO_POINTER(ublob.resource_id));
++    if (!blob || !blob->mapped) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++    if (!vu_shmem_unmap(&g->dev.parent, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
++                        blob->offset, blob->size)) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++        return;
++    }
++    blob->mapped = false;
++}
++
+ void vg_virgl_process_cmd(VuGpu *g, struct virtio_gpu_ctrl_command *cmd)
+ {
+     virgl_renderer_force_ctx_0();
+@@ -550,6 +741,15 @@ void vg_virgl_process_cmd(VuGpu *g, struct virtio_gpu_ctrl_command *cmd)
+     case VIRTIO_GPU_CMD_GET_EDID:
+         vg_get_edid(g, cmd);
+         break;
++    case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
++        virgl_cmd_resource_create_blob(g, cmd);
++        break;
++    case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
++        virgl_cmd_resource_map_blob(g, cmd);
++        break;
++    case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
++        virgl_cmd_resource_unmap_blob(g, cmd);
++        break;
+     default:
+         g_debug("TODO handle ctrl %x\n", cmd->cmd_hdr.type);
+         cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+@@ -574,6 +774,14 @@ void vg_virgl_process_cmd(VuGpu *g, struct virtio_gpu_ctrl_command *cmd)
+ 
+     g_debug("Creating fence id:%" PRId64 " type:%d",
+             cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
++    /* A fence on one of a context's timelines (Venus' queues) */
++    if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
++        virgl_renderer_context_create_fence(cmd->cmd_hdr.ctx_id,
++                                            VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
++                                            cmd->cmd_hdr.ring_idx,
++                                            cmd->cmd_hdr.fence_id);
++        return;
++    }
+     virgl_renderer_create_fence(cmd->cmd_hdr.fence_id, cmd->cmd_hdr.type);
+ }
+ 
+@@ -588,6 +796,7 @@ vg_virgl_reset(VuGpu *g)
+         free(cmd);
+         g->inflight--;
+     }
++    g_hash_table_remove_all(g->blobs); /* the frontend unmapped them */
+     virgl_renderer_reset();
+ }
+ 
+@@ -602,7 +811,8 @@ virgl_write_fence(void *opaque, uint32_t fence)
+          * the guest can end up emitting fences out of order
+          * so we should check all fenced cmds not just the first one.
+          */
+-        if (cmd->cmd_hdr.fence_id > fence) {
++        if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX ||
++            cmd->cmd_hdr.fence_id > fence) {
+             continue;
+         }
+         g_debug("FENCE %" PRIu64, cmd->cmd_hdr.fence_id);
+@@ -613,6 +823,27 @@ virgl_write_fence(void *opaque, uint32_t fence)
+     }
+ }
+ 
++static void
++virgl_write_context_fence(void *opaque, uint32_t ctx_id, uint32_t ring_idx,
++                          uint64_t fence_id)
++{
++    VuGpu *g = opaque;
++    struct virtio_gpu_ctrl_command *cmd, *tmp;
++
++    QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
++        if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) ||
++            cmd->cmd_hdr.ctx_id != ctx_id ||
++            cmd->cmd_hdr.ring_idx != ring_idx ||
++            cmd->cmd_hdr.fence_id > fence_id) {
++            continue;
++        }
++        vg_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
++        QTAILQ_REMOVE(&g->fenceq, cmd, next);
++        free(cmd);
++        g->inflight--;
++    }
++}
++
+ #if defined(VIRGL_RENDERER_CALLBACKS_VERSION) && \
+     VIRGL_RENDERER_CALLBACKS_VERSION >= 2
+ static int
+@@ -626,6 +857,11 @@ virgl_get_drm_fd(void *opaque)
+ 
+ static struct virgl_renderer_callbacks virgl_cbs = {
+ #if defined(VIRGL_RENDERER_CALLBACKS_VERSION) &&    \
++    VIRGL_RENDERER_CALLBACKS_VERSION >= 3
++    .get_drm_fd  = virgl_get_drm_fd,
++    .write_context_fence = virgl_write_context_fence,
++    .version     = 3,
++#elif defined(VIRGL_RENDERER_CALLBACKS_VERSION) &&    \
+     VIRGL_RENDERER_CALLBACKS_VERSION >= 2
+     .get_drm_fd  = virgl_get_drm_fd,
+     .version     = 2,
+@@ -650,9 +886,14 @@ vg_virgl_init(VuGpu *g)
+         g_warning("virgl will use the default rendernode");
+     }
+ 
++    g->blobs = g_hash_table_new_full(NULL, NULL, NULL, g_free);
++
++    /* Venus runs in virglrenderer's render server, a process of its own */
+     ret = virgl_renderer_init(g,
+                               VIRGL_RENDERER_USE_EGL |
+-                              VIRGL_RENDERER_THREAD_SYNC,
++                              VIRGL_RENDERER_THREAD_SYNC |
++                              (g->venus ? VIRGL_RENDERER_VENUS |
++                                          VIRGL_RENDERER_RENDER_SERVER : 0),
+                               &virgl_cbs);
+     if (ret != 0) {
+         return false;
+diff --git a/contrib/vhost-user-gpu/virgl.h b/contrib/vhost-user-gpu/virgl.h
+index 67c21f2aa..417c83f8d 100644
+--- a/contrib/vhost-user-gpu/virgl.h
++++ b/contrib/vhost-user-gpu/virgl.h
+@@ -19,7 +19,7 @@
+ 
+ bool vg_virgl_init(VuGpu *g);
+ void vg_virgl_reset(VuGpu *g);
+-uint32_t vg_virgl_get_num_capsets(void);
++uint32_t vg_virgl_get_num_capsets(VuGpu *g);
+ void vg_virgl_process_cmd(VuGpu *vg, struct virtio_gpu_ctrl_command *cmd);
+ void vg_virgl_update_cursor_data(VuGpu *g, uint32_t resource_id,
+                                  gpointer data);
+diff --git a/contrib/vhost-user-gpu/vugpu.h b/contrib/vhost-user-gpu/vugpu.h
+index aaf2870cb..6cd92237c 100644
+--- a/contrib/vhost-user-gpu/vugpu.h
++++ b/contrib/vhost-user-gpu/vugpu.h
+@@ -140,6 +140,8 @@ typedef struct VuGpu {
+ 
+     bool virgl;
+     bool virgl_inited;
++    bool venus;        /* Venus (Vulkan) contexts, blob resources and the host-visible memory window */
++    GHashTable *blobs; /* resource id -> struct vg_blob */
+     bool edid_inited;
+     bool use_modifiers;
+     uint32_t inflight;
+@@ -198,6 +200,10 @@ int     vg_create_mapping_iov(VuGpu *g,
+                               struct virtio_gpu_resource_attach_backing *ab,
+                               struct virtio_gpu_ctrl_command *cmd,
+                               struct iovec **iov);
++int     vg_create_mapping_iov_at(VuGpu *g, uint32_t resource_id,
++                                 uint32_t nr_entries, size_t offset,
++                                 struct virtio_gpu_ctrl_command *cmd,
++                                 struct iovec **iov);
+ void    vg_cleanup_mapping_iov(VuGpu *g, struct iovec *iov, uint32_t count);
+ void    vg_get_display_info(VuGpu *vg, struct virtio_gpu_ctrl_command *cmd);
+ void    vg_get_edid(VuGpu *vg, struct virtio_gpu_ctrl_command *cmd);
+diff --git a/hw/display/vhost-user-gpu.c b/hw/display/vhost-user-gpu.c
+index 85af53351..47ddb5725 100644
+--- a/hw/display/vhost-user-gpu.c
++++ b/hw/display/vhost-user-gpu.c
+@@ -741,11 +741,33 @@ vhost_user_gpu_device_realize(DeviceState *qdev, Error **errp)
+     if (vhost_dev_has_feature(&g->vhost->dev, VIRTIO_GPU_F_RESOURCE_UUID)) {
+         g->parent_obj.conf.flags |= 1 << VIRTIO_GPU_FLAG_RESOURCE_UUID_ENABLED;
+     }
++    /*
++     * Blob resources (Venus): the backend maps them into the host-visible
++     * memory window (hostmem), which the PCI device put in a BAR
++     */
++    if (virtio_gpu_hostmem_enabled(g->parent_obj.conf) &&
++        vhost_dev_has_feature(&g->vhost->dev, VIRTIO_GPU_F_RESOURCE_BLOB)) {
++        g->parent_obj.conf.flags |= 1 << VIRTIO_GPU_FLAG_BLOB_ENABLED;
++        if (vhost_dev_has_feature(&g->vhost->dev,
++                                  VIRTIO_GPU_F_CONTEXT_INIT)) {
++            g->parent_obj.conf.flags |=
++                1 << VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED;
++        }
++    }
+ 
+     if (!virtio_gpu_base_device_realize(qdev, NULL, NULL, errp)) {
+         return;
+     }
+ 
++    /* After virtio_init(), which sets up the device's shared memory list */
++    if (virtio_gpu_blob_enabled(g->parent_obj.conf)) {
++        VirtioSharedMemory *shmem;
++
++        shmem = virtio_new_shmem_region(vdev, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
++                                        g->parent_obj.conf.hostmem);
++        memory_region_add_subregion(&g->parent_obj.hostmem, 0, &shmem->mr);
++    }
++
+     g->vhost_gpu_fd = -1;
+ }
+ 
+@@ -757,6 +779,7 @@ static struct vhost_dev *vhost_user_gpu_get_vhost(VirtIODevice *vdev)
+ 
+ static const Property vhost_user_gpu_properties[] = {
+     VIRTIO_GPU_BASE_PROPERTIES(VhostUserGPU, parent_obj.conf),
++    DEFINE_PROP_SIZE("hostmem", VhostUserGPU, parent_obj.conf.hostmem, 0),
+ };
+ 
+ static void
+diff --git a/hw/virtio/vhost-user.c b/hw/virtio/vhost-user.c
+index 2881cec72..5b6d3af78 100644
+--- a/hw/virtio/vhost-user.c
++++ b/hw/virtio/vhost-user.c
+@@ -2001,17 +2001,22 @@ vhost_user_backend_handle_shmem_map(struct vhost_dev *dev,
+     }
+ 
+ send_reply_commit:
+-    /* Send reply and commit after transaction started */
++    /*
++     * Commit before replying: the backend tells the guest the memory is
++     * there once it has the reply, and guest accesses before the commit
++     * would go nowhere. The mapping isn't part of the backend's memory
++     * table (vhost_section() skips it), so the commit doesn't wait for the
++     * backend.
++     */
++    memory_region_transaction_commit();
+     if (hdr->flags & VHOST_USER_NEED_REPLY_MASK) {
+         payload->u64 = !!ret;
+         hdr->size = sizeof(payload->u64);
+         if (!vhost_user_send_resp(ioc, hdr, payload, &local_err)) {
+             error_report_err(local_err);
+-            memory_region_transaction_commit();
+             return -EFAULT;
+         }
+     }
+-    memory_region_transaction_commit();
+     return 0;
+ 
+ send_reply:
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index 371dca17d..a99494598 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -652,6 +652,19 @@ static bool vhost_section(struct vhost_dev *dev, MemoryRegionSection *section)
+         handled_dirty = (1 << DIRTY_MEMORY_MIGRATION) |
+             (1 << DIRTY_MEMORY_CODE);
+ 
++        /*
++         * Files a vhost-user backend mapped into a VIRTIO shared memory
++         * region (SHMEM_MAP) are the backend's own memory: it has them
++         * already. Telling it about each one would also deadlock, as the
++         * memory table update waits for the backend while the backend may
++         * be waiting for the reply to its next SHMEM_MAP.
++         */
++        if (object_dynamic_cast(memory_region_owner(mr),
++                                TYPE_VIRTIO_SHARED_MEMORY_MAPPING)) {
++            trace_vhost_reject_section(mr->name, 3);
++            return false;
++        }
++
+         if (dirty_mask & ~handled_dirty) {
+             trace_vhost_reject_section(mr->name, 1);
+             return false;

@@ -1,0 +1,51 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: feature level 10_1 by its own host caps
+
+Feature level 10_1 was offered only with 11_0, so a host GPU short of 11_0
+(no tessellation or compute: older GPUs, OpenGL 3.3 drivers) gave
+applications 10_0 although it can do 10_1. It now has its own check: cube
+map arrays, independent blending, four-component Gather and 4x MSAA.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -292,6 +292,21 @@
+ 
+ 
+ /*
++ * Feature level 10_1 for hosts short of 11_0 (older GPUs): cube map arrays, independent blending, Gather and 4x MSAA
++ */
++static bool
++HostSupportsFL10_1(void)
++{
++   if (HostSupportsFL11()) {
++      return true;
++   }
++   return host_caps_valid && host_caps.v1.bset.cube_map_array && host_caps.v1.bset.indep_blend_enable &&
++          host_caps.v1.bset.indep_blend_func && host_caps.v1.max_texture_gather_components >= 4 &&
++          host_caps.v1.bset.texture_multisample && host_caps.v1.max_samples >= 4;
++}
++
++
++/*
+  * Feature level 11_1 on top of 11_0: target-independent rasterization (rasterization samples apart from the
+  * framebuffer's: WinBoat's virglrenderer patch, VIRGL_CAP_V2_RASTER_SAMPLES, from GL_EXT_raster_multisample) and
+  * UAVs in every shader stage. Logic ops and the 11.1 interface are there anyway. WINBOAT_D3D_FL11_1=0 leaves it out.
+@@ -347,13 +362,13 @@
+       }
+       break;
+    case D3D11DDICAPS_3DPIPELINESUPPORT:
+-      /* The 11.x DDI runtime asks which feature levels the device has: 10_0, and 10_1 and 11_0 when the host has
+-       * what they need */
++      /* The 11.x DDI runtime asks which feature levels the device has: 10_0, and 10_1, 11_0 and 11_1 when the host
++       * has what they need */
+       if (pData->DataSize >= sizeof(D3D11DDI_3DPIPELINESUPPORT_CAPS)) {
+          static_cast<D3D11DDI_3DPIPELINESUPPORT_CAPS *>(pData->pData)->Caps =
+             D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0) |
+-            (HostSupportsFL11() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1) |
+-                                  D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0) : 0) |
++            (HostSupportsFL10_1() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1) : 0) |
++            (HostSupportsFL11() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0) : 0) |
+             (HostSupportsFL11_1() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11_1DDI_3DPIPELINELEVEL_11_1) : 0);
+       }
+       break;

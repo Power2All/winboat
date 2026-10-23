@@ -1,0 +1,117 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: the AMF runtime in the package, faster resource busy checks
+
+- The AMF runtime (WinBoat's amfrt64.dll, tools/amf-runtime: AMD's Advanced
+  Media Framework API, MIT-licensed headers, on Vulkan Video) goes to System32
+  (never over a newer one), with its license in the driver store. Programs
+  that offer AMD encoders (h264_amf/hevc_amf in ffmpeg, Topaz Video AI)
+  encode on the host GPU through it.
+- The adapter is "Red Hat VirtIO GPU 3D controller (AMD AMF-compatible)":
+  programs that pick encoders by the GPU's name (Topaz Video AI's
+  video-encoders.json wants "amd|radeon" for its AMF entries) offer them. The
+  name is the INF's DeviceDesc: DriverDesc and FriendlyName don't change what
+  DXGI reports.
+- EscapeResourceBusy only yields when the resource is still busy: a kernel
+  delay lasts until the next clock tick (up to 15.6 ms), which every D3D11
+  readback (map of a staging texture) paid after the GPU was done. ffmpeg's
+  d3d11va with frames read back went from ~1x to 4-7x.
+---
+diff --git a/viogpu/viogpu3d/viogpu3d.inx b/viogpu/viogpu3d/viogpu3d.inx
+index 4ec3e70..d65ff89 100644
+--- a/viogpu/viogpu3d/viogpu3d.inx
++++ b/viogpu/viogpu3d/viogpu3d.inx
+@@ -20,6 +20,7 @@ VioGpu3D_Files.Driver = 13   ; drivers
+ VioGpu3D_Files.Usermode = 13 ; DriverStore
+ VioGpu3D_Files.VulkanLoader = 11      ; System32: the Khronos Vulkan loader (Windows has none of its own)
+ VioGpu3D_Files.VulkanLoaderWow = 10,SysWOW64
++VioGpu3D_Files.Amf = 11            ; System32: the AMF runtime (WinBoat's, on Vulkan Video: AMF encoders reach the host GPU)
+ 
+ 
+ 
+@@ -44,6 +45,8 @@ viogpu_vk_x86.json = 1,,
+ vulkan-1.dll = 1,,
+ vulkan-1_x86.dll = 1,,
+ vulkan-1-license.txt = 1,,
++amfrt64.dll = 1,,
++amfrt64-license.txt = 1,,
+ 
+ [Manufacturer]
+ %RHEL%=RHEL,NT$ARCH$
+@@ -69,6 +72,7 @@ viogpu_vk.json,,,0
+ viogpu_vk_x86.dll,,,0
+ viogpu_vk_x86.json,,,0
+ vulkan-1-license.txt,,,0
++amfrt64-license.txt,,,0
+ 
+ ; 0x20: never over a newer loader another driver or the Vulkan runtime installed
+ [VioGpu3D_Files.VulkanLoader]
+@@ -77,10 +81,14 @@ vulkan-1.dll,,,0x20
+ [VioGpu3D_Files.VulkanLoaderWow]
+ vulkan-1.dll,vulkan-1_x86.dll,,0x20
+ 
++; 0x20: never over a newer one (AMD's own, should a VM have it)
++[VioGpu3D_Files.Amf]
++amfrt64.dll,,,0x20
++
+ [VioGpu3D_Inst]
+ Include=msdv.inf
+ FeatureScore=F9
+-CopyFiles=VioGpu3D_Files.Driver, VioGpu3D_Files.Usermode, VioGpu3D_Files.VulkanLoader, VioGpu3D_Files.VulkanLoaderWow
++CopyFiles=VioGpu3D_Files.Driver, VioGpu3D_Files.Usermode, VioGpu3D_Files.VulkanLoader, VioGpu3D_Files.VulkanLoaderWow, VioGpu3D_Files.Amf
+ AddReg=VioGpu3D_DeviceSettings
+ 
+ 
+@@ -141,7 +149,7 @@ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLim
+ 
+ ;  *******Localizable Strings*******
+ diskId1 = "Red Hat VirtIO GPU controller Installation Disk"
+-VioGpu3D.DeviceDesc = "Red Hat VirtIO GPU 3D controller"
++VioGpu3D.DeviceDesc = "Red Hat VirtIO GPU 3D controller (AMD AMF-compatible)"
+ RHEL = "Red Hat, Inc."
+ 
+ ;  *******Non Localizable Strings*******
+diff --git a/viogpu/viogpu3d/viogpu3d.vcxproj b/viogpu/viogpu3d/viogpu3d.vcxproj
+index 118e427..5111c83 100644
+--- a/viogpu/viogpu3d/viogpu3d.vcxproj
++++ b/viogpu/viogpu3d/viogpu3d.vcxproj
+@@ -217,7 +217,7 @@
+       </PackageRelativeDirectory>
+     </FilesToPackage>
+     <!-- Vulkan: Mesa's Venus driver (clang-cl builds into the same prefixes) and the Khronos loader -->
+-    <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll">
++    <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX)\bin\amfrt64.dll;$(MESA_PREFIX)\bin\amfrt64-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll">
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
+@@ -238,7 +238,7 @@
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d9_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll;$(MESA_PREFIX32)\bin\viogpu_d3d12_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_wgl_x86.dll" />
+-    <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll" />
++    <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX)\bin\amfrt64.dll;$(MESA_PREFIX)\bin\amfrt64-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll" />
+   </ItemGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <Import Condition="Exists('$(MESA_PREFIX)\bin\viogpu_d3d10.dll')" Project="$(MSBuildProjectDirectory)\..\..\build\Driver.Common.targets" />
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index e7fcfb7..279605b 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -455,9 +455,15 @@ NTSTATUS VioGpuAllocation::EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy)
+             break;
+         }
+ 
+-        LARGE_INTEGER wait;
+-        wait.QuadPart = -10LL;
+-        KeDelayExecutionThread(KernelMode, FALSE, &wait);
++        // The event can still be set while the resource is busy (between a new use's increment and its clear):
++        // yield then rather than spin. Only then: a kernel delay lasts until the next clock tick (up to 15.6 ms),
++        // which every D3D11 readback paid after the GPU was done
++        if (m_busy != 0 && KeReadStateEvent(&m_busyNotification))
++        {
++            LARGE_INTEGER wait;
++            wait.QuadPart = -10LL;
++            KeDelayExecutionThread(KernelMode, FALSE, &wait);
++        }
+     }
+ 
+     resBusy->IsBusy = m_busy != 0;

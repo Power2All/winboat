@@ -1,0 +1,3634 @@
+From: WinBoat
+Subject: [PATCH] venus: VK_EXT_device_generated_commands
+
+vkd3d-proton takes it for ExecuteIndirect tier 1.1 (incrementing constants) and for every ExecuteIndirect that
+changes state per command (root constants, vertex/index buffers, root descriptors): without it those record
+nothing. The protocol headers are venus-protocol's generator output (git-70991d4c plus the video branch) with
+VK_KHR_maintenance8 and VK_EXT_device_generated_commands in its extension list (commands 1100-1108; the token data of
+dispatch and draw tokens selects no union member: the tag alone goes on the wire); maintenance8's generated code is
+0006's, plus its VkMemoryBarrierAccessFlags3KHR in subpass dependencies. vn_generated_commands.c: indirect commands
+layouts and the memory requirements query, passed through; no indirect execution sets (the physical device reports
+no stage bindable through them). Preprocessing in one command buffer with another's state (as vkd3d-proton does)
+sends that command buffer's batched commands first and the preprocessing right after: the host reads the state when
+it records the preprocessing (the GPU hung on a stale pipeline otherwise, Xid 109).
+---
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_command_buffer.h b/src/virtio/venus-protocol/vn_protocol_driver_command_buffer.h
+index e4da804..140f483 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_command_buffer.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_command_buffer.h
+@@ -1664,6 +1664,130 @@ vn_encode_VkRenderPassBeginInfo(struct vn_cs_encoder *enc, const VkRenderPassBeg
+     vn_encode_VkRenderPassBeginInfo_self(enc, val);
+ }
+ 
++/* struct VkGeneratedCommandsInfoEXT chain */
++
++static inline size_t
++vn_sizeof_VkGeneratedCommandsInfoEXT_pnext(const void *val)
++{
++    const VkBaseInStructure *pnext = val;
++    size_t size = 0;
++
++    while (pnext) {
++        switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkGeneratedCommandsInfoEXT_pnext(((const VkGeneratedCommandsPipelineInfoEXT *)pnext)->pNext);
++            size += vn_sizeof_VkGeneratedCommandsPipelineInfoEXT_self((const VkGeneratedCommandsPipelineInfoEXT *)pnext);
++            return size;
++        case VK_STRUCTURE_TYPE_GENERATED_COMMANDS_SHADER_INFO_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkGeneratedCommandsInfoEXT_pnext(((const VkGeneratedCommandsShaderInfoEXT *)pnext)->pNext);
++            size += vn_sizeof_VkGeneratedCommandsShaderInfoEXT_self((const VkGeneratedCommandsShaderInfoEXT *)pnext);
++            return size;
++        default:
++            /* ignore unknown/unsupported struct */
++            break;
++        }
++        pnext = pnext->pNext;
++    }
++
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkGeneratedCommandsInfoEXT_self(const VkGeneratedCommandsInfoEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_VkFlags(&val->shaderStages);
++    size += vn_sizeof_VkIndirectExecutionSetEXT(&val->indirectExecutionSet);
++    size += vn_sizeof_VkIndirectCommandsLayoutEXT(&val->indirectCommandsLayout);
++    size += vn_sizeof_VkDeviceAddress(&val->indirectAddress);
++    size += vn_sizeof_VkDeviceSize(&val->indirectAddressSize);
++    size += vn_sizeof_VkDeviceAddress(&val->preprocessAddress);
++    size += vn_sizeof_VkDeviceSize(&val->preprocessSize);
++    size += vn_sizeof_uint32_t(&val->maxSequenceCount);
++    size += vn_sizeof_VkDeviceAddress(&val->sequenceCountAddress);
++    size += vn_sizeof_uint32_t(&val->maxDrawCount);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkGeneratedCommandsInfoEXT(const VkGeneratedCommandsInfoEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkGeneratedCommandsInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkGeneratedCommandsInfoEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkGeneratedCommandsInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    const VkBaseInStructure *pnext = val;
++
++    while (pnext) {
++        switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkGeneratedCommandsInfoEXT_pnext(enc, ((const VkGeneratedCommandsPipelineInfoEXT *)pnext)->pNext);
++            vn_encode_VkGeneratedCommandsPipelineInfoEXT_self(enc, (const VkGeneratedCommandsPipelineInfoEXT *)pnext);
++            return;
++        case VK_STRUCTURE_TYPE_GENERATED_COMMANDS_SHADER_INFO_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkGeneratedCommandsInfoEXT_pnext(enc, ((const VkGeneratedCommandsShaderInfoEXT *)pnext)->pNext);
++            vn_encode_VkGeneratedCommandsShaderInfoEXT_self(enc, (const VkGeneratedCommandsShaderInfoEXT *)pnext);
++            return;
++        default:
++            /* ignore unknown/unsupported struct */
++            break;
++        }
++        pnext = pnext->pNext;
++    }
++
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkGeneratedCommandsInfoEXT_self(struct vn_cs_encoder *enc, const VkGeneratedCommandsInfoEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_VkFlags(enc, &val->shaderStages);
++    vn_encode_VkIndirectExecutionSetEXT(enc, &val->indirectExecutionSet);
++    vn_encode_VkIndirectCommandsLayoutEXT(enc, &val->indirectCommandsLayout);
++    vn_encode_VkDeviceAddress(enc, &val->indirectAddress);
++    vn_encode_VkDeviceSize(enc, &val->indirectAddressSize);
++    vn_encode_VkDeviceAddress(enc, &val->preprocessAddress);
++    vn_encode_VkDeviceSize(enc, &val->preprocessSize);
++    vn_encode_uint32_t(enc, &val->maxSequenceCount);
++    vn_encode_VkDeviceAddress(enc, &val->sequenceCountAddress);
++    vn_encode_uint32_t(enc, &val->maxDrawCount);
++}
++
++static inline void
++vn_encode_VkGeneratedCommandsInfoEXT(struct vn_cs_encoder *enc, const VkGeneratedCommandsInfoEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_INFO_EXT });
++    vn_encode_VkGeneratedCommandsInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkGeneratedCommandsInfoEXT_self(enc, val);
++}
++
+ /* struct VkSubpassBeginInfo chain */
+ 
+ static inline size_t
+@@ -2658,6 +2782,14 @@ vn_sizeof_VkBufferMemoryBarrier2_pnext(const void *val)
+ 
+     while (pnext) {
+         switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR:
++            if (!vn_cs_renderer_protocol_has_extension(575 /* VK_KHR_maintenance8 */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkBufferMemoryBarrier2_pnext(((const VkMemoryBarrierAccessFlags3KHR *)pnext)->pNext);
++            size += vn_sizeof_VkMemoryBarrierAccessFlags3KHR_self((const VkMemoryBarrierAccessFlags3KHR *)pnext);
++            return size;
+         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(454 /* VK_EXT_external_memory_acquire_unmodified */))
+                 break;
+@@ -2712,6 +2844,14 @@ vn_encode_VkBufferMemoryBarrier2_pnext(struct vn_cs_encoder *enc, const void *va
+ 
+     while (pnext) {
+         switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR:
++            if (!vn_cs_renderer_protocol_has_extension(575 /* VK_KHR_maintenance8 */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkBufferMemoryBarrier2_pnext(enc, ((const VkMemoryBarrierAccessFlags3KHR *)pnext)->pNext);
++            vn_encode_VkMemoryBarrierAccessFlags3KHR_self(enc, (const VkMemoryBarrierAccessFlags3KHR *)pnext);
++            return;
+         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(454 /* VK_EXT_external_memory_acquire_unmodified */))
+                 break;
+@@ -2772,6 +2912,14 @@ vn_sizeof_VkImageMemoryBarrier2_pnext(const void *val)
+             size += vn_sizeof_VkImageMemoryBarrier2_pnext(((const VkSampleLocationsInfoEXT *)pnext)->pNext);
+             size += vn_sizeof_VkSampleLocationsInfoEXT_self((const VkSampleLocationsInfoEXT *)pnext);
+             return size;
++        case VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR:
++            if (!vn_cs_renderer_protocol_has_extension(575 /* VK_KHR_maintenance8 */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkImageMemoryBarrier2_pnext(((const VkMemoryBarrierAccessFlags3KHR *)pnext)->pNext);
++            size += vn_sizeof_VkMemoryBarrierAccessFlags3KHR_self((const VkMemoryBarrierAccessFlags3KHR *)pnext);
++            return size;
+         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(454 /* VK_EXT_external_memory_acquire_unmodified */))
+                 break;
+@@ -2835,6 +2983,14 @@ vn_encode_VkImageMemoryBarrier2_pnext(struct vn_cs_encoder *enc, const void *val
+             vn_encode_VkImageMemoryBarrier2_pnext(enc, ((const VkSampleLocationsInfoEXT *)pnext)->pNext);
+             vn_encode_VkSampleLocationsInfoEXT_self(enc, (const VkSampleLocationsInfoEXT *)pnext);
+             return;
++        case VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR:
++            if (!vn_cs_renderer_protocol_has_extension(575 /* VK_KHR_maintenance8 */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkImageMemoryBarrier2_pnext(enc, ((const VkMemoryBarrierAccessFlags3KHR *)pnext)->pNext);
++            vn_encode_VkMemoryBarrierAccessFlags3KHR_self(enc, (const VkMemoryBarrierAccessFlags3KHR *)pnext);
++            return;
+         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(454 /* VK_EXT_external_memory_acquire_unmodified */))
+                 break;
+@@ -11093,6 +11249,108 @@ static inline void vn_decode_vkCmdExecuteCommands_reply(struct vn_cs_decoder *de
+     /* skip pCommandBuffers */
+ }
+ 
++static inline size_t vn_sizeof_vkCmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer, VkBool32 isPreprocessed, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCmdExecuteGeneratedCommandsEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
++
++    cmd_size += vn_sizeof_VkCommandBuffer(&commandBuffer);
++    cmd_size += vn_sizeof_VkBool32(&isPreprocessed);
++    cmd_size += vn_sizeof_simple_pointer(pGeneratedCommandsInfo);
++    if (pGeneratedCommandsInfo)
++        cmd_size += vn_sizeof_VkGeneratedCommandsInfoEXT(pGeneratedCommandsInfo);
++
++    return cmd_size;
++}
++
++static inline void vn_encode_vkCmdExecuteGeneratedCommandsEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkCommandBuffer commandBuffer, VkBool32 isPreprocessed, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCmdExecuteGeneratedCommandsEXT_EXT;
++
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
++
++    vn_encode_VkCommandBuffer(enc, &commandBuffer);
++    vn_encode_VkBool32(enc, &isPreprocessed);
++    if (vn_encode_simple_pointer(enc, pGeneratedCommandsInfo))
++        vn_encode_VkGeneratedCommandsInfoEXT(enc, pGeneratedCommandsInfo);
++}
++
++static inline size_t vn_sizeof_vkCmdExecuteGeneratedCommandsEXT_reply(VkCommandBuffer commandBuffer, VkBool32 isPreprocessed, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCmdExecuteGeneratedCommandsEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    /* skip commandBuffer */
++    /* skip isPreprocessed */
++    /* skip pGeneratedCommandsInfo */
++
++    return cmd_size;
++}
++
++static inline void vn_decode_vkCmdExecuteGeneratedCommandsEXT_reply(struct vn_cs_decoder *dec, VkCommandBuffer commandBuffer, VkBool32 isPreprocessed, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo)
++{
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkCmdExecuteGeneratedCommandsEXT_EXT);
++
++    /* skip commandBuffer */
++    /* skip isPreprocessed */
++    /* skip pGeneratedCommandsInfo */
++}
++
++static inline size_t vn_sizeof_vkCmdPreprocessGeneratedCommandsEXT(VkCommandBuffer commandBuffer, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo, VkCommandBuffer stateCommandBuffer)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCmdPreprocessGeneratedCommandsEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
++
++    cmd_size += vn_sizeof_VkCommandBuffer(&commandBuffer);
++    cmd_size += vn_sizeof_simple_pointer(pGeneratedCommandsInfo);
++    if (pGeneratedCommandsInfo)
++        cmd_size += vn_sizeof_VkGeneratedCommandsInfoEXT(pGeneratedCommandsInfo);
++    cmd_size += vn_sizeof_VkCommandBuffer(&stateCommandBuffer);
++
++    return cmd_size;
++}
++
++static inline void vn_encode_vkCmdPreprocessGeneratedCommandsEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkCommandBuffer commandBuffer, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo, VkCommandBuffer stateCommandBuffer)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCmdPreprocessGeneratedCommandsEXT_EXT;
++
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
++
++    vn_encode_VkCommandBuffer(enc, &commandBuffer);
++    if (vn_encode_simple_pointer(enc, pGeneratedCommandsInfo))
++        vn_encode_VkGeneratedCommandsInfoEXT(enc, pGeneratedCommandsInfo);
++    vn_encode_VkCommandBuffer(enc, &stateCommandBuffer);
++}
++
++static inline size_t vn_sizeof_vkCmdPreprocessGeneratedCommandsEXT_reply(VkCommandBuffer commandBuffer, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo, VkCommandBuffer stateCommandBuffer)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCmdPreprocessGeneratedCommandsEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    /* skip commandBuffer */
++    /* skip pGeneratedCommandsInfo */
++    /* skip stateCommandBuffer */
++
++    return cmd_size;
++}
++
++static inline void vn_decode_vkCmdPreprocessGeneratedCommandsEXT_reply(struct vn_cs_decoder *dec, VkCommandBuffer commandBuffer, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo, VkCommandBuffer stateCommandBuffer)
++{
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkCmdPreprocessGeneratedCommandsEXT_EXT);
++
++    /* skip commandBuffer */
++    /* skip pGeneratedCommandsInfo */
++    /* skip stateCommandBuffer */
++}
++
+ static inline size_t vn_sizeof_vkCmdPushDescriptorSet(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout, uint32_t set, uint32_t descriptorWriteCount, const VkWriteDescriptorSet* pDescriptorWrites)
+ {
+     const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCmdPushDescriptorSet_EXT;
+@@ -17493,6 +17751,48 @@ static inline void vn_submit_vkCmdExecuteCommands(struct vn_ring *vn_ring, VkCom
+     }
+ }
+ 
++static inline void vn_submit_vkCmdExecuteGeneratedCommandsEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkCommandBuffer commandBuffer, VkBool32 isPreprocessed, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkCmdExecuteGeneratedCommandsEXT(commandBuffer, isPreprocessed, pGeneratedCommandsInfo);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkCmdExecuteGeneratedCommandsEXT_reply(commandBuffer, isPreprocessed, pGeneratedCommandsInfo) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkCmdExecuteGeneratedCommandsEXT(enc, cmd_flags, commandBuffer, isPreprocessed, pGeneratedCommandsInfo);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
++static inline void vn_submit_vkCmdPreprocessGeneratedCommandsEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkCommandBuffer commandBuffer, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo, VkCommandBuffer stateCommandBuffer, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkCmdPreprocessGeneratedCommandsEXT(commandBuffer, pGeneratedCommandsInfo, stateCommandBuffer);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkCmdPreprocessGeneratedCommandsEXT_reply(commandBuffer, pGeneratedCommandsInfo, stateCommandBuffer) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkCmdPreprocessGeneratedCommandsEXT(enc, cmd_flags, commandBuffer, pGeneratedCommandsInfo, stateCommandBuffer);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
+ static inline void vn_submit_vkCmdPushDescriptorSet(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout, uint32_t set, uint32_t descriptorWriteCount, const VkWriteDescriptorSet* pDescriptorWrites, struct vn_ring_submit_command *submit)
+ {
+     uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
+@@ -19960,6 +20260,18 @@ static inline void vn_async_vkCmdExecuteCommands(struct vn_ring *vn_ring, VkComm
+     vn_submit_vkCmdExecuteCommands(vn_ring, 0, commandBuffer, commandBufferCount, pCommandBuffers, &submit);
+ }
+ 
++static inline void vn_async_vkCmdExecuteGeneratedCommandsEXT(struct vn_ring *vn_ring, VkCommandBuffer commandBuffer, VkBool32 isPreprocessed, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkCmdExecuteGeneratedCommandsEXT(vn_ring, 0, commandBuffer, isPreprocessed, pGeneratedCommandsInfo, &submit);
++}
++
++static inline void vn_async_vkCmdPreprocessGeneratedCommandsEXT(struct vn_ring *vn_ring, VkCommandBuffer commandBuffer, const VkGeneratedCommandsInfoEXT* pGeneratedCommandsInfo, VkCommandBuffer stateCommandBuffer)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkCmdPreprocessGeneratedCommandsEXT(vn_ring, 0, commandBuffer, pGeneratedCommandsInfo, stateCommandBuffer, &submit);
++}
++
+ static inline void vn_async_vkCmdPushDescriptorSet(struct vn_ring *vn_ring, VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout, uint32_t set, uint32_t descriptorWriteCount, const VkWriteDescriptorSet* pDescriptorWrites)
+ {
+     struct vn_ring_submit_command submit;
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_defines.h b/src/virtio/venus-protocol/vn_protocol_driver_defines.h
+index 20e1ace..7536312 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_defines.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_defines.h
+@@ -492,6 +492,15 @@ typedef enum VkCommandTypeEXT {
+     VK_COMMAND_TYPE_vkCmdEncodeVideoKHR_EXT = 1013,
+     VK_COMMAND_TYPE_vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR_EXT = 1014,
+     VK_COMMAND_TYPE_vkGetEncodedVideoSessionParametersKHR_EXT = 1015,
++    VK_COMMAND_TYPE_vkGetGeneratedCommandsMemoryRequirementsEXT_EXT = 1100,
++    VK_COMMAND_TYPE_vkCmdPreprocessGeneratedCommandsEXT_EXT = 1101,
++    VK_COMMAND_TYPE_vkCmdExecuteGeneratedCommandsEXT_EXT = 1102,
++    VK_COMMAND_TYPE_vkCreateIndirectCommandsLayoutEXT_EXT = 1103,
++    VK_COMMAND_TYPE_vkDestroyIndirectCommandsLayoutEXT_EXT = 1104,
++    VK_COMMAND_TYPE_vkCreateIndirectExecutionSetEXT_EXT = 1105,
++    VK_COMMAND_TYPE_vkDestroyIndirectExecutionSetEXT_EXT = 1106,
++    VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetPipelineEXT_EXT = 1107,
++    VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetShaderEXT_EXT = 1108,
+ } VkCommandTypeEXT;
+ 
+ typedef enum VkCommandFlagBitsEXT {
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_device.h b/src/virtio/venus-protocol/vn_protocol_driver_device.h
+index 75b8883..9da551c 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_device.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_device.h
+@@ -12699,6 +12699,142 @@ vn_encode_VkPhysicalDeviceDepthClipControlFeaturesEXT_partial(struct vn_cs_encod
+     vn_encode_VkPhysicalDeviceDepthClipControlFeaturesEXT_self_partial(enc, val);
+ }
+ 
++/* struct VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT chain */
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_VkBool32(&val->deviceGeneratedCommands);
++    size += vn_sizeof_VkBool32(&val->dynamicGeneratedPipelineLayout);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT(const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext(val->pNext);
++    size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(struct vn_cs_encoder *enc, const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_VkBool32(enc, &val->deviceGeneratedCommands);
++    vn_encode_VkBool32(enc, &val->dynamicGeneratedPipelineLayout);
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT(struct vn_cs_encoder *enc, const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT });
++    vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext(enc, val->pNext);
++    vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(enc, val);
++}
++
++static inline void
++vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext(struct vn_cs_decoder *dec, const void *val)
++{
++    /* no known/supported struct */
++    if (vn_decode_simple_pointer(dec))
++        assert(false);
++}
++
++static inline void
++vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(struct vn_cs_decoder *dec, VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_decode_VkBool32(dec, &val->deviceGeneratedCommands);
++    vn_decode_VkBool32(dec, &val->dynamicGeneratedPipelineLayout);
++}
++
++static inline void
++vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT(struct vn_cs_decoder *dec, VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    VkStructureType stype;
++    vn_decode_VkStructureType(dec, &stype);
++    assert(stype == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT);
++
++    assert(val->sType == stype);
++    vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext(dec, val->pNext);
++    vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(dec, val);
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext_partial(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self_partial(const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    /* skip val->deviceGeneratedCommands */
++    /* skip val->dynamicGeneratedPipelineLayout */
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_partial(const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext_partial(val->pNext);
++    size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self_partial(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext_partial(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self_partial(struct vn_cs_encoder *enc, const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    /* skip val->deviceGeneratedCommands */
++    /* skip val->dynamicGeneratedPipelineLayout */
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_partial(struct vn_cs_encoder *enc, const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT });
++    vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_pnext_partial(enc, val->pNext);
++    vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self_partial(enc, val);
++}
++
+ /* struct VkPhysicalDeviceDepthClampControlFeaturesEXT chain */
+ 
+ static inline size_t
+@@ -19014,6 +19150,14 @@ vn_sizeof_VkPhysicalDeviceFeatures2_pnext(const void *val)
+             size += vn_sizeof_VkPhysicalDeviceFeatures2_pnext(((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext)->pNext);
+             size += vn_sizeof_VkPhysicalDeviceDepthClipControlFeaturesEXT_self((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext);
+             return size;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkPhysicalDeviceFeatures2_pnext(((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext)->pNext);
++            size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext);
++            return size;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(583 /* VK_EXT_depth_clamp_control */))
+                 break;
+@@ -19978,6 +20122,14 @@ vn_encode_VkPhysicalDeviceFeatures2_pnext(struct vn_cs_encoder *enc, const void
+             vn_encode_VkPhysicalDeviceFeatures2_pnext(enc, ((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext)->pNext);
+             vn_encode_VkPhysicalDeviceDepthClipControlFeaturesEXT_self(enc, (const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext);
+             return;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkPhysicalDeviceFeatures2_pnext(enc, ((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext)->pNext);
++            vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(enc, (const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext);
++            return;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(583 /* VK_EXT_depth_clamp_control */))
+                 break;
+@@ -20679,6 +20831,10 @@ vn_decode_VkPhysicalDeviceFeatures2_pnext(struct vn_cs_decoder *dec, const void
+         vn_decode_VkPhysicalDeviceFeatures2_pnext(dec, ((VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext)->pNext);
+         vn_decode_VkPhysicalDeviceDepthClipControlFeaturesEXT_self(dec, (VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext);
+         break;
++    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT:
++        vn_decode_VkPhysicalDeviceFeatures2_pnext(dec, ((VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext)->pNext);
++        vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(dec, (VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext);
++        break;
+     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT:
+         vn_decode_VkPhysicalDeviceFeatures2_pnext(dec, ((VkPhysicalDeviceDepthClampControlFeaturesEXT *)pnext)->pNext);
+         vn_decode_VkPhysicalDeviceDepthClampControlFeaturesEXT_self(dec, (VkPhysicalDeviceDepthClampControlFeaturesEXT *)pnext);
+@@ -21466,6 +21622,14 @@ vn_sizeof_VkPhysicalDeviceFeatures2_pnext_partial(const void *val)
+             size += vn_sizeof_VkPhysicalDeviceFeatures2_pnext_partial(((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext)->pNext);
+             size += vn_sizeof_VkPhysicalDeviceDepthClipControlFeaturesEXT_self_partial((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext);
+             return size;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkPhysicalDeviceFeatures2_pnext_partial(((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext)->pNext);
++            size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self_partial((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext);
++            return size;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(583 /* VK_EXT_depth_clamp_control */))
+                 break;
+@@ -22430,6 +22594,14 @@ vn_encode_VkPhysicalDeviceFeatures2_pnext_partial(struct vn_cs_encoder *enc, con
+             vn_encode_VkPhysicalDeviceFeatures2_pnext_partial(enc, ((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext)->pNext);
+             vn_encode_VkPhysicalDeviceDepthClipControlFeaturesEXT_self_partial(enc, (const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext);
+             return;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkPhysicalDeviceFeatures2_pnext_partial(enc, ((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext)->pNext);
++            vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self_partial(enc, (const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext);
++            return;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(583 /* VK_EXT_depth_clamp_control */))
+                 break;
+@@ -23479,6 +23651,14 @@ vn_sizeof_VkDeviceCreateInfo_pnext(const void *val)
+             size += vn_sizeof_VkDeviceCreateInfo_pnext(((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext)->pNext);
+             size += vn_sizeof_VkPhysicalDeviceDepthClipControlFeaturesEXT_self((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext);
+             return size;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkDeviceCreateInfo_pnext(((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext)->pNext);
++            size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext);
++            return size;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(583 /* VK_EXT_depth_clamp_control */))
+                 break;
+@@ -24496,6 +24676,14 @@ vn_encode_VkDeviceCreateInfo_pnext(struct vn_cs_encoder *enc, const void *val)
+             vn_encode_VkDeviceCreateInfo_pnext(enc, ((const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext)->pNext);
+             vn_encode_VkPhysicalDeviceDepthClipControlFeaturesEXT_self(enc, (const VkPhysicalDeviceDepthClipControlFeaturesEXT *)pnext);
+             return;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkDeviceCreateInfo_pnext(enc, ((const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext)->pNext);
++            vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT_self(enc, (const VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT *)pnext);
++            return;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_CONTROL_FEATURES_EXT:
+             if (!vn_cs_renderer_protocol_has_extension(583 /* VK_EXT_depth_clamp_control */))
+                 break;
+@@ -30758,6 +30946,158 @@ vn_encode_VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT_partial(struct vn_
+     vn_encode_VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT_self_partial(enc, val);
+ }
+ 
++/* struct VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT chain */
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self(const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_uint32_t(&val->maxIndirectPipelineCount);
++    size += vn_sizeof_uint32_t(&val->maxIndirectShaderObjectCount);
++    size += vn_sizeof_uint32_t(&val->maxIndirectSequenceCount);
++    size += vn_sizeof_uint32_t(&val->maxIndirectCommandsTokenCount);
++    size += vn_sizeof_uint32_t(&val->maxIndirectCommandsTokenOffset);
++    size += vn_sizeof_uint32_t(&val->maxIndirectCommandsIndirectStride);
++    size += vn_sizeof_VkFlags(&val->supportedIndirectCommandsInputModes);
++    size += vn_sizeof_VkFlags(&val->supportedIndirectCommandsShaderStages);
++    size += vn_sizeof_VkFlags(&val->supportedIndirectCommandsShaderStagesPipelineBinding);
++    size += vn_sizeof_VkFlags(&val->supportedIndirectCommandsShaderStagesShaderBinding);
++    size += vn_sizeof_VkBool32(&val->deviceGeneratedCommandsTransformFeedback);
++    size += vn_sizeof_VkBool32(&val->deviceGeneratedCommandsMultiDrawIndirectCount);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT(const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_pnext(val->pNext);
++    size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_pnext(struct vn_cs_decoder *dec, const void *val)
++{
++    /* no known/supported struct */
++    if (vn_decode_simple_pointer(dec))
++        assert(false);
++}
++
++static inline void
++vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self(struct vn_cs_decoder *dec, VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_decode_uint32_t(dec, &val->maxIndirectPipelineCount);
++    vn_decode_uint32_t(dec, &val->maxIndirectShaderObjectCount);
++    vn_decode_uint32_t(dec, &val->maxIndirectSequenceCount);
++    vn_decode_uint32_t(dec, &val->maxIndirectCommandsTokenCount);
++    vn_decode_uint32_t(dec, &val->maxIndirectCommandsTokenOffset);
++    vn_decode_uint32_t(dec, &val->maxIndirectCommandsIndirectStride);
++    vn_decode_VkFlags(dec, &val->supportedIndirectCommandsInputModes);
++    vn_decode_VkFlags(dec, &val->supportedIndirectCommandsShaderStages);
++    vn_decode_VkFlags(dec, &val->supportedIndirectCommandsShaderStagesPipelineBinding);
++    vn_decode_VkFlags(dec, &val->supportedIndirectCommandsShaderStagesShaderBinding);
++    vn_decode_VkBool32(dec, &val->deviceGeneratedCommandsTransformFeedback);
++    vn_decode_VkBool32(dec, &val->deviceGeneratedCommandsMultiDrawIndirectCount);
++}
++
++static inline void
++vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT(struct vn_cs_decoder *dec, VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *val)
++{
++    VkStructureType stype;
++    vn_decode_VkStructureType(dec, &stype);
++    assert(stype == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT);
++
++    assert(val->sType == stype);
++    vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_pnext(dec, val->pNext);
++    vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self(dec, val);
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_pnext_partial(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self_partial(const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    /* skip val->maxIndirectPipelineCount */
++    /* skip val->maxIndirectShaderObjectCount */
++    /* skip val->maxIndirectSequenceCount */
++    /* skip val->maxIndirectCommandsTokenCount */
++    /* skip val->maxIndirectCommandsTokenOffset */
++    /* skip val->maxIndirectCommandsIndirectStride */
++    /* skip val->supportedIndirectCommandsInputModes */
++    /* skip val->supportedIndirectCommandsShaderStages */
++    /* skip val->supportedIndirectCommandsShaderStagesPipelineBinding */
++    /* skip val->supportedIndirectCommandsShaderStagesShaderBinding */
++    /* skip val->deviceGeneratedCommandsTransformFeedback */
++    /* skip val->deviceGeneratedCommandsMultiDrawIndirectCount */
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_partial(const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_pnext_partial(val->pNext);
++    size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self_partial(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_pnext_partial(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self_partial(struct vn_cs_encoder *enc, const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    /* skip val->maxIndirectPipelineCount */
++    /* skip val->maxIndirectShaderObjectCount */
++    /* skip val->maxIndirectSequenceCount */
++    /* skip val->maxIndirectCommandsTokenCount */
++    /* skip val->maxIndirectCommandsTokenOffset */
++    /* skip val->maxIndirectCommandsIndirectStride */
++    /* skip val->supportedIndirectCommandsInputModes */
++    /* skip val->supportedIndirectCommandsShaderStages */
++    /* skip val->supportedIndirectCommandsShaderStagesPipelineBinding */
++    /* skip val->supportedIndirectCommandsShaderStagesShaderBinding */
++    /* skip val->deviceGeneratedCommandsTransformFeedback */
++    /* skip val->deviceGeneratedCommandsMultiDrawIndirectCount */
++}
++
++static inline void
++vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_partial(struct vn_cs_encoder *enc, const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT });
++    vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_pnext_partial(enc, val->pNext);
++    vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self_partial(enc, val);
++}
++
+ /* struct VkPhysicalDeviceHostImageCopyProperties chain */
+ 
+ static inline size_t
+@@ -32302,6 +32642,14 @@ vn_sizeof_VkPhysicalDeviceProperties2_pnext(const void *val)
+             size += vn_sizeof_VkPhysicalDeviceProperties2_pnext(((const VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT *)pnext)->pNext);
+             size += vn_sizeof_VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT_self((const VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT *)pnext);
+             return size;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkPhysicalDeviceProperties2_pnext(((const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *)pnext)->pNext);
++            size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self((const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *)pnext);
++            return size;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES:
+             if (!vn_cs_renderer_protocol_has_extension(271 /* VK_EXT_host_image_copy */))
+                 break;
+@@ -32592,6 +32940,10 @@ vn_decode_VkPhysicalDeviceProperties2_pnext(struct vn_cs_decoder *dec, const voi
+         vn_decode_VkPhysicalDeviceProperties2_pnext(dec, ((VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT *)pnext)->pNext);
+         vn_decode_VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT_self(dec, (VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT *)pnext);
+         break;
++    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT:
++        vn_decode_VkPhysicalDeviceProperties2_pnext(dec, ((VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *)pnext)->pNext);
++        vn_decode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self(dec, (VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *)pnext);
++        break;
+     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES:
+         vn_decode_VkPhysicalDeviceProperties2_pnext(dec, ((VkPhysicalDeviceHostImageCopyProperties *)pnext)->pNext);
+         vn_decode_VkPhysicalDeviceHostImageCopyProperties_self(dec, (VkPhysicalDeviceHostImageCopyProperties *)pnext);
+@@ -32969,6 +33321,14 @@ vn_sizeof_VkPhysicalDeviceProperties2_pnext_partial(const void *val)
+             size += vn_sizeof_VkPhysicalDeviceProperties2_pnext_partial(((const VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT *)pnext)->pNext);
+             size += vn_sizeof_VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT_self_partial((const VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT *)pnext);
+             return size;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkPhysicalDeviceProperties2_pnext_partial(((const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *)pnext)->pNext);
++            size += vn_sizeof_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self_partial((const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *)pnext);
++            return size;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES:
+             if (!vn_cs_renderer_protocol_has_extension(271 /* VK_EXT_host_image_copy */))
+                 break;
+@@ -33387,6 +33747,14 @@ vn_encode_VkPhysicalDeviceProperties2_pnext_partial(struct vn_cs_encoder *enc, c
+             vn_encode_VkPhysicalDeviceProperties2_pnext_partial(enc, ((const VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT *)pnext)->pNext);
+             vn_encode_VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT_self_partial(enc, (const VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT *)pnext);
+             return;
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkPhysicalDeviceProperties2_pnext_partial(enc, ((const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *)pnext)->pNext);
++            vn_encode_VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT_self_partial(enc, (const VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT *)pnext);
++            return;
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES:
+             if (!vn_cs_renderer_protocol_has_extension(271 /* VK_EXT_host_image_copy */))
+                 break;
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_handles.h b/src/virtio/venus-protocol/vn_protocol_driver_handles.h
+index 7eb97f0..651db5d 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_handles.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_handles.h
+@@ -585,6 +585,52 @@ vn_decode_VkPipelineCache(struct vn_cs_decoder *dec, VkPipelineCache *val)
+     vn_cs_handle_store_id((void **)val, id, VK_OBJECT_TYPE_PIPELINE_CACHE);
+ }
+ 
++/* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkIndirectCommandsLayoutEXT) */
++
++static inline size_t
++vn_sizeof_VkIndirectCommandsLayoutEXT(const VkIndirectCommandsLayoutEXT *val)
++{
++    return sizeof(uint64_t);
++}
++
++static inline void
++vn_encode_VkIndirectCommandsLayoutEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsLayoutEXT *val)
++{
++    const uint64_t id = vn_cs_handle_load_id((const void **)val, VK_OBJECT_TYPE_INDIRECT_COMMANDS_LAYOUT_EXT);
++    vn_encode_uint64_t(enc, &id);
++}
++
++static inline void
++vn_decode_VkIndirectCommandsLayoutEXT(struct vn_cs_decoder *dec, VkIndirectCommandsLayoutEXT *val)
++{
++    uint64_t id;
++    vn_decode_uint64_t(dec, &id);
++    vn_cs_handle_store_id((void **)val, id, VK_OBJECT_TYPE_INDIRECT_COMMANDS_LAYOUT_EXT);
++}
++
++/* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkIndirectExecutionSetEXT) */
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetEXT(const VkIndirectExecutionSetEXT *val)
++{
++    return sizeof(uint64_t);
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetEXT(struct vn_cs_encoder *enc, const VkIndirectExecutionSetEXT *val)
++{
++    const uint64_t id = vn_cs_handle_load_id((const void **)val, VK_OBJECT_TYPE_INDIRECT_EXECUTION_SET_EXT);
++    vn_encode_uint64_t(enc, &id);
++}
++
++static inline void
++vn_decode_VkIndirectExecutionSetEXT(struct vn_cs_decoder *dec, VkIndirectExecutionSetEXT *val)
++{
++    uint64_t id;
++    vn_decode_uint64_t(dec, &id);
++    vn_cs_handle_store_id((void **)val, id, VK_OBJECT_TYPE_INDIRECT_EXECUTION_SET_EXT);
++}
++
+ /* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkDescriptorUpdateTemplate) */
+ 
+ static inline size_t
+@@ -700,6 +746,29 @@ vn_decode_VkPrivateDataSlot(struct vn_cs_decoder *dec, VkPrivateDataSlot *val)
+     vn_cs_handle_store_id((void **)val, id, VK_OBJECT_TYPE_PRIVATE_DATA_SLOT);
+ }
+ 
++/* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkShaderEXT) */
++
++static inline size_t
++vn_sizeof_VkShaderEXT(const VkShaderEXT *val)
++{
++    return sizeof(uint64_t);
++}
++
++static inline void
++vn_encode_VkShaderEXT(struct vn_cs_encoder *enc, const VkShaderEXT *val)
++{
++    const uint64_t id = vn_cs_handle_load_id((const void **)val, VK_OBJECT_TYPE_SHADER_EXT);
++    vn_encode_uint64_t(enc, &id);
++}
++
++static inline void
++vn_decode_VkShaderEXT(struct vn_cs_decoder *dec, VkShaderEXT *val)
++{
++    uint64_t id;
++    vn_decode_uint64_t(dec, &id);
++    vn_cs_handle_store_id((void **)val, id, VK_OBJECT_TYPE_SHADER_EXT);
++}
++
+ /* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkTensorARM) */
+ 
+ static inline size_t
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_info.h b/src/virtio/venus-protocol/vn_protocol_driver_info.h
+index 163c773..f472c4d 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_info.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_info.h
+@@ -19,8 +19,8 @@ struct vn_info_extension {
+ };
+ 
+ /* sorted by extension names for bsearch */
+-static const uint32_t _vn_info_extension_count = 199;
+-static const struct vn_info_extension _vn_info_extensions[199] = {
++static const uint32_t _vn_info_extension_count = 200;
++static const struct vn_info_extension _vn_info_extensions[200] = {
+    { "VK_ARM_rasterization_order_attachment_access", 343, 1 },
+    { "VK_EXT_4444_formats", 341, 1 },
+    { "VK_EXT_attachment_feedback_loop_dynamic_state", 525, 1 },
+@@ -42,6 +42,7 @@ static const struct vn_info_extension _vn_info_extensions[199] = {
+    { "VK_EXT_depth_range_unrestricted", 14, 1 },
+    { "VK_EXT_descriptor_heap", 136, 1 },
+    { "VK_EXT_descriptor_indexing", 162, 2 },
++   { "VK_EXT_device_generated_commands", 573, 1 },
+    { "VK_EXT_dynamic_rendering_unused_attachments", 500, 1 },
+    { "VK_EXT_extended_dynamic_state", 268, 1 },
+    { "VK_EXT_extended_dynamic_state2", 378, 1 },
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_render_pass.h b/src/virtio/venus-protocol/vn_protocol_driver_render_pass.h
+index be4b91a..e2c4a3f 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_render_pass.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_render_pass.h
+@@ -1192,6 +1192,14 @@ vn_sizeof_VkSubpassDependency2_pnext(const void *val)
+             size += vn_sizeof_VkSubpassDependency2_pnext(((const VkMemoryBarrier2 *)pnext)->pNext);
+             size += vn_sizeof_VkMemoryBarrier2_self((const VkMemoryBarrier2 *)pnext);
+             return size;
++        case VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR:
++            if (!vn_cs_renderer_protocol_has_extension(575 /* VK_KHR_maintenance8 */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkSubpassDependency2_pnext(((const VkMemoryBarrierAccessFlags3KHR *)pnext)->pNext);
++            size += vn_sizeof_VkMemoryBarrierAccessFlags3KHR_self((const VkMemoryBarrierAccessFlags3KHR *)pnext);
++            return size;
+         default:
+             /* ignore unknown/unsupported struct */
+             break;
+@@ -1245,6 +1253,14 @@ vn_encode_VkSubpassDependency2_pnext(struct vn_cs_encoder *enc, const void *val)
+             vn_encode_VkSubpassDependency2_pnext(enc, ((const VkMemoryBarrier2 *)pnext)->pNext);
+             vn_encode_VkMemoryBarrier2_self(enc, (const VkMemoryBarrier2 *)pnext);
+             return;
++        case VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR:
++            if (!vn_cs_renderer_protocol_has_extension(575 /* VK_KHR_maintenance8 */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkSubpassDependency2_pnext(enc, ((const VkMemoryBarrierAccessFlags3KHR *)pnext)->pNext);
++            vn_encode_VkMemoryBarrierAccessFlags3KHR_self(enc, (const VkMemoryBarrierAccessFlags3KHR *)pnext);
++            return;
+         default:
+             /* ignore unknown/unsupported struct */
+             break;
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_structs.h b/src/virtio/venus-protocol/vn_protocol_driver_structs.h
+index 4f14846..963a12f 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_structs.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_structs.h
+@@ -3193,60 +3193,124 @@ vn_encode_VkImageSubresourceLayers(struct vn_cs_encoder *enc, const VkImageSubre
+     vn_encode_uint32_t(enc, &val->layerCount);
+ }
+ 
+-/* struct VkBindMemoryStatus chain */
++/* struct VkGeneratedCommandsPipelineInfoEXT chain */
+ 
+ static inline size_t
+-vn_sizeof_VkBindMemoryStatus_pnext(const void *val)
++vn_sizeof_VkGeneratedCommandsPipelineInfoEXT_pnext(const void *val)
+ {
+     /* no known/supported struct */
+     return vn_sizeof_simple_pointer(NULL);
+ }
+ 
+ static inline size_t
+-vn_sizeof_VkBindMemoryStatus_self(const VkBindMemoryStatus *val)
++vn_sizeof_VkGeneratedCommandsPipelineInfoEXT_self(const VkGeneratedCommandsPipelineInfoEXT *val)
+ {
+     size_t size = 0;
+     /* skip val->{sType,pNext} */
+-    size += vn_sizeof_simple_pointer(val->pResult);
+-    if (val->pResult)
+-        size += vn_sizeof_VkResult(val->pResult);
++    size += vn_sizeof_VkPipeline(&val->pipeline);
+     return size;
+ }
+ 
+ static inline size_t
+-vn_sizeof_VkBindMemoryStatus(const VkBindMemoryStatus *val)
++vn_sizeof_VkGeneratedCommandsPipelineInfoEXT(const VkGeneratedCommandsPipelineInfoEXT *val)
+ {
+     size_t size = 0;
+ 
+     size += vn_sizeof_VkStructureType(&val->sType);
+-    size += vn_sizeof_VkBindMemoryStatus_pnext(val->pNext);
+-    size += vn_sizeof_VkBindMemoryStatus_self(val);
++    size += vn_sizeof_VkGeneratedCommandsPipelineInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkGeneratedCommandsPipelineInfoEXT_self(val);
+ 
+     return size;
+ }
+ 
+ static inline void
+-vn_encode_VkBindMemoryStatus_pnext(struct vn_cs_encoder *enc, const void *val)
++vn_encode_VkGeneratedCommandsPipelineInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
+ {
+     /* no known/supported struct */
+     vn_encode_simple_pointer(enc, NULL);
+ }
+ 
+ static inline void
+-vn_encode_VkBindMemoryStatus_self(struct vn_cs_encoder *enc, const VkBindMemoryStatus *val)
++vn_encode_VkGeneratedCommandsPipelineInfoEXT_self(struct vn_cs_encoder *enc, const VkGeneratedCommandsPipelineInfoEXT *val)
+ {
+     /* skip val->{sType,pNext} */
+-    if (vn_encode_simple_pointer(enc, val->pResult))
+-        vn_encode_VkResult(enc, val->pResult);
++    vn_encode_VkPipeline(enc, &val->pipeline);
+ }
+ 
+ static inline void
+-vn_encode_VkBindMemoryStatus(struct vn_cs_encoder *enc, const VkBindMemoryStatus *val)
++vn_encode_VkGeneratedCommandsPipelineInfoEXT(struct vn_cs_encoder *enc, const VkGeneratedCommandsPipelineInfoEXT *val)
+ {
+-    assert(val->sType == VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS);
+-    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS });
+-    vn_encode_VkBindMemoryStatus_pnext(enc, val->pNext);
+-    vn_encode_VkBindMemoryStatus_self(enc, val);
++    assert(val->sType == VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT });
++    vn_encode_VkGeneratedCommandsPipelineInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkGeneratedCommandsPipelineInfoEXT_self(enc, val);
++}
++
++/* struct VkGeneratedCommandsShaderInfoEXT chain */
++
++static inline size_t
++vn_sizeof_VkGeneratedCommandsShaderInfoEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkGeneratedCommandsShaderInfoEXT_self(const VkGeneratedCommandsShaderInfoEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_uint32_t(&val->shaderCount);
++    if (val->pShaders) {
++        size += vn_sizeof_array_size(val->shaderCount);
++        for (uint32_t i = 0; i < val->shaderCount; i++)
++            size += vn_sizeof_VkShaderEXT(&val->pShaders[i]);
++    } else {
++        size += vn_sizeof_array_size(0);
++    }
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkGeneratedCommandsShaderInfoEXT(const VkGeneratedCommandsShaderInfoEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkGeneratedCommandsShaderInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkGeneratedCommandsShaderInfoEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkGeneratedCommandsShaderInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkGeneratedCommandsShaderInfoEXT_self(struct vn_cs_encoder *enc, const VkGeneratedCommandsShaderInfoEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_uint32_t(enc, &val->shaderCount);
++    if (val->pShaders) {
++        vn_encode_array_size(enc, val->shaderCount);
++        for (uint32_t i = 0; i < val->shaderCount; i++)
++            vn_encode_VkShaderEXT(enc, &val->pShaders[i]);
++    } else {
++        vn_encode_array_size(enc, 0);
++    }
++}
++
++static inline void
++vn_encode_VkGeneratedCommandsShaderInfoEXT(struct vn_cs_encoder *enc, const VkGeneratedCommandsShaderInfoEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_GENERATED_COMMANDS_SHADER_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_SHADER_INFO_EXT });
++    vn_encode_VkGeneratedCommandsShaderInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkGeneratedCommandsShaderInfoEXT_self(enc, val);
+ }
+ 
+ /* struct VkMemoryDedicatedRequirements chain */
+@@ -3540,6 +3604,62 @@ vn_encode_VkMemoryRequirements2_partial(struct vn_cs_encoder *enc, const VkMemor
+     vn_encode_VkMemoryRequirements2_self_partial(enc, val);
+ }
+ 
++/* struct VkBindMemoryStatus chain */
++
++static inline size_t
++vn_sizeof_VkBindMemoryStatus_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkBindMemoryStatus_self(const VkBindMemoryStatus *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_simple_pointer(val->pResult);
++    if (val->pResult)
++        size += vn_sizeof_VkResult(val->pResult);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkBindMemoryStatus(const VkBindMemoryStatus *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkBindMemoryStatus_pnext(val->pNext);
++    size += vn_sizeof_VkBindMemoryStatus_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkBindMemoryStatus_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkBindMemoryStatus_self(struct vn_cs_encoder *enc, const VkBindMemoryStatus *val)
++{
++    /* skip val->{sType,pNext} */
++    if (vn_encode_simple_pointer(enc, val->pResult))
++        vn_encode_VkResult(enc, val->pResult);
++}
++
++static inline void
++vn_encode_VkBindMemoryStatus(struct vn_cs_encoder *enc, const VkBindMemoryStatus *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS });
++    vn_encode_VkBindMemoryStatus_pnext(enc, val->pNext);
++    vn_encode_VkBindMemoryStatus_self(enc, val);
++}
++
+ /* struct VkMultisampledRenderToSingleSampledInfoEXT chain */
+ 
+ static inline size_t
+@@ -3654,6 +3774,61 @@ vn_encode_VkMemoryBarrier2(struct vn_cs_encoder *enc, const VkMemoryBarrier2 *va
+     vn_encode_VkMemoryBarrier2_self(enc, val);
+ }
+ 
++/* struct VkMemoryBarrierAccessFlags3KHR chain */
++
++static inline size_t
++vn_sizeof_VkMemoryBarrierAccessFlags3KHR_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkMemoryBarrierAccessFlags3KHR_self(const VkMemoryBarrierAccessFlags3KHR *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_VkFlags64(&val->srcAccessMask3);
++    size += vn_sizeof_VkFlags64(&val->dstAccessMask3);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkMemoryBarrierAccessFlags3KHR(const VkMemoryBarrierAccessFlags3KHR *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkMemoryBarrierAccessFlags3KHR_pnext(val->pNext);
++    size += vn_sizeof_VkMemoryBarrierAccessFlags3KHR_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkMemoryBarrierAccessFlags3KHR_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkMemoryBarrierAccessFlags3KHR_self(struct vn_cs_encoder *enc, const VkMemoryBarrierAccessFlags3KHR *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_VkFlags64(enc, &val->srcAccessMask3);
++    vn_encode_VkFlags64(enc, &val->dstAccessMask3);
++}
++
++static inline void
++vn_encode_VkMemoryBarrierAccessFlags3KHR(struct vn_cs_encoder *enc, const VkMemoryBarrierAccessFlags3KHR *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_MEMORY_BARRIER_ACCESS_FLAGS_3_KHR });
++    vn_encode_VkMemoryBarrierAccessFlags3KHR_pnext(enc, val->pNext);
++    vn_encode_VkMemoryBarrierAccessFlags3KHR_self(enc, val);
++}
++
+ /* struct VkCopyAccelerationStructureInfoKHR chain */
+ 
+ static inline size_t
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_transport.h b/src/virtio/venus-protocol/vn_protocol_driver_transport.h
+index 56c6d92..9300d3a 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_transport.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_transport.h
+@@ -11,171 +11,360 @@
+ #include "vn_ring.h"
+ #include "vn_protocol_driver_structs.h"
+ 
+-/* struct VkCommandStreamDescriptionMESA */
++/* struct VkGeneratedCommandsMemoryRequirementsInfoEXT chain */
+ 
+ static inline size_t
+-vn_sizeof_VkCommandStreamDescriptionMESA(const VkCommandStreamDescriptionMESA *val)
++vn_sizeof_VkGeneratedCommandsMemoryRequirementsInfoEXT_pnext(const void *val)
+ {
++    const VkBaseInStructure *pnext = val;
+     size_t size = 0;
+-    size += vn_sizeof_uint32_t(&val->resourceId);
+-    size += vn_sizeof_size_t(&val->offset);
+-    size += vn_sizeof_size_t(&val->size);
+-    return size;
++
++    while (pnext) {
++        switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkGeneratedCommandsMemoryRequirementsInfoEXT_pnext(((const VkGeneratedCommandsPipelineInfoEXT *)pnext)->pNext);
++            size += vn_sizeof_VkGeneratedCommandsPipelineInfoEXT_self((const VkGeneratedCommandsPipelineInfoEXT *)pnext);
++            return size;
++        case VK_STRUCTURE_TYPE_GENERATED_COMMANDS_SHADER_INFO_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkGeneratedCommandsMemoryRequirementsInfoEXT_pnext(((const VkGeneratedCommandsShaderInfoEXT *)pnext)->pNext);
++            size += vn_sizeof_VkGeneratedCommandsShaderInfoEXT_self((const VkGeneratedCommandsShaderInfoEXT *)pnext);
++            return size;
++        default:
++            /* ignore unknown/unsupported struct */
++            break;
++        }
++        pnext = pnext->pNext;
++    }
++
++    return vn_sizeof_simple_pointer(NULL);
+ }
+ 
+-static inline void
+-vn_encode_VkCommandStreamDescriptionMESA(struct vn_cs_encoder *enc, const VkCommandStreamDescriptionMESA *val)
++static inline size_t
++vn_sizeof_VkGeneratedCommandsMemoryRequirementsInfoEXT_self(const VkGeneratedCommandsMemoryRequirementsInfoEXT *val)
+ {
+-    vn_encode_uint32_t(enc, &val->resourceId);
+-    vn_encode_size_t(enc, &val->offset);
+-    vn_encode_size_t(enc, &val->size);
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_VkIndirectExecutionSetEXT(&val->indirectExecutionSet);
++    size += vn_sizeof_VkIndirectCommandsLayoutEXT(&val->indirectCommandsLayout);
++    size += vn_sizeof_uint32_t(&val->maxSequenceCount);
++    size += vn_sizeof_uint32_t(&val->maxDrawCount);
++    return size;
+ }
+ 
+-/* struct VkCommandStreamDependencyMESA */
+-
+ static inline size_t
+-vn_sizeof_VkCommandStreamDependencyMESA(const VkCommandStreamDependencyMESA *val)
++vn_sizeof_VkGeneratedCommandsMemoryRequirementsInfoEXT(const VkGeneratedCommandsMemoryRequirementsInfoEXT *val)
+ {
+     size_t size = 0;
+-    size += vn_sizeof_uint32_t(&val->srcCommandStream);
+-    size += vn_sizeof_uint32_t(&val->dstCommandStream);
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkGeneratedCommandsMemoryRequirementsInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkGeneratedCommandsMemoryRequirementsInfoEXT_self(val);
++
+     return size;
+ }
+ 
+ static inline void
+-vn_encode_VkCommandStreamDependencyMESA(struct vn_cs_encoder *enc, const VkCommandStreamDependencyMESA *val)
++vn_encode_VkGeneratedCommandsMemoryRequirementsInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
+ {
+-    vn_encode_uint32_t(enc, &val->srcCommandStream);
+-    vn_encode_uint32_t(enc, &val->dstCommandStream);
++    const VkBaseInStructure *pnext = val;
++
++    while (pnext) {
++        switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_GENERATED_COMMANDS_PIPELINE_INFO_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkGeneratedCommandsMemoryRequirementsInfoEXT_pnext(enc, ((const VkGeneratedCommandsPipelineInfoEXT *)pnext)->pNext);
++            vn_encode_VkGeneratedCommandsPipelineInfoEXT_self(enc, (const VkGeneratedCommandsPipelineInfoEXT *)pnext);
++            return;
++        case VK_STRUCTURE_TYPE_GENERATED_COMMANDS_SHADER_INFO_EXT:
++            if (!vn_cs_renderer_protocol_has_extension(573 /* VK_EXT_device_generated_commands */))
++                break;
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkGeneratedCommandsMemoryRequirementsInfoEXT_pnext(enc, ((const VkGeneratedCommandsShaderInfoEXT *)pnext)->pNext);
++            vn_encode_VkGeneratedCommandsShaderInfoEXT_self(enc, (const VkGeneratedCommandsShaderInfoEXT *)pnext);
++            return;
++        default:
++            /* ignore unknown/unsupported struct */
++            break;
++        }
++        pnext = pnext->pNext;
++    }
++
++    vn_encode_simple_pointer(enc, NULL);
+ }
+ 
+-/* struct VkRingMonitorInfoMESA chain */
++static inline void
++vn_encode_VkGeneratedCommandsMemoryRequirementsInfoEXT_self(struct vn_cs_encoder *enc, const VkGeneratedCommandsMemoryRequirementsInfoEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_VkIndirectExecutionSetEXT(enc, &val->indirectExecutionSet);
++    vn_encode_VkIndirectCommandsLayoutEXT(enc, &val->indirectCommandsLayout);
++    vn_encode_uint32_t(enc, &val->maxSequenceCount);
++    vn_encode_uint32_t(enc, &val->maxDrawCount);
++}
+ 
+-static inline size_t
+-vn_sizeof_VkRingMonitorInfoMESA_pnext(const void *val)
++static inline void
++vn_encode_VkGeneratedCommandsMemoryRequirementsInfoEXT(struct vn_cs_encoder *enc, const VkGeneratedCommandsMemoryRequirementsInfoEXT *val)
+ {
+-    /* no known/supported struct */
+-    return vn_sizeof_simple_pointer(NULL);
++    assert(val->sType == VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT });
++    vn_encode_VkGeneratedCommandsMemoryRequirementsInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkGeneratedCommandsMemoryRequirementsInfoEXT_self(enc, val);
+ }
+ 
++/* struct VkIndirectCommandsPushConstantTokenEXT */
++
+ static inline size_t
+-vn_sizeof_VkRingMonitorInfoMESA_self(const VkRingMonitorInfoMESA *val)
++vn_sizeof_VkIndirectCommandsPushConstantTokenEXT(const VkIndirectCommandsPushConstantTokenEXT *val)
+ {
+     size_t size = 0;
+-    /* skip val->{sType,pNext} */
+-    size += vn_sizeof_uint32_t(&val->maxReportingPeriodMicroseconds);
++    size += vn_sizeof_VkPushConstantRange(&val->updateRange);
+     return size;
+ }
+ 
++static inline void
++vn_encode_VkIndirectCommandsPushConstantTokenEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsPushConstantTokenEXT *val)
++{
++    vn_encode_VkPushConstantRange(enc, &val->updateRange);
++}
++
++/* struct VkIndirectCommandsVertexBufferTokenEXT */
++
+ static inline size_t
+-vn_sizeof_VkRingMonitorInfoMESA(const VkRingMonitorInfoMESA *val)
++vn_sizeof_VkIndirectCommandsVertexBufferTokenEXT(const VkIndirectCommandsVertexBufferTokenEXT *val)
+ {
+     size_t size = 0;
++    size += vn_sizeof_uint32_t(&val->vertexBindingUnit);
++    return size;
++}
+ 
+-    size += vn_sizeof_VkStructureType(&val->sType);
+-    size += vn_sizeof_VkRingMonitorInfoMESA_pnext(val->pNext);
+-    size += vn_sizeof_VkRingMonitorInfoMESA_self(val);
++static inline void
++vn_encode_VkIndirectCommandsVertexBufferTokenEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsVertexBufferTokenEXT *val)
++{
++    vn_encode_uint32_t(enc, &val->vertexBindingUnit);
++}
+ 
++/* struct VkIndirectCommandsIndexBufferTokenEXT */
++
++static inline size_t
++vn_sizeof_VkIndirectCommandsIndexBufferTokenEXT(const VkIndirectCommandsIndexBufferTokenEXT *val)
++{
++    size_t size = 0;
++    size += vn_sizeof_VkIndirectCommandsInputModeFlagBitsEXT(&val->mode);
+     return size;
+ }
+ 
+ static inline void
+-vn_encode_VkRingMonitorInfoMESA_pnext(struct vn_cs_encoder *enc, const void *val)
++vn_encode_VkIndirectCommandsIndexBufferTokenEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsIndexBufferTokenEXT *val)
+ {
+-    /* no known/supported struct */
+-    vn_encode_simple_pointer(enc, NULL);
++    vn_encode_VkIndirectCommandsInputModeFlagBitsEXT(enc, &val->mode);
+ }
+ 
+-static inline void
+-vn_encode_VkRingMonitorInfoMESA_self(struct vn_cs_encoder *enc, const VkRingMonitorInfoMESA *val)
++/* struct VkIndirectCommandsExecutionSetTokenEXT */
++
++static inline size_t
++vn_sizeof_VkIndirectCommandsExecutionSetTokenEXT(const VkIndirectCommandsExecutionSetTokenEXT *val)
+ {
+-    /* skip val->{sType,pNext} */
+-    vn_encode_uint32_t(enc, &val->maxReportingPeriodMicroseconds);
++    size_t size = 0;
++    size += vn_sizeof_VkIndirectExecutionSetInfoTypeEXT(&val->type);
++    size += vn_sizeof_VkFlags(&val->shaderStages);
++    return size;
+ }
+ 
+ static inline void
+-vn_encode_VkRingMonitorInfoMESA(struct vn_cs_encoder *enc, const VkRingMonitorInfoMESA *val)
++vn_encode_VkIndirectCommandsExecutionSetTokenEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsExecutionSetTokenEXT *val)
+ {
+-    assert(val->sType == VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA);
+-    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA });
+-    vn_encode_VkRingMonitorInfoMESA_pnext(enc, val->pNext);
+-    vn_encode_VkRingMonitorInfoMESA_self(enc, val);
++    vn_encode_VkIndirectExecutionSetInfoTypeEXT(enc, &val->type);
++    vn_encode_VkFlags(enc, &val->shaderStages);
+ }
+ 
+-/* struct VkRingPriorityInfoMESA chain */
++/* union VkIndirectCommandsTokenDataEXT */
+ 
+ static inline size_t
+-vn_sizeof_VkRingPriorityInfoMESA_pnext(const void *val)
++vn_sizeof_VkIndirectCommandsTokenDataEXT(const VkIndirectCommandsTokenDataEXT *val, VkIndirectCommandsTokenTypeEXT tag)
++{
++    size_t size = vn_sizeof_VkIndirectCommandsTokenTypeEXT(&tag);
++    switch (tag) {
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT:
++        size += vn_sizeof_simple_pointer(val->pPushConstant);
++        if (val->pPushConstant)
++            size += vn_sizeof_VkIndirectCommandsPushConstantTokenEXT(val->pPushConstant);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_SEQUENCE_INDEX_EXT:
++        size += vn_sizeof_simple_pointer(val->pPushConstant);
++        if (val->pPushConstant)
++            size += vn_sizeof_VkIndirectCommandsPushConstantTokenEXT(val->pPushConstant);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_EXT:
++        size += vn_sizeof_simple_pointer(val->pPushConstant);
++        if (val->pPushConstant)
++            size += vn_sizeof_VkIndirectCommandsPushConstantTokenEXT(val->pPushConstant);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_SEQUENCE_INDEX_EXT:
++        size += vn_sizeof_simple_pointer(val->pPushConstant);
++        if (val->pPushConstant)
++            size += vn_sizeof_VkIndirectCommandsPushConstantTokenEXT(val->pPushConstant);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_VERTEX_BUFFER_EXT:
++        size += vn_sizeof_simple_pointer(val->pVertexBuffer);
++        if (val->pVertexBuffer)
++            size += vn_sizeof_VkIndirectCommandsVertexBufferTokenEXT(val->pVertexBuffer);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_INDEX_BUFFER_EXT:
++        size += vn_sizeof_simple_pointer(val->pIndexBuffer);
++        if (val->pIndexBuffer)
++            size += vn_sizeof_VkIndirectCommandsIndexBufferTokenEXT(val->pIndexBuffer);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_EXECUTION_SET_EXT:
++        size += vn_sizeof_simple_pointer(val->pExecutionSet);
++        if (val->pExecutionSet)
++            size += vn_sizeof_VkIndirectCommandsExecutionSetTokenEXT(val->pExecutionSet);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_COUNT_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_COUNT_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_COUNT_EXT:
++        break;
++    default:
++        assert(false);
++        break;
++    }
++    return size;
++}
++
++static inline void
++vn_encode_VkIndirectCommandsTokenDataEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsTokenDataEXT *val, VkIndirectCommandsTokenTypeEXT tag)
++{
++    vn_encode_VkIndirectCommandsTokenTypeEXT(enc, &tag);
++    switch (tag) {
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT:
++        if (vn_encode_simple_pointer(enc, val->pPushConstant))
++            vn_encode_VkIndirectCommandsPushConstantTokenEXT(enc, val->pPushConstant);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_SEQUENCE_INDEX_EXT:
++        if (vn_encode_simple_pointer(enc, val->pPushConstant))
++            vn_encode_VkIndirectCommandsPushConstantTokenEXT(enc, val->pPushConstant);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_EXT:
++        if (vn_encode_simple_pointer(enc, val->pPushConstant))
++            vn_encode_VkIndirectCommandsPushConstantTokenEXT(enc, val->pPushConstant);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_SEQUENCE_INDEX_EXT:
++        if (vn_encode_simple_pointer(enc, val->pPushConstant))
++            vn_encode_VkIndirectCommandsPushConstantTokenEXT(enc, val->pPushConstant);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_VERTEX_BUFFER_EXT:
++        if (vn_encode_simple_pointer(enc, val->pVertexBuffer))
++            vn_encode_VkIndirectCommandsVertexBufferTokenEXT(enc, val->pVertexBuffer);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_INDEX_BUFFER_EXT:
++        if (vn_encode_simple_pointer(enc, val->pIndexBuffer))
++            vn_encode_VkIndirectCommandsIndexBufferTokenEXT(enc, val->pIndexBuffer);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_EXECUTION_SET_EXT:
++        if (vn_encode_simple_pointer(enc, val->pExecutionSet))
++            vn_encode_VkIndirectCommandsExecutionSetTokenEXT(enc, val->pExecutionSet);
++        break;
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DISPATCH_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_COUNT_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_COUNT_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_EXT:
++    case VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_MESH_TASKS_COUNT_EXT:
++        break;
++    default:
++        assert(false);
++        break;
++    }
++}
++
++/* struct VkIndirectCommandsLayoutTokenEXT chain */
++
++static inline size_t
++vn_sizeof_VkIndirectCommandsLayoutTokenEXT_pnext(const void *val)
+ {
+     /* no known/supported struct */
+     return vn_sizeof_simple_pointer(NULL);
+ }
+ 
+ static inline size_t
+-vn_sizeof_VkRingPriorityInfoMESA_self(const VkRingPriorityInfoMESA *val)
++vn_sizeof_VkIndirectCommandsLayoutTokenEXT_self(const VkIndirectCommandsLayoutTokenEXT *val)
+ {
+     size_t size = 0;
+     /* skip val->{sType,pNext} */
+-    size += vn_sizeof_int32_t(&val->priority);
++    size += vn_sizeof_VkIndirectCommandsTokenTypeEXT(&val->type);
++    size += vn_sizeof_VkIndirectCommandsTokenDataEXT(&val->data, val->type);
++    size += vn_sizeof_uint32_t(&val->offset);
+     return size;
+ }
+ 
+ static inline size_t
+-vn_sizeof_VkRingPriorityInfoMESA(const VkRingPriorityInfoMESA *val)
++vn_sizeof_VkIndirectCommandsLayoutTokenEXT(const VkIndirectCommandsLayoutTokenEXT *val)
+ {
+     size_t size = 0;
+ 
+     size += vn_sizeof_VkStructureType(&val->sType);
+-    size += vn_sizeof_VkRingPriorityInfoMESA_pnext(val->pNext);
+-    size += vn_sizeof_VkRingPriorityInfoMESA_self(val);
++    size += vn_sizeof_VkIndirectCommandsLayoutTokenEXT_pnext(val->pNext);
++    size += vn_sizeof_VkIndirectCommandsLayoutTokenEXT_self(val);
+ 
+     return size;
+ }
+ 
+ static inline void
+-vn_encode_VkRingPriorityInfoMESA_pnext(struct vn_cs_encoder *enc, const void *val)
++vn_encode_VkIndirectCommandsLayoutTokenEXT_pnext(struct vn_cs_encoder *enc, const void *val)
+ {
+     /* no known/supported struct */
+     vn_encode_simple_pointer(enc, NULL);
+ }
+ 
+ static inline void
+-vn_encode_VkRingPriorityInfoMESA_self(struct vn_cs_encoder *enc, const VkRingPriorityInfoMESA *val)
++vn_encode_VkIndirectCommandsLayoutTokenEXT_self(struct vn_cs_encoder *enc, const VkIndirectCommandsLayoutTokenEXT *val)
+ {
+     /* skip val->{sType,pNext} */
+-    vn_encode_int32_t(enc, &val->priority);
++    vn_encode_VkIndirectCommandsTokenTypeEXT(enc, &val->type);
++    vn_encode_VkIndirectCommandsTokenDataEXT(enc, &val->data, val->type);
++    vn_encode_uint32_t(enc, &val->offset);
+ }
+ 
+ static inline void
+-vn_encode_VkRingPriorityInfoMESA(struct vn_cs_encoder *enc, const VkRingPriorityInfoMESA *val)
++vn_encode_VkIndirectCommandsLayoutTokenEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsLayoutTokenEXT *val)
+ {
+-    assert(val->sType == VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA);
+-    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA });
+-    vn_encode_VkRingPriorityInfoMESA_pnext(enc, val->pNext);
+-    vn_encode_VkRingPriorityInfoMESA_self(enc, val);
++    assert(val->sType == VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_TOKEN_EXT });
++    vn_encode_VkIndirectCommandsLayoutTokenEXT_pnext(enc, val->pNext);
++    vn_encode_VkIndirectCommandsLayoutTokenEXT_self(enc, val);
+ }
+ 
+-/* struct VkRingCreateInfoMESA chain */
++/* struct VkIndirectCommandsLayoutCreateInfoEXT chain */
+ 
+ static inline size_t
+-vn_sizeof_VkRingCreateInfoMESA_pnext(const void *val)
++vn_sizeof_VkIndirectCommandsLayoutCreateInfoEXT_pnext(const void *val)
+ {
+     const VkBaseInStructure *pnext = val;
+     size_t size = 0;
+ 
+     while (pnext) {
+         switch ((int32_t)pnext->sType) {
+-        case VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA:
+-            size += vn_sizeof_simple_pointer(pnext);
+-            size += vn_sizeof_VkStructureType(&pnext->sType);
+-            size += vn_sizeof_VkRingCreateInfoMESA_pnext(((const VkRingMonitorInfoMESA *)pnext)->pNext);
+-            size += vn_sizeof_VkRingMonitorInfoMESA_self((const VkRingMonitorInfoMESA *)pnext);
+-            return size;
+-        case VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA:
++        case VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO:
+             size += vn_sizeof_simple_pointer(pnext);
+             size += vn_sizeof_VkStructureType(&pnext->sType);
+-            size += vn_sizeof_VkRingCreateInfoMESA_pnext(((const VkRingPriorityInfoMESA *)pnext)->pNext);
+-            size += vn_sizeof_VkRingPriorityInfoMESA_self((const VkRingPriorityInfoMESA *)pnext);
++            size += vn_sizeof_VkIndirectCommandsLayoutCreateInfoEXT_pnext(((const VkPipelineLayoutCreateInfo *)pnext)->pNext);
++            size += vn_sizeof_VkPipelineLayoutCreateInfo_self((const VkPipelineLayoutCreateInfo *)pnext);
+             return size;
+         default:
+             /* ignore unknown/unsupported struct */
+@@ -188,91 +377,1214 @@ vn_sizeof_VkRingCreateInfoMESA_pnext(const void *val)
+ }
+ 
+ static inline size_t
+-vn_sizeof_VkRingCreateInfoMESA_self(const VkRingCreateInfoMESA *val)
++vn_sizeof_VkIndirectCommandsLayoutCreateInfoEXT_self(const VkIndirectCommandsLayoutCreateInfoEXT *val)
+ {
+     size_t size = 0;
+     /* skip val->{sType,pNext} */
+     size += vn_sizeof_VkFlags(&val->flags);
+-    size += vn_sizeof_uint32_t(&val->resourceId);
+-    size += vn_sizeof_size_t(&val->offset);
+-    size += vn_sizeof_size_t(&val->size);
+-    size += vn_sizeof_uint64_t(&val->idleTimeout);
+-    size += vn_sizeof_size_t(&val->headOffset);
+-    size += vn_sizeof_size_t(&val->tailOffset);
+-    size += vn_sizeof_size_t(&val->statusOffset);
+-    size += vn_sizeof_size_t(&val->bufferOffset);
+-    size += vn_sizeof_size_t(&val->bufferSize);
+-    size += vn_sizeof_size_t(&val->extraOffset);
+-    size += vn_sizeof_size_t(&val->extraSize);
++    size += vn_sizeof_VkFlags(&val->shaderStages);
++    size += vn_sizeof_uint32_t(&val->indirectStride);
++    size += vn_sizeof_VkPipelineLayout(&val->pipelineLayout);
++    size += vn_sizeof_uint32_t(&val->tokenCount);
++    if (val->pTokens) {
++        size += vn_sizeof_array_size(val->tokenCount);
++        for (uint32_t i = 0; i < val->tokenCount; i++)
++            size += vn_sizeof_VkIndirectCommandsLayoutTokenEXT(&val->pTokens[i]);
++    } else {
++        size += vn_sizeof_array_size(0);
++    }
+     return size;
+ }
+ 
+ static inline size_t
+-vn_sizeof_VkRingCreateInfoMESA(const VkRingCreateInfoMESA *val)
++vn_sizeof_VkIndirectCommandsLayoutCreateInfoEXT(const VkIndirectCommandsLayoutCreateInfoEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkIndirectCommandsLayoutCreateInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkIndirectCommandsLayoutCreateInfoEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkIndirectCommandsLayoutCreateInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    const VkBaseInStructure *pnext = val;
++
++    while (pnext) {
++        switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO:
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkIndirectCommandsLayoutCreateInfoEXT_pnext(enc, ((const VkPipelineLayoutCreateInfo *)pnext)->pNext);
++            vn_encode_VkPipelineLayoutCreateInfo_self(enc, (const VkPipelineLayoutCreateInfo *)pnext);
++            return;
++        default:
++            /* ignore unknown/unsupported struct */
++            break;
++        }
++        pnext = pnext->pNext;
++    }
++
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkIndirectCommandsLayoutCreateInfoEXT_self(struct vn_cs_encoder *enc, const VkIndirectCommandsLayoutCreateInfoEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_VkFlags(enc, &val->flags);
++    vn_encode_VkFlags(enc, &val->shaderStages);
++    vn_encode_uint32_t(enc, &val->indirectStride);
++    vn_encode_VkPipelineLayout(enc, &val->pipelineLayout);
++    vn_encode_uint32_t(enc, &val->tokenCount);
++    if (val->pTokens) {
++        vn_encode_array_size(enc, val->tokenCount);
++        for (uint32_t i = 0; i < val->tokenCount; i++)
++            vn_encode_VkIndirectCommandsLayoutTokenEXT(enc, &val->pTokens[i]);
++    } else {
++        vn_encode_array_size(enc, 0);
++    }
++}
++
++static inline void
++vn_encode_VkIndirectCommandsLayoutCreateInfoEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsLayoutCreateInfoEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_INDIRECT_COMMANDS_LAYOUT_CREATE_INFO_EXT });
++    vn_encode_VkIndirectCommandsLayoutCreateInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkIndirectCommandsLayoutCreateInfoEXT_self(enc, val);
++}
++
++/* struct VkIndirectExecutionSetPipelineInfoEXT chain */
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetPipelineInfoEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetPipelineInfoEXT_self(const VkIndirectExecutionSetPipelineInfoEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_VkPipeline(&val->initialPipeline);
++    size += vn_sizeof_uint32_t(&val->maxPipelineCount);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetPipelineInfoEXT(const VkIndirectExecutionSetPipelineInfoEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkIndirectExecutionSetPipelineInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkIndirectExecutionSetPipelineInfoEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetPipelineInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetPipelineInfoEXT_self(struct vn_cs_encoder *enc, const VkIndirectExecutionSetPipelineInfoEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_VkPipeline(enc, &val->initialPipeline);
++    vn_encode_uint32_t(enc, &val->maxPipelineCount);
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetPipelineInfoEXT(struct vn_cs_encoder *enc, const VkIndirectExecutionSetPipelineInfoEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_PIPELINE_INFO_EXT });
++    vn_encode_VkIndirectExecutionSetPipelineInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkIndirectExecutionSetPipelineInfoEXT_self(enc, val);
++}
++
++/* struct VkIndirectExecutionSetShaderLayoutInfoEXT chain */
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetShaderLayoutInfoEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetShaderLayoutInfoEXT_self(const VkIndirectExecutionSetShaderLayoutInfoEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_uint32_t(&val->setLayoutCount);
++    if (val->pSetLayouts) {
++        size += vn_sizeof_array_size(val->setLayoutCount);
++        for (uint32_t i = 0; i < val->setLayoutCount; i++)
++            size += vn_sizeof_VkDescriptorSetLayout(&val->pSetLayouts[i]);
++    } else {
++        size += vn_sizeof_array_size(0);
++    }
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetShaderLayoutInfoEXT(const VkIndirectExecutionSetShaderLayoutInfoEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkIndirectExecutionSetShaderLayoutInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkIndirectExecutionSetShaderLayoutInfoEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetShaderLayoutInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetShaderLayoutInfoEXT_self(struct vn_cs_encoder *enc, const VkIndirectExecutionSetShaderLayoutInfoEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_uint32_t(enc, &val->setLayoutCount);
++    if (val->pSetLayouts) {
++        vn_encode_array_size(enc, val->setLayoutCount);
++        for (uint32_t i = 0; i < val->setLayoutCount; i++)
++            vn_encode_VkDescriptorSetLayout(enc, &val->pSetLayouts[i]);
++    } else {
++        vn_encode_array_size(enc, 0);
++    }
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetShaderLayoutInfoEXT(struct vn_cs_encoder *enc, const VkIndirectExecutionSetShaderLayoutInfoEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_SHADER_LAYOUT_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_SHADER_LAYOUT_INFO_EXT });
++    vn_encode_VkIndirectExecutionSetShaderLayoutInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkIndirectExecutionSetShaderLayoutInfoEXT_self(enc, val);
++}
++
++/* struct VkIndirectExecutionSetShaderInfoEXT chain */
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetShaderInfoEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetShaderInfoEXT_self(const VkIndirectExecutionSetShaderInfoEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_uint32_t(&val->shaderCount);
++    if (val->pInitialShaders) {
++        size += vn_sizeof_array_size(val->shaderCount);
++        for (uint32_t i = 0; i < val->shaderCount; i++)
++            size += vn_sizeof_VkShaderEXT(&val->pInitialShaders[i]);
++    } else {
++        size += vn_sizeof_array_size(0);
++    }
++    if (val->pSetLayoutInfos) {
++        size += vn_sizeof_array_size(val->shaderCount);
++        for (uint32_t i = 0; i < val->shaderCount; i++)
++            size += vn_sizeof_VkIndirectExecutionSetShaderLayoutInfoEXT(&val->pSetLayoutInfos[i]);
++    } else {
++        size += vn_sizeof_array_size(0);
++    }
++    size += vn_sizeof_uint32_t(&val->maxShaderCount);
++    size += vn_sizeof_uint32_t(&val->pushConstantRangeCount);
++    if (val->pPushConstantRanges) {
++        size += vn_sizeof_array_size(val->pushConstantRangeCount);
++        for (uint32_t i = 0; i < val->pushConstantRangeCount; i++)
++            size += vn_sizeof_VkPushConstantRange(&val->pPushConstantRanges[i]);
++    } else {
++        size += vn_sizeof_array_size(0);
++    }
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetShaderInfoEXT(const VkIndirectExecutionSetShaderInfoEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkIndirectExecutionSetShaderInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkIndirectExecutionSetShaderInfoEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetShaderInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetShaderInfoEXT_self(struct vn_cs_encoder *enc, const VkIndirectExecutionSetShaderInfoEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_uint32_t(enc, &val->shaderCount);
++    if (val->pInitialShaders) {
++        vn_encode_array_size(enc, val->shaderCount);
++        for (uint32_t i = 0; i < val->shaderCount; i++)
++            vn_encode_VkShaderEXT(enc, &val->pInitialShaders[i]);
++    } else {
++        vn_encode_array_size(enc, 0);
++    }
++    if (val->pSetLayoutInfos) {
++        vn_encode_array_size(enc, val->shaderCount);
++        for (uint32_t i = 0; i < val->shaderCount; i++)
++            vn_encode_VkIndirectExecutionSetShaderLayoutInfoEXT(enc, &val->pSetLayoutInfos[i]);
++    } else {
++        vn_encode_array_size(enc, 0);
++    }
++    vn_encode_uint32_t(enc, &val->maxShaderCount);
++    vn_encode_uint32_t(enc, &val->pushConstantRangeCount);
++    if (val->pPushConstantRanges) {
++        vn_encode_array_size(enc, val->pushConstantRangeCount);
++        for (uint32_t i = 0; i < val->pushConstantRangeCount; i++)
++            vn_encode_VkPushConstantRange(enc, &val->pPushConstantRanges[i]);
++    } else {
++        vn_encode_array_size(enc, 0);
++    }
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetShaderInfoEXT(struct vn_cs_encoder *enc, const VkIndirectExecutionSetShaderInfoEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_SHADER_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_SHADER_INFO_EXT });
++    vn_encode_VkIndirectExecutionSetShaderInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkIndirectExecutionSetShaderInfoEXT_self(enc, val);
++}
++
++/* union VkIndirectExecutionSetInfoEXT */
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetInfoEXT(const VkIndirectExecutionSetInfoEXT *val, VkIndirectExecutionSetInfoTypeEXT tag)
++{
++    size_t size = vn_sizeof_VkIndirectExecutionSetInfoTypeEXT(&tag);
++    switch (tag) {
++    case VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT:
++        size += vn_sizeof_simple_pointer(val->pPipelineInfo);
++        if (val->pPipelineInfo)
++            size += vn_sizeof_VkIndirectExecutionSetPipelineInfoEXT(val->pPipelineInfo);
++        break;
++    case VK_INDIRECT_EXECUTION_SET_INFO_TYPE_SHADER_OBJECTS_EXT:
++        size += vn_sizeof_simple_pointer(val->pShaderInfo);
++        if (val->pShaderInfo)
++            size += vn_sizeof_VkIndirectExecutionSetShaderInfoEXT(val->pShaderInfo);
++        break;
++    default:
++        assert(false);
++        break;
++    }
++    return size;
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetInfoEXT(struct vn_cs_encoder *enc, const VkIndirectExecutionSetInfoEXT *val, VkIndirectExecutionSetInfoTypeEXT tag)
++{
++    vn_encode_VkIndirectExecutionSetInfoTypeEXT(enc, &tag);
++    switch (tag) {
++    case VK_INDIRECT_EXECUTION_SET_INFO_TYPE_PIPELINES_EXT:
++        if (vn_encode_simple_pointer(enc, val->pPipelineInfo))
++            vn_encode_VkIndirectExecutionSetPipelineInfoEXT(enc, val->pPipelineInfo);
++        break;
++    case VK_INDIRECT_EXECUTION_SET_INFO_TYPE_SHADER_OBJECTS_EXT:
++        if (vn_encode_simple_pointer(enc, val->pShaderInfo))
++            vn_encode_VkIndirectExecutionSetShaderInfoEXT(enc, val->pShaderInfo);
++        break;
++    default:
++        assert(false);
++        break;
++    }
++}
++
++/* struct VkIndirectExecutionSetCreateInfoEXT chain */
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetCreateInfoEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetCreateInfoEXT_self(const VkIndirectExecutionSetCreateInfoEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_VkIndirectExecutionSetInfoTypeEXT(&val->type);
++    size += vn_sizeof_VkIndirectExecutionSetInfoEXT(&val->info, val->type);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetCreateInfoEXT(const VkIndirectExecutionSetCreateInfoEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkIndirectExecutionSetCreateInfoEXT_pnext(val->pNext);
++    size += vn_sizeof_VkIndirectExecutionSetCreateInfoEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetCreateInfoEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetCreateInfoEXT_self(struct vn_cs_encoder *enc, const VkIndirectExecutionSetCreateInfoEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_VkIndirectExecutionSetInfoTypeEXT(enc, &val->type);
++    vn_encode_VkIndirectExecutionSetInfoEXT(enc, &val->info, val->type);
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetCreateInfoEXT(struct vn_cs_encoder *enc, const VkIndirectExecutionSetCreateInfoEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_CREATE_INFO_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_INDIRECT_EXECUTION_SET_CREATE_INFO_EXT });
++    vn_encode_VkIndirectExecutionSetCreateInfoEXT_pnext(enc, val->pNext);
++    vn_encode_VkIndirectExecutionSetCreateInfoEXT_self(enc, val);
++}
++
++/* struct VkWriteIndirectExecutionSetPipelineEXT chain */
++
++static inline size_t
++vn_sizeof_VkWriteIndirectExecutionSetPipelineEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkWriteIndirectExecutionSetPipelineEXT_self(const VkWriteIndirectExecutionSetPipelineEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_uint32_t(&val->index);
++    size += vn_sizeof_VkPipeline(&val->pipeline);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkWriteIndirectExecutionSetPipelineEXT(const VkWriteIndirectExecutionSetPipelineEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkWriteIndirectExecutionSetPipelineEXT_pnext(val->pNext);
++    size += vn_sizeof_VkWriteIndirectExecutionSetPipelineEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkWriteIndirectExecutionSetPipelineEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkWriteIndirectExecutionSetPipelineEXT_self(struct vn_cs_encoder *enc, const VkWriteIndirectExecutionSetPipelineEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_uint32_t(enc, &val->index);
++    vn_encode_VkPipeline(enc, &val->pipeline);
++}
++
++static inline void
++vn_encode_VkWriteIndirectExecutionSetPipelineEXT(struct vn_cs_encoder *enc, const VkWriteIndirectExecutionSetPipelineEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_PIPELINE_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_PIPELINE_EXT });
++    vn_encode_VkWriteIndirectExecutionSetPipelineEXT_pnext(enc, val->pNext);
++    vn_encode_VkWriteIndirectExecutionSetPipelineEXT_self(enc, val);
++}
++
++/* struct VkWriteIndirectExecutionSetShaderEXT chain */
++
++static inline size_t
++vn_sizeof_VkWriteIndirectExecutionSetShaderEXT_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkWriteIndirectExecutionSetShaderEXT_self(const VkWriteIndirectExecutionSetShaderEXT *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_uint32_t(&val->index);
++    size += vn_sizeof_VkShaderEXT(&val->shader);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkWriteIndirectExecutionSetShaderEXT(const VkWriteIndirectExecutionSetShaderEXT *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkWriteIndirectExecutionSetShaderEXT_pnext(val->pNext);
++    size += vn_sizeof_VkWriteIndirectExecutionSetShaderEXT_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkWriteIndirectExecutionSetShaderEXT_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkWriteIndirectExecutionSetShaderEXT_self(struct vn_cs_encoder *enc, const VkWriteIndirectExecutionSetShaderEXT *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_uint32_t(enc, &val->index);
++    vn_encode_VkShaderEXT(enc, &val->shader);
++}
++
++static inline void
++vn_encode_VkWriteIndirectExecutionSetShaderEXT(struct vn_cs_encoder *enc, const VkWriteIndirectExecutionSetShaderEXT *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_SHADER_EXT);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_WRITE_INDIRECT_EXECUTION_SET_SHADER_EXT });
++    vn_encode_VkWriteIndirectExecutionSetShaderEXT_pnext(enc, val->pNext);
++    vn_encode_VkWriteIndirectExecutionSetShaderEXT_self(enc, val);
++}
++
++/* struct VkCommandStreamDescriptionMESA */
++
++static inline size_t
++vn_sizeof_VkCommandStreamDescriptionMESA(const VkCommandStreamDescriptionMESA *val)
++{
++    size_t size = 0;
++    size += vn_sizeof_uint32_t(&val->resourceId);
++    size += vn_sizeof_size_t(&val->offset);
++    size += vn_sizeof_size_t(&val->size);
++    return size;
++}
++
++static inline void
++vn_encode_VkCommandStreamDescriptionMESA(struct vn_cs_encoder *enc, const VkCommandStreamDescriptionMESA *val)
++{
++    vn_encode_uint32_t(enc, &val->resourceId);
++    vn_encode_size_t(enc, &val->offset);
++    vn_encode_size_t(enc, &val->size);
++}
++
++/* struct VkCommandStreamDependencyMESA */
++
++static inline size_t
++vn_sizeof_VkCommandStreamDependencyMESA(const VkCommandStreamDependencyMESA *val)
++{
++    size_t size = 0;
++    size += vn_sizeof_uint32_t(&val->srcCommandStream);
++    size += vn_sizeof_uint32_t(&val->dstCommandStream);
++    return size;
++}
++
++static inline void
++vn_encode_VkCommandStreamDependencyMESA(struct vn_cs_encoder *enc, const VkCommandStreamDependencyMESA *val)
++{
++    vn_encode_uint32_t(enc, &val->srcCommandStream);
++    vn_encode_uint32_t(enc, &val->dstCommandStream);
++}
++
++/* struct VkRingMonitorInfoMESA chain */
++
++static inline size_t
++vn_sizeof_VkRingMonitorInfoMESA_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkRingMonitorInfoMESA_self(const VkRingMonitorInfoMESA *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_uint32_t(&val->maxReportingPeriodMicroseconds);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkRingMonitorInfoMESA(const VkRingMonitorInfoMESA *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkRingMonitorInfoMESA_pnext(val->pNext);
++    size += vn_sizeof_VkRingMonitorInfoMESA_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkRingMonitorInfoMESA_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkRingMonitorInfoMESA_self(struct vn_cs_encoder *enc, const VkRingMonitorInfoMESA *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_uint32_t(enc, &val->maxReportingPeriodMicroseconds);
++}
++
++static inline void
++vn_encode_VkRingMonitorInfoMESA(struct vn_cs_encoder *enc, const VkRingMonitorInfoMESA *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA });
++    vn_encode_VkRingMonitorInfoMESA_pnext(enc, val->pNext);
++    vn_encode_VkRingMonitorInfoMESA_self(enc, val);
++}
++
++/* struct VkRingPriorityInfoMESA chain */
++
++static inline size_t
++vn_sizeof_VkRingPriorityInfoMESA_pnext(const void *val)
++{
++    /* no known/supported struct */
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkRingPriorityInfoMESA_self(const VkRingPriorityInfoMESA *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_int32_t(&val->priority);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkRingPriorityInfoMESA(const VkRingPriorityInfoMESA *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkRingPriorityInfoMESA_pnext(val->pNext);
++    size += vn_sizeof_VkRingPriorityInfoMESA_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkRingPriorityInfoMESA_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    /* no known/supported struct */
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkRingPriorityInfoMESA_self(struct vn_cs_encoder *enc, const VkRingPriorityInfoMESA *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_int32_t(enc, &val->priority);
++}
++
++static inline void
++vn_encode_VkRingPriorityInfoMESA(struct vn_cs_encoder *enc, const VkRingPriorityInfoMESA *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA });
++    vn_encode_VkRingPriorityInfoMESA_pnext(enc, val->pNext);
++    vn_encode_VkRingPriorityInfoMESA_self(enc, val);
++}
++
++/* struct VkRingCreateInfoMESA chain */
++
++static inline size_t
++vn_sizeof_VkRingCreateInfoMESA_pnext(const void *val)
++{
++    const VkBaseInStructure *pnext = val;
++    size_t size = 0;
++
++    while (pnext) {
++        switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA:
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkRingCreateInfoMESA_pnext(((const VkRingMonitorInfoMESA *)pnext)->pNext);
++            size += vn_sizeof_VkRingMonitorInfoMESA_self((const VkRingMonitorInfoMESA *)pnext);
++            return size;
++        case VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA:
++            size += vn_sizeof_simple_pointer(pnext);
++            size += vn_sizeof_VkStructureType(&pnext->sType);
++            size += vn_sizeof_VkRingCreateInfoMESA_pnext(((const VkRingPriorityInfoMESA *)pnext)->pNext);
++            size += vn_sizeof_VkRingPriorityInfoMESA_self((const VkRingPriorityInfoMESA *)pnext);
++            return size;
++        default:
++            /* ignore unknown/unsupported struct */
++            break;
++        }
++        pnext = pnext->pNext;
++    }
++
++    return vn_sizeof_simple_pointer(NULL);
++}
++
++static inline size_t
++vn_sizeof_VkRingCreateInfoMESA_self(const VkRingCreateInfoMESA *val)
++{
++    size_t size = 0;
++    /* skip val->{sType,pNext} */
++    size += vn_sizeof_VkFlags(&val->flags);
++    size += vn_sizeof_uint32_t(&val->resourceId);
++    size += vn_sizeof_size_t(&val->offset);
++    size += vn_sizeof_size_t(&val->size);
++    size += vn_sizeof_uint64_t(&val->idleTimeout);
++    size += vn_sizeof_size_t(&val->headOffset);
++    size += vn_sizeof_size_t(&val->tailOffset);
++    size += vn_sizeof_size_t(&val->statusOffset);
++    size += vn_sizeof_size_t(&val->bufferOffset);
++    size += vn_sizeof_size_t(&val->bufferSize);
++    size += vn_sizeof_size_t(&val->extraOffset);
++    size += vn_sizeof_size_t(&val->extraSize);
++    return size;
++}
++
++static inline size_t
++vn_sizeof_VkRingCreateInfoMESA(const VkRingCreateInfoMESA *val)
++{
++    size_t size = 0;
++
++    size += vn_sizeof_VkStructureType(&val->sType);
++    size += vn_sizeof_VkRingCreateInfoMESA_pnext(val->pNext);
++    size += vn_sizeof_VkRingCreateInfoMESA_self(val);
++
++    return size;
++}
++
++static inline void
++vn_encode_VkRingCreateInfoMESA_pnext(struct vn_cs_encoder *enc, const void *val)
++{
++    const VkBaseInStructure *pnext = val;
++
++    while (pnext) {
++        switch ((int32_t)pnext->sType) {
++        case VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA:
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkRingCreateInfoMESA_pnext(enc, ((const VkRingMonitorInfoMESA *)pnext)->pNext);
++            vn_encode_VkRingMonitorInfoMESA_self(enc, (const VkRingMonitorInfoMESA *)pnext);
++            return;
++        case VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA:
++            vn_encode_simple_pointer(enc, pnext);
++            vn_encode_VkStructureType(enc, &pnext->sType);
++            vn_encode_VkRingCreateInfoMESA_pnext(enc, ((const VkRingPriorityInfoMESA *)pnext)->pNext);
++            vn_encode_VkRingPriorityInfoMESA_self(enc, (const VkRingPriorityInfoMESA *)pnext);
++            return;
++        default:
++            /* ignore unknown/unsupported struct */
++            break;
++        }
++        pnext = pnext->pNext;
++    }
++
++    vn_encode_simple_pointer(enc, NULL);
++}
++
++static inline void
++vn_encode_VkRingCreateInfoMESA_self(struct vn_cs_encoder *enc, const VkRingCreateInfoMESA *val)
++{
++    /* skip val->{sType,pNext} */
++    vn_encode_VkFlags(enc, &val->flags);
++    vn_encode_uint32_t(enc, &val->resourceId);
++    vn_encode_size_t(enc, &val->offset);
++    vn_encode_size_t(enc, &val->size);
++    vn_encode_uint64_t(enc, &val->idleTimeout);
++    vn_encode_size_t(enc, &val->headOffset);
++    vn_encode_size_t(enc, &val->tailOffset);
++    vn_encode_size_t(enc, &val->statusOffset);
++    vn_encode_size_t(enc, &val->bufferOffset);
++    vn_encode_size_t(enc, &val->bufferSize);
++    vn_encode_size_t(enc, &val->extraOffset);
++    vn_encode_size_t(enc, &val->extraSize);
++}
++
++static inline void
++vn_encode_VkRingCreateInfoMESA(struct vn_cs_encoder *enc, const VkRingCreateInfoMESA *val)
++{
++    assert(val->sType == VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA);
++    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA });
++    vn_encode_VkRingCreateInfoMESA_pnext(enc, val->pNext);
++    vn_encode_VkRingCreateInfoMESA_self(enc, val);
++}
++
++static inline size_t vn_sizeof_vkGetGeneratedCommandsMemoryRequirementsEXT(VkDevice device, const VkGeneratedCommandsMemoryRequirementsInfoEXT* pInfo, VkMemoryRequirements2* pMemoryRequirements)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkGetGeneratedCommandsMemoryRequirementsEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
++
++    cmd_size += vn_sizeof_VkDevice(&device);
++    cmd_size += vn_sizeof_simple_pointer(pInfo);
++    if (pInfo)
++        cmd_size += vn_sizeof_VkGeneratedCommandsMemoryRequirementsInfoEXT(pInfo);
++    cmd_size += vn_sizeof_simple_pointer(pMemoryRequirements);
++    if (pMemoryRequirements)
++        cmd_size += vn_sizeof_VkMemoryRequirements2_partial(pMemoryRequirements);
++
++    return cmd_size;
++}
++
++static inline void vn_encode_vkGetGeneratedCommandsMemoryRequirementsEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkDevice device, const VkGeneratedCommandsMemoryRequirementsInfoEXT* pInfo, VkMemoryRequirements2* pMemoryRequirements)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkGetGeneratedCommandsMemoryRequirementsEXT_EXT;
++
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
++
++    vn_encode_VkDevice(enc, &device);
++    if (vn_encode_simple_pointer(enc, pInfo))
++        vn_encode_VkGeneratedCommandsMemoryRequirementsInfoEXT(enc, pInfo);
++    if (vn_encode_simple_pointer(enc, pMemoryRequirements))
++        vn_encode_VkMemoryRequirements2_partial(enc, pMemoryRequirements);
++}
++
++static inline size_t vn_sizeof_vkGetGeneratedCommandsMemoryRequirementsEXT_reply(VkDevice device, const VkGeneratedCommandsMemoryRequirementsInfoEXT* pInfo, VkMemoryRequirements2* pMemoryRequirements)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkGetGeneratedCommandsMemoryRequirementsEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    /* skip device */
++    /* skip pInfo */
++    cmd_size += vn_sizeof_simple_pointer(pMemoryRequirements);
++    if (pMemoryRequirements)
++        cmd_size += vn_sizeof_VkMemoryRequirements2(pMemoryRequirements);
++
++    return cmd_size;
++}
++
++static inline void vn_decode_vkGetGeneratedCommandsMemoryRequirementsEXT_reply(struct vn_cs_decoder *dec, VkDevice device, const VkGeneratedCommandsMemoryRequirementsInfoEXT* pInfo, VkMemoryRequirements2* pMemoryRequirements)
++{
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkGetGeneratedCommandsMemoryRequirementsEXT_EXT);
++
++    /* skip device */
++    /* skip pInfo */
++    if (vn_decode_simple_pointer(dec)) {
++        vn_decode_VkMemoryRequirements2(dec, pMemoryRequirements);
++    } else {
++        pMemoryRequirements = NULL;
++    }
++}
++
++static inline size_t vn_sizeof_vkCreateIndirectCommandsLayoutEXT(VkDevice device, const VkIndirectCommandsLayoutCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectCommandsLayoutEXT* pIndirectCommandsLayout)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCreateIndirectCommandsLayoutEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
++
++    cmd_size += vn_sizeof_VkDevice(&device);
++    cmd_size += vn_sizeof_simple_pointer(pCreateInfo);
++    if (pCreateInfo)
++        cmd_size += vn_sizeof_VkIndirectCommandsLayoutCreateInfoEXT(pCreateInfo);
++    cmd_size += vn_sizeof_simple_pointer(pAllocator);
++    if (pAllocator)
++        assert(false);
++    cmd_size += vn_sizeof_simple_pointer(pIndirectCommandsLayout);
++    if (pIndirectCommandsLayout)
++        cmd_size += vn_sizeof_VkIndirectCommandsLayoutEXT(pIndirectCommandsLayout);
++
++    return cmd_size;
++}
++
++static inline void vn_encode_vkCreateIndirectCommandsLayoutEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkDevice device, const VkIndirectCommandsLayoutCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectCommandsLayoutEXT* pIndirectCommandsLayout)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCreateIndirectCommandsLayoutEXT_EXT;
++
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
++
++    vn_encode_VkDevice(enc, &device);
++    if (vn_encode_simple_pointer(enc, pCreateInfo))
++        vn_encode_VkIndirectCommandsLayoutCreateInfoEXT(enc, pCreateInfo);
++    if (vn_encode_simple_pointer(enc, pAllocator))
++        assert(false);
++    if (vn_encode_simple_pointer(enc, pIndirectCommandsLayout))
++        vn_encode_VkIndirectCommandsLayoutEXT(enc, pIndirectCommandsLayout);
++}
++
++static inline size_t vn_sizeof_vkCreateIndirectCommandsLayoutEXT_reply(VkDevice device, const VkIndirectCommandsLayoutCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectCommandsLayoutEXT* pIndirectCommandsLayout)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCreateIndirectCommandsLayoutEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    VkResult ret;
++    cmd_size += vn_sizeof_VkResult(&ret);
++    /* skip device */
++    /* skip pCreateInfo */
++    /* skip pAllocator */
++    cmd_size += vn_sizeof_simple_pointer(pIndirectCommandsLayout);
++    if (pIndirectCommandsLayout)
++        cmd_size += vn_sizeof_VkIndirectCommandsLayoutEXT(pIndirectCommandsLayout);
++
++    return cmd_size;
++}
++
++static inline VkResult vn_decode_vkCreateIndirectCommandsLayoutEXT_reply(struct vn_cs_decoder *dec, VkDevice device, const VkIndirectCommandsLayoutCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectCommandsLayoutEXT* pIndirectCommandsLayout)
++{
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkCreateIndirectCommandsLayoutEXT_EXT);
++
++    VkResult ret;
++    vn_decode_VkResult(dec, &ret);
++    /* skip device */
++    /* skip pCreateInfo */
++    /* skip pAllocator */
++    if (vn_decode_simple_pointer(dec)) {
++        vn_decode_VkIndirectCommandsLayoutEXT(dec, pIndirectCommandsLayout);
++    } else {
++        pIndirectCommandsLayout = NULL;
++    }
++
++    return ret;
++}
++
++static inline size_t vn_sizeof_vkDestroyIndirectCommandsLayoutEXT(VkDevice device, VkIndirectCommandsLayoutEXT indirectCommandsLayout, const VkAllocationCallbacks* pAllocator)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkDestroyIndirectCommandsLayoutEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
++
++    cmd_size += vn_sizeof_VkDevice(&device);
++    cmd_size += vn_sizeof_VkIndirectCommandsLayoutEXT(&indirectCommandsLayout);
++    cmd_size += vn_sizeof_simple_pointer(pAllocator);
++    if (pAllocator)
++        assert(false);
++
++    return cmd_size;
++}
++
++static inline void vn_encode_vkDestroyIndirectCommandsLayoutEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkDevice device, VkIndirectCommandsLayoutEXT indirectCommandsLayout, const VkAllocationCallbacks* pAllocator)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkDestroyIndirectCommandsLayoutEXT_EXT;
++
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
++
++    vn_encode_VkDevice(enc, &device);
++    vn_encode_VkIndirectCommandsLayoutEXT(enc, &indirectCommandsLayout);
++    if (vn_encode_simple_pointer(enc, pAllocator))
++        assert(false);
++}
++
++static inline size_t vn_sizeof_vkDestroyIndirectCommandsLayoutEXT_reply(VkDevice device, VkIndirectCommandsLayoutEXT indirectCommandsLayout, const VkAllocationCallbacks* pAllocator)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkDestroyIndirectCommandsLayoutEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    /* skip device */
++    /* skip indirectCommandsLayout */
++    /* skip pAllocator */
++
++    return cmd_size;
++}
++
++static inline void vn_decode_vkDestroyIndirectCommandsLayoutEXT_reply(struct vn_cs_decoder *dec, VkDevice device, VkIndirectCommandsLayoutEXT indirectCommandsLayout, const VkAllocationCallbacks* pAllocator)
++{
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkDestroyIndirectCommandsLayoutEXT_EXT);
++
++    /* skip device */
++    /* skip indirectCommandsLayout */
++    /* skip pAllocator */
++}
++
++static inline size_t vn_sizeof_vkCreateIndirectExecutionSetEXT(VkDevice device, const VkIndirectExecutionSetCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectExecutionSetEXT* pIndirectExecutionSet)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCreateIndirectExecutionSetEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
++
++    cmd_size += vn_sizeof_VkDevice(&device);
++    cmd_size += vn_sizeof_simple_pointer(pCreateInfo);
++    if (pCreateInfo)
++        cmd_size += vn_sizeof_VkIndirectExecutionSetCreateInfoEXT(pCreateInfo);
++    cmd_size += vn_sizeof_simple_pointer(pAllocator);
++    if (pAllocator)
++        assert(false);
++    cmd_size += vn_sizeof_simple_pointer(pIndirectExecutionSet);
++    if (pIndirectExecutionSet)
++        cmd_size += vn_sizeof_VkIndirectExecutionSetEXT(pIndirectExecutionSet);
++
++    return cmd_size;
++}
++
++static inline void vn_encode_vkCreateIndirectExecutionSetEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkDevice device, const VkIndirectExecutionSetCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectExecutionSetEXT* pIndirectExecutionSet)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCreateIndirectExecutionSetEXT_EXT;
++
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
++
++    vn_encode_VkDevice(enc, &device);
++    if (vn_encode_simple_pointer(enc, pCreateInfo))
++        vn_encode_VkIndirectExecutionSetCreateInfoEXT(enc, pCreateInfo);
++    if (vn_encode_simple_pointer(enc, pAllocator))
++        assert(false);
++    if (vn_encode_simple_pointer(enc, pIndirectExecutionSet))
++        vn_encode_VkIndirectExecutionSetEXT(enc, pIndirectExecutionSet);
++}
++
++static inline size_t vn_sizeof_vkCreateIndirectExecutionSetEXT_reply(VkDevice device, const VkIndirectExecutionSetCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectExecutionSetEXT* pIndirectExecutionSet)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkCreateIndirectExecutionSetEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    VkResult ret;
++    cmd_size += vn_sizeof_VkResult(&ret);
++    /* skip device */
++    /* skip pCreateInfo */
++    /* skip pAllocator */
++    cmd_size += vn_sizeof_simple_pointer(pIndirectExecutionSet);
++    if (pIndirectExecutionSet)
++        cmd_size += vn_sizeof_VkIndirectExecutionSetEXT(pIndirectExecutionSet);
++
++    return cmd_size;
++}
++
++static inline VkResult vn_decode_vkCreateIndirectExecutionSetEXT_reply(struct vn_cs_decoder *dec, VkDevice device, const VkIndirectExecutionSetCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectExecutionSetEXT* pIndirectExecutionSet)
++{
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkCreateIndirectExecutionSetEXT_EXT);
++
++    VkResult ret;
++    vn_decode_VkResult(dec, &ret);
++    /* skip device */
++    /* skip pCreateInfo */
++    /* skip pAllocator */
++    if (vn_decode_simple_pointer(dec)) {
++        vn_decode_VkIndirectExecutionSetEXT(dec, pIndirectExecutionSet);
++    } else {
++        pIndirectExecutionSet = NULL;
++    }
++
++    return ret;
++}
++
++static inline size_t vn_sizeof_vkDestroyIndirectExecutionSetEXT(VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, const VkAllocationCallbacks* pAllocator)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkDestroyIndirectExecutionSetEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
++
++    cmd_size += vn_sizeof_VkDevice(&device);
++    cmd_size += vn_sizeof_VkIndirectExecutionSetEXT(&indirectExecutionSet);
++    cmd_size += vn_sizeof_simple_pointer(pAllocator);
++    if (pAllocator)
++        assert(false);
++
++    return cmd_size;
++}
++
++static inline void vn_encode_vkDestroyIndirectExecutionSetEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, const VkAllocationCallbacks* pAllocator)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkDestroyIndirectExecutionSetEXT_EXT;
++
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
++
++    vn_encode_VkDevice(enc, &device);
++    vn_encode_VkIndirectExecutionSetEXT(enc, &indirectExecutionSet);
++    if (vn_encode_simple_pointer(enc, pAllocator))
++        assert(false);
++}
++
++static inline size_t vn_sizeof_vkDestroyIndirectExecutionSetEXT_reply(VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, const VkAllocationCallbacks* pAllocator)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkDestroyIndirectExecutionSetEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    /* skip device */
++    /* skip indirectExecutionSet */
++    /* skip pAllocator */
++
++    return cmd_size;
++}
++
++static inline void vn_decode_vkDestroyIndirectExecutionSetEXT_reply(struct vn_cs_decoder *dec, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, const VkAllocationCallbacks* pAllocator)
++{
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkDestroyIndirectExecutionSetEXT_EXT);
++
++    /* skip device */
++    /* skip indirectExecutionSet */
++    /* skip pAllocator */
++}
++
++static inline size_t vn_sizeof_vkUpdateIndirectExecutionSetPipelineEXT(VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetPipelineEXT* pExecutionSetWrites)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetPipelineEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
++
++    cmd_size += vn_sizeof_VkDevice(&device);
++    cmd_size += vn_sizeof_VkIndirectExecutionSetEXT(&indirectExecutionSet);
++    cmd_size += vn_sizeof_uint32_t(&executionSetWriteCount);
++    if (pExecutionSetWrites) {
++        cmd_size += vn_sizeof_array_size(executionSetWriteCount);
++        for (uint32_t i = 0; i < executionSetWriteCount; i++)
++            cmd_size += vn_sizeof_VkWriteIndirectExecutionSetPipelineEXT(&pExecutionSetWrites[i]);
++    } else {
++        cmd_size += vn_sizeof_array_size(0);
++    }
++
++    return cmd_size;
++}
++
++static inline void vn_encode_vkUpdateIndirectExecutionSetPipelineEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetPipelineEXT* pExecutionSetWrites)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetPipelineEXT_EXT;
++
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
++
++    vn_encode_VkDevice(enc, &device);
++    vn_encode_VkIndirectExecutionSetEXT(enc, &indirectExecutionSet);
++    vn_encode_uint32_t(enc, &executionSetWriteCount);
++    if (pExecutionSetWrites) {
++        vn_encode_array_size(enc, executionSetWriteCount);
++        for (uint32_t i = 0; i < executionSetWriteCount; i++)
++            vn_encode_VkWriteIndirectExecutionSetPipelineEXT(enc, &pExecutionSetWrites[i]);
++    } else {
++        vn_encode_array_size(enc, 0);
++    }
++}
++
++static inline size_t vn_sizeof_vkUpdateIndirectExecutionSetPipelineEXT_reply(VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetPipelineEXT* pExecutionSetWrites)
++{
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetPipelineEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    /* skip device */
++    /* skip indirectExecutionSet */
++    /* skip executionSetWriteCount */
++    /* skip pExecutionSetWrites */
++
++    return cmd_size;
++}
++
++static inline void vn_decode_vkUpdateIndirectExecutionSetPipelineEXT_reply(struct vn_cs_decoder *dec, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetPipelineEXT* pExecutionSetWrites)
++{
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetPipelineEXT_EXT);
++
++    /* skip device */
++    /* skip indirectExecutionSet */
++    /* skip executionSetWriteCount */
++    /* skip pExecutionSetWrites */
++}
++
++static inline size_t vn_sizeof_vkUpdateIndirectExecutionSetShaderEXT(VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetShaderEXT* pExecutionSetWrites)
+ {
+-    size_t size = 0;
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetShaderEXT_EXT;
++    const VkFlags cmd_flags = 0;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type) + vn_sizeof_VkFlags(&cmd_flags);
+ 
+-    size += vn_sizeof_VkStructureType(&val->sType);
+-    size += vn_sizeof_VkRingCreateInfoMESA_pnext(val->pNext);
+-    size += vn_sizeof_VkRingCreateInfoMESA_self(val);
++    cmd_size += vn_sizeof_VkDevice(&device);
++    cmd_size += vn_sizeof_VkIndirectExecutionSetEXT(&indirectExecutionSet);
++    cmd_size += vn_sizeof_uint32_t(&executionSetWriteCount);
++    if (pExecutionSetWrites) {
++        cmd_size += vn_sizeof_array_size(executionSetWriteCount);
++        for (uint32_t i = 0; i < executionSetWriteCount; i++)
++            cmd_size += vn_sizeof_VkWriteIndirectExecutionSetShaderEXT(&pExecutionSetWrites[i]);
++    } else {
++        cmd_size += vn_sizeof_array_size(0);
++    }
+ 
+-    return size;
++    return cmd_size;
+ }
+ 
+-static inline void
+-vn_encode_VkRingCreateInfoMESA_pnext(struct vn_cs_encoder *enc, const void *val)
++static inline void vn_encode_vkUpdateIndirectExecutionSetShaderEXT(struct vn_cs_encoder *enc, VkCommandFlagsEXT cmd_flags, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetShaderEXT* pExecutionSetWrites)
+ {
+-    const VkBaseInStructure *pnext = val;
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetShaderEXT_EXT;
+ 
+-    while (pnext) {
+-        switch ((int32_t)pnext->sType) {
+-        case VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA:
+-            vn_encode_simple_pointer(enc, pnext);
+-            vn_encode_VkStructureType(enc, &pnext->sType);
+-            vn_encode_VkRingCreateInfoMESA_pnext(enc, ((const VkRingMonitorInfoMESA *)pnext)->pNext);
+-            vn_encode_VkRingMonitorInfoMESA_self(enc, (const VkRingMonitorInfoMESA *)pnext);
+-            return;
+-        case VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA:
+-            vn_encode_simple_pointer(enc, pnext);
+-            vn_encode_VkStructureType(enc, &pnext->sType);
+-            vn_encode_VkRingCreateInfoMESA_pnext(enc, ((const VkRingPriorityInfoMESA *)pnext)->pNext);
+-            vn_encode_VkRingPriorityInfoMESA_self(enc, (const VkRingPriorityInfoMESA *)pnext);
+-            return;
+-        default:
+-            /* ignore unknown/unsupported struct */
+-            break;
+-        }
+-        pnext = pnext->pNext;
+-    }
++    vn_encode_VkCommandTypeEXT(enc, &cmd_type);
++    vn_encode_VkFlags(enc, &cmd_flags);
+ 
+-    vn_encode_simple_pointer(enc, NULL);
++    vn_encode_VkDevice(enc, &device);
++    vn_encode_VkIndirectExecutionSetEXT(enc, &indirectExecutionSet);
++    vn_encode_uint32_t(enc, &executionSetWriteCount);
++    if (pExecutionSetWrites) {
++        vn_encode_array_size(enc, executionSetWriteCount);
++        for (uint32_t i = 0; i < executionSetWriteCount; i++)
++            vn_encode_VkWriteIndirectExecutionSetShaderEXT(enc, &pExecutionSetWrites[i]);
++    } else {
++        vn_encode_array_size(enc, 0);
++    }
+ }
+ 
+-static inline void
+-vn_encode_VkRingCreateInfoMESA_self(struct vn_cs_encoder *enc, const VkRingCreateInfoMESA *val)
++static inline size_t vn_sizeof_vkUpdateIndirectExecutionSetShaderEXT_reply(VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetShaderEXT* pExecutionSetWrites)
+ {
+-    /* skip val->{sType,pNext} */
+-    vn_encode_VkFlags(enc, &val->flags);
+-    vn_encode_uint32_t(enc, &val->resourceId);
+-    vn_encode_size_t(enc, &val->offset);
+-    vn_encode_size_t(enc, &val->size);
+-    vn_encode_uint64_t(enc, &val->idleTimeout);
+-    vn_encode_size_t(enc, &val->headOffset);
+-    vn_encode_size_t(enc, &val->tailOffset);
+-    vn_encode_size_t(enc, &val->statusOffset);
+-    vn_encode_size_t(enc, &val->bufferOffset);
+-    vn_encode_size_t(enc, &val->bufferSize);
+-    vn_encode_size_t(enc, &val->extraOffset);
+-    vn_encode_size_t(enc, &val->extraSize);
++    const VkCommandTypeEXT cmd_type = VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetShaderEXT_EXT;
++    size_t cmd_size = vn_sizeof_VkCommandTypeEXT(&cmd_type);
++
++    /* skip device */
++    /* skip indirectExecutionSet */
++    /* skip executionSetWriteCount */
++    /* skip pExecutionSetWrites */
++
++    return cmd_size;
+ }
+ 
+-static inline void
+-vn_encode_VkRingCreateInfoMESA(struct vn_cs_encoder *enc, const VkRingCreateInfoMESA *val)
++static inline void vn_decode_vkUpdateIndirectExecutionSetShaderEXT_reply(struct vn_cs_decoder *dec, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetShaderEXT* pExecutionSetWrites)
+ {
+-    assert(val->sType == VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA);
+-    vn_encode_VkStructureType(enc, &(VkStructureType){ VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA });
+-    vn_encode_VkRingCreateInfoMESA_pnext(enc, val->pNext);
+-    vn_encode_VkRingCreateInfoMESA_self(enc, val);
++    VkCommandTypeEXT command_type;
++    vn_decode_VkCommandTypeEXT(dec, &command_type);
++    assert(command_type == VK_COMMAND_TYPE_vkUpdateIndirectExecutionSetShaderEXT_EXT);
++
++    /* skip device */
++    /* skip indirectExecutionSet */
++    /* skip executionSetWriteCount */
++    /* skip pExecutionSetWrites */
+ }
+ 
+ static inline size_t vn_sizeof_vkCreateDeferredOperationKHR(VkDevice device, const VkAllocationCallbacks* pAllocator, VkDeferredOperationKHR* pDeferredOperation)
+@@ -1030,6 +2342,153 @@ static inline void vn_decode_vkWaitRingSeqnoMESA_reply(struct vn_cs_decoder *dec
+     /* skip seqno */
+ }
+ 
++static inline void vn_submit_vkGetGeneratedCommandsMemoryRequirementsEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkDevice device, const VkGeneratedCommandsMemoryRequirementsInfoEXT* pInfo, VkMemoryRequirements2* pMemoryRequirements, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkGetGeneratedCommandsMemoryRequirementsEXT(device, pInfo, pMemoryRequirements);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkGetGeneratedCommandsMemoryRequirementsEXT_reply(device, pInfo, pMemoryRequirements) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkGetGeneratedCommandsMemoryRequirementsEXT(enc, cmd_flags, device, pInfo, pMemoryRequirements);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
++static inline void vn_submit_vkCreateIndirectCommandsLayoutEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkDevice device, const VkIndirectCommandsLayoutCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectCommandsLayoutEXT* pIndirectCommandsLayout, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkCreateIndirectCommandsLayoutEXT(device, pCreateInfo, pAllocator, pIndirectCommandsLayout);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkCreateIndirectCommandsLayoutEXT_reply(device, pCreateInfo, pAllocator, pIndirectCommandsLayout) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkCreateIndirectCommandsLayoutEXT(enc, cmd_flags, device, pCreateInfo, pAllocator, pIndirectCommandsLayout);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
++static inline void vn_submit_vkDestroyIndirectCommandsLayoutEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkDevice device, VkIndirectCommandsLayoutEXT indirectCommandsLayout, const VkAllocationCallbacks* pAllocator, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkDestroyIndirectCommandsLayoutEXT(device, indirectCommandsLayout, pAllocator);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkDestroyIndirectCommandsLayoutEXT_reply(device, indirectCommandsLayout, pAllocator) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkDestroyIndirectCommandsLayoutEXT(enc, cmd_flags, device, indirectCommandsLayout, pAllocator);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
++static inline void vn_submit_vkCreateIndirectExecutionSetEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkDevice device, const VkIndirectExecutionSetCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectExecutionSetEXT* pIndirectExecutionSet, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkCreateIndirectExecutionSetEXT(device, pCreateInfo, pAllocator, pIndirectExecutionSet);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkCreateIndirectExecutionSetEXT_reply(device, pCreateInfo, pAllocator, pIndirectExecutionSet) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkCreateIndirectExecutionSetEXT(enc, cmd_flags, device, pCreateInfo, pAllocator, pIndirectExecutionSet);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
++static inline void vn_submit_vkDestroyIndirectExecutionSetEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, const VkAllocationCallbacks* pAllocator, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkDestroyIndirectExecutionSetEXT(device, indirectExecutionSet, pAllocator);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkDestroyIndirectExecutionSetEXT_reply(device, indirectExecutionSet, pAllocator) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkDestroyIndirectExecutionSetEXT(enc, cmd_flags, device, indirectExecutionSet, pAllocator);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
++static inline void vn_submit_vkUpdateIndirectExecutionSetPipelineEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetPipelineEXT* pExecutionSetWrites, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkUpdateIndirectExecutionSetPipelineEXT(device, indirectExecutionSet, executionSetWriteCount, pExecutionSetWrites);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkUpdateIndirectExecutionSetPipelineEXT_reply(device, indirectExecutionSet, executionSetWriteCount, pExecutionSetWrites) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkUpdateIndirectExecutionSetPipelineEXT(enc, cmd_flags, device, indirectExecutionSet, executionSetWriteCount, pExecutionSetWrites);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
++static inline void vn_submit_vkUpdateIndirectExecutionSetShaderEXT(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetShaderEXT* pExecutionSetWrites, struct vn_ring_submit_command *submit)
++{
++    uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
++    void *cmd_data = local_cmd_data;
++    size_t cmd_size = vn_sizeof_vkUpdateIndirectExecutionSetShaderEXT(device, indirectExecutionSet, executionSetWriteCount, pExecutionSetWrites);
++    if (cmd_size > sizeof(local_cmd_data)) {
++        cmd_data = malloc(cmd_size);
++        if (!cmd_data)
++            cmd_size = 0;
++    }
++    const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkUpdateIndirectExecutionSetShaderEXT_reply(device, indirectExecutionSet, executionSetWriteCount, pExecutionSetWrites) : 0;
++
++    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
++    if (cmd_size) {
++        vn_encode_vkUpdateIndirectExecutionSetShaderEXT(enc, cmd_flags, device, indirectExecutionSet, executionSetWriteCount, pExecutionSetWrites);
++        vn_ring_submit_command(vn_ring, submit);
++        if (cmd_data != local_cmd_data)
++            free(cmd_data);
++    }
++}
++
+ static inline void vn_submit_vkCreateDeferredOperationKHR(struct vn_ring *vn_ring, VkCommandFlagsEXT cmd_flags, VkDevice device, const VkAllocationCallbacks* pAllocator, VkDeferredOperationKHR* pDeferredOperation, struct vn_ring_submit_command *submit)
+ {
+     uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
+@@ -1345,6 +2804,93 @@ static inline void vn_submit_vkWaitRingSeqnoMESA(struct vn_ring *vn_ring, VkComm
+     }
+ }
+ 
++static inline void vn_call_vkGetGeneratedCommandsMemoryRequirementsEXT(struct vn_ring *vn_ring, VkDevice device, const VkGeneratedCommandsMemoryRequirementsInfoEXT* pInfo, VkMemoryRequirements2* pMemoryRequirements)
++{
++    VN_TRACE_FUNC();
++
++    struct vn_ring_submit_command submit;
++    vn_submit_vkGetGeneratedCommandsMemoryRequirementsEXT(vn_ring, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device, pInfo, pMemoryRequirements, &submit);
++    struct vn_cs_decoder *dec = vn_ring_get_command_reply(vn_ring, &submit);
++    if (dec) {
++        vn_decode_vkGetGeneratedCommandsMemoryRequirementsEXT_reply(dec, device, pInfo, pMemoryRequirements);
++        vn_ring_free_command_reply(vn_ring, &submit);
++    }
++}
++
++static inline void vn_async_vkGetGeneratedCommandsMemoryRequirementsEXT(struct vn_ring *vn_ring, VkDevice device, const VkGeneratedCommandsMemoryRequirementsInfoEXT* pInfo, VkMemoryRequirements2* pMemoryRequirements)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkGetGeneratedCommandsMemoryRequirementsEXT(vn_ring, 0, device, pInfo, pMemoryRequirements, &submit);
++}
++
++static inline VkResult vn_call_vkCreateIndirectCommandsLayoutEXT(struct vn_ring *vn_ring, VkDevice device, const VkIndirectCommandsLayoutCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectCommandsLayoutEXT* pIndirectCommandsLayout)
++{
++    VN_TRACE_FUNC();
++
++    struct vn_ring_submit_command submit;
++    vn_submit_vkCreateIndirectCommandsLayoutEXT(vn_ring, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device, pCreateInfo, pAllocator, pIndirectCommandsLayout, &submit);
++    struct vn_cs_decoder *dec = vn_ring_get_command_reply(vn_ring, &submit);
++    if (dec) {
++        const VkResult ret = vn_decode_vkCreateIndirectCommandsLayoutEXT_reply(dec, device, pCreateInfo, pAllocator, pIndirectCommandsLayout);
++        vn_ring_free_command_reply(vn_ring, &submit);
++        return ret;
++    } else {
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++}
++
++static inline void vn_async_vkCreateIndirectCommandsLayoutEXT(struct vn_ring *vn_ring, VkDevice device, const VkIndirectCommandsLayoutCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectCommandsLayoutEXT* pIndirectCommandsLayout)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkCreateIndirectCommandsLayoutEXT(vn_ring, 0, device, pCreateInfo, pAllocator, pIndirectCommandsLayout, &submit);
++}
++
++static inline void vn_async_vkDestroyIndirectCommandsLayoutEXT(struct vn_ring *vn_ring, VkDevice device, VkIndirectCommandsLayoutEXT indirectCommandsLayout, const VkAllocationCallbacks* pAllocator)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkDestroyIndirectCommandsLayoutEXT(vn_ring, 0, device, indirectCommandsLayout, pAllocator, &submit);
++}
++
++static inline VkResult vn_call_vkCreateIndirectExecutionSetEXT(struct vn_ring *vn_ring, VkDevice device, const VkIndirectExecutionSetCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectExecutionSetEXT* pIndirectExecutionSet)
++{
++    VN_TRACE_FUNC();
++
++    struct vn_ring_submit_command submit;
++    vn_submit_vkCreateIndirectExecutionSetEXT(vn_ring, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device, pCreateInfo, pAllocator, pIndirectExecutionSet, &submit);
++    struct vn_cs_decoder *dec = vn_ring_get_command_reply(vn_ring, &submit);
++    if (dec) {
++        const VkResult ret = vn_decode_vkCreateIndirectExecutionSetEXT_reply(dec, device, pCreateInfo, pAllocator, pIndirectExecutionSet);
++        vn_ring_free_command_reply(vn_ring, &submit);
++        return ret;
++    } else {
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++}
++
++static inline void vn_async_vkCreateIndirectExecutionSetEXT(struct vn_ring *vn_ring, VkDevice device, const VkIndirectExecutionSetCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkIndirectExecutionSetEXT* pIndirectExecutionSet)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkCreateIndirectExecutionSetEXT(vn_ring, 0, device, pCreateInfo, pAllocator, pIndirectExecutionSet, &submit);
++}
++
++static inline void vn_async_vkDestroyIndirectExecutionSetEXT(struct vn_ring *vn_ring, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, const VkAllocationCallbacks* pAllocator)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkDestroyIndirectExecutionSetEXT(vn_ring, 0, device, indirectExecutionSet, pAllocator, &submit);
++}
++
++static inline void vn_async_vkUpdateIndirectExecutionSetPipelineEXT(struct vn_ring *vn_ring, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetPipelineEXT* pExecutionSetWrites)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkUpdateIndirectExecutionSetPipelineEXT(vn_ring, 0, device, indirectExecutionSet, executionSetWriteCount, pExecutionSetWrites, &submit);
++}
++
++static inline void vn_async_vkUpdateIndirectExecutionSetShaderEXT(struct vn_ring *vn_ring, VkDevice device, VkIndirectExecutionSetEXT indirectExecutionSet, uint32_t executionSetWriteCount, const VkWriteIndirectExecutionSetShaderEXT* pExecutionSetWrites)
++{
++    struct vn_ring_submit_command submit;
++    vn_submit_vkUpdateIndirectExecutionSetShaderEXT(vn_ring, 0, device, indirectExecutionSet, executionSetWriteCount, pExecutionSetWrites, &submit);
++}
++
+ static inline VkResult vn_call_vkCreateDeferredOperationKHR(struct vn_ring *vn_ring, VkDevice device, const VkAllocationCallbacks* pAllocator, VkDeferredOperationKHR* pDeferredOperation)
+ {
+     VN_TRACE_FUNC();
+diff --git a/src/virtio/venus-protocol/vn_protocol_driver_types.h b/src/virtio/venus-protocol/vn_protocol_driver_types.h
+index 359ac69..e5e72b9 100644
+--- a/src/virtio/venus-protocol/vn_protocol_driver_types.h
++++ b/src/virtio/venus-protocol/vn_protocol_driver_types.h
+@@ -2688,6 +2688,48 @@ vn_decode_VkRenderingFlagBits(struct vn_cs_decoder *dec, VkRenderingFlagBits *va
+     vn_decode_int32_t(dec, (int32_t *)val);
+ }
+ 
++/* enum VkIndirectCommandsLayoutUsageFlagBitsEXT */
++
++static inline size_t
++vn_sizeof_VkIndirectCommandsLayoutUsageFlagBitsEXT(const VkIndirectCommandsLayoutUsageFlagBitsEXT *val)
++{
++    assert(sizeof(*val) == sizeof(int32_t));
++    return vn_sizeof_int32_t((const int32_t *)val);
++}
++
++static inline void
++vn_encode_VkIndirectCommandsLayoutUsageFlagBitsEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsLayoutUsageFlagBitsEXT *val)
++{
++    vn_encode_int32_t(enc, (const int32_t *)val);
++}
++
++static inline void
++vn_decode_VkIndirectCommandsLayoutUsageFlagBitsEXT(struct vn_cs_decoder *dec, VkIndirectCommandsLayoutUsageFlagBitsEXT *val)
++{
++    vn_decode_int32_t(dec, (int32_t *)val);
++}
++
++/* enum VkIndirectCommandsInputModeFlagBitsEXT */
++
++static inline size_t
++vn_sizeof_VkIndirectCommandsInputModeFlagBitsEXT(const VkIndirectCommandsInputModeFlagBitsEXT *val)
++{
++    assert(sizeof(*val) == sizeof(int32_t));
++    return vn_sizeof_int32_t((const int32_t *)val);
++}
++
++static inline void
++vn_encode_VkIndirectCommandsInputModeFlagBitsEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsInputModeFlagBitsEXT *val)
++{
++    vn_encode_int32_t(enc, (const int32_t *)val);
++}
++
++static inline void
++vn_decode_VkIndirectCommandsInputModeFlagBitsEXT(struct vn_cs_decoder *dec, VkIndirectCommandsInputModeFlagBitsEXT *val)
++{
++    vn_decode_int32_t(dec, (int32_t *)val);
++}
++
+ /* typedef VkFlags64 VkPipelineCreateFlagBits2 */
+ 
+ static inline size_t
+@@ -3633,6 +3675,27 @@ vn_decode_VkVideoEncodeH265TransformBlockSizeFlagBitsKHR(struct vn_cs_decoder *d
+     vn_decode_int32_t(dec, (int32_t *)val);
+ }
+ 
++/* typedef VkFlags64 VkAccessFlagBits3KHR */
++
++static inline size_t
++vn_sizeof_VkAccessFlagBits3KHR(const VkAccessFlagBits3KHR *val)
++{
++    assert(sizeof(*val) == sizeof(uint64_t));
++    return vn_sizeof_uint64_t((const uint64_t *)val);
++}
++
++static inline void
++vn_encode_VkAccessFlagBits3KHR(struct vn_cs_encoder *enc, const VkAccessFlagBits3KHR *val)
++{
++    vn_encode_uint64_t(enc, (const uint64_t *)val);
++}
++
++static inline void
++vn_decode_VkAccessFlagBits3KHR(struct vn_cs_decoder *dec, VkAccessFlagBits3KHR *val)
++{
++    vn_decode_uint64_t(dec, (uint64_t *)val);
++}
++
+ /* enum VkAttachmentLoadOp */
+ 
+ static inline size_t
+@@ -4083,6 +4146,27 @@ vn_decode_VkImageViewType(struct vn_cs_decoder *dec, VkImageViewType *val)
+     vn_decode_int32_t(dec, (int32_t *)val);
+ }
+ 
++/* enum VkIndirectCommandsTokenTypeEXT */
++
++static inline size_t
++vn_sizeof_VkIndirectCommandsTokenTypeEXT(const VkIndirectCommandsTokenTypeEXT *val)
++{
++    assert(sizeof(*val) == sizeof(int32_t));
++    return vn_sizeof_int32_t((const int32_t *)val);
++}
++
++static inline void
++vn_encode_VkIndirectCommandsTokenTypeEXT(struct vn_cs_encoder *enc, const VkIndirectCommandsTokenTypeEXT *val)
++{
++    vn_encode_int32_t(enc, (const int32_t *)val);
++}
++
++static inline void
++vn_decode_VkIndirectCommandsTokenTypeEXT(struct vn_cs_decoder *dec, VkIndirectCommandsTokenTypeEXT *val)
++{
++    vn_decode_int32_t(dec, (int32_t *)val);
++}
++
+ /* enum VkSharingMode */
+ 
+ static inline size_t
+@@ -4926,6 +5010,27 @@ vn_decode_VkPipelineRobustnessImageBehavior(struct vn_cs_decoder *dec, VkPipelin
+     vn_decode_int32_t(dec, (int32_t *)val);
+ }
+ 
++/* enum VkIndirectExecutionSetInfoTypeEXT */
++
++static inline size_t
++vn_sizeof_VkIndirectExecutionSetInfoTypeEXT(const VkIndirectExecutionSetInfoTypeEXT *val)
++{
++    assert(sizeof(*val) == sizeof(int32_t));
++    return vn_sizeof_int32_t((const int32_t *)val);
++}
++
++static inline void
++vn_encode_VkIndirectExecutionSetInfoTypeEXT(struct vn_cs_encoder *enc, const VkIndirectExecutionSetInfoTypeEXT *val)
++{
++    vn_encode_int32_t(enc, (const int32_t *)val);
++}
++
++static inline void
++vn_decode_VkIndirectExecutionSetInfoTypeEXT(struct vn_cs_decoder *dec, VkIndirectExecutionSetInfoTypeEXT *val)
++{
++    vn_decode_int32_t(dec, (int32_t *)val);
++}
++
+ /* enum VkDepthBiasRepresentationEXT */
+ 
+ static inline size_t
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index 6b1f179..4c688b5 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -87,6 +87,7 @@ devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+ 
+ libvn_files = files(
+   'vn_acceleration_structure.c',
++  'vn_generated_commands.c',
+   'vn_buffer.c',
+   'vn_command_buffer.c',
+   'vn_common.c',
+diff --git a/src/virtio/vulkan/vn_command_buffer.c b/src/virtio/vulkan/vn_command_buffer.c
+index e0c9ca9..d3ddf4d 100644
+--- a/src/virtio/vulkan/vn_command_buffer.c
++++ b/src/virtio/vulkan/vn_command_buffer.c
+@@ -2827,6 +2827,32 @@ vn_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer,
+                   groupCountY, groupCountZ);
+ }
+ 
++VKAPI_ATTR void VKAPI_CALL
++vn_CmdPreprocessGeneratedCommandsEXT(
++   VkCommandBuffer commandBuffer,
++   const VkGeneratedCommandsInfoEXT *pGeneratedCommandsInfo,
++   VkCommandBuffer stateCommandBuffer)
++{
++   /* The host reads stateCommandBuffer's state (pipeline, push constants) when it records this: that command buffer's
++    * commands so far go out first and this one right after, not batched until either one's next flush */
++   if (stateCommandBuffer != commandBuffer)
++      vn_cmd_submit(vn_command_buffer_from_handle(stateCommandBuffer));
++   VN_CMD_ENQUEUE(vkCmdPreprocessGeneratedCommandsEXT, commandBuffer,
++                  pGeneratedCommandsInfo, stateCommandBuffer);
++   if (stateCommandBuffer != commandBuffer)
++      vn_cmd_submit(vn_command_buffer_from_handle(commandBuffer));
++}
++
++VKAPI_ATTR void VKAPI_CALL
++vn_CmdExecuteGeneratedCommandsEXT(
++   VkCommandBuffer commandBuffer,
++   VkBool32 isPreprocessed,
++   const VkGeneratedCommandsInfoEXT *pGeneratedCommandsInfo)
++{
++   VN_CMD_ENQUEUE(vkCmdExecuteGeneratedCommandsEXT, commandBuffer,
++                  isPreprocessed, pGeneratedCommandsInfo);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ vn_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer,
+                                VkBuffer buffer,
+diff --git a/src/virtio/vulkan/vn_generated_commands.c b/src/virtio/vulkan/vn_generated_commands.c
+new file mode 100644
+index 0000000..8c03ba2
+--- /dev/null
++++ b/src/virtio/vulkan/vn_generated_commands.c
+@@ -0,0 +1,115 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* VK_EXT_device_generated_commands: indirect commands layouts, passed through. Indirect execution sets aren't
++ * (the physical device reports no stage bindable through them) */
++
++#include "vn_generated_commands.h"
++
++#include "venus-protocol/vn_protocol_driver_transport.h"
++
++#include "vn_device.h"
++
++VKAPI_ATTR VkResult VKAPI_CALL
++vn_CreateIndirectCommandsLayoutEXT(
++   VkDevice device,
++   const VkIndirectCommandsLayoutCreateInfoEXT *pCreateInfo,
++   const VkAllocationCallbacks *pAllocator,
++   VkIndirectCommandsLayoutEXT *pIndirectCommandsLayout)
++{
++   struct vn_device *dev = vn_device_from_handle(device);
++   const VkAllocationCallbacks *alloc =
++      pAllocator ? pAllocator : &dev->base.vk.alloc;
++
++   struct vn_indirect_commands_layout *layout =
++      vk_zalloc(alloc, sizeof(*layout), VN_DEFAULT_ALIGN,
++                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (!layout)
++      return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   vn_object_base_init(&layout->base,
++                       VK_OBJECT_TYPE_INDIRECT_COMMANDS_LAYOUT_EXT,
++                       &dev->base);
++
++   VkIndirectCommandsLayoutEXT layout_handle =
++      vn_indirect_commands_layout_to_handle(layout);
++   vn_async_vkCreateIndirectCommandsLayoutEXT(dev->primary_ring, device,
++                                              pCreateInfo, NULL,
++                                              &layout_handle);
++
++   *pIndirectCommandsLayout = layout_handle;
++
++   return VK_SUCCESS;
++}
++
++VKAPI_ATTR void VKAPI_CALL
++vn_DestroyIndirectCommandsLayoutEXT(
++   VkDevice device,
++   VkIndirectCommandsLayoutEXT indirectCommandsLayout,
++   const VkAllocationCallbacks *pAllocator)
++{
++   struct vn_device *dev = vn_device_from_handle(device);
++   struct vn_indirect_commands_layout *layout =
++      vn_indirect_commands_layout_from_handle(indirectCommandsLayout);
++   const VkAllocationCallbacks *alloc =
++      pAllocator ? pAllocator : &dev->base.vk.alloc;
++
++   if (!layout)
++      return;
++
++   vn_async_vkDestroyIndirectCommandsLayoutEXT(dev->primary_ring, device,
++                                               indirectCommandsLayout, NULL);
++
++   vn_object_base_fini(&layout->base);
++   vk_free(alloc, layout);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++vn_GetGeneratedCommandsMemoryRequirementsEXT(
++   VkDevice device,
++   const VkGeneratedCommandsMemoryRequirementsInfoEXT *pInfo,
++   VkMemoryRequirements2 *pMemoryRequirements)
++{
++   struct vn_device *dev = vn_device_from_handle(device);
++
++   vn_call_vkGetGeneratedCommandsMemoryRequirementsEXT(
++      dev->primary_ring, device, pInfo, pMemoryRequirements);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++vn_CreateIndirectExecutionSetEXT(
++   VkDevice device,
++   const VkIndirectExecutionSetCreateInfoEXT *pCreateInfo,
++   const VkAllocationCallbacks *pAllocator,
++   VkIndirectExecutionSetEXT *pIndirectExecutionSet)
++{
++   struct vn_device *dev = vn_device_from_handle(device);
++   return vn_error(dev->instance, VK_ERROR_FEATURE_NOT_PRESENT);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++vn_DestroyIndirectExecutionSetEXT(VkDevice device,
++                                  VkIndirectExecutionSetEXT indirectExecutionSet,
++                                  const VkAllocationCallbacks *pAllocator)
++{
++}
++
++VKAPI_ATTR void VKAPI_CALL
++vn_UpdateIndirectExecutionSetPipelineEXT(
++   VkDevice device,
++   VkIndirectExecutionSetEXT indirectExecutionSet,
++   uint32_t executionSetWriteCount,
++   const VkWriteIndirectExecutionSetPipelineEXT *pExecutionSetWrites)
++{
++}
++
++VKAPI_ATTR void VKAPI_CALL
++vn_UpdateIndirectExecutionSetShaderEXT(
++   VkDevice device,
++   VkIndirectExecutionSetEXT indirectExecutionSet,
++   uint32_t executionSetWriteCount,
++   const VkWriteIndirectExecutionSetShaderEXT *pExecutionSetWrites)
++{
++}
+diff --git a/src/virtio/vulkan/vn_generated_commands.h b/src/virtio/vulkan/vn_generated_commands.h
+new file mode 100644
+index 0000000..144320e
+--- /dev/null
++++ b/src/virtio/vulkan/vn_generated_commands.h
+@@ -0,0 +1,19 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VN_GENERATED_COMMANDS_H
++#define VN_GENERATED_COMMANDS_H
++
++#include "vn_common.h"
++
++struct vn_indirect_commands_layout {
++   struct vn_object_base base;
++};
++VK_DEFINE_NONDISP_HANDLE_CASTS(vn_indirect_commands_layout,
++                               base.vk,
++                               VkIndirectCommandsLayoutEXT,
++                               VK_OBJECT_TYPE_INDIRECT_COMMANDS_LAYOUT_EXT)
++
++#endif /* VN_GENERATED_COMMANDS_H */
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 5d6c48a..0890c98 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -219,6 +219,8 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
+       VkPhysicalDeviceColorWriteEnableFeaturesEXT color_write_enable;
+       VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering;
+       VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color;
++      VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT
++         device_generated_commands;
+       VkPhysicalDeviceDepthBiasControlFeaturesEXT depth_bias_control;
+       VkPhysicalDeviceDepthClampControlFeaturesEXT depth_clamp_control;
+       VkPhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control;
+@@ -389,6 +391,7 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
+    VN_ADD_PNEXT_EXT(feats2, COLOR_WRITE_ENABLE_FEATURES_EXT, local_feats.color_write_enable, exts->EXT_color_write_enable);
+    VN_ADD_PNEXT_EXT(feats2, CONDITIONAL_RENDERING_FEATURES_EXT, local_feats.conditional_rendering, exts->EXT_conditional_rendering);
+    VN_ADD_PNEXT_EXT(feats2, CUSTOM_BORDER_COLOR_FEATURES_EXT, local_feats.custom_border_color, exts->EXT_custom_border_color);
++   VN_ADD_PNEXT_EXT(feats2, DEVICE_GENERATED_COMMANDS_FEATURES_EXT, local_feats.device_generated_commands, exts->EXT_device_generated_commands);
+    VN_ADD_PNEXT_EXT(feats2, DEPTH_BIAS_CONTROL_FEATURES_EXT, local_feats.depth_bias_control, exts->EXT_depth_bias_control);
+    VN_ADD_PNEXT_EXT(feats2, DEPTH_CLAMP_CONTROL_FEATURES_EXT, local_feats.depth_clamp_control, exts->EXT_depth_clamp_control);
+    VN_ADD_PNEXT_EXT(feats2, DEPTH_CLIP_CONTROL_FEATURES_EXT, local_feats.depth_clip_control, exts->EXT_depth_clip_control);
+@@ -658,6 +661,8 @@ vn_physical_device_init_properties(struct vn_physical_device *physical_dev)
+       VkPhysicalDeviceConservativeRasterizationPropertiesEXT
+          conservative_rasterization;
+       VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color;
++      VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT
++         device_generated_commands;
+       VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptor_heap;
+       VkPhysicalDeviceExtendedDynamicState3PropertiesEXT
+          extended_dynamic_state_3;
+@@ -753,6 +758,7 @@ vn_physical_device_init_properties(struct vn_physical_device *physical_dev)
+    VN_ADD_PNEXT_EXT(props2, BLEND_OPERATION_ADVANCED_PROPERTIES_EXT, local_props.blend_operation_advanced, exts->EXT_blend_operation_advanced);
+    VN_ADD_PNEXT_EXT(props2, CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT, local_props.conservative_rasterization, exts->EXT_conservative_rasterization);
+    VN_ADD_PNEXT_EXT(props2, CUSTOM_BORDER_COLOR_PROPERTIES_EXT, local_props.custom_border_color, exts->EXT_custom_border_color);
++   VN_ADD_PNEXT_EXT(props2, DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT, local_props.device_generated_commands, exts->EXT_device_generated_commands);
+    VN_ADD_PNEXT_EXT(props2, DESCRIPTOR_HEAP_PROPERTIES_EXT, local_props.descriptor_heap, exts->EXT_descriptor_heap);
+    VN_ADD_PNEXT_EXT(props2, EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT, local_props.extended_dynamic_state_3, exts->EXT_extended_dynamic_state3);
+    VN_ADD_PNEXT_EXT(props2, GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT, local_props.graphics_pipeline_library, exts->EXT_graphics_pipeline_library);
+@@ -837,6 +843,10 @@ vn_physical_device_init_properties(struct vn_physical_device *physical_dev)
+    VN_SET_VK_PROPS_EXT(props, &local_props.blend_operation_advanced, exts->EXT_blend_operation_advanced);
+    VN_SET_VK_PROPS_EXT(props, &local_props.conservative_rasterization, exts->EXT_conservative_rasterization);
+    VN_SET_VK_PROPS_EXT(props, &local_props.custom_border_color, exts->EXT_custom_border_color);
++   /* no indirect execution sets (vn_generated_commands.c): no stage bindable through them */
++   local_props.device_generated_commands.supportedIndirectCommandsShaderStagesPipelineBinding = 0;
++   local_props.device_generated_commands.supportedIndirectCommandsShaderStagesShaderBinding = 0;
++   VN_SET_VK_PROPS_EXT(props, &local_props.device_generated_commands, exts->EXT_device_generated_commands);
+    VN_SET_VK_PROPS_EXT(props, &local_props.descriptor_heap, exts->EXT_descriptor_heap);
+    VN_SET_VK_PROPS_EXT(props, &local_props.extended_dynamic_state_3, exts->EXT_extended_dynamic_state3);
+    VN_SET_VK_PROPS_EXT(props, &local_props.graphics_pipeline_library, exts->EXT_graphics_pipeline_library);
+@@ -1356,6 +1366,7 @@ vn_physical_device_get_passthrough_extensions(
+       .EXT_conditional_rendering = true,
+       .EXT_conservative_rasterization = true,
+       .EXT_custom_border_color = true,
++      .EXT_device_generated_commands = true,
+       .EXT_debug_marker = true,
+       .EXT_depth_bias_control = true,
+       .EXT_depth_clamp_control = true,

@@ -1,0 +1,22 @@
+vrend: video through NVIDIA's VA-API driver too (WinBoat)
+
+virgl's video decoding (VA-API on the host) only accepted Mesa's VA-API
+drivers. On NVIDIA GPUs the VA-API driver is nvidia-vaapi-driver (on NVDEC),
+which exports its surfaces as DRM PRIME DMA-BUFs like Mesa's, and NVIDIA's EGL
+imports those, which is all virgl's decoding path needs. Accept it too
+(vendor string "VA-API NVDEC driver"); it has no encoding entrypoints, so the
+guest sees decoding only.
+
+--- a/src/vrend/virgl_video.c
++++ b/src/vrend/virgl_video.c
+@@ -573,7 +573,9 @@
+     driver = vaQueryVendorString(va_dpy);
+     virgl_info("Driver version: %s\n", driver ? driver : "<unknown>");
+ 
+-    if (!driver || !strstr(driver, "Mesa Gallium")) {
++    /* Mesa's drivers, and NVIDIA's (nvidia-vaapi-driver on NVDEC: decoding only, surfaces exported as DMA-BUFs
++     * like Mesa's, which EGL imports) (WinBoat) */
++    if (!driver || (!strstr(driver, "Mesa Gallium") && !strstr(driver, "NVDEC"))) {
+         virgl_error("only supports mesa va drivers now\n");
+         virgl_video_destroy();
+         return -1;

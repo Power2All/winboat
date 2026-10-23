@@ -1,0 +1,37 @@
+vrend: restart the sync thread after a reset
+
+VIRGL_RENDERER_THREAD_SYNC starts a thread that waits for fences and signals
+the poll fd. virgl_renderer_reset stops it, but vrend_renderer_reset only
+starts it again with VIRGL_RENDERER_ASYNC_FENCE_CB. Without the async
+callback (QEMU's vhost-user-gpu), no fence completed after a reset: the guest
+waited forever for its first one after a reboot. Start it again whenever it
+ran before the reset.
+
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -395,6 +395,8 @@
+    bool use_explicit_locations : 1;
+    /* threaded sync */
+    bool stop_sync_thread : 1;
++   /* a reset stopped the sync thread, which then runs again */
++   bool restart_sync_thread : 1;
+    /* async fence callback */
+    bool use_async_fence_cb : 1;
+ 
+@@ -13312,6 +13314,7 @@
+ void vrend_renderer_prepare_reset(void)
+ {
+    /* make sure user contexts are no longer accessed */
++   vrend_state.restart_sync_thread = vrend_state.sync_thread != 0;
+    vrend_free_sync_thread();
+    vrend_hw_switch_context(vrend_state.ctx0, true);
+ }
+@@ -13325,7 +13328,7 @@
+ 
+    vrend_state.ctx0 = vrend_create_context(0, strlen("HOST"), "HOST");
+ 
+-   if (vrend_state.use_async_fence_cb)
++   if (vrend_state.use_async_fence_cb || vrend_state.restart_sync_thread)
+       vrend_renderer_use_threaded_sync();
+ }
+ 

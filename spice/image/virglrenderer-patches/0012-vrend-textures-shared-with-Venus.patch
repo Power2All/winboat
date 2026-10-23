@@ -1,0 +1,281 @@
+From: WinBoat
+Subject: [PATCH] vrend: textures shared with Venus (VIRGL_BIND_VK_SHARED)
+
+A Windows guest's D3D12 swap chain buffers are Venus images, and DWM composes them as virgl textures: the guest
+copied every frame through a readback buffer and the CPU, and the KMD uploaded it again for every composition. A
+texture created with VIRGL_BIND_VK_SHARED (2D, one level, layer and sample; RGBA8, BGRA8, RGB10A2 or RGBA16F) now
+takes its storage from a dedicated, device-local Vulkan image of fixed parameters (VREND_VK_IMAGE_USAGE, mutable
+format, optimal tiling) through vrend_vk, of the format GL's storage has (GL keeps BGRA as RGBA, so a BGRA texture's
+image is RGBA and the guest converts into it): GL imports it as an opaque fd (EXT_memory_object_fd, optimal tiling),
+and the resource exports it as a dma-buf, which the render server's Venus imports into the guest's image of the same
+parameters - the guest renders straight into what DWM composes. Where anything is missing (format, extension, the
+driver's dma-buf export of optimal images) it stays an ordinary texture and the guest keeps copying. A resource id
+vkr can't find for such an import is an error the app gets (VK_ERROR_INVALID_EXTERNAL_HANDLE), not a lost context:
+the guest driver then copies too.
+---
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index ffe621b..ad8b936 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -17,8 +17,9 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
+ {
+    struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
+    if (!res) {
++      /* WinBoat: an error the app can take (VK_ERROR_INVALID_EXTERNAL_HANDLE): its D3D12 driver then makes a copied
++       * swap chain buffer instead of losing the device */
+       vkr_log("failed to import resource: invalid res_id %u", res_info->resourceId);
+-      vkr_context_set_fatal(ctx);
+       return false;
+    }
+ 
+diff --git a/src/virgl_hw.h b/src/virgl_hw.h
+index bd9a9de..407b9a0 100644
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -643,6 +643,8 @@ enum virgl_formats {
+ #define VIRGL_BIND_DISPLAY_TARGET (1u << 7)
+ #define VIRGL_BIND_COMMAND_ARGS  (1u << 8)
+ #define VIRGL_BIND_STREAM_OUTPUT (1u << 11)
++/* WinBoat: a texture the guest also renders to through Venus (vrend_vk.h); storage in exportable Vulkan memory */
++#define VIRGL_BIND_VK_SHARED     (1u << 13)
+ #define VIRGL_BIND_SHADER_BUFFER (1u << 14)
+ #define VIRGL_BIND_QUERY_BUFFER  (1u << 15)
+ #define VIRGL_BIND_CURSOR        (1u << 16)
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index f29cb9a..46c3b92 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -7566,6 +7566,11 @@ static enum virgl_resource_fd_type vrend_pipe_resource_export_fd(UNUSED struct p
+       if (*fd >= 0)
+          return VIRGL_RESOURCE_FD_DMABUF;
+    }
++   if (((struct vrend_resource *)pres)->vk_image) {
++      *fd = vrend_vk_image_export(((struct vrend_resource *)pres)->vk_image);
++      if (*fd >= 0)
++         return VIRGL_RESOURCE_FD_DMABUF;
++   }
+ #endif
+ #if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+    struct vrend_resource *res = (struct vrend_resource *)pres;
+@@ -8732,6 +8737,42 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
+ #endif
+ }
+ 
++#ifdef ENABLE_VENUS
++/* A texture the guest's Venus image shares (VIRGL_BIND_VK_SHARED: its D3D12 swap chain buffers) gets its storage from
++ * Vulkan memory (vrend_vk_image_create), an image of the format GL's storage has: GL keeps BGRA as RGBA, so a BGRA
++ * texture's image is RGBA (the guest converts into it). False: an ordinary texture, the guest finds no dma-buf to
++ * import and keeps copying */
++static bool vrend_texture_vk_storage(struct vrend_resource *gr, enum virgl_formats format, GLenum internalformat)
++{
++   const struct pipe_resource *pr = &gr->base;
++   uint32_t vk_format;
++   switch (format) {
++   case VIRGL_FORMAT_R8G8B8A8_UNORM:
++   case VIRGL_FORMAT_B8G8R8A8_UNORM: vk_format = 37; break;      /* VK_FORMAT_R8G8B8A8_UNORM */
++   case VIRGL_FORMAT_R10G10B10A2_UNORM: vk_format = 64; break;   /* VK_FORMAT_A2B10G10R10_UNORM_PACK32 */
++   case VIRGL_FORMAT_R16G16B16A16_FLOAT: vk_format = 97; break;  /* VK_FORMAT_R16G16B16A16_SFLOAT */
++   default: return false;
++   }
++   if (!(pr->bind & VIRGL_BIND_VK_SHARED) || gr->target != GL_TEXTURE_2D || pr->last_level || pr->array_size > 1 ||
++       pr->nr_samples > 1 || !has_feature(feat_memory_object) || !has_feature(feat_memory_object_fd) ||
++       !vrend_vk_buffers_init())
++      return false;
++   int fd = -1;
++   uint64_t alloc_size = 0;
++   gr->vk_image = vrend_vk_image_create(vk_format, pr->width0, pr->height0, &fd, &alloc_size);
++   if (!gr->vk_image)
++      return false;
++   glCreateMemoryObjectsEXT(1, &gr->memobj);
++   GLint dedicated = GL_TRUE;
++   glMemoryObjectParameterivEXT(gr->memobj, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
++   glImportMemoryFdEXT(gr->memobj, alloc_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
++   glTexParameteri(gr->target, GL_TEXTURE_TILING_EXT, GL_OPTIMAL_TILING_EXT);
++   glTexStorageMem2DEXT(gr->target, 1, internalformat, pr->width0, pr->height0, gr->memobj, 0);
++   gr->storage_bits |= VREND_STORAGE_GL_MEMOBJ;
++   return true;
++}
++#endif
++
+ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+                                         enum virgl_formats format,
+                                         void *image_oes)
+@@ -8815,6 +8856,11 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+          return EINVAL;
+       }
+ 
++#ifdef ENABLE_VENUS
++      if (vrend_texture_vk_storage(gr, format, internalformat)) {
++         /* immutable storage, one level */
++      } else
++#endif
+       if (pr->nr_samples > 1) {
+          if (format_can_texture_storage) {
+             if (gr->target == GL_TEXTURE_2D_MULTISAMPLE) {
+@@ -9000,6 +9046,9 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+ #ifdef ENABLE_VENUS
+    if (res->vk_buffer)
+       vrend_vk_buffer_destroy(res->vk_buffer);
++   /* after GL's texture and memory object */
++   if (res->vk_image)
++      vrend_vk_image_destroy(res->vk_image);
+ #endif
+ 
+ #ifdef ENABLE_GBM
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 70670c1..d6f582c 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -113,6 +113,7 @@ struct vrend_resource {
+    GLuint memobj;
+    /* a persistently mappable buffer's storage, when it is Vulkan memory (vrend_vk.c) */
+    struct vrend_vk_buffer *vk_buffer;
++   struct vrend_vk_image *vk_image;
+ 
+    uint32_t blob_id;
+    struct list_head head;
+diff --git a/src/vrend/vrend_vk.c b/src/vrend/vrend_vk.c
+index 4899740..9581027 100644
+--- a/src/vrend/vrend_vk.c
++++ b/src/vrend/vrend_vk.c
+@@ -29,15 +29,25 @@ struct vrend_vk_buffer {
+    void *ptr;
+ };
+ 
++struct vrend_vk_image {
++   VkImage image;
++   VkDeviceMemory memory;
++};
++
+ static struct {
+    bool tried, ok;
+    VkDevice device;
+    uint32_t memory_type;
+    uint32_t map_info;
++   VkPhysicalDeviceMemoryProperties memory;
+    PFN_vkAllocateMemory AllocateMemory;
+    PFN_vkFreeMemory FreeMemory;
+    PFN_vkMapMemory MapMemory;
+    PFN_vkGetMemoryFdKHR GetMemoryFdKHR;
++   PFN_vkCreateImage CreateImage;
++   PFN_vkDestroyImage DestroyImage;
++   PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
++   PFN_vkBindImageMemory BindImageMemory;
+ } vk;
+ 
+ /* The Vulkan device of the GL driver's GPU (same UUID), and a memory type exportable buffers may use: host-visible
+@@ -104,8 +114,13 @@ static bool vrend_vk_setup(void)
+    vk.FreeMemory = VK_DEVICE_PROC(FreeMemory);
+    vk.MapMemory = VK_DEVICE_PROC(MapMemory);
+    vk.GetMemoryFdKHR = VK_DEVICE_PROC(GetMemoryFdKHR);
++   vk.CreateImage = VK_DEVICE_PROC(CreateImage);
++   vk.DestroyImage = VK_DEVICE_PROC(DestroyImage);
++   vk.GetImageMemoryRequirements = VK_DEVICE_PROC(GetImageMemoryRequirements);
++   vk.BindImageMemory = VK_DEVICE_PROC(BindImageMemory);
+    if (!CreateBuffer || !GetBufferMemoryRequirements || !DestroyBuffer || !vk.AllocateMemory || !vk.FreeMemory ||
+-       !vk.MapMemory || !vk.GetMemoryFdKHR)
++       !vk.MapMemory || !vk.GetMemoryFdKHR || !vk.CreateImage || !vk.DestroyImage || !vk.GetImageMemoryRequirements ||
++       !vk.BindImageMemory)
+       return false;
+ 
+    VkExternalMemoryBufferCreateInfo external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+@@ -121,6 +136,7 @@ static bool vrend_vk_setup(void)
+ 
+    VkPhysicalDeviceMemoryProperties memory;
+    GetPhysicalDeviceMemoryProperties(pd, &memory);
++   vk.memory = memory;
+    const VkMemoryPropertyFlags needed = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    int found = -1;
+    for (uint32_t t = 0; t < memory.memoryTypeCount; t++) {
+@@ -200,3 +216,69 @@ uint32_t vrend_vk_map_info(void)
+ {
+    return vk.map_info;
+ }
++
++struct vrend_vk_image *vrend_vk_image_create(uint32_t vk_format, uint32_t width, uint32_t height, int *opaque_fd,
++                                             uint64_t *alloc_size)
++{
++   struct vrend_vk_image *image = calloc(1, sizeof(*image));
++   if (!image)
++      return NULL;
++   VkExternalMemoryImageCreateInfo external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++                                                .handleTypes = VREND_VK_HANDLE_TYPES };
++   VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &external,
++                             .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, .imageType = VK_IMAGE_TYPE_2D,
++                             .format = (VkFormat)vk_format, .extent = { width, height, 1 }, .mipLevels = 1,
++                             .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
++                             .usage = VREND_VK_IMAGE_USAGE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
++   if (vk.CreateImage(vk.device, &ici, NULL, &image->image) != VK_SUCCESS) {
++      free(image);
++      return NULL;
++   }
++   VkMemoryRequirements requirements;
++   vk.GetImageMemoryRequirements(vk.device, image->image, &requirements);
++   int type = -1;
++   for (uint32_t t = 0; t < vk.memory.memoryTypeCount && type < 0; t++) {
++      if ((requirements.memoryTypeBits & (1u << t)) &&
++          (vk.memory.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++         type = t;
++   }
++   VkMemoryDedicatedAllocateInfo dedicated = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++                                               .image = image->image };
++   VkExportMemoryAllocateInfo export = { .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++                                         .pNext = &dedicated, .handleTypes = VREND_VK_HANDLE_TYPES };
++   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &export,
++                                .allocationSize = requirements.size, .memoryTypeIndex = type };
++   VkMemoryGetFdInfoKHR get = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
++                                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++   *opaque_fd = -1;
++   if (type < 0 || vk.AllocateMemory(vk.device, &mai, NULL, &image->memory) != VK_SUCCESS) {
++      vk.DestroyImage(vk.device, image->image, NULL);
++      free(image);
++      return NULL;
++   }
++   get.memory = image->memory;
++   if (vk.BindImageMemory(vk.device, image->image, image->memory, 0) != VK_SUCCESS ||
++       vk.GetMemoryFdKHR(vk.device, &get, opaque_fd) != VK_SUCCESS) {
++      vrend_vk_image_destroy(image);
++      return NULL;
++   }
++   *alloc_size = requirements.size;
++   return image;
++}
++
++void vrend_vk_image_destroy(struct vrend_vk_image *image)
++{
++   vk.DestroyImage(vk.device, image->image, NULL);
++   vk.FreeMemory(vk.device, image->memory, NULL);
++   free(image);
++}
++
++/* ponytail: NVIDIA (615) advertises dma-buf for optimal images as import-only, yet exports it (the Venus side's
++ * import then works bit-exact); a driver that refuses gets -1 here and the guest stays on its copying present */
++int vrend_vk_image_export(struct vrend_vk_image *image)
++{
++   VkMemoryGetFdInfoKHR get = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = image->memory,
++                                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
++   int fd = -1;
++   return vk.GetMemoryFdKHR(vk.device, &get, &fd) == VK_SUCCESS ? fd : -1;
++}
+diff --git a/src/vrend/vrend_vk.h b/src/vrend/vrend_vk.h
+index 71bb495..2647d5f 100644
+--- a/src/vrend/vrend_vk.h
++++ b/src/vrend/vrend_vk.h
+@@ -25,4 +25,17 @@ void *vrend_vk_buffer_ptr(struct vrend_vk_buffer *buffer);
+ /* VIRGL_RENDERER_MAP_CACHE_* of the memory */
+ uint32_t vrend_vk_map_info(void);
+ 
++/* Textures the guest renders to through Venus (its D3D12 swap chain buffers, VIRGL_BIND_VK_SHARED): a 2D image of one
++ * level, layer and sample in device-local memory, exported as an opaque fd GL imports as the texture's storage and
++ * as a dma-buf for Venus. The guest's image of it must have the same parameters: VREND_VK_IMAGE_USAGE, mutable
++ * format, optimal tiling, a dedicated allocation */
++#define VREND_VK_IMAGE_USAGE 0x17 /* color attachment 0x10, sampled 0x4, transfer src 0x1 and dst 0x2 */
++struct vrend_vk_image;
++/* vk_format: a VkFormat; *opaque_fd (the caller's: GL's import takes it) and *alloc_size are what GL imports */
++struct vrend_vk_image *vrend_vk_image_create(uint32_t vk_format, uint32_t width, uint32_t height, int *opaque_fd,
++                                             uint64_t *alloc_size);
++void vrend_vk_image_destroy(struct vrend_vk_image *image);
++/* A new dma-buf fd of the memory, for Venus (-1 where the driver won't export it: the caller falls back) */
++int vrend_vk_image_export(struct vrend_vk_image *image);
++
+ #endif

@@ -1,0 +1,123 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: monochrome hardware cursors
+
+The hardware cursor took color shapes only, so Windows drew monochrome ones (the text cursor, among others) into
+the frames itself: they lag behind the host's pointer, and in WinBoat's seamless app windows the last one stays in
+a window the pointer has left. Take monochrome shapes too, converted to ARGB: AND 0 is black or white, AND 1 is
+transparent or inverts the screen. ARGB can't invert: those pixels are black with a white outline, so they show on
+any background.
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 1c6e6d0..c7ad387 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -510,13 +510,14 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 pDriverCaps->SupportNonVGA = IsVgaDevice();
+ 
+                 // A hardware cursor: the host draws it (a SPICE client on its own side), instead of Windows
+-                // drawing it into every frame. Masked and monochrome shapes stay software cursors.
++                // drawing it into every frame. Masked color shapes stay software cursors.
+                 if (IsPointerEnabled())
+                 {
+                     pDriverCaps->MaxPointerWidth = POINTER_SIZE;
+                     pDriverCaps->MaxPointerHeight = POINTER_SIZE;
+                     pDriverCaps->PointerCaps.Value = 0;
+                     pDriverCaps->PointerCaps.Color = 1;
++                    pDriverCaps->PointerCaps.Monochrome = 1;
+                 }
+ 
+                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Driver caps return\n", __FUNCTION__));
+@@ -1646,13 +1647,68 @@ BOOLEAN VioGpuAdapter::CreateCursor(void)
+     return TRUE;
+ }
+ 
++// A pixel of a monochrome shape: its AND mask bit and its XOR mask bit
++static void MonochromeBits(_In_ CONST DXGKARG_SETPOINTERSHAPE *pShape, UINT x, UINT y, BOOLEAN *pAnd, BOOLEAN *pXor)
++{
++    CONST BYTE *pAndMask = (CONST BYTE *)pShape->pPixels;
++    CONST BYTE *pXorMask = pAndMask + pShape->Pitch * pShape->Height;
++    UINT offset = y * pShape->Pitch + x / 8;
++    BYTE bit = (BYTE)(0x80 >> (x % 8));
++    *pAnd = (pAndMask[offset] & bit) != 0;
++    *pXor = (pXorMask[offset] & bit) != 0;
++}
++
++// A monochrome shape (an AND mask, then an XOR mask, 1 bit a pixel) as ARGB: AND 0 is black or white (XOR), AND 1
++// is transparent or inverts the screen (XOR). ARGB can't invert: those pixels are black with a white outline, so
++// they show on any background (the text cursor is made of them).
++static void MonochromeToArgb(_In_ CONST DXGKARG_SETPOINTERSHAPE *pShape,
++                             _Out_writes_(POINTER_SIZE *POINTER_SIZE) UINT32 *pDst)
++{
++    UINT width = pShape->Width, height = pShape->Height;
++    BOOLEAN andBit, xorBit;
++    for (UINT y = 0; y < height; y++)
++    {
++        for (UINT x = 0; x < width; x++)
++        {
++            MonochromeBits(pShape, x, y, &andBit, &xorBit);
++            if (!andBit || xorBit)
++            {
++                pDst[y * POINTER_SIZE + x] = (!andBit && xorBit) ? 0xFFFFFFFF : 0xFF000000;
++            }
++        }
++    }
++    for (UINT y = 0; y < height; y++)
++    {
++        for (UINT x = 0; x < width; x++)
++        {
++            MonochromeBits(pShape, x, y, &andBit, &xorBit);
++            if (!andBit || !xorBit)
++            {
++                continue;
++            }
++            for (INT dy = -1; dy <= 1; dy++)
++            {
++                for (INT dx = -1; dx <= 1; dx++)
++                {
++                    INT nx = (INT)x + dx, ny = (INT)y + dy;
++                    if (nx >= 0 && ny >= 0 && nx < POINTER_SIZE && ny < POINTER_SIZE &&
++                        pDst[ny * POINTER_SIZE + nx] == 0)
++                    {
++                        pDst[ny * POINTER_SIZE + nx] = 0xFFFFFFFF;
++                    }
++                }
++            }
++        }
++    }
++}
++
+ // Copies the shape into the cursor resource and sends it to the host
+ BOOLEAN VioGpuAdapter::UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape)
+ {
+     PAGED_CODE();
+ 
+-    if (!pSetPointerShape->Flags.Color || pSetPointerShape->Width > POINTER_SIZE ||
+-        pSetPointerShape->Height > POINTER_SIZE)
++    if (!(pSetPointerShape->Flags.Color || pSetPointerShape->Flags.Monochrome) ||
++        pSetPointerShape->Width > POINTER_SIZE || pSetPointerShape->Height > POINTER_SIZE)
+     {
+         return FALSE;
+     }
+@@ -1660,6 +1716,13 @@ BOOLEAN VioGpuAdapter::UpdateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
+     {
+         return FALSE;
+     }
++    if (pSetPointerShape->Flags.Monochrome)
++    {
++        RtlZeroMemory(m_pCursorBuf->GetVirtualAddress(), POINTER_SIZE * POINTER_SIZE * 4);
++        MonochromeToArgb(pSetPointerShape, (UINT32 *)m_pCursorBuf->GetVirtualAddress());
++        ctrlQueue.TransferToHost2D(m_pCursorBuf->GetId(), 0, POINTER_SIZE, POINTER_SIZE, 0, 0);
++        return TRUE;
++    }
+ 
+     RECT Rect;
+     Rect.left = 0;
+@@ -1710,7 +1773,7 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSet
+               pSetPointerShape->YHot,
+               pSetPointerShape->Pitch,
+               IsPointerEnabled()));
+-    // Windows draws the shapes this can't take (monochrome, masked color) itself
++    // Windows draws the shapes this can't take (masked color) itself
+     if (!IsPointerEnabled() || pSetPointerShape->VidPnSourceId != 0 || !UpdateCursor(pSetPointerShape))
+     {
+         DbgPrint(TRACE_LEVEL_VERBOSE, ("%s not taken, software cursor\n", __FUNCTION__));

@@ -1,0 +1,5215 @@
+From: WinBoat
+Subject: [PATCH] gallium: d3d9umd, a Direct3D 9 user-mode driver on gallium nine
+
+A WDDM Direct3D 9 user-mode driver (D3DDDI, OpenAdapter) for virtio-gpu, built as viogpu_d3d9.dll
+(-Dgallium-d3d9umd=true -Dgallium-d3d9-dll-name=...). The Microsoft D3D9 runtime keeps the API, swapchains and
+presentation; the driver implements the DDI on a headless gallium nine device over the virgl GDI winsys.
+
+- frontends/d3d9umd: the DDI side (C++, WDK headers: adapter, caps, device, pipeline, generated DDI stubs) and
+  nine_bridge.c (C, nine's D3D9 headers), which maps DDI resources/state/draws onto nine objects. System memory
+  resources wrap the runtime's memory; the runtime's lock notifications invalidate nine's uploads.
+- gdikmt: create a device on an adapter LUID (the D3D9 driver probes the virtio-gpu adapter at OpenAdapter).
+- nine: builds with MSVC (VLAs, void * arithmetic, GNU variadic macros, Linux-only allocator and threadpool code);
+  a headless device without a present group; buffers on external memory; system memory surfaces keep the memory
+  they are given; NineBeforeDraw/NineAfterDraw exported; a user_constbufs driver cap (virgl only reads constant
+  buffer 0 when it is user data).
+
+Development tracing: create C:\viogpu_d3d9_trace.txt and every DDI call is logged to C:\viogpu_d3d9_trace.log.
+---
+diff --git a/include/D3D9/d3d9types.h b/include/D3D9/d3d9types.h
+index 88f22b9..0c1ca29 100644
+--- a/include/D3D9/d3d9types.h
++++ b/include/D3D9/d3d9types.h
+@@ -1775,9 +1775,11 @@ typedef struct _D3DVOLUME_DESC {
+     UINT Depth;
+ } D3DVOLUME_DESC, *PD3DVOLUME_DESC, *LPD3DVOLUME_DESC;
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) || !defined(__IUnknown_INTERFACE_DEFINED__)
+ /* If _WIN32 isn't declared it means only internal header files are used. To
+- * avoid a conflict, IUnknown is declared here rather than in d3d9.h */
++ * avoid a conflict, IUnknown is declared here rather than in d3d9.h. The same
++ * goes for Windows builds that don't include the COM headers (the d3d9umd
++ * WDDM driver, built with WIN32_LEAN_AND_MEAN). */
+ 
+ typedef struct IUnknown IUnknown, *PUNKNOWN, *LPUNKNOWN;
+ 
+diff --git a/meson.build b/meson.build
+index 1b1f5b8..3644d30 100644
+--- a/meson.build
++++ b/meson.build
+@@ -796,6 +796,16 @@ if with_gallium_st_d3d10umd
+   endif
+ endif
+ 
++with_gallium_st_d3d9umd = get_option('gallium-d3d9umd')
++if with_gallium_st_d3d9umd
++  if host_machine.system() != 'windows'
++    error('The d3d9umd state tracker is a Windows WDDM user-mode driver.')
++  endif
++  if not with_gallium_virgl
++    error('The d3d9umd state tracker requires virgl.')
++  endif
++endif
++
+ _power8 = get_option('power8')
+ if _power8.allowed()
+   if host_machine.cpu_family() == 'ppc64' and host_machine.endian() == 'little'
+diff --git a/meson_options.txt b/meson_options.txt
+index a3f98b0..fe80c1e 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -168,6 +168,13 @@ option(
+   description : 'build gallium D3D10 WDDM UMD frontend.',
+ )
+ 
++option(
++  'gallium-d3d9umd',
++  type : 'boolean',
++  value : false,
++  description : 'build gallium D3D9 WDDM UMD frontend (the D3D9 DDI on top of the nine state tracker).',
++)
++
+ option(
+   'gallium-opencl',
+   type : 'combo',
+@@ -199,6 +206,13 @@ option(
+                 'defaults to libgallium_d3d10.dll to match DRI',
+ )
+ 
++option(
++  'gallium-d3d9-dll-name',
++  type : 'string',
++  value : 'libgallium_d3d9',
++  description : 'name of gallium d3d9 WDDM UMD target DLL built for Windows.',
++)
++
+ option(
+   'opencl-spirv',
+   type : 'boolean',
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt.h b/src/gallium/auxiliary/gdikmt/gdikmt.h
+index 5cf7690..0faf0f0 100644
+--- a/src/gallium/auxiliary/gdikmt/gdikmt.h
++++ b/src/gallium/auxiliary/gdikmt/gdikmt.h
+@@ -96,6 +96,16 @@ struct gdikmt_device {
+ };
+ 
+ 
++#ifdef __cplusplus
++extern "C" {
++#endif
++
+ struct gdikmt_device *gdikmt_create_from_hdc(HDC hDC);
++/* Opens the adapter with this LUID through the D3DKMT* functions */
++struct gdikmt_device *gdikmt_create_from_luid(LUID luid);
++
++#ifdef __cplusplus
++}
++#endif
+ 
+ #endif
+\ No newline at end of file
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+index 4c985a3..d49f85c 100644
+--- a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
++++ b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+@@ -24,6 +24,7 @@ struct d3dkmt_callbacks {
+    PFND3DKMT_CREATEDEVICE createDevice;
+    PFND3DKMT_DESTROYDEVICE destroyDevice;
+    PFND3DKMT_OPENADAPTERFROMHDC openAdapterFromHdc;
++   PFND3DKMT_OPENADAPTERFROMLUID openAdapterFromLuid;
+    PFND3DKMT_CLOSEADAPTER closeAdapter;
+ };
+ 
+@@ -56,6 +57,8 @@ gdikmt_load_callbacks(HINSTANCE gdi32lib, struct d3dkmt_callbacks *cb)
+       (PFND3DKMT_DESTROYDEVICE)GetProcAddress(gdi32lib, "D3DKMTDestroyDevice");
+    cb->openAdapterFromHdc = (PFND3DKMT_OPENADAPTERFROMHDC)GetProcAddress(
+       gdi32lib, "D3DKMTOpenAdapterFromHdc");
++   cb->openAdapterFromLuid = (PFND3DKMT_OPENADAPTERFROMLUID)GetProcAddress(
++      gdi32lib, "D3DKMTOpenAdapterFromLuid");
+    cb->closeAdapter =
+       (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32lib, "D3DKMTCloseAdapter");
+ }
+@@ -373,37 +376,25 @@ gdikmt_d3dkmt_destroy(struct gdikmt_device *_device)
+    FREE(device);
+ }
+ 
+-struct gdikmt_device *
+-gdikmt_create_from_hdc(HDC hDC)
++/* Creates a device on an opened adapter; takes ownership of the adapter handle */
++static struct gdikmt_device *
++gdikmt_create_on_adapter(struct gdikmt_device_d3dkmt *device, D3DKMT_HANDLE hAdapter)
+ {
+-   struct gdikmt_device_d3dkmt *device = CALLOC_STRUCT(gdikmt_device_d3dkmt);
+-   if (!device)
+-      return NULL;
+-
+-   device->gdi32lib = LoadLibraryA("GDI32.dll");
+-   gdikmt_load_callbacks(device->gdi32lib, &device->cb);
+-
+-   D3DKMT_OPENADAPTERFROMHDC openFromHdc;
+-   NTSTATUS Status;
+-   openFromHdc.hDc = hDC;
+-   Status = device->cb.openAdapterFromHdc(&openFromHdc);
+-   if (!NT_SUCCESS(Status)) {
+-      _debug_printf(
+-         "Failed to open device(D3DKMTOpenAdapterFromHdc) with status code: %lx\n",
+-         Status);
+-      return NULL;
+-   }
+-   device->hAdapter = openFromHdc.hAdapter;
++   device->hAdapter = hAdapter;
+ 
+    D3DKMT_CREATEDEVICE createDevice;
+    memset(&createDevice, 0, sizeof(createDevice));
+    createDevice.hAdapter = device->hAdapter;
+ 
+-   Status = device->cb.createDevice(&createDevice);
++   NTSTATUS Status = device->cb.createDevice(&createDevice);
+ 
+    if (!NT_SUCCESS(Status)) {
+-      printf("Failed to create D3DKMTCreateDevice with status code: %lx\n",
+-             Status);
++      _debug_printf("Failed to create D3DKMTCreateDevice with status code: %lx\n",
++                    Status);
++      D3DKMT_CLOSEADAPTER closeAdapter;
++      closeAdapter.hAdapter = device->hAdapter;
++      device->cb.closeAdapter(&closeAdapter);
++      FreeLibrary(device->gdi32lib);
+       FREE(device);
+       return NULL;
+    }
+@@ -425,4 +416,55 @@ gdikmt_create_from_hdc(HDC hDC)
+    device->base.setDisplayMode = gdikmt_d3dkmt_setdisplaymode;
+ 
+    return &device->base;
+-};
+\ No newline at end of file
++}
++
++struct gdikmt_device *
++gdikmt_create_from_hdc(HDC hDC)
++{
++   struct gdikmt_device_d3dkmt *device = CALLOC_STRUCT(gdikmt_device_d3dkmt);
++   if (!device)
++      return NULL;
++
++   device->gdi32lib = LoadLibraryA("GDI32.dll");
++   gdikmt_load_callbacks(device->gdi32lib, &device->cb);
++
++   D3DKMT_OPENADAPTERFROMHDC openFromHdc;
++   NTSTATUS Status;
++   openFromHdc.hDc = hDC;
++   Status = device->cb.openAdapterFromHdc(&openFromHdc);
++   if (!NT_SUCCESS(Status)) {
++      _debug_printf(
++         "Failed to open device(D3DKMTOpenAdapterFromHdc) with status code: %lx\n",
++         Status);
++      FreeLibrary(device->gdi32lib);
++      FREE(device);
++      return NULL;
++   }
++   return gdikmt_create_on_adapter(device, openFromHdc.hAdapter);
++};
++
++struct gdikmt_device *
++gdikmt_create_from_luid(LUID luid)
++{
++   struct gdikmt_device_d3dkmt *device = CALLOC_STRUCT(gdikmt_device_d3dkmt);
++   if (!device)
++      return NULL;
++
++   device->gdi32lib = LoadLibraryA("GDI32.dll");
++   gdikmt_load_callbacks(device->gdi32lib, &device->cb);
++
++   D3DKMT_OPENADAPTERFROMLUID openFromLuid;
++   memset(&openFromLuid, 0, sizeof(openFromLuid));
++   openFromLuid.AdapterLuid = luid;
++   NTSTATUS Status = device->cb.openAdapterFromLuid ? device->cb.openAdapterFromLuid(&openFromLuid)
++                                                     : (NTSTATUS)0xC00000BBL /* STATUS_NOT_SUPPORTED */;
++   if (!NT_SUCCESS(Status)) {
++      _debug_printf(
++         "Failed to open device(D3DKMTOpenAdapterFromLuid) with status code: %lx\n",
++         Status);
++      FreeLibrary(device->gdi32lib);
++      FREE(device);
++      return NULL;
++   }
++   return gdikmt_create_on_adapter(device, openFromLuid.hAdapter);
++}
+diff --git a/src/gallium/frontends/d3d9umd/adapter.cpp b/src/gallium/frontends/d3d9umd/adapter.cpp
+new file mode 100644
+index 0000000..186b2ff
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/adapter.cpp
+@@ -0,0 +1,274 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* OpenAdapter, GetCaps, CreateDevice and CloseAdapter */
++
++#include "d3d9umd.h"
++
++#include <new>
++#include <string.h>
++#include <vector>
++
++#include "pipe/p_screen.h"
++#include "util/u_memory.h"
++#include "virgl/gdi/virgl_gdi_public.h"
++#include "virtio/wddm/viogpu_wddm_driver.h"
++
++/* ---- Probing the GPU ---- */
++
++/* The runtime asks for caps before creating any device, and a gallium screen needs a kernel device. The adapter's
++ * callbacks can't create one, so open the virtio-gpu adapter through D3DKMT ourselves: find it by asking every
++ * adapter for its driver's private data (in an RDP session the desktop belongs to a different, remote adapter). */
++static bool
++FindVioGpuAdapter(LUID *luid)
++{
++   HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
++   auto enumAdapters2 = (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gdi32, "D3DKMTEnumAdapters2");
++   auto queryAdapterInfo = (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(gdi32, "D3DKMTQueryAdapterInfo");
++   auto closeAdapter = (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32, "D3DKMTCloseAdapter");
++   if (!enumAdapters2 || !queryAdapterInfo || !closeAdapter)
++      return false;
++
++   D3DKMT_ENUMADAPTERS2 enumerate;
++   memset(&enumerate, 0, sizeof(enumerate));
++   if (!NT_SUCCESS(enumAdapters2(&enumerate)) || !enumerate.NumAdapters)
++      return false;
++   std::vector<D3DKMT_ADAPTERINFO> adapters(enumerate.NumAdapters);
++   enumerate.pAdapters = adapters.data();
++   if (!NT_SUCCESS(enumAdapters2(&enumerate)))
++      return false;
++
++   bool found = false;
++   for (UINT i = 0; i < enumerate.NumAdapters; i++) {
++      VIOGPU_ADAPTERINFO info;
++      memset(&info, 0, sizeof(info));
++      D3DKMT_QUERYADAPTERINFO query;
++      memset(&query, 0, sizeof(query));
++      query.hAdapter = adapters[i].hAdapter;
++      query.Type = KMTQAITYPE_UMDRIVERPRIVATE;
++      query.pPrivateDriverData = &info;
++      query.PrivateDriverDataSize = sizeof(info);
++      if (!found && NT_SUCCESS(queryAdapterInfo(&query)) && info.IamVioGPU == VIOGPU_IAM) {
++         *luid = adapters[i].AdapterLuid;
++         found = true;
++      }
++      D3DKMT_CLOSEADAPTER close;
++      close.hAdapter = adapters[i].hAdapter;
++      closeAdapter(&close);
++   }
++   return found;
++}
++
++/* Formats the runtime may ask about; the operations are worked out with nine's CheckDeviceFormat */
++static const D3DDDIFORMAT candidateFormats[] = {
++   D3DDDIFMT_X8R8G8B8, D3DDDIFMT_A8R8G8B8, D3DDDIFMT_R5G6B5, D3DDDIFMT_X1R5G5B5, D3DDDIFMT_A1R5G5B5,
++   D3DDDIFMT_A4R4G4B4, D3DDDIFMT_X4R4G4B4, D3DDDIFMT_A2R10G10B10, D3DDDIFMT_A2B10G10R10, D3DDDIFMT_A8B8G8R8,
++   D3DDDIFMT_X8B8G8R8, D3DDDIFMT_R8G8B8, D3DDDIFMT_R3G3B2, D3DDDIFMT_A8R3G3B2, D3DDDIFMT_A8, D3DDDIFMT_L8,
++   D3DDDIFMT_A8L8, D3DDDIFMT_A4L4, D3DDDIFMT_L16, D3DDDIFMT_V8U8, D3DDDIFMT_L6V5U5, D3DDDIFMT_X8L8V8U8,
++   D3DDDIFMT_Q8W8V8U8, D3DDDIFMT_V16U16, D3DDDIFMT_A2W10V10U10, D3DDDIFMT_Q16W16V16U16, D3DDDIFMT_G16R16,
++   D3DDDIFMT_A16B16G16R16, D3DDDIFMT_R16F, D3DDDIFMT_G16R16F, D3DDDIFMT_A16B16G16R16F, D3DDDIFMT_R32F,
++   D3DDDIFMT_G32R32F, D3DDDIFMT_A32B32G32R32F, D3DDDIFMT_DXT1, D3DDDIFMT_DXT2, D3DDDIFMT_DXT3, D3DDDIFMT_DXT4,
++   D3DDDIFMT_DXT5, D3DDDIFMT_UYVY, D3DDDIFMT_YUY2, D3DDDIFMT_R8G8_B8G8, D3DDDIFMT_G8R8_G8B8,
++   (D3DDDIFORMAT)MAKEFOURCC('A', 'T', 'I', '1'), (D3DDDIFORMAT)MAKEFOURCC('A', 'T', 'I', '2'),
++   (D3DDDIFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z'), (D3DDDIFORMAT)MAKEFOURCC('N', 'U', 'L', 'L'),
++   (D3DDDIFORMAT)MAKEFOURCC('D', 'F', '1', '6'), (D3DDDIFORMAT)MAKEFOURCC('D', 'F', '2', '4'),
++   D3DDDIFMT_D16, D3DDDIFMT_D16_LOCKABLE, D3DDDIFMT_D24S8, D3DDDIFMT_D24X8, D3DDDIFMT_D24X4S4,
++   D3DDDIFMT_D15S1, D3DDDIFMT_D32, D3DDDIFMT_D32F_LOCKABLE, D3DDDIFMT_D24FS8, D3DDDIFMT_S8_LOCKABLE,
++   D3DDDIFMT_D32_LOCKABLE,
++};
++
++static bool
++IsArgbGroup(D3DDDIFORMAT f)
++{
++   return f == D3DDDIFMT_X8R8G8B8 || f == D3DDDIFMT_A8R8G8B8 || f == D3DDDIFMT_A2R10G10B10 ||
++          f == D3DDDIFMT_X1R5G5B5 || f == D3DDDIFMT_A1R5G5B5 || f == D3DDDIFMT_R5G6B5;
++}
++
++static void
++BuildFormatList(D3D9UmdAdapter *adapter)
++{
++   const UINT display = D3DDDIFMT_X8R8G8B8;
++   std::vector<FORMATOP> list;
++   for (D3DDDIFORMAT f : candidateFormats) {
++      FORMATOP op;
++      memset(&op, 0, sizeof(op));
++      op.Format = f;
++      auto check = [&](DWORD usage, D3DRESOURCETYPE rtype) {
++         return nddi_adapter_check_format(adapter->nine, display, usage, rtype, f);
++      };
++      if (check(0, D3DRTYPE_TEXTURE))
++         op.Operations |= FORMATOP_TEXTURE;
++      if (check(0, D3DRTYPE_VOLUMETEXTURE))
++         op.Operations |= FORMATOP_VOLUMETEXTURE;
++      if (check(0, D3DRTYPE_CUBETEXTURE))
++         op.Operations |= FORMATOP_CUBETEXTURE;
++      if (check(0, D3DRTYPE_SURFACE))
++         op.Operations |= FORMATOP_OFFSCREENPLAIN;
++      bool rt = check(D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE);
++      if (rt) {
++         op.Operations |= FORMATOP_OFFSCREEN_RENDERTARGET;
++         if (IsArgbGroup(f))
++            op.Operations |= FORMATOP_SAME_FORMAT_RENDERTARGET | FORMATOP_SAME_FORMAT_UP_TO_ALPHA_RENDERTARGET |
++                             FORMATOP_CONVERT_TO_ARGB;
++         if (!check(D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DRTYPE_SURFACE))
++            op.Operations |= FORMATOP_NOALPHABLEND;
++      }
++      if (check(D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE))
++         op.Operations |= FORMATOP_ZSTENCIL | FORMATOP_ZSTENCIL_WITH_ARBITRARY_COLOR_DEPTH;
++      if (IsArgbGroup(f) && (op.Operations & FORMATOP_TEXTURE))
++         op.Operations |= FORMATOP_MEMBEROFGROUP_ARGB;
++      if (f == D3DDDIFMT_X8R8G8B8 && rt)
++         op.Operations |= FORMATOP_DISPLAYMODE | FORMATOP_3DACCELERATION;
++      if (op.Operations & FORMATOP_TEXTURE) {
++         if (check(D3DUSAGE_QUERY_SRGBREAD, D3DRTYPE_TEXTURE))
++            op.Operations |= FORMATOP_SRGBREAD;
++         if (check(D3DUSAGE_AUTOGENMIPMAP, D3DRTYPE_TEXTURE))
++            op.Operations |= FORMATOP_AUTOGENMIPMAP;
++         if (check(D3DUSAGE_QUERY_VERTEXTEXTURE, D3DRTYPE_TEXTURE))
++            op.Operations |= FORMATOP_VERTEXTEXTURE;
++         if (check(D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DRTYPE_TEXTURE))
++            op.Operations |= FORMATOP_BUMPMAP;
++         if (!check(D3DUSAGE_QUERY_FILTER, D3DRTYPE_TEXTURE))
++            op.Operations |= FORMATOP_NOFILTER;
++      }
++      if (rt && check(D3DUSAGE_QUERY_SRGBWRITE, D3DRTYPE_TEXTURE))
++         op.Operations |= FORMATOP_SRGBWRITE;
++      if (op.Operations & (FORMATOP_OFFSCREEN_RENDERTARGET | FORMATOP_ZSTENCIL)) {
++         for (UINT samples = 2; samples <= 16; samples++) {
++            uint32_t levels = 0;
++            if (nddi_adapter_check_multisample(adapter->nine, f, samples, &levels))
++               op.BltMsTypes |= 1u << (samples - 1);
++         }
++         /* Multisampling includes D3DMULTISAMPLE_NONMASKABLE (bit 0): the runtime's HAL check requires it */
++         if (op.BltMsTypes)
++            op.BltMsTypes |= 1u << (D3DDDIMULTISAMPLE_NONMASKABLE - 1);
++      }
++      if (op.Operations) {
++         list.push_back(op);
++         D3D9UMD_TRACE("  format %u: operations 0x%08x, multisample 0x%x", f, op.Operations, op.BltMsTypes);
++      }
++   }
++   adapter->formatCount = (UINT)list.size();
++   adapter->formats = (FORMATOP *)MALLOC(sizeof(FORMATOP) * list.size());
++   if (adapter->formats)
++      memcpy(adapter->formats, list.data(), sizeof(FORMATOP) * list.size());
++   else
++      adapter->formatCount = 0;
++}
++
++static bool
++ProbeAdapter(D3D9UmdAdapter *adapter)
++{
++   LUID luid;
++   if (!FindVioGpuAdapter(&luid)) {
++      D3D9UmdLog("no virtio-gpu adapter found");
++      return false;
++   }
++   adapter->probeKmt = gdikmt_create_from_luid(luid);
++   if (!adapter->probeKmt)
++      return false;
++   /* The screen's winsys owns the gdikmt device from here on */
++   adapter->probeScreen = virgl_gdi_screen_create(adapter->probeKmt);
++   if (!adapter->probeScreen) {
++      D3D9UmdLog("creating the virgl screen failed");
++      return false;
++   }
++   adapter->nine = nddi_adapter_create(adapter->probeScreen);
++   if (!adapter->nine || !nddi_adapter_get_caps(adapter->nine, &adapter->caps, sizeof(adapter->caps)))
++      return false;
++   /* A DDI-only cap that nine (an API implementation) doesn't know: vertices may carry a separate fog value (nine
++    * takes D3DDECLUSAGE_FOG). The runtime requires it of shader model 2+ drivers, or it reports no HAL where the
++    * adapter drives the display. */
++   adapter->caps.PrimitiveMiscCaps |= D3DPMISCCAPS_FOGINFVF;
++   BuildFormatList(adapter);
++   D3D9UMD_TRACE("probed %s: VS %lx PS %lx, %u formats", adapter->probeScreen->get_name(adapter->probeScreen),
++                 adapter->caps.VertexShaderVersion, adapter->caps.PixelShaderVersion, adapter->formatCount);
++   return true;
++}
++
++static void
++FreeAdapter(D3D9UmdAdapter *adapter)
++{
++   nddi_adapter_destroy(adapter->nine);
++   if (adapter->probeScreen)
++      adapter->probeScreen->destroy(adapter->probeScreen);
++   FREE(adapter->formats);
++   delete adapter;
++}
++
++/* ---- Adapter functions ---- */
++
++static HRESULT APIENTRY
++CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *pCreateData)
++{
++   D3D9UmdAdapter *adapter = (D3D9UmdAdapter *)hAdapter;
++   D3D9UMD_TRACE("CreateDevice interface %u version %u", pCreateData->Interface, pCreateData->Version);
++
++   D3D9UmdDevice *device = new (std::nothrow) D3D9UmdDevice();
++   if (!device)
++      return E_OUTOFMEMORY;
++   device->hRTDevice = pCreateData->hDevice;
++   device->adapter = adapter;
++
++   device->kmt.hRTAdapter = adapter->hRTAdapter;
++   device->kmt.hRTDevice = pCreateData->hDevice;
++   device->kmt.callbacks = *pCreateData->pCallbacks;
++   device->kmt.adapterCallbacks = &adapter->callbacks;
++   gdikmt_d3d9_init(&device->kmt);
++
++   D3D9UMD_TRACE("CreateDevice: creating the virgl screen");
++   device->screen = virgl_gdi_screen_create(&device->kmt.base);
++   if (!device->screen) {
++      D3D9UmdLog("CreateDevice: creating the virgl screen failed");
++      delete device;
++      return E_FAIL;
++   }
++   D3D9UMD_TRACE("CreateDevice: creating the nine device");
++   device->nine = nddi_device_create(adapter->nine, device->screen);
++   if (!device->nine) {
++      device->screen->destroy(device->screen);
++      delete device;
++      return E_FAIL;
++   }
++   device->viewport.max_z = 1.0f;
++
++   D3D9UmdFillStubs(pCreateData->pDeviceFuncs);
++   D3D9UmdFillDeviceFuncs(pCreateData->pDeviceFuncs);
++   pCreateData->hDevice = device;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++CloseAdapter(HANDLE hAdapter)
++{
++   FreeAdapter((D3D9UmdAdapter *)hAdapter);
++   return S_OK;
++}
++
++/* Exported through d3d9.def (undecorated on x86 as well) */
++extern "C" HRESULT APIENTRY
++OpenAdapter(D3DDDIARG_OPENADAPTER *pOpenData)
++{
++   D3D9UmdInstallCrashHandler();
++   D3D9UMD_TRACE("OpenAdapter interface %u version %u", pOpenData->Interface, pOpenData->Version);
++
++   D3D9UmdAdapter *adapter = new (std::nothrow) D3D9UmdAdapter();
++   if (!adapter)
++      return E_OUTOFMEMORY;
++   adapter->hRTAdapter = pOpenData->hAdapter;
++   adapter->callbacks = *pOpenData->pAdapterCallbacks;
++   if (!ProbeAdapter(adapter)) {
++      D3D9UmdLog("OpenAdapter: the GPU can't run Direct3D 9");
++      FreeAdapter(adapter);
++      return E_FAIL;
++   }
++
++   pOpenData->hAdapter = adapter;
++   pOpenData->pAdapterFuncs->pfnGetCaps = D3D9UmdGetCaps;
++   pOpenData->pAdapterFuncs->pfnCreateDevice = CreateDevice;
++   pOpenData->pAdapterFuncs->pfnCloseAdapter = CloseAdapter;
++   pOpenData->DriverVersion = D3D_UMD_INTERFACE_VERSION_WIN7;
++   return S_OK;
++}
+diff --git a/src/gallium/frontends/d3d9umd/caps.cpp b/src/gallium/frontends/d3d9umd/caps.cpp
+new file mode 100644
+index 0000000..7b79d92
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/caps.cpp
+@@ -0,0 +1,197 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* GetCaps: what the D3D9 runtime asks the driver about the GPU. D3DCAPS9 and the format list come from gallium nine
++ * (probed in adapter.cpp); the older DirectDraw/D3D3/D3D7/D3D8 caps structures are derived from D3DCAPS9. */
++
++#include "d3d9umd.h"
++
++#include <string.h>
++
++static const char *
++CapsTypeName(D3DDDICAPS_TYPE type)
++{
++   switch (type) {
++   case D3DDDICAPS_DDRAW: return "DDRAW";
++   case D3DDDICAPS_DDRAW_MODE_SPECIFIC: return "DDRAW_MODE_SPECIFIC";
++   case D3DDDICAPS_GETFORMATCOUNT: return "GETFORMATCOUNT";
++   case D3DDDICAPS_GETFORMATDATA: return "GETFORMATDATA";
++   case D3DDDICAPS_GETMULTISAMPLEQUALITYLEVELS: return "GETMULTISAMPLEQUALITYLEVELS";
++   case D3DDDICAPS_GETD3DQUERYCOUNT: return "GETD3DQUERYCOUNT";
++   case D3DDDICAPS_GETD3DQUERYDATA: return "GETD3DQUERYDATA";
++   case D3DDDICAPS_GETD3D3CAPS: return "GETD3D3CAPS";
++   case D3DDDICAPS_GETD3D5CAPS: return "GETD3D5CAPS";
++   case D3DDDICAPS_GETD3D6CAPS: return "GETD3D6CAPS";
++   case D3DDDICAPS_GETD3D7CAPS: return "GETD3D7CAPS";
++   case D3DDDICAPS_GETD3D8CAPS: return "GETD3D8CAPS";
++   case D3DDDICAPS_GETD3D9CAPS: return "GETD3D9CAPS";
++   default: return "other";
++   }
++}
++
++static void
++FillPrimCaps(D3DPRIMCAPS *p, const D3DCAPS9 &c)
++{
++   memset(p, 0, sizeof(*p));
++   p->dwSize = sizeof(*p);
++   p->dwMiscCaps = c.PrimitiveMiscCaps;
++   p->dwRasterCaps = c.RasterCaps;
++   p->dwZCmpCaps = c.ZCmpCaps;
++   p->dwSrcBlendCaps = c.SrcBlendCaps;
++   p->dwDestBlendCaps = c.DestBlendCaps;
++   p->dwAlphaCmpCaps = c.AlphaCmpCaps;
++   p->dwShadeCaps = c.ShadeCaps;
++   p->dwTextureCaps = c.TextureCaps;
++   p->dwTextureFilterCaps = c.TextureFilterCaps;
++   p->dwTextureBlendCaps = D3DPTBLENDCAPS_ADD | D3DPTBLENDCAPS_MODULATE | D3DPTBLENDCAPS_MODULATEALPHA |
++                           D3DPTBLENDCAPS_DECAL | D3DPTBLENDCAPS_DECALALPHA | D3DPTBLENDCAPS_COPY;
++   p->dwTextureAddressCaps = c.TextureAddressCaps;
++}
++
++static void
++FillD3D3Caps(D3DHAL_GLOBALDRIVERDATA *g, const D3DCAPS9 &c)
++{
++   memset(g, 0, sizeof(*g));
++   g->dwSize = sizeof(*g);
++   D3DDEVICEDESC_V1 *d = &g->hwCaps;
++   d->dwSize = sizeof(*d);
++   d->dwFlags = D3DDD_COLORMODEL | D3DDD_DEVCAPS | D3DDD_TRANSFORMCAPS | D3DDD_LIGHTINGCAPS | D3DDD_BCLIPPING |
++                D3DDD_LINECAPS | D3DDD_TRICAPS | D3DDD_DEVICERENDERBITDEPTH | D3DDD_DEVICEZBUFFERBITDEPTH;
++   d->dcmColorModel = D3DCOLOR_RGB;
++   d->dwDevCaps = c.DevCaps;
++   d->dtcTransformCaps.dwSize = sizeof(d->dtcTransformCaps);
++   d->dtcTransformCaps.dwCaps = D3DTRANSFORMCAPS_CLIP;
++   d->bClipping = TRUE;
++   d->dlcLightingCaps.dwSize = sizeof(d->dlcLightingCaps);
++   d->dlcLightingCaps.dwCaps = D3DLIGHTCAPS_POINT | D3DLIGHTCAPS_SPOT | D3DLIGHTCAPS_DIRECTIONAL;
++   d->dlcLightingCaps.dwLightingModel = D3DLIGHTINGMODEL_RGB;
++   d->dlcLightingCaps.dwNumLights = c.MaxActiveLights;
++   FillPrimCaps(&d->dpcLineCaps, c);
++   FillPrimCaps(&d->dpcTriCaps, c);
++   d->dwDeviceRenderBitDepth = DDBD_16 | DDBD_24 | DDBD_32;
++   d->dwDeviceZBufferBitDepth = DDBD_16 | DDBD_24 | DDBD_32;
++}
++
++static void
++FillD3D7Caps(D3DHAL_D3DEXTENDEDCAPS *e, const D3DCAPS9 &c)
++{
++   memset(e, 0, sizeof(*e));
++   e->dwSize = sizeof(*e);
++   e->dwMinTextureWidth = 1;
++   e->dwMaxTextureWidth = c.MaxTextureWidth;
++   e->dwMinTextureHeight = 1;
++   e->dwMaxTextureHeight = c.MaxTextureHeight;
++   e->dwMaxTextureRepeat = c.MaxTextureRepeat;
++   e->dwMaxTextureAspectRatio = c.MaxTextureAspectRatio;
++   e->dwMaxAnisotropy = c.MaxAnisotropy;
++   e->dvGuardBandLeft = c.GuardBandLeft;
++   e->dvGuardBandTop = c.GuardBandTop;
++   e->dvGuardBandRight = c.GuardBandRight;
++   e->dvGuardBandBottom = c.GuardBandBottom;
++   e->dvExtentsAdjust = c.ExtentsAdjust;
++   e->dwStencilCaps = c.StencilCaps;
++   e->dwFVFCaps = c.FVFCaps;
++   e->dwTextureOpCaps = c.TextureOpCaps;
++   e->wMaxTextureBlendStages = (WORD)c.MaxTextureBlendStages;
++   e->wMaxSimultaneousTextures = (WORD)c.MaxSimultaneousTextures;
++   e->dwMaxActiveLights = c.MaxActiveLights;
++   e->dvMaxVertexW = c.MaxVertexW;
++   e->wMaxUserClipPlanes = (WORD)c.MaxUserClipPlanes;
++   e->wMaxVertexBlendMatrices = (WORD)c.MaxVertexBlendMatrices;
++   e->dwVertexProcessingCaps = c.VertexProcessingCaps;
++}
++
++/* Writes a value of type T into the caller's buffer if it's big enough */
++template <typename T>
++static HRESULT
++Put(const D3DDDIARG_GETCAPS *p, const T &value)
++{
++   if (!p->pData || p->DataSize < sizeof(T))
++      return E_INVALIDARG;
++   memcpy(p->pData, &value, sizeof(T));
++   return S_OK;
++}
++
++HRESULT APIENTRY
++D3D9UmdGetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *p)
++{
++   D3D9UmdAdapter *adapter = (D3D9UmdAdapter *)hAdapter;
++   const D3DCAPS9 &c = adapter->caps;
++   D3D9UMD_TRACE("GetCaps %s (%d), %u bytes", CapsTypeName(p->Type), (int)p->Type, p->DataSize);
++
++   switch (p->Type) {
++   case D3DDDICAPS_DDRAW: {
++      DDRAW_CAPS caps;
++      memset(&caps, 0, sizeof(caps));
++      caps.Caps = DDRAW_CAPS_BLTDEPTHFILL;
++      caps.Caps2 = DDRAW_CAPS2_FLIPNOVSYNC | DDRAW_CAPS2_DYNAMICTEXTURES;
++      return Put(p, caps);
++   }
++   case D3DDDICAPS_DDRAW_MODE_SPECIFIC: {
++      DDRAW_MODE_SPECIFIC_CAPS caps;
++      memset(&caps, 0, sizeof(caps));
++      if (p->pInfo)
++         caps.Head = *(const UINT *)p->pInfo;
++      return Put(p, caps);
++   }
++   case D3DDDICAPS_GETFORMATCOUNT:
++      return Put(p, adapter->formatCount);
++   case D3DDDICAPS_GETFORMATDATA: {
++      UINT bytes = adapter->formatCount * sizeof(FORMATOP);
++      if (!p->pData || p->DataSize < bytes)
++         return E_INVALIDARG;
++      memcpy(p->pData, adapter->formats, bytes);
++      return S_OK;
++   }
++   case D3DDDICAPS_GETMULTISAMPLEQUALITYLEVELS: {
++      DDIMULTISAMPLEQUALITYLEVELSDATA *ms = (DDIMULTISAMPLEQUALITYLEVELSDATA *)p->pData;
++      if (!ms || p->DataSize < sizeof(*ms))
++         return E_INVALIDARG;
++      uint32_t levels = 0;
++      if (ms->MsType == D3DDDIMULTISAMPLE_NONE)
++         levels = 1;
++      else if (!nddi_adapter_check_multisample(adapter->nine, ms->Format, ms->MsType, &levels))
++         levels = 0;
++      ms->QualityLevels = levels;
++      return S_OK;
++   }
++   case D3DDDICAPS_GETD3DQUERYCOUNT:
++      return Put(p, (UINT)2);
++   case D3DDDICAPS_GETD3DQUERYDATA: {
++      const D3DDDIQUERYTYPE queries[] = {D3DDDIQUERYTYPE_EVENT, D3DDDIQUERYTYPE_OCCLUSION};
++      if (!p->pData || p->DataSize < sizeof(queries))
++         return E_INVALIDARG;
++      memcpy(p->pData, queries, sizeof(queries));
++      return S_OK;
++   }
++   case D3DDDICAPS_GETD3D3CAPS: {
++      D3DHAL_GLOBALDRIVERDATA data;
++      FillD3D3Caps(&data, c);
++      return Put(p, data);
++   }
++   case D3DDDICAPS_GETD3D7CAPS: {
++      D3DHAL_D3DEXTENDEDCAPS data;
++      FillD3D7Caps(&data, c);
++      return Put(p, data);
++   }
++   case D3DDDICAPS_GETD3D8CAPS: {
++      /* D3DCAPS8 is the start of D3DCAPS9 */
++      if (!p->pData || p->DataSize < sizeof(D3DCAPS8))
++         return E_INVALIDARG;
++      memcpy(p->pData, &c, sizeof(D3DCAPS8));
++      return S_OK;
++   }
++   case D3DDDICAPS_GETD3D9CAPS:
++      return Put(p, c);
++   case D3DDDICAPS_GETD3D5CAPS:
++   case D3DDDICAPS_GETD3D6CAPS:
++   default:
++      /* Video decode/processing, overlays, content protection, ...: nothing to report. Counts are zero. */
++      if (p->pData && p->DataSize)
++         memset(p->pData, 0, p->DataSize);
++      D3D9UMD_TRACE("GetCaps: nothing for type %d", (int)p->Type);
++      return S_OK;
++   }
++}
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd.h b/src/gallium/frontends/d3d9umd/d3d9umd.h
+new file mode 100644
+index 0000000..5dfc146
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/d3d9umd.h
+@@ -0,0 +1,90 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * d3d9umd: a Direct3D 9 WDDM user-mode driver (the D3D9 DDI: OpenAdapter + D3DDDI_DEVICEFUNCS) on top of gallium.
++ * This is the DDI side; the D3D9 work is done by the gallium nine state tracker behind d3d9umd_bridge.h.
++ */
++
++#ifndef D3D9UMD_H
++#define D3D9UMD_H
++
++#include <windows.h>
++#include "winddk_compat.h"
++
++#include <d3d9.h>
++#include <d3dumddi.h>
++#include <d3dhal.h>
++
++#include "d3d9umd_bridge.h"
++#include "gdikmt_d3d9.h"
++
++struct pipe_screen;
++
++struct D3D9UmdAdapter {
++   HANDLE hRTAdapter;
++   D3DDDI_ADAPTERCALLBACKS callbacks;
++
++   /* What the GPU supports, from a gallium screen on a D3DKMT device of our own (the runtime asks before any
++    * device exists) */
++   struct gdikmt_device *probeKmt;
++   struct pipe_screen *probeScreen;
++   struct nddi_adapter *nine;
++   D3DCAPS9 caps;
++   FORMATOP *formats;
++   UINT formatCount;
++};
++
++struct D3D9UmdResource {
++   HANDLE hRTResource;
++   D3DDDIFORMAT format;
++   D3DDDI_POOL pool;
++   D3DDDI_RESOURCEFLAGS flags;
++   UINT surfCount;
++   UINT width, height;      /* of subresource 0 */
++   struct nddi_resource *nine;
++};
++
++
++struct D3D9UmdDevice {
++   HANDLE hRTDevice;
++   D3D9UmdAdapter *adapter;
++   struct gdikmt_device_d3d9 kmt;
++   struct pipe_screen *screen;
++   struct nddi_device *nine;
++
++   bool inScene;
++   struct nddi_viewport viewport;   /* the DDI sets position/size and the z range separately */
++   D3D9UmdResource *renderTarget0;
++
++   /* For the DrawPrimitive2/DrawIndexedPrimitive2 variants, which give byte offsets into stream 0 and indices */
++   UINT streamStride[16];
++   D3D9UmdResource *indexBuffer;    /* or user memory indices: */
++   const void *memoryIndices;
++   UINT memoryIndexSize;
++};
++
++static inline D3D9UmdDevice *D3D9UmdCastDevice(HANDLE h) { return (D3D9UmdDevice *)h; }
++static inline D3D9UmdResource *D3D9UmdCastResource(HANDLE h) { return (D3D9UmdResource *)h; }
++
++/* Logging through OutputDebugString (also to a file when C:\viogpu_d3d9_trace.txt exists, see debug.cpp) */
++void D3D9UmdLog(const char *format, ...);
++bool D3D9UmdTracing(void);
++void D3D9UmdTraceLog(const char *format, ...);
++#define D3D9UMD_TRACE(...) do { if (D3D9UmdTracing()) D3D9UmdTraceLog(__VA_ARGS__); } while (0)
++
++/* For DDI entry points that aren't implemented yet: logs the first call of each and returns S_OK */
++HRESULT D3D9UmdUnimplemented(const char *name);
++
++/* When tracing: logs crashes (exception, module+offset, stack) before the process dies */
++void D3D9UmdInstallCrashHandler(void);
++
++void D3D9UmdFillStubs(D3DDDI_DEVICEFUNCS *funcs);
++void D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *funcs);
++void D3D9UmdFillPipelineFuncs(D3DDDI_DEVICEFUNCS *funcs);
++
++HRESULT APIENTRY D3D9UmdGetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *pData);
++
++#endif /* D3D9UMD_H */
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h b/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
+new file mode 100644
+index 0000000..3800349
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
+@@ -0,0 +1,199 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * The boundary between the two halves of d3d9umd:
++ *
++ * - the DDI side (adapter.cpp, device.cpp, ...) implements the D3D9 user-mode driver interface with the Windows
++ *   WDK headers (d3dumddi.h, which pulls in the SDK's d3d9types.h);
++ * - the nine side (nine_bridge.c) drives the gallium nine state tracker, which has its own D3D9 headers
++ *   (include/D3D9).
++ *
++ * The two sets of headers can't be included together, so only plain C types cross this boundary. D3D9 enums
++ * (formats, render states, primitive types, D3DUSAGE, D3DLOCK, D3DCLEAR, ...) have the same values in the DDI and
++ * the API, and travel as uint32_t; HRESULTs as int32_t.
++ */
++
++#ifndef D3D9UMD_BRIDGE_H
++#define D3D9UMD_BRIDGE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct pipe_screen;
++struct pipe_resource;
++
++struct nddi_adapter;
++struct nddi_device;
++struct nddi_resource;
++
++struct nddi_rect {
++   int32_t left, top, right, bottom;
++};
++
++struct nddi_box {
++   uint32_t left, top, right, bottom, front, back;
++};
++
++struct nddi_viewport {
++   uint32_t x, y, width, height;
++   float min_z, max_z;
++};
++
++/* ---- Adapter: what a pipe_screen supports ---- */
++
++struct nddi_adapter *nddi_adapter_create(struct pipe_screen *screen);
++void nddi_adapter_destroy(struct nddi_adapter *adapter);
++
++/* Fills a D3DCAPS9 (both header sets have the same layout; size is checked) */
++bool nddi_adapter_get_caps(struct nddi_adapter *adapter, void *d3dcaps9, unsigned size);
++
++/* IDirect3D9::CheckDeviceFormat for a HAL device; usage is D3DUSAGE_*, rtype D3DRTYPE_* */
++bool nddi_adapter_check_format(struct nddi_adapter *adapter, uint32_t adapter_format, uint32_t usage,
++                               uint32_t rtype, uint32_t format);
++
++/* IDirect3D9::CheckDeviceMultiSampleType; returns false if unsupported */
++bool nddi_adapter_check_multisample(struct nddi_adapter *adapter, uint32_t format, uint32_t samples,
++                                    uint32_t *quality_levels);
++
++/* ---- Device ---- */
++
++struct nddi_device *nddi_device_create(struct nddi_adapter *adapter, struct pipe_screen *screen);
++void nddi_device_destroy(struct nddi_device *dev);
++
++enum nddi_resource_kind {
++   NDDI_SURFACE,           /* offscreen plain surface */
++   NDDI_RENDER_TARGET,
++   NDDI_DEPTH_STENCIL,
++   NDDI_TEXTURE,
++   NDDI_CUBE_TEXTURE,
++   NDDI_VOLUME_TEXTURE,
++   NDDI_VERTEX_BUFFER,
++   NDDI_INDEX_BUFFER,
++};
++
++struct nddi_resource_desc {
++   enum nddi_resource_kind kind;
++   uint32_t format;         /* D3DFORMAT */
++   uint32_t width;          /* bytes for buffers */
++   uint32_t height;
++   uint32_t depth;
++   uint32_t levels;
++   uint32_t usage;          /* D3DUSAGE_* */
++   uint32_t multisample;    /* D3DMULTISAMPLE_TYPE */
++   uint32_t multisample_quality;
++   bool lockable;
++   uint32_t fvf;
++   /* System memory resources: one runtime-owned buffer per subresource (levels, or levels * 6 for cubes) */
++   bool system_memory;
++   void *const *sysmem;
++   const uint32_t *sysmem_pitch;
++};
++
++int32_t nddi_resource_create(struct nddi_device *dev, const struct nddi_resource_desc *desc,
++                             struct nddi_resource **out);
++void nddi_resource_destroy(struct nddi_resource *res);
++
++/* The pipe_resource behind a subresource (for presentation), and its mip level / array layer */
++struct pipe_resource *nddi_resource_get_pipe(struct nddi_resource *res, unsigned subresource, unsigned *level,
++                                             unsigned *layer);
++
++/* CPU access; box is NULL for the whole subresource. flags are D3DLOCK_* */
++int32_t nddi_resource_lock(struct nddi_resource *res, unsigned subresource, const struct nddi_box *box,
++                           uint32_t flags, void **data, uint32_t *pitch, uint32_t *slice_pitch);
++int32_t nddi_resource_unlock(struct nddi_resource *res, unsigned subresource);
++/* The runtime wrote a system memory resource itself (it only notifies the driver of such locks) */
++void nddi_resource_written(struct nddi_resource *res);
++
++/* Copies between surfaces (any pool): UpdateSurface, GetRenderTargetData or StretchRect depending on the pools.
++ * filter is D3DTEXTUREFILTERTYPE. */
++int32_t nddi_blt(struct nddi_device *dev, struct nddi_resource *src, unsigned src_sub, const struct nddi_rect *src_rect,
++                 struct nddi_resource *dst, unsigned dst_sub, const struct nddi_rect *dst_rect, uint32_t filter);
++int32_t nddi_color_fill(struct nddi_device *dev, struct nddi_resource *res, unsigned subresource,
++                        const struct nddi_rect *rect, uint32_t color);
++
++/* ---- State ---- */
++
++int32_t nddi_set_render_state(struct nddi_device *dev, uint32_t state, uint32_t value);
++int32_t nddi_set_render_target(struct nddi_device *dev, uint32_t index, struct nddi_resource *res,
++                               unsigned subresource);
++int32_t nddi_set_depth_stencil(struct nddi_device *dev, struct nddi_resource *res);
++int32_t nddi_set_viewport(struct nddi_device *dev, const struct nddi_viewport *viewport);
++int32_t nddi_set_scissor(struct nddi_device *dev, const struct nddi_rect *rect);
++
++/* Vertex and index data: from a buffer resource, or from user memory (the DDI's "Um" calls), which is uploaded
++ * per draw */
++int32_t nddi_set_stream_source(struct nddi_device *dev, uint32_t stream, struct nddi_resource *vb, uint32_t offset,
++                               uint32_t stride);
++int32_t nddi_set_stream_source_memory(struct nddi_device *dev, uint32_t stream, const void *data, uint32_t stride);
++int32_t nddi_set_stream_source_freq(struct nddi_device *dev, uint32_t stream, uint32_t setting);
++int32_t nddi_set_indices(struct nddi_device *dev, struct nddi_resource *ib);
++int32_t nddi_set_indices_memory(struct nddi_device *dev, const void *data, uint32_t index_size);
++
++/* Shaders and vertex declarations (opaque objects owned by the DDI side) */
++struct nddi_object;
++struct nddi_vertex_element {   /* D3DVERTEXELEMENT9 / D3DDDIVERTEXELEMENT */
++   uint16_t stream, offset;
++   uint8_t type, method, usage, usage_index;
++};
++int32_t nddi_create_vertex_declaration(struct nddi_device *dev, const struct nddi_vertex_element *elements,
++                                       uint32_t count, struct nddi_object **out);
++int32_t nddi_set_vertex_declaration(struct nddi_device *dev, struct nddi_object *decl);
++int32_t nddi_create_vertex_shader(struct nddi_device *dev, const uint32_t *code, struct nddi_object **out);
++int32_t nddi_set_vertex_shader(struct nddi_device *dev, struct nddi_object *shader);
++int32_t nddi_create_pixel_shader(struct nddi_device *dev, const uint32_t *code, struct nddi_object **out);
++int32_t nddi_set_pixel_shader(struct nddi_device *dev, struct nddi_object *shader);
++void nddi_object_destroy(struct nddi_object *obj);
++
++int32_t nddi_set_shader_constants_f(struct nddi_device *dev, bool pixel, uint32_t start, const float *data,
++                                    uint32_t vec4_count);
++int32_t nddi_set_shader_constants_i(struct nddi_device *dev, bool pixel, uint32_t start, const int32_t *data,
++                                    uint32_t vec4_count);
++int32_t nddi_set_shader_constants_b(struct nddi_device *dev, bool pixel, uint32_t start, const int32_t *data,
++                                    uint32_t count);
++
++/* Textures and samplers; stage uses the API numbering (0-15, D3DDMAPSAMPLER, D3DVERTEXTEXTURESAMPLER0-3) */
++int32_t nddi_set_texture(struct nddi_device *dev, uint32_t stage, struct nddi_resource *texture);
++int32_t nddi_set_sampler_state(struct nddi_device *dev, uint32_t stage, uint32_t type, uint32_t value);
++int32_t nddi_set_texture_stage_state(struct nddi_device *dev, uint32_t stage, uint32_t type, uint32_t value);
++int32_t nddi_generate_mip_sublevels(struct nddi_resource *texture);
++
++/* Fixed function; matrices are 16 floats, material and light are D3DMATERIAL9 and D3DLIGHT9 */
++int32_t nddi_set_transform(struct nddi_device *dev, uint32_t type, const float *matrix, bool multiply);
++int32_t nddi_set_material(struct nddi_device *dev, const void *material);
++int32_t nddi_set_light(struct nddi_device *dev, uint32_t index, const void *light);
++int32_t nddi_light_enable(struct nddi_device *dev, uint32_t index, bool enable);
++int32_t nddi_set_clip_plane(struct nddi_device *dev, uint32_t index, const float *plane);
++
++/* Queries (D3DQUERYTYPE); get_data returns S_FALSE until the result is ready */
++int32_t nddi_create_query(struct nddi_device *dev, uint32_t type, struct nddi_object **out);
++int32_t nddi_issue_query(struct nddi_object *query, uint32_t flags);
++int32_t nddi_get_query_data(struct nddi_object *query, void *data, uint32_t size);
++uint32_t nddi_get_query_data_size(struct nddi_object *query);
++
++/* ---- Commands ---- */
++
++int32_t nddi_begin_scene(struct nddi_device *dev);
++int32_t nddi_end_scene(struct nddi_device *dev);
++int32_t nddi_clear(struct nddi_device *dev, uint32_t rect_count, const struct nddi_rect *rects, uint32_t flags,
++                   uint32_t color, float z, uint32_t stencil);
++int32_t nddi_draw_primitive(struct nddi_device *dev, uint32_t type, uint32_t start_vertex, uint32_t count);
++int32_t nddi_draw_indexed_primitive(struct nddi_device *dev, uint32_t type, int32_t base_vertex, uint32_t min_index,
++                                    uint32_t num_vertices, uint32_t start_index, uint32_t count);
++/* Development tracing: logs the draw state nine has (shaders, declaration, constants, streams) */
++void nddi_debug_draw_state(struct nddi_device *dev, void (*log)(const char *format, ...));
++
++/* Flushes pending rendering to the GPU; the pipe_context is returned for presentation */
++struct pipe_context *nddi_flush(struct nddi_device *dev);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* D3D9UMD_BRIDGE_H */
+diff --git a/src/gallium/frontends/d3d9umd/ddi_stubs.cpp b/src/gallium/frontends/d3d9umd/ddi_stubs.cpp
+new file mode 100644
+index 0000000..d955350
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/ddi_stubs.cpp
+@@ -0,0 +1,1008 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * Generated from d3dumddi.h: a typed stub for every D3DDDI_DEVICEFUNCS entry, so the runtime never calls a NULL
++ * pointer. device.cpp overrides the implemented ones. Regenerate with gen_stubs.py when the DDI grows.
++ */
++
++#include "d3d9umd.h"
++
++static HRESULT APIENTRY
++StubSetRenderState(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_RENDERSTATE*)
++{
++   return D3D9UmdUnimplemented("SetRenderState");
++}
++
++static HRESULT APIENTRY
++StubUpdateWInfo(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_WINFO*)
++{
++   return D3D9UmdUnimplemented("UpdateWInfo");
++}
++
++static HRESULT APIENTRY
++StubValidateDevice(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_VALIDATETEXTURESTAGESTATE*)
++{
++   return D3D9UmdUnimplemented("ValidateDevice");
++}
++
++static HRESULT APIENTRY
++StubSetTextureStageState(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_TEXTURESTAGESTATE*)
++{
++   return D3D9UmdUnimplemented("SetTextureStageState");
++}
++
++static HRESULT APIENTRY
++StubSetTexture(_In_ HANDLE hDevice, _In_ UINT, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("SetTexture");
++}
++
++static HRESULT APIENTRY
++StubSetPixelShader(_In_ HANDLE hDevice, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("SetPixelShader");
++}
++
++static HRESULT APIENTRY
++StubSetPixelShaderConst(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETPIXELSHADERCONST*, _In_ CONST FLOAT*)
++{
++   return D3D9UmdUnimplemented("SetPixelShaderConst");
++}
++
++static HRESULT APIENTRY
++StubSetStreamSourceUm(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETSTREAMSOURCEUM*, _In_ CONST VOID*)
++{
++   return D3D9UmdUnimplemented("SetStreamSourceUm");
++}
++
++static HRESULT APIENTRY
++StubSetIndices(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETINDICES*)
++{
++   return D3D9UmdUnimplemented("SetIndices");
++}
++
++static HRESULT APIENTRY
++StubSetIndicesUm(_In_ HANDLE hDevice, _In_ UINT, _In_ CONST VOID*)
++{
++   return D3D9UmdUnimplemented("SetIndicesUm");
++}
++
++static HRESULT APIENTRY
++StubDrawPrimitive(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DRAWPRIMITIVE*, _In_opt_ CONST UINT*)
++{
++   return D3D9UmdUnimplemented("DrawPrimitive");
++}
++
++static HRESULT APIENTRY
++StubDrawIndexedPrimitive(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DRAWINDEXEDPRIMITIVE*)
++{
++   return D3D9UmdUnimplemented("DrawIndexedPrimitive");
++}
++
++static HRESULT APIENTRY
++StubDrawRectPatch(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DRAWRECTPATCH*, _In_ CONST D3DDDIRECTPATCH_INFO*, _In_ CONST FLOAT*)
++{
++   return D3D9UmdUnimplemented("DrawRectPatch");
++}
++
++static HRESULT APIENTRY
++StubDrawTriPatch(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DRAWTRIPATCH*, _In_ CONST D3DDDITRIPATCH_INFO*, _In_ CONST FLOAT*)
++{
++   return D3D9UmdUnimplemented("DrawTriPatch");
++}
++
++static HRESULT APIENTRY
++StubDrawPrimitive2(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DRAWPRIMITIVE2*)
++{
++   return D3D9UmdUnimplemented("DrawPrimitive2");
++}
++
++static HRESULT APIENTRY
++StubDrawIndexedPrimitive2(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DRAWINDEXEDPRIMITIVE2*, _In_ UINT, _In_ CONST VOID*, _In_opt_ CONST UINT*)
++{
++   return D3D9UmdUnimplemented("DrawIndexedPrimitive2");
++}
++
++static HRESULT APIENTRY
++StubVolBlt(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_VOLUMEBLT*)
++{
++   return D3D9UmdUnimplemented("VolBlt");
++}
++
++static HRESULT APIENTRY
++StubBufBlt(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_BUFFERBLT*)
++{
++   return D3D9UmdUnimplemented("BufBlt");
++}
++
++static HRESULT APIENTRY
++StubTexBlt(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_TEXBLT*)
++{
++   return D3D9UmdUnimplemented("TexBlt");
++}
++
++static HRESULT APIENTRY
++StubStateSet(_In_ HANDLE hDevice, _In_ D3DDDIARG_STATESET*)
++{
++   return D3D9UmdUnimplemented("StateSet");
++}
++
++static HRESULT APIENTRY
++StubSetPriority(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETPRIORITY*)
++{
++   return D3D9UmdUnimplemented("SetPriority");
++}
++
++static HRESULT APIENTRY
++StubClear(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_CLEAR*, _In_ UINT, _In_ CONST RECT*)
++{
++   return D3D9UmdUnimplemented("Clear");
++}
++
++static HRESULT APIENTRY
++StubUpdatePalette(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_UPDATEPALETTE*, _In_ CONST PALETTEENTRY*)
++{
++   return D3D9UmdUnimplemented("UpdatePalette");
++}
++
++static HRESULT APIENTRY
++StubSetPalette(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETPALETTE*)
++{
++   return D3D9UmdUnimplemented("SetPalette");
++}
++
++static HRESULT APIENTRY
++StubSetVertexShaderConst(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETVERTEXSHADERCONST*, _In_ CONST VOID*)
++{
++   return D3D9UmdUnimplemented("SetVertexShaderConst");
++}
++
++static HRESULT APIENTRY
++StubMultiplyTransform(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_MULTIPLYTRANSFORM*)
++{
++   return D3D9UmdUnimplemented("MultiplyTransform");
++}
++
++static HRESULT APIENTRY
++StubSetTransform(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETTRANSFORM*)
++{
++   return D3D9UmdUnimplemented("SetTransform");
++}
++
++static HRESULT APIENTRY
++StubSetViewport(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_VIEWPORTINFO*)
++{
++   return D3D9UmdUnimplemented("SetViewport");
++}
++
++static HRESULT APIENTRY
++StubSetZRange(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_ZRANGE*)
++{
++   return D3D9UmdUnimplemented("SetZRange");
++}
++
++static HRESULT APIENTRY
++StubSetMaterial(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETMATERIAL*)
++{
++   return D3D9UmdUnimplemented("SetMaterial");
++}
++
++static HRESULT APIENTRY
++StubSetLight(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETLIGHT*, _In_ CONST D3DDDI_LIGHT*)
++{
++   return D3D9UmdUnimplemented("SetLight");
++}
++
++static HRESULT APIENTRY
++StubCreateLight(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_CREATELIGHT*)
++{
++   return D3D9UmdUnimplemented("CreateLight");
++}
++
++static HRESULT APIENTRY
++StubDestroyLight(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DESTROYLIGHT*)
++{
++   return D3D9UmdUnimplemented("DestroyLight");
++}
++
++static HRESULT APIENTRY
++StubSetClipPlane(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETCLIPPLANE*)
++{
++   return D3D9UmdUnimplemented("SetClipPlane");
++}
++
++static HRESULT APIENTRY
++StubGetInfo(_In_ HANDLE hDevice, _In_ UINT, _Out_writes_bytes_(DevInfoSize)VOID*, _In_ UINT DevInfoSize)
++{
++   return D3D9UmdUnimplemented("GetInfo");
++}
++
++static HRESULT APIENTRY
++StubLock(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_LOCK*)
++{
++   return D3D9UmdUnimplemented("Lock");
++}
++
++static HRESULT APIENTRY
++StubUnlock(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_UNLOCK*)
++{
++   return D3D9UmdUnimplemented("Unlock");
++}
++
++static HRESULT APIENTRY
++StubCreateResource(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATERESOURCE*)
++{
++   return D3D9UmdUnimplemented("CreateResource");
++}
++
++static HRESULT APIENTRY
++StubDestroyResource(_In_ HANDLE hDevice, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("DestroyResource");
++}
++
++static HRESULT APIENTRY
++StubSetDisplayMode(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETDISPLAYMODE*)
++{
++   return D3D9UmdUnimplemented("SetDisplayMode");
++}
++
++static HRESULT APIENTRY
++StubPresent(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_PRESENT*)
++{
++   return D3D9UmdUnimplemented("Present");
++}
++
++static HRESULT APIENTRY
++StubFlush(_In_ HANDLE hDevice)
++{
++   return D3D9UmdUnimplemented("Flush");
++}
++
++static HRESULT APIENTRY
++StubCreateVertexShaderFunc(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEVERTEXSHADERFUNC*, _In_ CONST UINT*)
++{
++   return D3D9UmdUnimplemented("CreateVertexShaderFunc");
++}
++
++static HRESULT APIENTRY
++StubDeleteVertexShaderFunc(_In_ HANDLE hDevice, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("DeleteVertexShaderFunc");
++}
++
++static HRESULT APIENTRY
++StubSetVertexShaderFunc(_In_ HANDLE hDevice, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("SetVertexShaderFunc");
++}
++
++static HRESULT APIENTRY
++StubCreateVertexShaderDecl(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEVERTEXSHADERDECL*, _In_ CONST D3DDDIVERTEXELEMENT*)
++{
++   return D3D9UmdUnimplemented("CreateVertexShaderDecl");
++}
++
++static HRESULT APIENTRY
++StubDeleteVertexShaderDecl(_In_ HANDLE hDevice, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("DeleteVertexShaderDecl");
++}
++
++static HRESULT APIENTRY
++StubSetVertexShaderDecl(_In_ HANDLE hDevice, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("SetVertexShaderDecl");
++}
++
++static HRESULT APIENTRY
++StubSetVertexShaderConstI(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETVERTEXSHADERCONSTI*, _In_ CONST INT*)
++{
++   return D3D9UmdUnimplemented("SetVertexShaderConstI");
++}
++
++static HRESULT APIENTRY
++StubSetVertexShaderConstB(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETVERTEXSHADERCONSTB*, _In_ CONST BOOL*)
++{
++   return D3D9UmdUnimplemented("SetVertexShaderConstB");
++}
++
++static HRESULT APIENTRY
++StubSetScissorRect(_In_ HANDLE hDevice, _In_ CONST RECT*)
++{
++   return D3D9UmdUnimplemented("SetScissorRect");
++}
++
++static HRESULT APIENTRY
++StubSetStreamSource(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETSTREAMSOURCE*)
++{
++   return D3D9UmdUnimplemented("SetStreamSource");
++}
++
++static HRESULT APIENTRY
++StubSetStreamSourceFreq(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETSTREAMSOURCEFREQ*)
++{
++   return D3D9UmdUnimplemented("SetStreamSourceFreq");
++}
++
++static HRESULT APIENTRY
++StubSetConvolutionKernelMono(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETCONVOLUTIONKERNELMONO*)
++{
++   return D3D9UmdUnimplemented("SetConvolutionKernelMono");
++}
++
++static HRESULT APIENTRY
++StubComposeRects(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_COMPOSERECTS*)
++{
++   return D3D9UmdUnimplemented("ComposeRects");
++}
++
++static HRESULT APIENTRY
++StubBlt(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_BLT*)
++{
++   return D3D9UmdUnimplemented("Blt");
++}
++
++static HRESULT APIENTRY
++StubColorFill(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_COLORFILL*)
++{
++   return D3D9UmdUnimplemented("ColorFill");
++}
++
++static HRESULT APIENTRY
++StubDepthFill(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DEPTHFILL*)
++{
++   return D3D9UmdUnimplemented("DepthFill");
++}
++
++static HRESULT APIENTRY
++StubCreateQuery(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEQUERY*)
++{
++   return D3D9UmdUnimplemented("CreateQuery");
++}
++
++static HRESULT APIENTRY
++StubDestroyQuery(_In_ HANDLE hDevice, _In_ CONST HANDLE)
++{
++   return D3D9UmdUnimplemented("DestroyQuery");
++}
++
++static HRESULT APIENTRY
++StubIssueQuery(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_ISSUEQUERY*)
++{
++   return D3D9UmdUnimplemented("IssueQuery");
++}
++
++static HRESULT APIENTRY
++StubGetQueryData(_In_ HANDLE hDevice, _Inout_ CONST D3DDDIARG_GETQUERYDATA*)
++{
++   return D3D9UmdUnimplemented("GetQueryData");
++}
++
++static HRESULT APIENTRY
++StubSetRenderTarget(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETRENDERTARGET*)
++{
++   return D3D9UmdUnimplemented("SetRenderTarget");
++}
++
++static HRESULT APIENTRY
++StubSetDepthStencil(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETDEPTHSTENCIL*)
++{
++   return D3D9UmdUnimplemented("SetDepthStencil");
++}
++
++static HRESULT APIENTRY
++StubGenerateMipSubLevels(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_GENERATEMIPSUBLEVELS*)
++{
++   return D3D9UmdUnimplemented("GenerateMipSubLevels");
++}
++
++static HRESULT APIENTRY
++StubSetPixelShaderConstI(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETPIXELSHADERCONSTI*, _In_ CONST INT*)
++{
++   return D3D9UmdUnimplemented("SetPixelShaderConstI");
++}
++
++static HRESULT APIENTRY
++StubSetPixelShaderConstB(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETPIXELSHADERCONSTB*, _In_ CONST BOOL*)
++{
++   return D3D9UmdUnimplemented("SetPixelShaderConstB");
++}
++
++static HRESULT APIENTRY
++StubCreatePixelShader(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEPIXELSHADER*, _In_ CONST UINT*)
++{
++   return D3D9UmdUnimplemented("CreatePixelShader");
++}
++
++static HRESULT APIENTRY
++StubDeletePixelShader(_In_ HANDLE hDevice, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("DeletePixelShader");
++}
++
++static HRESULT APIENTRY
++StubCreateDecodeDevice(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEDECODEDEVICE*)
++{
++   return D3D9UmdUnimplemented("CreateDecodeDevice");
++}
++
++static HRESULT APIENTRY
++StubDestroyDecodeDevice(_In_ HANDLE hDevice, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("DestroyDecodeDevice");
++}
++
++static HRESULT APIENTRY
++StubSetDecodeRenderTarget(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETDECODERENDERTARGET*)
++{
++   return D3D9UmdUnimplemented("SetDecodeRenderTarget");
++}
++
++static HRESULT APIENTRY
++StubDecodeBeginFrame(_In_ HANDLE hDevice, _In_ D3DDDIARG_DECODEBEGINFRAME*)
++{
++   return D3D9UmdUnimplemented("DecodeBeginFrame");
++}
++
++static HRESULT APIENTRY
++StubDecodeEndFrame(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_DECODEENDFRAME*)
++{
++   return D3D9UmdUnimplemented("DecodeEndFrame");
++}
++
++static HRESULT APIENTRY
++StubDecodeExecute(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DECODEEXECUTE*)
++{
++   return D3D9UmdUnimplemented("DecodeExecute");
++}
++
++static HRESULT APIENTRY
++StubDecodeExtensionExecute(_In_ HANDLE hDevice, _Inout_ CONST D3DDDIARG_DECODEEXTENSIONEXECUTE*)
++{
++   return D3D9UmdUnimplemented("DecodeExtensionExecute");
++}
++
++static HRESULT APIENTRY
++StubCreateVideoProcessDevice(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEVIDEOPROCESSDEVICE*)
++{
++   return D3D9UmdUnimplemented("CreateVideoProcessDevice");
++}
++
++static HRESULT APIENTRY
++StubDestroyVideoProcessDevice(_In_ HANDLE hDevice, _In_ HANDLE hVideoProcessor)
++{
++   return D3D9UmdUnimplemented("DestroyVideoProcessDevice");
++}
++
++static HRESULT APIENTRY
++StubVideoProcessBeginFrame(_In_ HANDLE hDevice, _In_ HANDLE hVideoProcess)
++{
++   return D3D9UmdUnimplemented("VideoProcessBeginFrame");
++}
++
++static HRESULT APIENTRY
++StubVideoProcessEndFrame(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_VIDEOPROCESSENDFRAME*)
++{
++   return D3D9UmdUnimplemented("VideoProcessEndFrame");
++}
++
++static HRESULT APIENTRY
++StubSetVideoProcessRenderTarget(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETVIDEOPROCESSRENDERTARGET*)
++{
++   return D3D9UmdUnimplemented("SetVideoProcessRenderTarget");
++}
++
++static HRESULT APIENTRY
++StubVideoProcessBlt(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_VIDEOPROCESSBLT*)
++{
++   return D3D9UmdUnimplemented("VideoProcessBlt");
++}
++
++static HRESULT APIENTRY
++StubCreateExtensionDevice(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEEXTENSIONDEVICE*)
++{
++   return D3D9UmdUnimplemented("CreateExtensionDevice");
++}
++
++static HRESULT APIENTRY
++StubDestroyExtensionDevice(_In_ HANDLE hDevice, _In_ HANDLE hExtension)
++{
++   return D3D9UmdUnimplemented("DestroyExtensionDevice");
++}
++
++static HRESULT APIENTRY
++StubExtensionExecute(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_EXTENSIONEXECUTE*)
++{
++   return D3D9UmdUnimplemented("ExtensionExecute");
++}
++
++static HRESULT APIENTRY
++StubCreateOverlay(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEOVERLAY*)
++{
++   return D3D9UmdUnimplemented("CreateOverlay");
++}
++
++static HRESULT APIENTRY
++StubUpdateOverlay(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_UPDATEOVERLAY*)
++{
++   return D3D9UmdUnimplemented("UpdateOverlay");
++}
++
++static HRESULT APIENTRY
++StubFlipOverlay(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_FLIPOVERLAY*)
++{
++   return D3D9UmdUnimplemented("FlipOverlay");
++}
++
++static HRESULT APIENTRY
++StubGetOverlayColorControls(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_GETOVERLAYCOLORCONTROLS*)
++{
++   return D3D9UmdUnimplemented("GetOverlayColorControls");
++}
++
++static HRESULT APIENTRY
++StubSetOverlayColorControls(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SETOVERLAYCOLORCONTROLS*)
++{
++   return D3D9UmdUnimplemented("SetOverlayColorControls");
++}
++
++static HRESULT APIENTRY
++StubDestroyOverlay(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DESTROYOVERLAY*)
++{
++   return D3D9UmdUnimplemented("DestroyOverlay");
++}
++
++static HRESULT APIENTRY
++StubDestroyDevice(_In_ HANDLE hDevice)
++{
++   return D3D9UmdUnimplemented("DestroyDevice");
++}
++
++static HRESULT APIENTRY
++StubQueryResourceResidency(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_QUERYRESOURCERESIDENCY*)
++{
++   return D3D9UmdUnimplemented("QueryResourceResidency");
++}
++
++static HRESULT APIENTRY
++StubOpenResource(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_OPENRESOURCE*)
++{
++   return D3D9UmdUnimplemented("OpenResource");
++}
++
++static HRESULT APIENTRY
++StubGetCaptureAllocationHandle(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_GETCAPTUREALLOCATIONHANDLE*)
++{
++   return D3D9UmdUnimplemented("GetCaptureAllocationHandle");
++}
++
++static HRESULT APIENTRY
++StubCaptureToSysMem(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_CAPTURETOSYSMEM*)
++{
++   return D3D9UmdUnimplemented("CaptureToSysMem");
++}
++
++static HRESULT APIENTRY
++StubLockAsync(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_LOCKASYNC*)
++{
++   return D3D9UmdUnimplemented("LockAsync");
++}
++
++static HRESULT APIENTRY
++StubUnlockAsync(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_UNLOCKASYNC*)
++{
++   return D3D9UmdUnimplemented("UnlockAsync");
++}
++
++static HRESULT APIENTRY
++StubRename(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_RENAME*)
++{
++   return D3D9UmdUnimplemented("Rename");
++}
++
++static HRESULT APIENTRY
++StubCreateVideoProcessor(_In_ HANDLE, _Inout_ D3DDDIARG_DXVAHD_CREATEVIDEOPROCESSOR*)
++{
++   return D3D9UmdUnimplemented("CreateVideoProcessor");
++}
++
++static HRESULT APIENTRY
++StubSetVideoProcessBltState(_In_ HANDLE, _In_ CONST D3DDDIARG_DXVAHD_SETVIDEOPROCESSBLTSTATE*)
++{
++   return D3D9UmdUnimplemented("SetVideoProcessBltState");
++}
++
++static HRESULT APIENTRY
++StubGetVideoProcessBltStatePrivate(_In_ HANDLE, _Inout_ D3DDDIARG_DXVAHD_GETVIDEOPROCESSBLTSTATEPRIVATE*)
++{
++   return D3D9UmdUnimplemented("GetVideoProcessBltStatePrivate");
++}
++
++static HRESULT APIENTRY
++StubSetVideoProcessStreamState(_In_ HANDLE, _In_ CONST D3DDDIARG_DXVAHD_SETVIDEOPROCESSSTREAMSTATE*)
++{
++   return D3D9UmdUnimplemented("SetVideoProcessStreamState");
++}
++
++static HRESULT APIENTRY
++StubGetVideoProcessStreamStatePrivate(_In_ HANDLE, _Inout_ D3DDDIARG_DXVAHD_GETVIDEOPROCESSSTREAMSTATEPRIVATE*)
++{
++   return D3D9UmdUnimplemented("GetVideoProcessStreamStatePrivate");
++}
++
++static HRESULT APIENTRY
++StubVideoProcessBltHD(_In_ HANDLE, _In_ CONST D3DDDIARG_DXVAHD_VIDEOPROCESSBLTHD*)
++{
++   return D3D9UmdUnimplemented("VideoProcessBltHD");
++}
++
++static HRESULT APIENTRY
++StubDestroyVideoProcessor(_In_ HANDLE, _In_ HANDLE)
++{
++   return D3D9UmdUnimplemented("DestroyVideoProcessor");
++}
++
++static HRESULT APIENTRY
++StubCreateAuthenticatedChannel(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATEAUTHENTICATEDCHANNEL*)
++{
++   return D3D9UmdUnimplemented("CreateAuthenticatedChannel");
++}
++
++static HRESULT APIENTRY
++StubAuthenticatedChannelKeyExchange(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_AUTHENTICATEDCHANNELKEYEXCHANGE*)
++{
++   return D3D9UmdUnimplemented("AuthenticatedChannelKeyExchange");
++}
++
++static HRESULT APIENTRY
++StubQueryAuthenticatedChannel(_In_ HANDLE hDevice, _Inout_ CONST D3DDDIARG_QUERYAUTHENTICATEDCHANNEL*)
++{
++   return D3D9UmdUnimplemented("QueryAuthenticatedChannel");
++}
++
++static HRESULT APIENTRY
++StubConfigureAuthenticatedChannel(_In_ HANDLE hDevice, _Inout_ CONST D3DDDIARG_CONFIGUREAUTHENTICATEDCHANNEL*)
++{
++   return D3D9UmdUnimplemented("ConfigureAuthenticatedChannel");
++}
++
++static HRESULT APIENTRY
++StubDestroyAuthenticatedChannel(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DESTROYAUTHENTICATEDCHANNEL*)
++{
++   return D3D9UmdUnimplemented("DestroyAuthenticatedChannel");
++}
++
++static HRESULT APIENTRY
++StubCreateCryptoSession(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATECRYPTOSESSION*)
++{
++   return D3D9UmdUnimplemented("CreateCryptoSession");
++}
++
++static HRESULT APIENTRY
++StubCryptoSessionKeyExchange(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CRYPTOSESSIONKEYEXCHANGE*)
++{
++   return D3D9UmdUnimplemented("CryptoSessionKeyExchange");
++}
++
++static HRESULT APIENTRY
++StubDestroyCryptoSession(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DESTROYCRYPTOSESSION*)
++{
++   return D3D9UmdUnimplemented("DestroyCryptoSession");
++}
++
++static HRESULT APIENTRY
++StubEncryptionBlt(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_ENCRYPTIONBLT*)
++{
++   return D3D9UmdUnimplemented("EncryptionBlt");
++}
++
++static HRESULT APIENTRY
++StubGetPitch(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_GETPITCH*)
++{
++   return D3D9UmdUnimplemented("GetPitch");
++}
++
++static HRESULT APIENTRY
++StubStartSessionKeyRefresh(_In_ HANDLE hDevice, _Inout_ CONST D3DDDIARG_STARTSESSIONKEYREFRESH*)
++{
++   return D3D9UmdUnimplemented("StartSessionKeyRefresh");
++}
++
++static HRESULT APIENTRY
++StubFinishSessionKeyRefresh(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_FINISHSESSIONKEYREFRESH*)
++{
++   return D3D9UmdUnimplemented("FinishSessionKeyRefresh");
++}
++
++static HRESULT APIENTRY
++StubGetEncryptionBltKey(_In_ HANDLE hDevice, _Inout_ CONST D3DDDIARG_GETENCRYPTIONBLTKEY*)
++{
++   return D3D9UmdUnimplemented("GetEncryptionBltKey");
++}
++
++static HRESULT APIENTRY
++StubDecryptionBlt(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DECRYPTIONBLT*)
++{
++   return D3D9UmdUnimplemented("DecryptionBlt");
++}
++
++static HRESULT APIENTRY
++StubResolveSharedResource(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_RESOLVESHAREDRESOURCE*)
++{
++   return D3D9UmdUnimplemented("ResolveSharedResource");
++}
++
++static HRESULT APIENTRY
++StubVolBlt1(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_VOLUMEBLT1*)
++{
++   return D3D9UmdUnimplemented("VolBlt1");
++}
++
++static HRESULT APIENTRY
++StubBufBlt1(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_BUFFERBLT1*)
++{
++   return D3D9UmdUnimplemented("BufBlt1");
++}
++
++static HRESULT APIENTRY
++StubTexBlt1(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_TEXBLT1*)
++{
++   return D3D9UmdUnimplemented("TexBlt1");
++}
++
++static HRESULT APIENTRY
++StubDiscard(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_DISCARD*)
++{
++   return D3D9UmdUnimplemented("Discard");
++}
++
++static HRESULT APIENTRY
++StubOfferResources(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_OFFERRESOURCES*)
++{
++   return D3D9UmdUnimplemented("OfferResources");
++}
++
++static HRESULT APIENTRY
++StubReclaimResources(_In_ HANDLE hDevice, _Inout_ CONST D3DDDIARG_RECLAIMRESOURCES*)
++{
++   return D3D9UmdUnimplemented("ReclaimResources");
++}
++
++static HRESULT APIENTRY
++StubCheckDirectFlipSupport(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CHECKDIRECTFLIPSUPPORT*)
++{
++   return D3D9UmdUnimplemented("CheckDirectFlipSupport");
++}
++
++static HRESULT APIENTRY
++StubCreateResource2(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CREATERESOURCE2*)
++{
++   return D3D9UmdUnimplemented("CreateResource2");
++}
++
++static HRESULT APIENTRY
++StubCheckMultiPlaneOverlaySupport(_In_ HANDLE hDevice, _Inout_ D3DDDIARG_CHECKMULTIPLANEOVERLAYSUPPORT*)
++{
++   return D3D9UmdUnimplemented("CheckMultiPlaneOverlaySupport");
++}
++
++static HRESULT APIENTRY
++StubPresentMultiPlaneOverlay(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_PRESENTMULTIPLANEOVERLAY*)
++{
++   return D3D9UmdUnimplemented("PresentMultiPlaneOverlay");
++}
++
++static HRESULT APIENTRY
++StubFlush1(_In_ HANDLE hDevice, UINT /*D3DDDI_FLUSH_FLAGS*/ FlushFlags)
++{
++   return D3D9UmdUnimplemented("Flush1");
++}
++
++static VOID APIENTRY
++StubCheckCounterInfo(_In_ HANDLE hDevice, _Out_ D3DDDIARG_COUNTER_INFO*)
++{
++   D3D9UmdUnimplemented("CheckCounterInfo");
++}
++
++static HRESULT APIENTRY
++StubCheckCounter(_In_ HANDLE hDevice, _In_ D3DDDIQUERYTYPE, _Out_ D3DDDI_COUNTER_TYPE*, _Out_ UINT*, _Out_writes_to_opt_(*pNameLength, *pNameLength) LPSTR, _Inout_opt_ UINT* pNameLength, _Out_writes_to_opt_(*pUnitsLength, *pUnitsLength) LPSTR, _Inout_opt_ UINT* pUnitsLength, _Out_writes_to_opt_(*pDescriptionLength, *pDescriptionLength) LPSTR, _Inout_opt_ UINT* pDescriptionLength)
++{
++   return D3D9UmdUnimplemented("CheckCounter");
++}
++
++static HRESULT APIENTRY
++StubUpdateSubresourceUP(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_UPDATESUBRESOURCEUP*)
++{
++   return D3D9UmdUnimplemented("UpdateSubresourceUP");
++}
++
++static HRESULT APIENTRY
++StubPresent1(_In_ HANDLE hDevice, _In_ D3DDDIARG_PRESENT1*)
++{
++   return D3D9UmdUnimplemented("Present1");
++}
++
++static HRESULT APIENTRY
++StubCheckPresentDurationSupport(_In_ HANDLE hDevice, _In_ D3DDDIARG_CHECKPRESENTDURATIONSUPPORT*)
++{
++   return D3D9UmdUnimplemented("CheckPresentDurationSupport");
++}
++
++static HRESULT APIENTRY
++StubSetMarker(_In_ HANDLE hDevice)
++{
++   return D3D9UmdUnimplemented("SetMarker");
++}
++
++static HRESULT APIENTRY
++StubSetMarkerMode(_In_ HANDLE hDevice, _In_ D3DDDI_MARKERTYPE Type, /*D3DDDI_SETMARKERMODE*/ UINT Flags)
++{
++   return D3D9UmdUnimplemented("SetMarkerMode");
++}
++
++static HRESULT APIENTRY
++StubTrimResidencySet(_In_ HANDLE hDevice, _In_ D3DDDIARG_TRIMRESIDENCYSET*)
++{
++   return D3D9UmdUnimplemented("TrimResidencySet");
++}
++
++static VOID APIENTRY
++StubAcquireResource(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SYNCTOKEN*)
++{
++   D3D9UmdUnimplemented("AcquireResource");
++}
++
++static VOID APIENTRY
++StubReleaseResource(_In_ HANDLE hDevice, _In_ CONST D3DDDIARG_SYNCTOKEN*)
++{
++   D3D9UmdUnimplemented("ReleaseResource");
++}
++
++void
++D3D9UmdFillStubs(D3DDDI_DEVICEFUNCS *funcs)
++{
++   funcs->pfnSetRenderState = StubSetRenderState;
++   funcs->pfnUpdateWInfo = StubUpdateWInfo;
++   funcs->pfnValidateDevice = StubValidateDevice;
++   funcs->pfnSetTextureStageState = StubSetTextureStageState;
++   funcs->pfnSetTexture = StubSetTexture;
++   funcs->pfnSetPixelShader = StubSetPixelShader;
++   funcs->pfnSetPixelShaderConst = StubSetPixelShaderConst;
++   funcs->pfnSetStreamSourceUm = StubSetStreamSourceUm;
++   funcs->pfnSetIndices = StubSetIndices;
++   funcs->pfnSetIndicesUm = StubSetIndicesUm;
++   funcs->pfnDrawPrimitive = StubDrawPrimitive;
++   funcs->pfnDrawIndexedPrimitive = StubDrawIndexedPrimitive;
++   funcs->pfnDrawRectPatch = StubDrawRectPatch;
++   funcs->pfnDrawTriPatch = StubDrawTriPatch;
++   funcs->pfnDrawPrimitive2 = StubDrawPrimitive2;
++   funcs->pfnDrawIndexedPrimitive2 = StubDrawIndexedPrimitive2;
++   funcs->pfnVolBlt = StubVolBlt;
++   funcs->pfnBufBlt = StubBufBlt;
++   funcs->pfnTexBlt = StubTexBlt;
++   funcs->pfnStateSet = StubStateSet;
++   funcs->pfnSetPriority = StubSetPriority;
++   funcs->pfnClear = StubClear;
++   funcs->pfnUpdatePalette = StubUpdatePalette;
++   funcs->pfnSetPalette = StubSetPalette;
++   funcs->pfnSetVertexShaderConst = StubSetVertexShaderConst;
++   funcs->pfnMultiplyTransform = StubMultiplyTransform;
++   funcs->pfnSetTransform = StubSetTransform;
++   funcs->pfnSetViewport = StubSetViewport;
++   funcs->pfnSetZRange = StubSetZRange;
++   funcs->pfnSetMaterial = StubSetMaterial;
++   funcs->pfnSetLight = StubSetLight;
++   funcs->pfnCreateLight = StubCreateLight;
++   funcs->pfnDestroyLight = StubDestroyLight;
++   funcs->pfnSetClipPlane = StubSetClipPlane;
++   funcs->pfnGetInfo = StubGetInfo;
++   funcs->pfnLock = StubLock;
++   funcs->pfnUnlock = StubUnlock;
++   funcs->pfnCreateResource = StubCreateResource;
++   funcs->pfnDestroyResource = StubDestroyResource;
++   funcs->pfnSetDisplayMode = StubSetDisplayMode;
++   funcs->pfnPresent = StubPresent;
++   funcs->pfnFlush = StubFlush;
++   funcs->pfnCreateVertexShaderFunc = StubCreateVertexShaderFunc;
++   funcs->pfnDeleteVertexShaderFunc = StubDeleteVertexShaderFunc;
++   funcs->pfnSetVertexShaderFunc = StubSetVertexShaderFunc;
++   funcs->pfnCreateVertexShaderDecl = StubCreateVertexShaderDecl;
++   funcs->pfnDeleteVertexShaderDecl = StubDeleteVertexShaderDecl;
++   funcs->pfnSetVertexShaderDecl = StubSetVertexShaderDecl;
++   funcs->pfnSetVertexShaderConstI = StubSetVertexShaderConstI;
++   funcs->pfnSetVertexShaderConstB = StubSetVertexShaderConstB;
++   funcs->pfnSetScissorRect = StubSetScissorRect;
++   funcs->pfnSetStreamSource = StubSetStreamSource;
++   funcs->pfnSetStreamSourceFreq = StubSetStreamSourceFreq;
++   funcs->pfnSetConvolutionKernelMono = StubSetConvolutionKernelMono;
++   funcs->pfnComposeRects = StubComposeRects;
++   funcs->pfnBlt = StubBlt;
++   funcs->pfnColorFill = StubColorFill;
++   funcs->pfnDepthFill = StubDepthFill;
++   funcs->pfnCreateQuery = StubCreateQuery;
++   funcs->pfnDestroyQuery = StubDestroyQuery;
++   funcs->pfnIssueQuery = StubIssueQuery;
++   funcs->pfnGetQueryData = StubGetQueryData;
++   funcs->pfnSetRenderTarget = StubSetRenderTarget;
++   funcs->pfnSetDepthStencil = StubSetDepthStencil;
++   funcs->pfnGenerateMipSubLevels = StubGenerateMipSubLevels;
++   funcs->pfnSetPixelShaderConstI = StubSetPixelShaderConstI;
++   funcs->pfnSetPixelShaderConstB = StubSetPixelShaderConstB;
++   funcs->pfnCreatePixelShader = StubCreatePixelShader;
++   funcs->pfnDeletePixelShader = StubDeletePixelShader;
++   funcs->pfnCreateDecodeDevice = StubCreateDecodeDevice;
++   funcs->pfnDestroyDecodeDevice = StubDestroyDecodeDevice;
++   funcs->pfnSetDecodeRenderTarget = StubSetDecodeRenderTarget;
++   funcs->pfnDecodeBeginFrame = StubDecodeBeginFrame;
++   funcs->pfnDecodeEndFrame = StubDecodeEndFrame;
++   funcs->pfnDecodeExecute = StubDecodeExecute;
++   funcs->pfnDecodeExtensionExecute = StubDecodeExtensionExecute;
++   funcs->pfnCreateVideoProcessDevice = StubCreateVideoProcessDevice;
++   funcs->pfnDestroyVideoProcessDevice = StubDestroyVideoProcessDevice;
++   funcs->pfnVideoProcessBeginFrame = StubVideoProcessBeginFrame;
++   funcs->pfnVideoProcessEndFrame = StubVideoProcessEndFrame;
++   funcs->pfnSetVideoProcessRenderTarget = StubSetVideoProcessRenderTarget;
++   funcs->pfnVideoProcessBlt = StubVideoProcessBlt;
++   funcs->pfnCreateExtensionDevice = StubCreateExtensionDevice;
++   funcs->pfnDestroyExtensionDevice = StubDestroyExtensionDevice;
++   funcs->pfnExtensionExecute = StubExtensionExecute;
++   funcs->pfnCreateOverlay = StubCreateOverlay;
++   funcs->pfnUpdateOverlay = StubUpdateOverlay;
++   funcs->pfnFlipOverlay = StubFlipOverlay;
++   funcs->pfnGetOverlayColorControls = StubGetOverlayColorControls;
++   funcs->pfnSetOverlayColorControls = StubSetOverlayColorControls;
++   funcs->pfnDestroyOverlay = StubDestroyOverlay;
++   funcs->pfnDestroyDevice = StubDestroyDevice;
++   funcs->pfnQueryResourceResidency = StubQueryResourceResidency;
++   funcs->pfnOpenResource = StubOpenResource;
++   funcs->pfnGetCaptureAllocationHandle = StubGetCaptureAllocationHandle;
++   funcs->pfnCaptureToSysMem = StubCaptureToSysMem;
++   funcs->pfnLockAsync = StubLockAsync;
++   funcs->pfnUnlockAsync = StubUnlockAsync;
++   funcs->pfnRename = StubRename;
++   funcs->pfnCreateVideoProcessor = StubCreateVideoProcessor;
++   funcs->pfnSetVideoProcessBltState = StubSetVideoProcessBltState;
++   funcs->pfnGetVideoProcessBltStatePrivate = StubGetVideoProcessBltStatePrivate;
++   funcs->pfnSetVideoProcessStreamState = StubSetVideoProcessStreamState;
++   funcs->pfnGetVideoProcessStreamStatePrivate = StubGetVideoProcessStreamStatePrivate;
++   funcs->pfnVideoProcessBltHD = StubVideoProcessBltHD;
++   funcs->pfnDestroyVideoProcessor = StubDestroyVideoProcessor;
++   funcs->pfnCreateAuthenticatedChannel = StubCreateAuthenticatedChannel;
++   funcs->pfnAuthenticatedChannelKeyExchange = StubAuthenticatedChannelKeyExchange;
++   funcs->pfnQueryAuthenticatedChannel = StubQueryAuthenticatedChannel;
++   funcs->pfnConfigureAuthenticatedChannel = StubConfigureAuthenticatedChannel;
++   funcs->pfnDestroyAuthenticatedChannel = StubDestroyAuthenticatedChannel;
++   funcs->pfnCreateCryptoSession = StubCreateCryptoSession;
++   funcs->pfnCryptoSessionKeyExchange = StubCryptoSessionKeyExchange;
++   funcs->pfnDestroyCryptoSession = StubDestroyCryptoSession;
++   funcs->pfnEncryptionBlt = StubEncryptionBlt;
++   funcs->pfnGetPitch = StubGetPitch;
++   funcs->pfnStartSessionKeyRefresh = StubStartSessionKeyRefresh;
++   funcs->pfnFinishSessionKeyRefresh = StubFinishSessionKeyRefresh;
++   funcs->pfnGetEncryptionBltKey = StubGetEncryptionBltKey;
++   funcs->pfnDecryptionBlt = StubDecryptionBlt;
++   funcs->pfnResolveSharedResource = StubResolveSharedResource;
++   funcs->pfnVolBlt1 = StubVolBlt1;
++   funcs->pfnBufBlt1 = StubBufBlt1;
++   funcs->pfnTexBlt1 = StubTexBlt1;
++   funcs->pfnDiscard = StubDiscard;
++   funcs->pfnOfferResources = StubOfferResources;
++   funcs->pfnReclaimResources = StubReclaimResources;
++   funcs->pfnCheckDirectFlipSupport = StubCheckDirectFlipSupport;
++   funcs->pfnCreateResource2 = StubCreateResource2;
++   funcs->pfnCheckMultiPlaneOverlaySupport = StubCheckMultiPlaneOverlaySupport;
++   funcs->pfnPresentMultiPlaneOverlay = StubPresentMultiPlaneOverlay;
++   funcs->pfnFlush1 = StubFlush1;
++   funcs->pfnCheckCounterInfo = StubCheckCounterInfo;
++   funcs->pfnCheckCounter = StubCheckCounter;
++   funcs->pfnUpdateSubresourceUP = StubUpdateSubresourceUP;
++   funcs->pfnPresent1 = StubPresent1;
++   funcs->pfnCheckPresentDurationSupport = StubCheckPresentDurationSupport;
++   funcs->pfnSetMarker = StubSetMarker;
++   funcs->pfnSetMarkerMode = StubSetMarkerMode;
++   funcs->pfnTrimResidencySet = StubTrimResidencySet;
++   funcs->pfnAcquireResource = StubAcquireResource;
++   funcs->pfnReleaseResource = StubReleaseResource;
++}
+diff --git a/src/gallium/frontends/d3d9umd/debug.cpp b/src/gallium/frontends/d3d9umd/debug.cpp
+new file mode 100644
+index 0000000..3de5586
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/debug.cpp
+@@ -0,0 +1,127 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "d3d9umd.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++/* Full call tracing is for development: create C:\viogpu_d3d9_trace.txt and every process using the driver appends
++ * its calls to C:\viogpu_d3d9_trace.log. Warnings always go to OutputDebugString. */
++static int tracing = -1;
++
++bool
++D3D9UmdTracing(void)
++{
++   if (tracing < 0)
++      tracing = GetFileAttributesA("C:\\viogpu_d3d9_trace.txt") != INVALID_FILE_ATTRIBUTES;
++   return tracing > 0;
++}
++
++static void
++LogV(bool debugger, const char *format, va_list args)
++{
++   char message[1024];
++   int prefix = snprintf(message, sizeof(message), "d3d9umd[%lu]: ", GetCurrentProcessId());
++   vsnprintf(message + prefix, sizeof(message) - prefix - 1, format, args);
++   size_t len = strlen(message);
++   if (len == 0 || message[len - 1] != '\n') {
++      message[len] = '\n';
++      message[len + 1] = '\0';
++   }
++   if (debugger)
++      OutputDebugStringA(message);
++   if (D3D9UmdTracing()) {
++      FILE *f = fopen("C:\\viogpu_d3d9_trace.log", "a");
++      if (f) {
++         fputs(message, f);
++         fclose(f);
++      }
++   }
++}
++
++/* Warnings: the debugger (and the trace) */
++void
++D3D9UmdLog(const char *format, ...)
++{
++   va_list args;
++   va_start(args, format);
++   LogV(true, format, args);
++   va_end(args);
++}
++
++/* Call tracing: only the trace file, so that the debugger output keeps what matters (the messages of gallium nine
++ * and virgl among them) */
++void
++D3D9UmdTraceLog(const char *format, ...)
++{
++   va_list args;
++   va_start(args, format);
++   LogV(false, format, args);
++   va_end(args);
++}
++
++/* "module+offset" for an address, to look up in the linker map */
++static void
++DescribeAddress(const void *address, char *out, size_t size)
++{
++   HMODULE module = NULL;
++   char path[MAX_PATH] = "?";
++   if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                          (LPCSTR)address, &module)) {
++      GetModuleFileNameA(module, path, sizeof(path));
++   }
++   const char *name = strrchr(path, '\\');
++   snprintf(out, size, "%s+0x%llx", name ? name + 1 : path,
++            (unsigned long long)((const char *)address - (const char *)module));
++}
++
++static LONG CALLBACK
++CrashHandler(EXCEPTION_POINTERS *info)
++{
++   DWORD code = info->ExceptionRecord->ExceptionCode;
++   if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
++       code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION)
++      return EXCEPTION_CONTINUE_SEARCH;
++   char where[MAX_PATH + 32];
++   DescribeAddress(info->ExceptionRecord->ExceptionAddress, where, sizeof(where));
++   D3D9UmdLog("exception 0x%08lx at %s (address 0x%llx)", code, where,
++              code == EXCEPTION_ACCESS_VIOLATION
++                 ? (unsigned long long)info->ExceptionRecord->ExceptionInformation[1] : 0ull);
++   void *frames[32];
++   USHORT count = RtlCaptureStackBackTrace(0, ARRAYSIZE(frames), frames, NULL);
++   for (USHORT i = 0; i < count; i++) {
++      DescribeAddress(frames[i], where, sizeof(where));
++      D3D9UmdLog("  #%u %s", i, where);
++   }
++   return EXCEPTION_CONTINUE_SEARCH;
++}
++
++void
++D3D9UmdInstallCrashHandler(void)
++{
++   static bool installed;
++   if (!installed && D3D9UmdTracing()) {
++      installed = true;
++      AddVectoredExceptionHandler(1, CrashHandler);
++   }
++}
++
++HRESULT
++D3D9UmdUnimplemented(const char *name)
++{
++   /* Log each entry point once (a small fixed set; the names are string literals) */
++   static const char *seen[160];
++   static unsigned seenCount;
++   for (unsigned i = 0; i < seenCount; i++) {
++      if (seen[i] == name)
++         return S_OK;
++   }
++   if (seenCount < ARRAYSIZE(seen))
++      seen[seenCount++] = name;
++   D3D9UmdLog("unimplemented: %s", name);
++   return S_OK;
++}
+diff --git a/src/gallium/frontends/d3d9umd/device.cpp b/src/gallium/frontends/d3d9umd/device.cpp
+new file mode 100644
+index 0000000..63d1dff
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/device.cpp
+@@ -0,0 +1,434 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* The implemented D3DDDI_DEVICEFUNCS entries; everything else is a stub from ddi_stubs.cpp */
++
++#include "d3d9umd.h"
++
++#include <new>
++#include <string.h>
++#include <vector>
++
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++
++/* ---- Device ---- */
++
++static HRESULT APIENTRY
++DestroyDevice(HANDLE hDevice)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UMD_TRACE("DestroyDevice");
++   nddi_device_destroy(dev->nine);
++   dev->screen->destroy(dev->screen);
++   delete dev;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++Flush(HANDLE hDevice)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   struct pipe_context *pipe = nddi_flush(dev->nine);
++   pipe->flush(pipe, NULL, 0);
++   return S_OK;
++}
++
++/* ---- Resources ---- */
++
++static DWORD
++UsageFromFlags(D3DDDI_RESOURCEFLAGS f)
++{
++   DWORD usage = 0;
++   if (f.RenderTarget)
++      usage |= D3DUSAGE_RENDERTARGET;
++   if (f.ZBuffer)
++      usage |= D3DUSAGE_DEPTHSTENCIL;
++   if (f.Dynamic)
++      usage |= D3DUSAGE_DYNAMIC;
++   if (f.AutogenMipmap)
++      usage |= D3DUSAGE_AUTOGENMIPMAP;
++   if (f.WriteOnly)
++      usage |= D3DUSAGE_WRITEONLY;
++   if (f.Points)
++      usage |= D3DUSAGE_POINTS;
++   if (f.RtPatches)
++      usage |= D3DUSAGE_RTPATCHES;
++   if (f.NPatches)
++      usage |= D3DUSAGE_NPATCHES;
++   if (f.DMap)
++      usage |= D3DUSAGE_DMAP;
++   return usage;
++}
++
++static HRESULT APIENTRY
++CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   const D3DDDI_SURFACEINFO &s0 = p->pSurfList[0];
++   D3D9UMD_TRACE("CreateResource format %u pool %u flags 0x%x surfaces %u mips %u %ux%ux%u ms %u fvf 0x%x",
++                 p->Format, p->Pool, p->Flags.Value, p->SurfCount, p->MipLevels, s0.Width, s0.Height, s0.Depth,
++                 p->MultisampleType, p->Fvf);
++
++   nddi_resource_desc desc;
++   memset(&desc, 0, sizeof(desc));
++   const D3DDDI_RESOURCEFLAGS f = p->Flags;
++   if (f.VertexBuffer)
++      desc.kind = NDDI_VERTEX_BUFFER;
++   else if (f.IndexBuffer)
++      desc.kind = NDDI_INDEX_BUFFER;
++   else if (f.Texture && f.CubeMap)
++      desc.kind = NDDI_CUBE_TEXTURE;
++   else if (f.Texture && f.Volume)
++      desc.kind = NDDI_VOLUME_TEXTURE;
++   else if (f.Texture)
++      desc.kind = NDDI_TEXTURE;
++   else if (f.ZBuffer)
++      desc.kind = NDDI_DEPTH_STENCIL;
++   else if (f.RenderTarget || f.Primary)
++      desc.kind = NDDI_RENDER_TARGET;
++   else
++      desc.kind = NDDI_SURFACE;
++
++   desc.format = p->Format;
++   desc.width = s0.Width;
++   desc.height = s0.Height;
++   desc.depth = s0.Depth;
++   desc.levels = desc.kind == NDDI_CUBE_TEXTURE ? p->SurfCount / 6
++                 : (desc.kind == NDDI_TEXTURE || desc.kind == NDDI_VOLUME_TEXTURE) ? p->SurfCount : 1;
++   desc.usage = UsageFromFlags(f);
++   desc.multisample = p->MultisampleType;
++   desc.multisample_quality = p->MultisampleQuality;
++   desc.lockable = !f.NotLockable;
++   desc.fvf = p->Fvf;
++
++   std::vector<void *> sysmem;
++   std::vector<uint32_t> pitches;
++   if (p->Pool == D3DDDIPOOL_SYSTEMMEM) {
++      desc.system_memory = true;
++      for (UINT i = 0; i < p->SurfCount; i++) {
++         sysmem.push_back((void *)p->pSurfList[i].pSysMem);
++         D3D9UMD_TRACE("  surface %u: system memory %p pitch %u", i, p->pSurfList[i].pSysMem,
++                       p->pSurfList[i].SysMemPitch);
++         pitches.push_back(p->pSurfList[i].SysMemPitch);
++      }
++      desc.sysmem = sysmem.data();
++      desc.sysmem_pitch = pitches.data();
++   }
++
++   D3D9UmdResource *res = new (std::nothrow) D3D9UmdResource();
++   if (!res)
++      return E_OUTOFMEMORY;
++   res->hRTResource = p->hResource;
++   res->format = p->Format;
++   res->pool = p->Pool;
++   res->flags = f;
++   res->surfCount = p->SurfCount;
++   res->width = s0.Width;
++   res->height = s0.Height;
++
++   /* The kernel allocations made while creating it belong to the runtime's resource */
++   dev->kmt.hRTResource = p->hResource;
++   HRESULT hr = nddi_resource_create(dev->nine, &desc, &res->nine);
++   dev->kmt.hRTResource = NULL;
++   if (FAILED(hr)) {
++      D3D9UmdLog("CreateResource failed (0x%08lx): format %u pool %u flags 0x%x %ux%u", hr, p->Format, p->Pool,
++                 f.Value, s0.Width, s0.Height);
++      delete res;
++      return hr;
++   }
++   p->hResource = res;
++   D3D9UMD_TRACE("  -> %p", res);
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++DestroyResource(HANDLE hDevice, HANDLE hResource)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *res = D3D9UmdCastResource(hResource);
++   D3D9UMD_TRACE("DestroyResource %p", res);
++   if (dev->renderTarget0 == res)
++      dev->renderTarget0 = NULL;
++   nddi_resource_destroy(res->nine);
++   delete res;
++   return S_OK;
++}
++
++static DWORD
++LockFlags(D3DDDI_LOCKFLAGS f)
++{
++   DWORD flags = 0;
++   if (f.ReadOnly)
++      flags |= D3DLOCK_READONLY;
++   if (f.NoOverwrite)
++      flags |= D3DLOCK_NOOVERWRITE;
++   if (f.Discard)
++      flags |= D3DLOCK_DISCARD;
++   if (f.DoNotWait)
++      flags |= D3DLOCK_DONOTWAIT;
++   return flags;
++}
++
++/* The part of a subresource a lock names (Range, Area or Box valid), NULL for all of it */
++template <typename Flags, typename Arg>
++static const nddi_box *
++LockBox(const Flags &f, const Arg *p, nddi_box *box)
++{
++   if (f.RangeValid)
++      *box = {p->Range.Offset, 0, p->Range.Offset + p->Range.Size, 1, 0, 1};
++   else if (f.AreaValid)
++      *box = {(uint32_t)p->Area.left, (uint32_t)p->Area.top, (uint32_t)p->Area.right, (uint32_t)p->Area.bottom, 0, 1};
++   else if (f.BoxValid)
++      *box = {p->Box.Left, p->Box.Top, p->Box.Right, p->Box.Bottom, p->Box.Front, p->Box.Back};
++   else
++      return NULL;
++   return box;
++}
++
++/* NotifyOnly locks are of system memory resources: the runtime writes its own memory and only tells the driver */
++static HRESULT APIENTRY
++Lock(HANDLE hDevice, D3DDDIARG_LOCK *p)
++{
++   D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
++   if (p->Flags.NotifyOnly) {
++      D3D9UMD_TRACE("Lock (notify) resource %p sub %u flags 0x%x", res, p->SubResourceIndex, p->Flags.Value);
++      nddi_resource_written(res->nine);
++      return S_OK;
++   }
++
++   nddi_box box;
++   void *data = NULL;
++   uint32_t pitch = 0, slicePitch = 0;
++   HRESULT hr = nddi_resource_lock(res->nine, p->SubResourceIndex, LockBox(p->Flags, p, &box), LockFlags(p->Flags),
++                                   &data, &pitch, &slicePitch);
++   D3D9UMD_TRACE("Lock resource %p sub %u flags 0x%x -> 0x%08lx", res, p->SubResourceIndex, p->Flags.Value, hr);
++   if (FAILED(hr))
++      return hr;
++   p->pSurfData = data;
++   p->Pitch = pitch;
++   p->SlicePitch = slicePitch;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++Unlock(HANDLE hDevice, const D3DDDIARG_UNLOCK *p)
++{
++   D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
++   D3D9UMD_TRACE("Unlock resource %p sub %u flags 0x%x", res, p->SubResourceIndex, p->Flags.Value);
++   if (p->Flags.NotifyOnly) {
++      nddi_resource_written(res->nine);
++      return S_OK;
++   }
++   return nddi_resource_unlock(res->nine, p->SubResourceIndex);
++}
++
++/* Locks from the application's thread while the runtime's own thread renders. Nine serializes the two. */
++static HRESULT APIENTRY
++LockAsync(HANDLE hDevice, D3DDDIARG_LOCKASYNC *p)
++{
++   D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
++   p->hCookie = NULL;
++   if (p->Flags.NotifyOnly) {
++      D3D9UMD_TRACE("LockAsync (notify) resource %p sub %u flags 0x%x", res, p->SubResourceIndex, p->Flags.Value);
++      nddi_resource_written(res->nine);
++      return S_OK;
++   }
++
++   DWORD flags = 0;
++   if (p->Flags.NoOverwrite)
++      flags |= D3DLOCK_NOOVERWRITE;
++   if (p->Flags.Discard)
++      flags |= D3DLOCK_DISCARD;
++   nddi_box box;
++   void *data = NULL;
++   uint32_t pitch = 0, slicePitch = 0;
++   HRESULT hr = nddi_resource_lock(res->nine, p->SubResourceIndex, LockBox(p->Flags, p, &box), flags, &data, &pitch,
++                                   &slicePitch);
++   D3D9UMD_TRACE("LockAsync resource %p sub %u flags 0x%x -> 0x%08lx", res, p->SubResourceIndex, p->Flags.Value, hr);
++   if (FAILED(hr))
++      return hr;
++   p->pSurfData = data;
++   p->Pitch = pitch;
++   p->SlicePitch = slicePitch;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++UnlockAsync(HANDLE hDevice, const D3DDDIARG_UNLOCKASYNC *p)
++{
++   D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
++   D3D9UMD_TRACE("UnlockAsync resource %p sub %u flags 0x%x", res, p->SubResourceIndex, p->Flags.Value);
++   if (p->Flags.NotifyOnly) {
++      nddi_resource_written(res->nine);
++      return S_OK;
++   }
++   return nddi_resource_unlock(res->nine, p->SubResourceIndex);
++}
++
++static HRESULT APIENTRY
++Blt(HANDLE hDevice, const D3DDDIARG_BLT *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource), *dst = D3D9UmdCastResource(p->hDstResource);
++   nddi_rect sr = {p->SrcRect.left, p->SrcRect.top, p->SrcRect.right, p->SrcRect.bottom};
++   nddi_rect dr = {p->DstRect.left, p->DstRect.top, p->DstRect.right, p->DstRect.bottom};
++   HRESULT hr = nddi_blt(dev->nine, src->nine, p->SrcSubResourceIndex, &sr, dst->nine, p->DstSubResourceIndex, &dr,
++                         p->Flags.Linear ? D3DTEXF_LINEAR : D3DTEXF_POINT);
++   D3D9UMD_TRACE("Blt %p[%u] -> %p[%u] flags 0x%x -> 0x%08lx", src, p->SrcSubResourceIndex, dst,
++                 p->DstSubResourceIndex, p->Flags.Value, hr);
++   return hr;
++}
++
++static HRESULT APIENTRY
++ColorFill(HANDLE hDevice, const D3DDDIARG_COLORFILL *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   nddi_rect r = {p->DstRect.left, p->DstRect.top, p->DstRect.right, p->DstRect.bottom};
++   return nddi_color_fill(dev->nine, D3D9UmdCastResource(p->hResource)->nine, p->SubResourceIndex, &r, p->Color);
++}
++
++/* ---- State ---- */
++
++static HRESULT APIENTRY
++SetRenderState(HANDLE hDevice, const D3DDDIARG_RENDERSTATE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UMD_TRACE("SetRenderState %u = 0x%x", (UINT)p->State, p->Value);
++   switch ((UINT)p->State) {
++   case D3DDDIRS_SCENECAPTURE:
++      /* The DDI's BeginScene/EndScene */
++      if (p->Value && !dev->inScene) {
++         dev->inScene = true;
++         return nddi_begin_scene(dev->nine);
++      }
++      if (!p->Value && dev->inScene) {
++         dev->inScene = false;
++         return nddi_end_scene(dev->nine);
++      }
++      return S_OK;
++   case D3DDDIRS_LINEPATTERN:
++   case D3DDDIRS_ZVISIBLE:
++   case D3DDDIRS_COLORKEYENABLE:
++   case D3DDDIRS_TRANSLUCENTSORTINDEPENDENT:
++      return S_OK;
++   default:
++      if (p->State >= D3DDDIRS_STIPPLEPATTERN00 && p->State <= D3DDDIRS_STIPPLEPATTERN31)
++         return S_OK;
++      /* Legacy and DDI-only states nine doesn't know are refused by it; ignore them */
++      if (FAILED(nddi_set_render_state(dev->nine, p->State, p->Value)))
++         D3D9UMD_TRACE("render state %u = %u not accepted", p->State, p->Value);
++      return S_OK;
++   }
++}
++
++static HRESULT APIENTRY
++SetRenderTarget(HANDLE hDevice, const D3DDDIARG_SETRENDERTARGET *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *res = D3D9UmdCastResource(p->hRenderTarget);
++   if (p->RenderTargetIndex == 0)
++      dev->renderTarget0 = res;
++   HRESULT hr = nddi_set_render_target(dev->nine, p->RenderTargetIndex, res ? res->nine : NULL, p->SubResourceIndex);
++   D3D9UMD_TRACE("SetRenderTarget %u = %p[%u] -> 0x%08lx", p->RenderTargetIndex, res, p->SubResourceIndex, hr);
++   return hr;
++}
++
++static HRESULT APIENTRY
++SetDepthStencil(HANDLE hDevice, const D3DDDIARG_SETDEPTHSTENCIL *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *res = D3D9UmdCastResource(p->hZBuffer);
++   return nddi_set_depth_stencil(dev->nine, res ? res->nine : NULL);
++}
++
++static HRESULT APIENTRY
++SetViewport(HANDLE hDevice, const D3DDDIARG_VIEWPORTINFO *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   dev->viewport.x = p->X;
++   dev->viewport.y = p->Y;
++   dev->viewport.width = p->Width;
++   dev->viewport.height = p->Height;
++   nddi_set_viewport(dev->nine, &dev->viewport);
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++SetZRange(HANDLE hDevice, const D3DDDIARG_ZRANGE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   dev->viewport.min_z = p->MinZ;
++   dev->viewport.max_z = p->MaxZ;
++   nddi_set_viewport(dev->nine, &dev->viewport);
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++SetScissorRect(HANDLE hDevice, const RECT *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   nddi_rect r = {p->left, p->top, p->right, p->bottom};
++   return nddi_set_scissor(dev->nine, &r);
++}
++
++/* ---- Commands ---- */
++
++static HRESULT APIENTRY
++Clear(HANDLE hDevice, const D3DDDIARG_CLEAR *p, UINT NumRect, const RECT *pRect)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   static_assert(sizeof(RECT) == sizeof(nddi_rect), "RECT layout");
++   HRESULT hr = nddi_clear(dev->nine, NumRect, (const nddi_rect *)pRect,
++                           p->Flags & (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL), p->FillColor,
++                           p->FillDepth, p->FillStencil);
++   D3D9UMD_TRACE("Clear flags 0x%x color 0x%08x rects %u -> 0x%08lx", p->Flags, p->FillColor, NumRect, hr);
++   return hr;
++}
++
++static HRESULT APIENTRY
++Present(HANDLE hDevice, const D3DDDIARG_PRESENT *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource);
++   unsigned level = 0, layer = 0;
++   struct pipe_resource *resource = nddi_resource_get_pipe(src->nine, p->SrcSubResourceIndex, &level, &layer);
++   if (!resource)
++      return E_INVALIDARG;
++   if (p->hDstResource)
++      D3D9UMD_TRACE("Present to a destination resource isn't supported yet (flags 0x%x)", p->Flags.Value);
++
++   /* flush_frontbuffer flushes the context and hands the source allocation to the runtime's present callback */
++   struct pipe_context *pipe = nddi_flush(dev->nine);
++   gdikmt_d3d9_present info;
++   memset(&info, 0, sizeof(info));
++   dev->screen->flush_frontbuffer(dev->screen, pipe, resource, level, layer, &info, 0, NULL);
++   D3D9UMD_TRACE("Present %p[%u] flags 0x%x", src, p->SrcSubResourceIndex, p->Flags.Value);
++   return S_OK;
++}
++
++void
++D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *f)
++{
++   f->pfnDestroyDevice = DestroyDevice;
++   f->pfnFlush = Flush;
++   f->pfnCreateResource = CreateResource;
++   f->pfnDestroyResource = DestroyResource;
++   f->pfnLock = Lock;
++   f->pfnUnlock = Unlock;
++   f->pfnLockAsync = LockAsync;
++   f->pfnUnlockAsync = UnlockAsync;
++   f->pfnBlt = Blt;
++   f->pfnColorFill = ColorFill;
++   f->pfnSetRenderState = SetRenderState;
++   f->pfnSetRenderTarget = SetRenderTarget;
++   f->pfnSetDepthStencil = SetDepthStencil;
++   f->pfnSetViewport = SetViewport;
++   f->pfnSetZRange = SetZRange;
++   f->pfnSetScissorRect = SetScissorRect;
++   f->pfnClear = Clear;
++   f->pfnPresent = Present;
++   D3D9UmdFillPipelineFuncs(f);
++}
+diff --git a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
+new file mode 100644
+index 0000000..23956a0
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
+@@ -0,0 +1,235 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include <windows.h>
++#include "winddk_compat.h"
++#include <string.h>
++
++#include "gdikmt_d3d9.h"
++#include "util/u_memory.h"
++
++struct gdikmt_context_d3d9 {
++   struct gdikmt_context base;
++   HANDLE hContext;
++};
++
++static inline struct gdikmt_context_d3d9 *
++context_d3d9(struct gdikmt_context *ctx)
++{
++   return (struct gdikmt_context_d3d9 *)ctx;
++}
++
++static inline struct gdikmt_device_d3d9 *
++device_d3d9(struct gdikmt_device *dev)
++{
++   return (struct gdikmt_device_d3d9 *)dev;
++}
++
++static NTSTATUS
++queryadapterinfo(struct gdikmt_device *_device, KMTQUERYADAPTERINFOTYPE Type, VOID *pPrivateDriverData,
++                 UINT PrivateDriverDataSize)
++{
++   struct gdikmt_device_d3d9 *device = device_d3d9(_device);
++   D3DDDICB_QUERYADAPTERINFO query;
++   memset(&query, 0, sizeof(query));
++   query.pPrivateDriverData = pPrivateDriverData;
++   query.PrivateDriverDataSize = PrivateDriverDataSize;
++   return device->adapterCallbacks->pfnQueryAdapterInfoCb(device->hRTAdapter, &query);
++}
++
++static NTSTATUS
++escape(struct gdikmt_device *_device, VOID *pPrivateDriverData, UINT PrivateDriverDataSize)
++{
++   struct gdikmt_device_d3d9 *device = device_d3d9(_device);
++   D3DDDICB_ESCAPE esc;
++   memset(&esc, 0, sizeof(esc));
++   esc.hDevice = device->hRTDevice;
++   esc.pPrivateDriverData = pPrivateDriverData;
++   esc.PrivateDriverDataSize = PrivateDriverDataSize;
++   return device->callbacks.pfnEscapeCb(device->hRTAdapter, &esc);
++}
++
++static NTSTATUS
++render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
++{
++   struct gdikmt_context_d3d9 *ctx = context_d3d9(_ctx);
++   struct gdikmt_device_d3d9 *dev = device_d3d9(ctx->base.device);
++
++   D3DDDICB_RENDER r;
++   memset(&r, 0, sizeof(r));
++   r.hContext = ctx->hContext;
++   r.CommandOffset = options->CommandOffset;
++   r.CommandLength = options->CommandLength;
++   r.NumAllocations = options->AllocationCount;
++   r.NumPatchLocations = options->PatchLocationCount;
++   r.NewCommandBufferSize = options->NewCommandBufferSize;
++   r.NewAllocationListSize = options->NewAllocationListSize;
++   r.NewPatchLocationListSize = options->NewPatchLocationListSize;
++   r.Flags.ResizeCommandBuffer = options->ResizeCommandBuffer;
++   r.Flags.ResizeAllocationList = options->ResizeAllocationList;
++   r.Flags.ResizePatchLocationList = options->ResizePatchLocationList;
++
++   NTSTATUS status = dev->callbacks.pfnRenderCb(dev->hRTDevice, &r);
++
++   if (options->CompletionEvent) {
++      D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 signal;
++      memset(&signal, 0, sizeof(signal));
++      signal.hContext = ctx->hContext;
++      signal.Flags.EnqueueCpuEvent = TRUE;
++      signal.CpuEventHandle = options->CompletionEvent;
++      dev->callbacks.pfnSignalSynchronizationObject2Cb(dev->hRTDevice, &signal);
++   }
++
++   ctx->base.pCommandBuffer = r.pNewCommandBuffer;
++   ctx->base.pAllocationList = r.pNewAllocationList;
++   ctx->base.pPatchLocationList = r.pNewPatchLocationList;
++   ctx->base.CommandBufferSize = r.NewCommandBufferSize;
++   ctx->base.AllocationListSize = r.NewAllocationListSize;
++   ctx->base.PatchLocationListSize = r.NewPatchLocationListSize;
++   return status;
++}
++
++static void
++destroycontext(struct gdikmt_context *_ctx)
++{
++   struct gdikmt_context_d3d9 *ctx = context_d3d9(_ctx);
++   struct gdikmt_device_d3d9 *dev = device_d3d9(ctx->base.device);
++   D3DDDICB_DESTROYCONTEXT destroy;
++   memset(&destroy, 0, sizeof(destroy));
++   destroy.hContext = ctx->hContext;
++   dev->callbacks.pfnDestroyContextCb(dev->hRTDevice, &destroy);
++   FREE(ctx);
++}
++
++static NTSTATUS
++createcontext(struct gdikmt_device *_device, struct gdikmt_context **out)
++{
++   struct gdikmt_device_d3d9 *device = device_d3d9(_device);
++   struct gdikmt_context_d3d9 *ctx = CALLOC_STRUCT(gdikmt_context_d3d9);
++   if (!ctx)
++      return STATUS_NO_MEMORY;
++   ctx->base.device = _device;
++
++   D3DDDICB_CREATECONTEXT create;
++   memset(&create, 0, sizeof(create));
++   NTSTATUS status = device->callbacks.pfnCreateContextCb(device->hRTDevice, &create);
++   if (!NT_SUCCESS(status)) {
++      FREE(ctx);
++      return status;
++   }
++   ctx->hContext = create.hContext;
++   ctx->base.pCommandBuffer = create.pCommandBuffer;
++   ctx->base.pAllocationList = create.pAllocationList;
++   ctx->base.pPatchLocationList = create.pPatchLocationList;
++   ctx->base.CommandBufferSize = create.CommandBufferSize;
++   ctx->base.AllocationListSize = create.AllocationListSize;
++   ctx->base.PatchLocationListSize = create.PatchLocationListSize;
++   ctx->base.destroy = destroycontext;
++   ctx->base.render = render;
++   *out = &ctx->base;
++   return status;
++}
++
++static NTSTATUS
++createallocation(struct gdikmt_device *_device, struct gdikmt_createallocation *options)
++{
++   struct gdikmt_device_d3d9 *device = device_d3d9(_device);
++   D3DDDICB_ALLOCATE allocate;
++   memset(&allocate, 0, sizeof(allocate));
++   allocate.NumAllocations = options->NumAllocations;
++   allocate.pAllocationInfo = options->pAllocationInfo;
++   allocate.pPrivateDriverData = options->pPrivateDriverData;
++   allocate.PrivateDriverDataSize = options->PrivateDriverDataSize;
++   allocate.hResource = device->hRTResource;
++   NTSTATUS status = device->callbacks.pfnAllocateCb(device->hRTDevice, &allocate);
++   options->hResource = (HANDLE)(uintptr_t)allocate.hKMResource;
++   return status;
++}
++
++static NTSTATUS
++destroyallocation(struct gdikmt_device *_device, HANDLE hResource, D3DKMT_HANDLE hAllocation)
++{
++   struct gdikmt_device_d3d9 *device = device_d3d9(_device);
++   D3DDDICB_DEALLOCATE deallocate;
++   memset(&deallocate, 0, sizeof(deallocate));
++   deallocate.NumAllocations = 1;
++   deallocate.HandleList = &hAllocation;
++   return device->callbacks.pfnDeallocateCb(device->hRTDevice, &deallocate);
++}
++
++static NTSTATUS
++lockallocation(struct gdikmt_device *_device, D3DKMT_HANDLE hAllocation, D3DDDICB_LOCKFLAGS flags, void **out)
++{
++   struct gdikmt_device_d3d9 *device = device_d3d9(_device);
++   D3DDDICB_LOCK lock;
++   memset(&lock, 0, sizeof(lock));
++   lock.Flags = flags;
++   lock.Flags.LockEntire = TRUE;
++   lock.hAllocation = hAllocation;
++   NTSTATUS status = device->callbacks.pfnLockCb(device->hRTDevice, &lock);
++   *out = lock.pData;
++   return status;
++}
++
++/* Shared resources (OpenResource) aren't supported yet */
++static NTSTATUS
++queryallocation(struct gdikmt_device *, struct gdikmt_openallocation *)
++{
++   return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS
++openallocation(struct gdikmt_device *, struct gdikmt_openallocation *)
++{
++   return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS
++present(struct gdikmt_context *_ctx, D3DKMT_HANDLE hSrcAllocation, void *winsys_drawable_handle,
++        struct pipe_box *sub_box)
++{
++   struct gdikmt_context_d3d9 *ctx = context_d3d9(_ctx);
++   struct gdikmt_device_d3d9 *dev = device_d3d9(_ctx->device);
++   const struct gdikmt_d3d9_present *info = (const struct gdikmt_d3d9_present *)winsys_drawable_handle;
++
++   D3DDDICB_PRESENT p;
++   memset(&p, 0, sizeof(p));
++   p.hSrcAllocation = hSrcAllocation;
++   p.hDstAllocation = info ? info->hDstAllocation : 0;
++   p.hContext = ctx->hContext;
++   return dev->callbacks.pfnPresentCb(dev->hRTDevice, &p);
++}
++
++static NTSTATUS
++setdisplaymode(struct gdikmt_device *_device, D3DKMT_HANDLE hSrcAllocation)
++{
++   struct gdikmt_device_d3d9 *device = device_d3d9(_device);
++   D3DDDICB_SETDISPLAYMODE mode;
++   memset(&mode, 0, sizeof(mode));
++   mode.hPrimaryAllocation = hSrcAllocation;
++   return device->callbacks.pfnSetDisplayModeCb(device->hRTDevice, &mode);
++}
++
++static void
++destroy(struct gdikmt_device *)
++{
++   /* Embedded in the driver's device; nothing to free */
++}
++
++void
++gdikmt_d3d9_init(struct gdikmt_device_d3d9 *device)
++{
++   device->base.destroy = destroy;
++   device->base.queryAdapterInfo = queryadapterinfo;
++   device->base.escape = escape;
++   device->base.createContext = createcontext;
++   device->base.createAllocation = createallocation;
++   device->base.destroyAllocation = destroyallocation;
++   device->base.lockAllocation = lockallocation;
++   device->base.queryAllocation = queryallocation;
++   device->base.openAllocation = openallocation;
++   device->base.present = present;
++   device->base.setDisplayMode = setdisplaymode;
++}
+diff --git a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h
+new file mode 100644
+index 0000000..744cb14
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* gdikmt (the kernel interface the virgl winsys uses) on top of the D3D9 runtime's callbacks, like
++ * d3d10umd/gdikmt_d3dddi for the D3D10 runtime */
++
++#ifndef GDIKMT_D3D9_H
++#define GDIKMT_D3D9_H
++
++#include "gdikmt/gdikmt.h"
++#include <d3d9.h> /* d3dumddi.h uses the D3D9 types without including them */
++#include <d3dumddi.h>
++
++struct gdikmt_device_d3d9 {
++   struct gdikmt_device base;
++
++   HANDLE hRTAdapter;
++   HANDLE hRTDevice;
++   D3DDDI_DEVICECALLBACKS callbacks;
++   const D3DDDI_ADAPTERCALLBACKS *adapterCallbacks;
++
++   /* Set while the driver creates a resource, so its allocations belong to the runtime's resource */
++   HANDLE hRTResource;
++};
++
++/* What flush_frontbuffer passes as its drawable handle when presenting */
++struct gdikmt_d3d9_present {
++   D3DKMT_HANDLE hDstAllocation;
++};
++
++void gdikmt_d3d9_init(struct gdikmt_device_d3d9 *device);
++
++#endif
+diff --git a/src/gallium/frontends/d3d9umd/gen_stubs.py b/src/gallium/frontends/d3d9umd/gen_stubs.py
+new file mode 100644
+index 0000000..2fa1c12
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/gen_stubs.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""Generates ddi_stubs.cpp: a typed stub for every D3DDDI_DEVICEFUNCS entry (from d3dumddi.h).
++
++    gen_stubs.py <WDK>/Include/<version>/um/d3dumddi.h ddi_stubs.cpp
++
++Typed stubs matter on 32-bit x86, where the __stdcall callee pops its own arguments: a generic stub with the wrong
++parameter list would corrupt the stack.
++"""
++import re
++import sys
++
++header = open(sys.argv[1]).read().replace('\r', '')
++
++# Members of D3DDDI_DEVICEFUNCS, in order, with their #if guards dropped (we build against the latest header)
++body = re.search(r'typedef struct _D3DDDI_DEVICEFUNCS\s*\{(.*?)\}\s*D3DDDI_DEVICEFUNCS;', header, re.S).group(1)
++members = re.findall(r'^\s*(PFND3DDDI_\w+)\s+(pfn\w+);', body, re.M)
++
++def typedef(pfn_type):
++    m = re.search(r'typedef\s+(?:_Check_return_\s+)?(\w+)\s*\(\s*APIENTRY\s*\*\s*' + pfn_type + r'\s*\)\s*\((.*?)\)\s*;',
++                  header, re.S)
++    if not m:
++        raise SystemExit('no typedef for ' + pfn_type)
++    ret, params = m.group(1), ' '.join(m.group(2).split())
++    return ret, params
++
++out = ['/*',
++       ' * Copyright 2026 WinBoat contributors',
++       ' * SPDX-License-Identifier: MIT',
++       ' *',
++       ' * Generated from d3dumddi.h: a typed stub for every D3DDDI_DEVICEFUNCS entry, so the runtime never calls a NULL',
++       ' * pointer. device.cpp overrides the implemented ones. Regenerate with gen_stubs.py when the DDI grows.',
++       ' */',
++       '',
++       '#include "d3d9umd.h"',
++       '']
++for pfn_type, member in members:
++    ret, params = typedef(pfn_type)
++    name = member[3:]
++    if ret.upper() in ('VOID', 'VOID_'):
++        out.append(f'static VOID APIENTRY\nStub{name}({params})\n{{\n   D3D9UmdUnimplemented("{name}");\n}}\n')
++    else:
++        out.append(f'static {ret} APIENTRY\nStub{name}({params})\n{{\n   return D3D9UmdUnimplemented("{name}");\n}}\n')
++
++out.append('void\nD3D9UmdFillStubs(D3DDDI_DEVICEFUNCS *funcs)\n{')
++for pfn_type, member in members:
++    out.append(f'   funcs->{member} = Stub{member[3:]};')
++out.append('}')
++open(sys.argv[2], 'w').write('\n'.join(out) + '\n')
++print(f'{len(members)} stubs')
+diff --git a/src/gallium/frontends/d3d9umd/meson.build b/src/gallium/frontends/d3d9umd/meson.build
+new file mode 100644
+index 0000000..0372e46
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/meson.build
+@@ -0,0 +1,31 @@
++# Copyright 2026 WinBoat contributors
++# SPDX-License-Identifier: MIT
++
++inc_d3d9umd = include_directories('.')
++
++# The DDI side, built against the WDK headers; nine_bridge.c is built separately against nine's own D3D9 headers
++libd3d9umd = static_library(
++  'd3d9umd',
++  files(
++    'adapter.cpp',
++    'caps.cpp',
++    'ddi_stubs.cpp',
++    'debug.cpp',
++    'device.cpp',
++    'gdikmt_d3d9.cpp',
++    'pipeline.cpp',
++  ),
++  include_directories : [
++    inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_gallium_winsys, inc_winddk,
++  ],
++)
++
++libd3d9umd_nine = static_library(
++  'd3d9umd_nine',
++  files('nine_bridge.c'),
++  c_args : nine_c_args,
++  include_directories : [
++    inc_d3d9, inc_include, inc_src, inc_gallium, inc_gallium_aux, include_directories('../nine'),
++  ],
++  dependencies : [idep_nir_headers],
++)
+diff --git a/src/gallium/frontends/d3d9umd/nine_bridge.c b/src/gallium/frontends/d3d9umd/nine_bridge.c
+new file mode 100644
+index 0000000..624c041
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/nine_bridge.c
+@@ -0,0 +1,966 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * The nine side of d3d9umd: a headless NineDevice9 per DDI device, and a nine object per DDI resource.
++ * Only gallium nine's D3D9 headers are visible here, never the WDK's (see d3d9umd_bridge.h).
++ */
++
++#include "d3d9umd_bridge.h"
++
++#include "adapter9.h"
++#include "cubetexture9.h"
++#include "device9.h"
++#include "buffer9.h"
++#include "indexbuffer9.h"
++#include "pixelshader9.h"
++#include "query9.h"
++#include "vertexdeclaration9.h"
++#include "vertexshader9.h"
++#include "nine_memory_helper.h"
++#include "nine_pipe.h"
++#include "nine_state.h"
++#include "surface9.h"
++#include "texture9.h"
++#include "vertexbuffer9.h"
++#include "volumetexture9.h"
++
++#include "pipe/p_screen.h"
++#include "util/format/u_format.h"
++#include "util/u_debug.h"
++#include "util/u_memory.h"
++#include "util/u_upload_mgr.h"
++#include "util/u_inlines.h"
++
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++/* Both header sets describe the same binary structures */
++static_assert(sizeof(D3DCAPS9) == 304, "D3DCAPS9 layout");
++static_assert(sizeof(D3DRECT) == sizeof(struct nddi_rect), "D3DRECT layout");
++
++struct nddi_adapter {
++   struct d3dadapter9_context ctx;
++   struct NineAdapter9 *adapter;
++};
++
++#define NDDI_MAX_STREAMS 16
++
++struct nddi_device {
++   struct nddi_adapter *adapter;
++   struct d3dadapter9_context ctx;
++   struct NineDevice9 *device;
++
++   /* User memory vertex streams and indices (SetStreamSourceUm / SetIndicesUm), uploaded per draw */
++   struct {
++      const void *data;
++      uint32_t stride;
++   } memory_stream[NDDI_MAX_STREAMS];
++   const void *memory_indices;
++   uint32_t memory_index_size;
++};
++
++struct nddi_object {
++   struct NineUnknown *obj;
++};
++
++struct nddi_resource {
++   struct nddi_device *dev;
++   enum nddi_resource_kind kind;
++   struct NineUnknown *obj;          /* the nine object, NULL for system memory resources */
++   unsigned levels;
++   unsigned subresource_count;
++   struct NineSurface9 **sysmem;     /* system memory: one surface wrapping runtime memory per subresource */
++};
++
++static void
++nddi_init_context(struct d3dadapter9_context *ctx, struct pipe_screen *screen)
++{
++   memset(ctx, 0, sizeof(*ctx));
++   ctx->hal = screen;
++   /* nine's software vertex processing context; the D3D9 runtime processes vertices itself for SWVP devices */
++   ctx->ref = screen;
++   snprintf(ctx->identifier.Driver, sizeof(ctx->identifier.Driver), "viogpu_d3d9.dll");
++   snprintf(ctx->identifier.Description, sizeof(ctx->identifier.Description), "%s", screen->get_name(screen));
++   ctx->identifier.VendorId = 0x1af4;
++   ctx->identifier.DeviceId = 0x1050;
++   ctx->identifier.WHQLLevel = 0;
++   /* The DDI calls arrive serialized from the runtime; no worker thread */
++   ctx->csmt_force = 0;
++   ctx->memfd_virtualsizelimit = -1;
++   ctx->override_vram_size = -1;
++}
++
++/* ---- Adapter ---- */
++
++struct nddi_adapter *
++nddi_adapter_create(struct pipe_screen *screen)
++{
++   struct nddi_adapter *adapter = CALLOC_STRUCT(nddi_adapter);
++   if (!adapter)
++      return NULL;
++   nddi_init_context(&adapter->ctx, screen);
++   if (FAILED(NineAdapter9_new(&adapter->ctx, &adapter->adapter))) {
++      _debug_printf("d3d9umd: gallium nine doesn't support %s\n", screen->get_name(screen));
++      FREE(adapter);
++      return NULL;
++   }
++   return adapter;
++}
++
++void
++nddi_adapter_destroy(struct nddi_adapter *adapter)
++{
++   if (!adapter)
++      return;
++   NineUnknown_Release(NineUnknown(adapter->adapter));
++   FREE(adapter);
++}
++
++bool
++nddi_adapter_get_caps(struct nddi_adapter *adapter, void *d3dcaps9, unsigned size)
++{
++   if (size < sizeof(D3DCAPS9))
++      return false;
++   return SUCCEEDED(NineAdapter9_GetDeviceCaps(adapter->adapter, D3DDEVTYPE_HAL, (D3DCAPS9 *)d3dcaps9));
++}
++
++bool
++nddi_adapter_check_format(struct nddi_adapter *adapter, uint32_t adapter_format, uint32_t usage, uint32_t rtype,
++                          uint32_t format)
++{
++   return NineAdapter9_CheckDeviceFormat(adapter->adapter, D3DDEVTYPE_HAL, (D3DFORMAT)adapter_format, usage,
++                                         (D3DRESOURCETYPE)rtype, (D3DFORMAT)format) == D3D_OK;
++}
++
++bool
++nddi_adapter_check_multisample(struct nddi_adapter *adapter, uint32_t format, uint32_t samples,
++                               uint32_t *quality_levels)
++{
++   DWORD levels = 0;
++   HRESULT hr = NineAdapter9_CheckDeviceMultiSampleType(adapter->adapter, D3DDEVTYPE_HAL, (D3DFORMAT)format, TRUE,
++                                                        (D3DMULTISAMPLE_TYPE)samples, &levels);
++   if (quality_levels)
++      *quality_levels = levels;
++   return SUCCEEDED(hr);
++}
++
++/* ---- Device ---- */
++
++struct nddi_device *
++nddi_device_create(struct nddi_adapter *adapter, struct pipe_screen *screen)
++{
++   struct nddi_device *dev = CALLOC_STRUCT(nddi_device);
++   if (!dev)
++      return NULL;
++   dev->adapter = adapter;
++   nddi_init_context(&dev->ctx, screen);
++
++   D3DCAPS9 caps;
++   if (FAILED(NineAdapter9_GetDeviceCaps(adapter->adapter, D3DDEVTYPE_HAL, &caps))) {
++      FREE(dev);
++      return NULL;
++   }
++   D3DDEVICE_CREATION_PARAMETERS params;
++   memset(&params, 0, sizeof(params));
++   params.AdapterOrdinal = 0;
++   params.DeviceType = D3DDEVTYPE_HAL;
++   /* The runtime transforms vertices itself for software vertex processing devices, so nine always gets HWVP.
++    * FPU_PRESERVE: the runtime manages the FPU state. */
++   params.BehaviorFlags = D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE;
++
++   /* No presentation group: a headless device, the runtime owns swapchains */
++   HRESULT hr = NineDevice9_new(screen, &params, &caps, NULL, NULL, NULL, &dev->ctx, false, NULL, &dev->device, 3);
++   if (FAILED(hr)) {
++      _debug_printf("d3d9umd: creating the nine device failed: 0x%08lx\n", (unsigned long)hr);
++      FREE(dev);
++      return NULL;
++   }
++   /* virgl turns an uploaded buffer in constant buffer slot 0 into a UBO, which the host's shaders don't read */
++   dev->device->driver_caps.user_constbufs = true;
++   return dev;
++}
++
++void
++nddi_device_destroy(struct nddi_device *dev)
++{
++   if (!dev)
++      return;
++   NineUnknown_Release(NineUnknown(dev->device));
++   FREE(dev);
++}
++
++/* ---- Resources ---- */
++
++static struct NineSurface9 *
++nddi_surface(struct nddi_resource *res, unsigned subresource)
++{
++   if (res->sysmem)
++      return subresource < res->subresource_count ? res->sysmem[subresource] : NULL;
++   switch (res->kind) {
++   case NDDI_SURFACE:
++   case NDDI_RENDER_TARGET:
++   case NDDI_DEPTH_STENCIL:
++      return subresource == 0 ? NineSurface9(res->obj) : NULL;
++   case NDDI_TEXTURE:
++      return subresource < res->levels ? NineTexture9(res->obj)->surfaces[subresource] : NULL;
++   case NDDI_CUBE_TEXTURE: {
++      /* DDI subresources are face-major (all levels of +X, then -X, ...); nine stores level-major */
++      unsigned face = subresource / res->levels, level = subresource % res->levels;
++      return face < 6 ? NineCubeTexture9(res->obj)->surfaces[face + 6 * level] : NULL;
++   }
++   default:
++      return NULL;
++   }
++}
++
++static int32_t
++nddi_create_sysmem(struct nddi_device *dev, const struct nddi_resource_desc *desc, struct nddi_resource *res)
++{
++   if (desc->kind == NDDI_VERTEX_BUFFER || desc->kind == NDDI_INDEX_BUFFER) {
++      /* A system memory buffer on the runtime's memory. DYNAMIC makes nine upload the range each draw uses: the
++       * runtime writes this memory directly (its DrawPrimitiveUP buffer, for one) */
++      void *obj = NULL;
++      HRESULT hr;
++      if (desc->kind == NDDI_VERTEX_BUFFER)
++         hr = NineDevice9_CreateVertexBuffer(dev->device, desc->width, desc->usage | D3DUSAGE_DYNAMIC, desc->fvf,
++                                             D3DPOOL_SYSTEMMEM, (IDirect3DVertexBuffer9 **)&obj, NULL);
++      else
++         hr = NineDevice9_CreateIndexBuffer(dev->device, desc->width, desc->usage | D3DUSAGE_DYNAMIC,
++                                            (D3DFORMAT)desc->format, D3DPOOL_SYSTEMMEM,
++                                            (IDirect3DIndexBuffer9 **)&obj, NULL);
++      if (FAILED(hr))
++         return hr;
++      NineBuffer9_SetExternalMemory(NineBuffer9(obj), desc->sysmem[0]);
++      res->obj = obj;
++      return D3D_OK;
++   }
++   if (desc->kind == NDDI_VOLUME_TEXTURE) {
++      _debug_printf("d3d9umd: system memory volume textures aren't supported yet\n");
++      return D3DERR_INVALIDCALL;
++   }
++   unsigned faces = desc->kind == NDDI_CUBE_TEXTURE ? 6 : 1;
++   unsigned levels = desc->kind == NDDI_TEXTURE || desc->kind == NDDI_CUBE_TEXTURE ? desc->levels : 1;
++   res->subresource_count = faces * levels;
++   res->sysmem = CALLOC(res->subresource_count, sizeof(*res->sysmem));
++   if (!res->sysmem)
++      return E_OUTOFMEMORY;
++
++   for (unsigned i = 0; i < res->subresource_count; i++) {
++      unsigned level = i % levels;
++      D3DSURFACE_DESC sd;
++      memset(&sd, 0, sizeof(sd));
++      sd.Format = (D3DFORMAT)desc->format;
++      sd.Type = D3DRTYPE_SURFACE;
++      sd.Pool = D3DPOOL_SYSTEMMEM;
++      sd.MultiSampleType = D3DMULTISAMPLE_NONE;
++      sd.Width = MAX2(desc->width >> level, 1);
++      sd.Height = MAX2(desc->height >> level, 1);
++      struct nine_allocation *memory = nine_wrap_external_pointer(dev->device->allocator, desc->sysmem[i]);
++      HRESULT hr = NineSurface9_new(dev->device, NULL, NULL, memory, D3DRTYPE_SURFACE, 0, 0, &sd, &res->sysmem[i]);
++      if (FAILED(hr))
++         return hr;
++      if (res->sysmem[i]->stride != desc->sysmem_pitch[i])
++         _debug_printf("d3d9umd: system memory pitch %u differs from nine's %u (format %u, width %u)\n",
++                       desc->sysmem_pitch[i], res->sysmem[i]->stride, desc->format, sd.Width);
++   }
++   return D3D_OK;
++}
++
++int32_t
++nddi_resource_create(struct nddi_device *dev, const struct nddi_resource_desc *desc, struct nddi_resource **out)
++{
++   struct nddi_resource *res = CALLOC_STRUCT(nddi_resource);
++   if (!res)
++      return E_OUTOFMEMORY;
++   res->dev = dev;
++   res->kind = desc->kind;
++   res->levels = MAX2(desc->levels, 1);
++   res->subresource_count = 1;
++
++   struct NineDevice9 *d = dev->device;
++   D3DFORMAT format = (D3DFORMAT)desc->format;
++   void *obj = NULL;
++   HRESULT hr;
++   if (desc->system_memory) {
++      hr = nddi_create_sysmem(dev, desc, res);
++   } else {
++      switch (desc->kind) {
++      case NDDI_SURFACE:
++         hr = NineDevice9_CreateOffscreenPlainSurface(d, desc->width, desc->height, format, D3DPOOL_DEFAULT,
++                                                      (IDirect3DSurface9 **)&obj, NULL);
++         break;
++      case NDDI_RENDER_TARGET:
++         hr = NineDevice9_CreateRenderTarget(d, desc->width, desc->height, format,
++                                             (D3DMULTISAMPLE_TYPE)desc->multisample, desc->multisample_quality,
++                                             desc->lockable, (IDirect3DSurface9 **)&obj, NULL);
++         break;
++      case NDDI_DEPTH_STENCIL:
++         hr = NineDevice9_CreateDepthStencilSurface(d, desc->width, desc->height, format,
++                                                    (D3DMULTISAMPLE_TYPE)desc->multisample,
++                                                    desc->multisample_quality, FALSE, (IDirect3DSurface9 **)&obj,
++                                                    NULL);
++         break;
++      case NDDI_TEXTURE:
++         hr = NineDevice9_CreateTexture(d, desc->width, desc->height, res->levels, desc->usage, format,
++                                        D3DPOOL_DEFAULT, (IDirect3DTexture9 **)&obj, NULL);
++         res->subresource_count = res->levels;
++         break;
++      case NDDI_CUBE_TEXTURE:
++         hr = NineDevice9_CreateCubeTexture(d, desc->width, res->levels, desc->usage, format, D3DPOOL_DEFAULT,
++                                            (IDirect3DCubeTexture9 **)&obj, NULL);
++         res->subresource_count = res->levels * 6;
++         break;
++      case NDDI_VOLUME_TEXTURE:
++         hr = NineDevice9_CreateVolumeTexture(d, desc->width, desc->height, desc->depth, res->levels, desc->usage,
++                                              format, D3DPOOL_DEFAULT, (IDirect3DVolumeTexture9 **)&obj, NULL);
++         res->subresource_count = res->levels;
++         break;
++      case NDDI_VERTEX_BUFFER:
++         hr = NineDevice9_CreateVertexBuffer(d, desc->width, desc->usage, desc->fvf, D3DPOOL_DEFAULT,
++                                             (IDirect3DVertexBuffer9 **)&obj, NULL);
++         break;
++      case NDDI_INDEX_BUFFER:
++         hr = NineDevice9_CreateIndexBuffer(d, desc->width, desc->usage, format, D3DPOOL_DEFAULT,
++                                            (IDirect3DIndexBuffer9 **)&obj, NULL);
++         break;
++      default:
++         hr = D3DERR_INVALIDCALL;
++      }
++      res->obj = obj;
++   }
++   if (FAILED(hr)) {
++      nddi_resource_destroy(res);
++      return hr;
++   }
++   *out = res;
++   return D3D_OK;
++}
++
++void
++nddi_resource_destroy(struct nddi_resource *res)
++{
++   if (!res)
++      return;
++   if (res->sysmem) {
++      for (unsigned i = 0; i < res->subresource_count; i++) {
++         if (res->sysmem[i])
++            NineUnknown_Release(NineUnknown(res->sysmem[i]));
++      }
++      FREE(res->sysmem);
++   }
++   if (res->obj)
++      NineUnknown_Release(res->obj);
++   FREE(res);
++}
++
++struct pipe_resource *
++nddi_resource_get_pipe(struct nddi_resource *res, unsigned subresource, unsigned *level, unsigned *layer)
++{
++   struct NineSurface9 *surf = nddi_surface(res, subresource);
++   if (!surf)
++      return NULL;
++   *level = surf->level;
++   *layer = surf->layer;
++   return surf->base.resource;
++}
++
++int32_t
++nddi_resource_lock(struct nddi_resource *res, unsigned subresource, const struct nddi_box *box, uint32_t flags,
++                   void **data, uint32_t *pitch, uint32_t *slice_pitch)
++{
++   *slice_pitch = 0;
++   switch (res->kind) {
++   case NDDI_VERTEX_BUFFER:
++   case NDDI_INDEX_BUFFER: {
++      /* For buffers the box's left/right are a byte range */
++      UINT offset = box ? box->left : 0, size = box ? box->right - box->left : 0;
++      *pitch = 0;
++      if (res->kind == NDDI_VERTEX_BUFFER)
++         return NineVertexBuffer9_Lock((struct NineVertexBuffer9 *)res->obj, offset, size, data, flags);
++      return NineIndexBuffer9_Lock((struct NineIndexBuffer9 *)res->obj, offset, size, data, flags);
++   }
++   case NDDI_VOLUME_TEXTURE: {
++      D3DLOCKED_BOX locked;
++      D3DBOX b;
++      if (box) {
++         b.Left = box->left; b.Top = box->top; b.Right = box->right;
++         b.Bottom = box->bottom; b.Front = box->front; b.Back = box->back;
++      }
++      HRESULT hr = NineVolumeTexture9_LockBox(NineVolumeTexture9(res->obj), subresource, &locked, box ? &b : NULL,
++                                              flags);
++      if (SUCCEEDED(hr)) {
++         *data = locked.pBits;
++         *pitch = locked.RowPitch;
++         *slice_pitch = locked.SlicePitch;
++      }
++      return hr;
++   }
++   default: {
++      struct NineSurface9 *surf = nddi_surface(res, subresource);
++      if (!surf)
++         return D3DERR_INVALIDCALL;
++      D3DLOCKED_RECT locked;
++      RECT r;
++      if (box) {
++         r.left = box->left; r.top = box->top; r.right = box->right; r.bottom = box->bottom;
++      }
++      HRESULT hr = NineSurface9_LockRect(surf, &locked, box ? &r : NULL, flags);
++      if (SUCCEEDED(hr)) {
++         *data = locked.pBits;
++         *pitch = locked.Pitch;
++      }
++      return hr;
++   }
++   }
++}
++
++int32_t
++nddi_resource_unlock(struct nddi_resource *res, unsigned subresource)
++{
++   switch (res->kind) {
++   case NDDI_VERTEX_BUFFER:
++      return NineVertexBuffer9_Unlock((struct NineVertexBuffer9 *)res->obj);
++   case NDDI_INDEX_BUFFER:
++      return NineIndexBuffer9_Unlock((struct NineIndexBuffer9 *)res->obj);
++   case NDDI_VOLUME_TEXTURE:
++      return NineVolumeTexture9_UnlockBox(NineVolumeTexture9(res->obj), subresource);
++   default: {
++      struct NineSurface9 *surf = nddi_surface(res, subresource);
++      return surf ? NineSurface9_UnlockRect(surf) : D3DERR_INVALIDCALL;
++   }
++   }
++}
++
++void
++nddi_resource_written(struct nddi_resource *res)
++{
++   /* System memory surfaces are read straight from the runtime's memory when used. System memory buffers are
++    * uploaded at draw time, for the range the draw needs, when nine's lock has invalidated them: lock them the same
++    * way. */
++   if ((res->kind != NDDI_VERTEX_BUFFER && res->kind != NDDI_INDEX_BUFFER) || !res->obj)
++      return;
++   struct NineBuffer9 *buf = NineBuffer9(res->obj);
++   if (buf->base.pool != D3DPOOL_SYSTEMMEM)
++      return;
++   void *data;
++   if (SUCCEEDED(NineBuffer9_Lock(buf, 0, 0, &data, 0)))
++      NineBuffer9_Unlock(buf);
++}
++
++static bool
++nddi_rect_is_whole(const struct nddi_rect *r, const struct NineSurface9 *surf)
++{
++   return r->left == 0 && r->top == 0 && (UINT)r->right == surf->desc.Width && (UINT)r->bottom == surf->desc.Height;
++}
++
++/* CPU copy of a rectangle between two lockable surfaces of the same format */
++static HRESULT
++nddi_copy_locked(struct NineSurface9 *src, const RECT *src_rect, struct NineSurface9 *dst, const RECT *dst_rect)
++{
++   D3DLOCKED_RECT s, d;
++   HRESULT hr = NineSurface9_LockRect(src, &s, src_rect, D3DLOCK_READONLY);
++   if (FAILED(hr))
++      return hr;
++   hr = NineSurface9_LockRect(dst, &d, dst_rect, 0);
++   if (FAILED(hr)) {
++      NineSurface9_UnlockRect(src);
++      return hr;
++   }
++   unsigned rows = util_format_get_nblocksy(src->base.info.format, src_rect->bottom - src_rect->top);
++   unsigned row_bytes = util_format_get_stride(src->base.info.format, src_rect->right - src_rect->left);
++   for (unsigned y = 0; y < rows; y++)
++      memcpy((uint8_t *)d.pBits + y * d.Pitch, (const uint8_t *)s.pBits + y * s.Pitch, row_bytes);
++   NineSurface9_UnlockRect(dst);
++   NineSurface9_UnlockRect(src);
++   return D3D_OK;
++}
++
++int32_t
++nddi_blt(struct nddi_device *dev, struct nddi_resource *src, unsigned src_sub, const struct nddi_rect *src_rect,
++         struct nddi_resource *dst, unsigned dst_sub, const struct nddi_rect *dst_rect, uint32_t filter)
++{
++   struct NineSurface9 *s = nddi_surface(src, src_sub), *d = nddi_surface(dst, dst_sub);
++   if (!s || !d)
++      return D3DERR_INVALIDCALL;
++   RECT sr = {src_rect->left, src_rect->top, src_rect->right, src_rect->bottom};
++   RECT dr = {dst_rect->left, dst_rect->top, dst_rect->right, dst_rect->bottom};
++   bool src_sys = s->desc.Pool == D3DPOOL_SYSTEMMEM, dst_sys = d->desc.Pool == D3DPOOL_SYSTEMMEM;
++   bool same_size = sr.right - sr.left == dr.right - dr.left && sr.bottom - sr.top == dr.bottom - dr.top;
++
++   if (src_sys && dst_sys)
++      return nddi_copy_locked(s, &sr, d, &dr);
++   if (src_sys) {
++      if (!same_size)
++         return D3DERR_INVALIDCALL;
++      POINT p = {dr.left, dr.top};
++      return NineDevice9_UpdateSurface(dev->device, (IDirect3DSurface9 *)s, &sr, (IDirect3DSurface9 *)d, &p);
++   }
++   if (dst_sys) {
++      if (!same_size)
++         return D3DERR_INVALIDCALL;
++      if ((s->desc.Usage & D3DUSAGE_RENDERTARGET) && nddi_rect_is_whole(src_rect, s) &&
++          nddi_rect_is_whole(dst_rect, d))
++         return NineDevice9_GetRenderTargetData(dev->device, (IDirect3DSurface9 *)s, (IDirect3DSurface9 *)d);
++      return nddi_copy_locked(s, &sr, d, &dr);
++   }
++   return NineDevice9_StretchRect(dev->device, (IDirect3DSurface9 *)s, &sr, (IDirect3DSurface9 *)d, &dr,
++                                  (D3DTEXTUREFILTERTYPE)filter);
++}
++
++int32_t
++nddi_color_fill(struct nddi_device *dev, struct nddi_resource *res, unsigned subresource, const struct nddi_rect *rect,
++                uint32_t color)
++{
++   struct NineSurface9 *surf = nddi_surface(res, subresource);
++   if (!surf)
++      return D3DERR_INVALIDCALL;
++   RECT r = {rect->left, rect->top, rect->right, rect->bottom};
++   return NineDevice9_ColorFill(dev->device, (IDirect3DSurface9 *)surf, &r, color);
++}
++
++/* ---- State ---- */
++
++int32_t
++nddi_set_render_state(struct nddi_device *dev, uint32_t state, uint32_t value)
++{
++   return NineDevice9_SetRenderState(dev->device, (D3DRENDERSTATETYPE)state, value);
++}
++
++int32_t
++nddi_set_render_target(struct nddi_device *dev, uint32_t index, struct nddi_resource *res, unsigned subresource)
++{
++   struct NineSurface9 *surf = res ? nddi_surface(res, subresource) : NULL;
++   /* nine (like the API) needs a render target 0; the runtime unbinds it while tearing down */
++   if (index == 0 && !surf)
++      return D3D_OK;
++   return NineDevice9_SetRenderTarget(dev->device, index, (IDirect3DSurface9 *)surf);
++}
++
++int32_t
++nddi_set_depth_stencil(struct nddi_device *dev, struct nddi_resource *res)
++{
++   struct NineSurface9 *surf = res ? nddi_surface(res, 0) : NULL;
++   return NineDevice9_SetDepthStencilSurface(dev->device, (IDirect3DSurface9 *)surf);
++}
++
++int32_t
++nddi_set_viewport(struct nddi_device *dev, const struct nddi_viewport *viewport)
++{
++   D3DVIEWPORT9 vp = {viewport->x, viewport->y, viewport->width, viewport->height, viewport->min_z, viewport->max_z};
++   return NineDevice9_SetViewport(dev->device, &vp);
++}
++
++int32_t
++nddi_set_scissor(struct nddi_device *dev, const struct nddi_rect *rect)
++{
++   RECT r = {rect->left, rect->top, rect->right, rect->bottom};
++   return NineDevice9_SetScissorRect(dev->device, &r);
++}
++
++/* ---- Commands ---- */
++
++int32_t
++nddi_begin_scene(struct nddi_device *dev)
++{
++   return NineDevice9_BeginScene(dev->device);
++}
++
++int32_t
++nddi_end_scene(struct nddi_device *dev)
++{
++   return NineDevice9_EndScene(dev->device);
++}
++
++int32_t
++nddi_clear(struct nddi_device *dev, uint32_t rect_count, const struct nddi_rect *rects, uint32_t flags,
++           uint32_t color, float z, uint32_t stencil)
++{
++   if (!dev->device->state.rt[0])
++      return D3D_OK;
++   return NineDevice9_Clear(dev->device, rect_count, (const D3DRECT *)rects, flags, color, z, stencil);
++}
++
++struct pipe_context *
++nddi_flush(struct nddi_device *dev)
++{
++   return nine_context_get_pipe(dev->device);
++}
++
++/* ---- Vertex and index data ---- */
++
++int32_t
++nddi_set_stream_source(struct nddi_device *dev, uint32_t stream, struct nddi_resource *vb, uint32_t offset,
++                       uint32_t stride)
++{
++   if (stream < NDDI_MAX_STREAMS)
++      dev->memory_stream[stream].data = NULL;
++   return NineDevice9_SetStreamSource(dev->device, stream, vb ? (IDirect3DVertexBuffer9 *)vb->obj : NULL, offset,
++                                      stride);
++}
++
++int32_t
++nddi_set_stream_source_memory(struct nddi_device *dev, uint32_t stream, const void *data, uint32_t stride)
++{
++   if (stream >= NDDI_MAX_STREAMS)
++      return D3DERR_INVALIDCALL;
++   NineDevice9_SetStreamSource(dev->device, stream, NULL, 0, stride);
++   dev->memory_stream[stream].data = data;
++   dev->memory_stream[stream].stride = stride;
++   return D3D_OK;
++}
++
++int32_t
++nddi_set_stream_source_freq(struct nddi_device *dev, uint32_t stream, uint32_t setting)
++{
++   return NineDevice9_SetStreamSourceFreq(dev->device, stream, setting);
++}
++
++int32_t
++nddi_set_indices(struct nddi_device *dev, struct nddi_resource *ib)
++{
++   dev->memory_indices = NULL;
++   return NineDevice9_SetIndices(dev->device, ib ? (IDirect3DIndexBuffer9 *)ib->obj : NULL);
++}
++
++int32_t
++nddi_set_indices_memory(struct nddi_device *dev, const void *data, uint32_t index_size)
++{
++   dev->memory_indices = data;
++   dev->memory_index_size = index_size;
++   return D3D_OK;
++}
++
++static unsigned
++vertex_count(uint32_t type, uint32_t count)
++{
++   switch (type) {
++   case D3DPT_POINTLIST: return count;
++   case D3DPT_LINELIST: return count * 2;
++   case D3DPT_LINESTRIP: return count + 1;
++   case D3DPT_TRIANGLELIST: return count * 3;
++   case D3DPT_TRIANGLESTRIP:
++   case D3DPT_TRIANGLEFAN: return count + 2;
++   default: return 0;
++   }
++}
++
++/* Uploads the user memory streams for vertices [first, first + count) and binds them. If every bound stream is in
++ * memory, only that range is uploaded and *rebase says by how many vertices the draw must shift (the uploaded data
++ * starts at vertex first). Otherwise the memory streams are uploaded from vertex 0 and *rebase is 0. Returns false if
++ * no stream is in memory. */
++static bool
++bind_memory_streams(struct nddi_device *dev, unsigned first, unsigned count, unsigned *rebase)
++{
++   struct NineDevice9 *d = dev->device;
++   bool any = false, all = true;
++   for (unsigned i = 0; i < NDDI_MAX_STREAMS && i < d->caps.MaxStreams; i++) {
++      if (dev->memory_stream[i].data)
++         any = true;
++      else if (d->state.stream[i])
++         all = false;
++   }
++   *rebase = 0;
++   if (!any)
++      return false;
++   unsigned start = all ? first : 0, num = all ? count : first + count;
++   for (unsigned i = 0; i < NDDI_MAX_STREAMS && i < d->caps.MaxStreams; i++) {
++      if (!dev->memory_stream[i].data)
++         continue;
++      unsigned stride = dev->memory_stream[i].stride;
++      /* stride 0: the same vertex for everything (instancing data); upload one */
++      unsigned size = stride ? num * stride : 256;
++      const uint8_t *data = (const uint8_t *)dev->memory_stream[i].data + (size_t)start * stride;
++      struct pipe_resource *res = NULL;
++      unsigned offset = 0;
++      u_upload_data(d->vertex_uploader, 0, size, 4, data, &offset, &res);
++      u_upload_unmap(d->vertex_uploader);
++      nine_context_set_stream_source_apply(d, i, res, offset, stride);
++      pipe_resource_reference(&res, NULL);
++   }
++   *rebase = start;
++   return true;
++}
++
++int32_t
++nddi_draw_primitive(struct nddi_device *dev, uint32_t type, uint32_t start_vertex, uint32_t count)
++{
++   unsigned rebase;
++   if (!count)
++      return D3D_OK;
++   bind_memory_streams(dev, start_vertex, vertex_count(type, count), &rebase);
++   return NineDevice9_DrawPrimitive(dev->device, (D3DPRIMITIVETYPE)type, start_vertex - rebase, count);
++}
++
++int32_t
++nddi_draw_indexed_primitive(struct nddi_device *dev, uint32_t type, int32_t base_vertex, uint32_t min_index,
++                            uint32_t num_vertices, uint32_t start_index, uint32_t count)
++{
++   struct NineDevice9 *d = dev->device;
++   unsigned rebase;
++   if (!count)
++      return D3D_OK;
++   /* The vertices an index i refers to are base_vertex + i; uploading from vertex base_vertex + min_index means
++    * the draw's base moves down by as much */
++   if (bind_memory_streams(dev, (unsigned)(base_vertex + (int32_t)min_index), num_vertices, &rebase))
++      base_vertex -= (int32_t)rebase;
++
++   if (!dev->memory_indices)
++      return NineDevice9_DrawIndexedPrimitive(d, (D3DPRIMITIVETYPE)type, base_vertex, min_index, num_vertices,
++                                              start_index, count);
++
++   /* User memory indices: upload the ones this draw uses and draw from them directly */
++   unsigned size = vertex_count(type, count) * dev->memory_index_size;
++   const uint8_t *indices = (const uint8_t *)dev->memory_indices + (size_t)start_index * dev->memory_index_size;
++   struct pipe_resource *res = NULL;
++   unsigned offset = 0;
++   u_upload_data(d->pipe_secondary->stream_uploader, 0, size, 4, indices, &offset, &res);
++   u_upload_unmap(d->pipe_secondary->stream_uploader);
++   nine_context_set_indices_apply(d, res, dev->memory_index_size, offset);
++   pipe_resource_reference(&res, NULL);
++   NineBeforeDraw(d);
++   nine_context_draw_indexed_primitive(d, (D3DPRIMITIVETYPE)type, base_vertex, min_index, num_vertices, 0, count);
++   NineAfterDraw(d);
++   /* Put back the index buffer the API state has */
++   NineDevice9_SetIndices(d, (IDirect3DIndexBuffer9 *)d->state.idxbuf);
++   return D3D_OK;
++}
++
++/* ---- Shaders and vertex declarations ---- */
++
++static int32_t
++wrap_object(HRESULT hr, void *obj, struct nddi_object **out)
++{
++   if (FAILED(hr))
++      return hr;
++   struct nddi_object *o = CALLOC_STRUCT(nddi_object);
++   if (!o) {
++      NineUnknown_Release(NineUnknown(obj));
++      return E_OUTOFMEMORY;
++   }
++   o->obj = NineUnknown(obj);
++   *out = o;
++   return D3D_OK;
++}
++
++void
++nddi_object_destroy(struct nddi_object *obj)
++{
++   if (!obj)
++      return;
++   NineUnknown_Release(obj->obj);
++   FREE(obj);
++}
++
++int32_t
++nddi_create_vertex_declaration(struct nddi_device *dev, const struct nddi_vertex_element *elements, uint32_t count,
++                               struct nddi_object **out)
++{
++   static_assert(sizeof(struct nddi_vertex_element) == sizeof(D3DVERTEXELEMENT9), "vertex element layout");
++   D3DVERTEXELEMENT9 *e = MALLOC((count + 1) * sizeof(*e));
++   if (!e)
++      return E_OUTOFMEMORY;
++   memcpy(e, elements, count * sizeof(*e));
++   /* The DDI passes a count, the API an end marker */
++   const D3DVERTEXELEMENT9 end = D3DDECL_END();
++   e[count] = end;
++   void *decl = NULL;
++   HRESULT hr = NineDevice9_CreateVertexDeclaration(dev->device, e, (IDirect3DVertexDeclaration9 **)&decl);
++   FREE(e);
++   return wrap_object(hr, decl, out);
++}
++
++int32_t
++nddi_set_vertex_declaration(struct nddi_device *dev, struct nddi_object *decl)
++{
++   return NineDevice9_SetVertexDeclaration(dev->device, decl ? (IDirect3DVertexDeclaration9 *)decl->obj : NULL);
++}
++
++int32_t
++nddi_create_vertex_shader(struct nddi_device *dev, const uint32_t *code, struct nddi_object **out)
++{
++   void *vs = NULL;
++   HRESULT hr = NineDevice9_CreateVertexShader(dev->device, (const DWORD *)code, (IDirect3DVertexShader9 **)&vs);
++   return wrap_object(hr, vs, out);
++}
++
++int32_t
++nddi_set_vertex_shader(struct nddi_device *dev, struct nddi_object *shader)
++{
++   return NineDevice9_SetVertexShader(dev->device, shader ? (IDirect3DVertexShader9 *)shader->obj : NULL);
++}
++
++int32_t
++nddi_create_pixel_shader(struct nddi_device *dev, const uint32_t *code, struct nddi_object **out)
++{
++   void *ps = NULL;
++   HRESULT hr = NineDevice9_CreatePixelShader(dev->device, (const DWORD *)code, (IDirect3DPixelShader9 **)&ps);
++   return wrap_object(hr, ps, out);
++}
++
++int32_t
++nddi_set_pixel_shader(struct nddi_device *dev, struct nddi_object *shader)
++{
++   return NineDevice9_SetPixelShader(dev->device, shader ? (IDirect3DPixelShader9 *)shader->obj : NULL);
++}
++
++int32_t
++nddi_set_shader_constants_f(struct nddi_device *dev, bool pixel, uint32_t start, const float *data,
++                            uint32_t vec4_count)
++{
++   return pixel ? NineDevice9_SetPixelShaderConstantF(dev->device, start, data, vec4_count)
++                : NineDevice9_SetVertexShaderConstantF(dev->device, start, data, vec4_count);
++}
++
++int32_t
++nddi_set_shader_constants_i(struct nddi_device *dev, bool pixel, uint32_t start, const int32_t *data,
++                            uint32_t vec4_count)
++{
++   return pixel ? NineDevice9_SetPixelShaderConstantI(dev->device, start, (const int *)data, vec4_count)
++                : NineDevice9_SetVertexShaderConstantI(dev->device, start, (const int *)data, vec4_count);
++}
++
++int32_t
++nddi_set_shader_constants_b(struct nddi_device *dev, bool pixel, uint32_t start, const int32_t *data, uint32_t count)
++{
++   return pixel ? NineDevice9_SetPixelShaderConstantB(dev->device, start, (const BOOL *)data, count)
++                : NineDevice9_SetVertexShaderConstantB(dev->device, start, (const BOOL *)data, count);
++}
++
++/* ---- Textures and samplers ---- */
++
++int32_t
++nddi_set_texture(struct nddi_device *dev, uint32_t stage, struct nddi_resource *texture)
++{
++   IDirect3DBaseTexture9 *tex = NULL;
++   if (texture && (texture->kind == NDDI_TEXTURE || texture->kind == NDDI_CUBE_TEXTURE ||
++                   texture->kind == NDDI_VOLUME_TEXTURE))
++      tex = (IDirect3DBaseTexture9 *)texture->obj;
++   return NineDevice9_SetTexture(dev->device, stage, tex);
++}
++
++int32_t
++nddi_set_sampler_state(struct nddi_device *dev, uint32_t stage, uint32_t type, uint32_t value)
++{
++   return NineDevice9_SetSamplerState(dev->device, stage, (D3DSAMPLERSTATETYPE)type, value);
++}
++
++int32_t
++nddi_set_texture_stage_state(struct nddi_device *dev, uint32_t stage, uint32_t type, uint32_t value)
++{
++   return NineDevice9_SetTextureStageState(dev->device, stage, (D3DTEXTURESTAGESTATETYPE)type, value);
++}
++
++int32_t
++nddi_generate_mip_sublevels(struct nddi_resource *texture)
++{
++   if (!texture || !texture->obj)
++      return D3DERR_INVALIDCALL;
++   NineBaseTexture9_GenerateMipSubLevels(NineBaseTexture9(texture->obj));
++   return D3D_OK;
++}
++
++/* ---- Fixed function ---- */
++
++int32_t
++nddi_set_transform(struct nddi_device *dev, uint32_t type, const float *matrix, bool multiply)
++{
++   return multiply ? NineDevice9_MultiplyTransform(dev->device, (D3DTRANSFORMSTATETYPE)type, (const D3DMATRIX *)matrix)
++                   : NineDevice9_SetTransform(dev->device, (D3DTRANSFORMSTATETYPE)type, (const D3DMATRIX *)matrix);
++}
++
++int32_t
++nddi_set_material(struct nddi_device *dev, const void *material)
++{
++   return NineDevice9_SetMaterial(dev->device, (const D3DMATERIAL9 *)material);
++}
++
++int32_t
++nddi_set_light(struct nddi_device *dev, uint32_t index, const void *light)
++{
++   return NineDevice9_SetLight(dev->device, index, (const D3DLIGHT9 *)light);
++}
++
++int32_t
++nddi_light_enable(struct nddi_device *dev, uint32_t index, bool enable)
++{
++   return NineDevice9_LightEnable(dev->device, index, enable);
++}
++
++int32_t
++nddi_set_clip_plane(struct nddi_device *dev, uint32_t index, const float *plane)
++{
++   return NineDevice9_SetClipPlane(dev->device, index, plane);
++}
++
++/* ---- Queries ---- */
++
++int32_t
++nddi_create_query(struct nddi_device *dev, uint32_t type, struct nddi_object **out)
++{
++   void *query = NULL;
++   HRESULT hr = NineDevice9_CreateQuery(dev->device, (D3DQUERYTYPE)type, (IDirect3DQuery9 **)&query);
++   return wrap_object(hr, query, out);
++}
++
++int32_t
++nddi_issue_query(struct nddi_object *query, uint32_t flags)
++{
++   return NineQuery9_Issue((struct NineQuery9 *)query->obj, flags);
++}
++
++int32_t
++nddi_get_query_data(struct nddi_object *query, void *data, uint32_t size)
++{
++   return NineQuery9_GetData((struct NineQuery9 *)query->obj, data, size, D3DGETDATA_FLUSH);
++}
++
++uint32_t
++nddi_get_query_data_size(struct nddi_object *query)
++{
++   return NineQuery9_GetDataSize((struct NineQuery9 *)query->obj);
++}
++
++/* ---- Development tracing ---- */
++
++/* The draw state nine has: shaders, declaration, vertex constants and the first vertex of the first streams */
++void
++nddi_debug_draw_state(struct nddi_device *dev, void (*log)(const char *format, ...))
++{
++   struct NineDevice9 *d = dev->device;
++   struct NineVertexDeclaration9 *vdecl = d->state.vdecl;
++   log("  draw state: vs %p ps %p vdecl %p (%u elements)", d->state.vs, d->state.ps, vdecl,
++       vdecl ? vdecl->nelems : 0);
++   for (unsigned i = 0; vdecl && i < vdecl->nelems; i++) {
++      const D3DVERTEXELEMENT9 *e = &vdecl->decls[i];
++      log("    element %u: stream %u offset %u type %u usage %u/%u", i, e->Stream, e->Offset, e->Type, e->Usage,
++          e->UsageIndex);
++   }
++   const struct nine_context *c = &d->context;
++   log("    vs constants: used size %u, ranges %p, swvp %d, programmable %d, c3 %g %g %g %g, c6 %g %g %g %g "
++       "(state c3 %g, c6.w %g)", c->cso_shader.vs_const_used_size, (void *)c->cso_shader.vs_const_ranges, c->swvp,
++       c->programmable_vs, c->vs_const_f[12], c->vs_const_f[13], c->vs_const_f[14], c->vs_const_f[15],
++       c->vs_const_f[24], c->vs_const_f[25], c->vs_const_f[26], c->vs_const_f[27], d->state.vs_const_f[12],
++       d->state.vs_const_f[27]);
++   if (d->state.vs) {
++      struct NineVertexShader9 *vs = d->state.vs;
++      log("    vs object: context vs %p, last key 0x%llx next 0x%llx, last used size %u, variant used size %u, "
++          "position_t %d swvp_only %d, cso %p (context cso %p)", c->vs, (unsigned long long)vs->last_key,
++          (unsigned long long)vs->next_key, vs->last_const_used_size, vs->variant.const_used_size, vs->position_t,
++          vs->swvp_only, vs->last_cso, c->cso_shader.vs);
++   }
++   for (unsigned i = 0; i < 2; i++) {
++      struct NineVertexBuffer9 *vb = d->state.stream[i];
++      if (!vb)
++         continue;
++      struct NineBuffer9 *b = &vb->base;
++      const float *f = b->managed.data ? (const float *)((const uint8_t *)b->managed.data +
++                                                         d->state.vtxbuf[i].buffer_offset) : NULL;
++      log("    stream %u: %p pool %u usage 0x%x size %u offset %u stride %u: %g %g %g %08x", i, vb, b->base.pool,
++          b->base.usage, b->size, d->state.vtxbuf[i].buffer_offset, d->state.vtxstride[i], f ? f[0] : 0.f,
++          f ? f[1] : 0.f, f ? f[2] : 0.f, f ? ((const uint32_t *)f)[3] : 0);
++   }
++}
+diff --git a/src/gallium/frontends/d3d9umd/pipeline.cpp b/src/gallium/frontends/d3d9umd/pipeline.cpp
+new file mode 100644
+index 0000000..3c5a150
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/pipeline.cpp
+@@ -0,0 +1,497 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Drawing: vertex/index sources, draws, shaders and declarations, constants, textures, samplers, fixed-function
++ * state and queries. Shaders, declarations and queries are nddi_objects, used directly as the DDI handles. */
++
++#include "d3d9umd.h"
++
++#include <stdio.h>
++#include <string.h>
++
++static inline nddi_object *
++Obj(HANDLE h)
++{
++   return (nddi_object *)h;
++}
++
++/* ---- Vertex and index data ---- */
++
++static HRESULT APIENTRY
++SetStreamSource(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *vb = D3D9UmdCastResource(p->hVertexBuffer);
++   if (p->Stream < ARRAYSIZE(dev->streamStride))
++      dev->streamStride[p->Stream] = p->Stride;
++   D3D9UMD_TRACE("SetStreamSource %u = %p offset %u stride %u", p->Stream, vb, p->Offset, p->Stride);
++   return nddi_set_stream_source(dev->nine, p->Stream, vb ? vb->nine : NULL, p->Offset, p->Stride);
++}
++
++static HRESULT APIENTRY
++SetStreamSourceUm(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCEUM *p, const VOID *pUMBuffer)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   if (p->Stream < ARRAYSIZE(dev->streamStride))
++      dev->streamStride[p->Stream] = p->Stride;
++   D3D9UMD_TRACE("SetStreamSourceUm %u = %p stride %u", p->Stream, pUMBuffer, p->Stride);
++   return nddi_set_stream_source_memory(dev->nine, p->Stream, pUMBuffer, p->Stride);
++}
++
++static HRESULT APIENTRY
++SetStreamSourceFreq(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCEFREQ *p)
++{
++   return nddi_set_stream_source_freq(D3D9UmdCastDevice(hDevice)->nine, p->Stream, p->Divider);
++}
++
++static HRESULT APIENTRY
++SetIndices(HANDLE hDevice, const D3DDDIARG_SETINDICES *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   dev->indexBuffer = D3D9UmdCastResource(p->hIndexBuffer);
++   dev->memoryIndices = NULL;
++   return nddi_set_indices(dev->nine, dev->indexBuffer ? dev->indexBuffer->nine : NULL);
++}
++
++static HRESULT APIENTRY
++SetIndicesUm(HANDLE hDevice, UINT IndexSize, const VOID *pIndexBuffer)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   dev->memoryIndices = pIndexBuffer;
++   dev->memoryIndexSize = IndexSize;
++   return nddi_set_indices_memory(dev->nine, pIndexBuffer, IndexSize);
++}
++
++/* ---- Draws ---- */
++
++static HRESULT APIENTRY
++DrawPrimitive(HANDLE hDevice, const D3DDDIARG_DRAWPRIMITIVE *p, const UINT *pFlagBuffer)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   HRESULT hr = nddi_draw_primitive(dev->nine, p->PrimitiveType, p->VStart, p->PrimitiveCount);
++   D3D9UMD_TRACE("DrawPrimitive type %u start %u count %u -> 0x%08lx", p->PrimitiveType, p->VStart,
++                 p->PrimitiveCount, hr);
++   if (D3D9UmdTracing())
++      nddi_debug_draw_state(dev->nine, D3D9UmdTraceLog);
++   return hr;
++}
++
++static HRESULT APIENTRY
++DrawIndexedPrimitive(HANDLE hDevice, const D3DDDIARG_DRAWINDEXEDPRIMITIVE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   HRESULT hr = nddi_draw_indexed_primitive(dev->nine, p->PrimitiveType, p->BaseVertexIndex, p->MinIndex,
++                                            p->NumVertices, p->StartIndex, p->PrimitiveCount);
++   D3D9UMD_TRACE("DrawIndexedPrimitive type %u base %d min %u num %u start %u count %u -> 0x%08lx",
++                 p->PrimitiveType, p->BaseVertexIndex, p->MinIndex, p->NumVertices, p->StartIndex,
++                 p->PrimitiveCount, hr);
++   return hr;
++}
++
++/* Stream 0 is user memory; the first vertex is a byte offset into it */
++static HRESULT APIENTRY
++DrawPrimitive2(HANDLE hDevice, const D3DDDIARG_DRAWPRIMITIVE2 *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   UINT stride = dev->streamStride[0];
++   UINT start = stride ? p->FirstVertexOffset / stride : 0;
++   HRESULT hr = nddi_draw_primitive(dev->nine, p->PrimitiveType, start, p->PrimitiveCount);
++   D3D9UMD_TRACE("DrawPrimitive2 type %u offset %u count %u -> 0x%08lx", p->PrimitiveType, p->FirstVertexOffset,
++                 p->PrimitiveCount, hr);
++   if (D3D9UmdTracing())
++      nddi_debug_draw_state(dev->nine, D3D9UmdTraceLog);
++   return hr;
++}
++
++/* Indices come with the call; the base vertex and first index are byte offsets */
++static HRESULT APIENTRY
++DrawIndexedPrimitive2(HANDLE hDevice, const D3DDDIARG_DRAWINDEXEDPRIMITIVE2 *p, UINT dwIndicesSize,
++                      const VOID *pIndexBuffer, const UINT *pFlagBuffer)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   UINT stride = dev->streamStride[0];
++   INT base = stride ? p->BaseVertexOffset / (INT)stride : 0;
++   nddi_set_indices_memory(dev->nine, (const BYTE *)pIndexBuffer + p->StartIndexOffset, dwIndicesSize);
++   HRESULT hr = nddi_draw_indexed_primitive(dev->nine, p->PrimitiveType, base, p->MinIndex, p->NumVertices, 0,
++                                            p->PrimitiveCount);
++   /* Back to the device's own index source */
++   if (dev->memoryIndices)
++      nddi_set_indices_memory(dev->nine, dev->memoryIndices, dev->memoryIndexSize);
++   else
++      nddi_set_indices(dev->nine, dev->indexBuffer ? dev->indexBuffer->nine : NULL);
++   D3D9UMD_TRACE("DrawIndexedPrimitive2 type %u base %d min %u num %u count %u -> 0x%08lx", p->PrimitiveType,
++                 p->BaseVertexOffset, p->MinIndex, p->NumVertices, p->PrimitiveCount, hr);
++   return hr;
++}
++
++/* ---- Vertex declarations and shaders ---- */
++
++static HRESULT APIENTRY
++CreateVertexShaderDecl(HANDLE hDevice, D3DDDIARG_CREATEVERTEXSHADERDECL *p, const D3DDDIVERTEXELEMENT *pElements)
++{
++   static_assert(sizeof(D3DDDIVERTEXELEMENT) == sizeof(nddi_vertex_element), "vertex element layout");
++   nddi_object *decl = NULL;
++   HRESULT hr = nddi_create_vertex_declaration(D3D9UmdCastDevice(hDevice)->nine,
++                                               (const nddi_vertex_element *)pElements, p->NumVertexElements, &decl);
++   D3D9UMD_TRACE("CreateVertexShaderDecl %u elements -> 0x%08lx", p->NumVertexElements, hr);
++   p->ShaderHandle = decl;
++   return hr;
++}
++
++static HRESULT APIENTRY
++SetVertexShaderDecl(HANDLE hDevice, HANDLE hShader)
++{
++   D3D9UMD_TRACE("SetVertexShaderDecl %p", hShader);
++   return nddi_set_vertex_declaration(D3D9UmdCastDevice(hDevice)->nine, Obj(hShader));
++}
++
++static HRESULT APIENTRY
++DeleteVertexShaderDecl(HANDLE hDevice, HANDLE hShader)
++{
++   nddi_object_destroy(Obj(hShader));
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++CreateVertexShaderFunc(HANDLE hDevice, D3DDDIARG_CREATEVERTEXSHADERFUNC *p, const UINT *pCode)
++{
++   nddi_object *shader = NULL;
++   HRESULT hr = nddi_create_vertex_shader(D3D9UmdCastDevice(hDevice)->nine, (const uint32_t *)pCode, &shader);
++   D3D9UMD_TRACE("CreateVertexShaderFunc %u bytes -> 0x%08lx", p->Size, hr);
++   if (D3D9UmdTracing()) {
++      for (UINT i = 0; i < p->Size / 4; i += 8) {
++         char line[128];
++         int n = 0;
++         for (UINT j = i; j < i + 8 && j < p->Size / 4; j++)
++            n += snprintf(line + n, sizeof(line) - n, " %08x", pCode[j]);
++         D3D9UmdTraceLog("  %s", line);
++      }
++   }
++   p->ShaderHandle = shader;
++   return hr;
++}
++
++static HRESULT APIENTRY
++SetVertexShaderFunc(HANDLE hDevice, HANDLE hShader)
++{
++   D3D9UMD_TRACE("SetVertexShaderFunc %p", hShader);
++   return nddi_set_vertex_shader(D3D9UmdCastDevice(hDevice)->nine, Obj(hShader));
++}
++
++static HRESULT APIENTRY
++DeleteVertexShaderFunc(HANDLE hDevice, HANDLE hShader)
++{
++   nddi_object_destroy(Obj(hShader));
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++CreatePixelShader(HANDLE hDevice, D3DDDIARG_CREATEPIXELSHADER *p, const UINT *pCode)
++{
++   nddi_object *shader = NULL;
++   HRESULT hr = nddi_create_pixel_shader(D3D9UmdCastDevice(hDevice)->nine, (const uint32_t *)pCode, &shader);
++   D3D9UMD_TRACE("CreatePixelShader %u bytes -> 0x%08lx", p->CodeSize, hr);
++   p->ShaderHandle = shader;
++   return hr;
++}
++
++static HRESULT APIENTRY
++SetPixelShader(HANDLE hDevice, HANDLE hShader)
++{
++   D3D9UMD_TRACE("SetPixelShader %p", hShader);
++   return nddi_set_pixel_shader(D3D9UmdCastDevice(hDevice)->nine, Obj(hShader));
++}
++
++static HRESULT APIENTRY
++DeletePixelShader(HANDLE hDevice, HANDLE hShader)
++{
++   nddi_object_destroy(Obj(hShader));
++   return S_OK;
++}
++
++/* ---- Shader constants ---- */
++
++static HRESULT APIENTRY
++SetVertexShaderConst(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONST *p, const VOID *pData)
++{
++   const float *f = (const float *)pData;
++   D3D9UMD_TRACE("SetVertexShaderConst c%u x%u", p->Register, p->Count);
++   if (D3D9UmdTracing()) {
++      for (UINT i = 0; i < p->Count && i < 12; i++)
++         D3D9UmdTraceLog("  c%u = %g %g %g %g", p->Register + i, f[4 * i], f[4 * i + 1], f[4 * i + 2], f[4 * i + 3]);
++   }
++   return nddi_set_shader_constants_f(D3D9UmdCastDevice(hDevice)->nine, false, p->Register, (const float *)pData,
++                                      p->Count);
++}
++
++static HRESULT APIENTRY
++SetVertexShaderConstI(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONSTI *p, const INT *pData)
++{
++   return nddi_set_shader_constants_i(D3D9UmdCastDevice(hDevice)->nine, false, p->Register,
++                                      (const int32_t *)pData, p->Count);
++}
++
++static HRESULT APIENTRY
++SetVertexShaderConstB(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONSTB *p, const BOOL *pData)
++{
++   return nddi_set_shader_constants_b(D3D9UmdCastDevice(hDevice)->nine, false, p->Register,
++                                      (const int32_t *)pData, p->Count);
++}
++
++static HRESULT APIENTRY
++SetPixelShaderConst(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONST *p, const FLOAT *pData)
++{
++   D3D9UMD_TRACE("SetPixelShaderConst c%u x%u: %g %g %g %g", p->Register, p->Count, pData[0], pData[1], pData[2],
++                 pData[3]);
++   return nddi_set_shader_constants_f(D3D9UmdCastDevice(hDevice)->nine, true, p->Register, pData, p->Count);
++}
++
++static HRESULT APIENTRY
++SetPixelShaderConstI(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONSTI *p, const INT *pData)
++{
++   return nddi_set_shader_constants_i(D3D9UmdCastDevice(hDevice)->nine, true, p->Register, (const int32_t *)pData,
++                                      p->Count);
++}
++
++static HRESULT APIENTRY
++SetPixelShaderConstB(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONSTB *p, const BOOL *pData)
++{
++   return nddi_set_shader_constants_b(D3D9UmdCastDevice(hDevice)->nine, true, p->Register, (const int32_t *)pData,
++                                      p->Count);
++}
++
++/* ---- Textures and samplers ---- */
++
++static HRESULT APIENTRY
++SetTexture(HANDLE hDevice, UINT Stage, HANDLE hTexture)
++{
++   D3D9UmdResource *tex = D3D9UmdCastResource(hTexture);
++   D3D9UMD_TRACE("SetTexture %u = %p", Stage, tex);
++   return nddi_set_texture(D3D9UmdCastDevice(hDevice)->nine, Stage, tex ? tex->nine : NULL);
++}
++
++/* The DDI sends sampler states as texture stage states with their pre-D3D9 numbers */
++static int
++SamplerStateFor(D3DDDITEXTURESTAGESTATETYPE state)
++{
++   switch (state) {
++   case D3DDDITSS_ADDRESSU: return D3DSAMP_ADDRESSU;
++   case D3DDDITSS_ADDRESSV: return D3DSAMP_ADDRESSV;
++   case D3DDDITSS_ADDRESSW: return D3DSAMP_ADDRESSW;
++   case D3DDDITSS_BORDERCOLOR: return D3DSAMP_BORDERCOLOR;
++   case D3DDDITSS_MAGFILTER: return D3DSAMP_MAGFILTER;
++   case D3DDDITSS_MINFILTER: return D3DSAMP_MINFILTER;
++   case D3DDDITSS_MIPFILTER: return D3DSAMP_MIPFILTER;
++   case D3DDDITSS_MIPMAPLODBIAS: return D3DSAMP_MIPMAPLODBIAS;
++   case D3DDDITSS_MAXMIPLEVEL: return D3DSAMP_MAXMIPLEVEL;
++   case D3DDDITSS_MAXANISOTROPY: return D3DSAMP_MAXANISOTROPY;
++   case D3DDDITSS_SRGBTEXTURE: return D3DSAMP_SRGBTEXTURE;
++   case D3DDDITSS_ELEMENTINDEX: return D3DSAMP_ELEMENTINDEX;
++   case D3DDDITSS_DMAPOFFSET: return D3DSAMP_DMAPOFFSET;
++   default: return -1;
++   }
++}
++
++static HRESULT APIENTRY
++SetTextureStageState(HANDLE hDevice, const D3DDDIARG_TEXTURESTAGESTATE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   int sampler = SamplerStateFor(p->State);
++   D3D9UMD_TRACE("SetTextureStageState %u %u = 0x%x", p->Stage, (UINT)p->State, p->Value);
++   if (sampler >= 0)
++      nddi_set_sampler_state(dev->nine, p->Stage, sampler, p->Value);
++   else if (p->State != D3DDDITSS_TEXTUREMAP && p->State != D3DDDITSS_DISABLETEXTURECOLORKEY &&
++            p->State != D3DDDITSS_TEXTURECOLORKEYVAL)
++      nddi_set_texture_stage_state(dev->nine, p->Stage, p->State, p->Value);
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++GenerateMipSubLevels(HANDLE hDevice, const D3DDDIARG_GENERATEMIPSUBLEVELS *p)
++{
++   return nddi_generate_mip_sublevels(D3D9UmdCastResource(p->hResource)->nine);
++}
++
++/* UpdateTexture: the source's levels (system memory) to the destination's, from the destination's matching level */
++static HRESULT APIENTRY
++TexBlt(HANDLE hDevice, const D3DDDIARG_TEXBLT *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource), *dst = D3D9UmdCastResource(p->hDstResource);
++   bool cube = src->flags.CubeMap;
++   UINT srcLevels = cube ? src->surfCount / 6 : src->surfCount;
++   UINT dstLevels = cube ? dst->surfCount / 6 : dst->surfCount;
++   /* The destination may have fewer levels: they match the source's smallest ones */
++   UINT skip = srcLevels > dstLevels ? srcLevels - dstLevels : 0;
++   UINT face = cube ? p->CubeMapFace : 0;
++   HRESULT hr = S_OK;
++   for (UINT level = 0; level < dstLevels && SUCCEEDED(hr); level++) {
++      UINT sl = level + skip, shift = sl;
++      nddi_rect sr = {p->SrcRect.left >> shift, p->SrcRect.top >> shift, MAX2(p->SrcRect.right >> shift, 1),
++                      MAX2(p->SrcRect.bottom >> shift, 1)};
++      nddi_rect dr = {p->DstPoint.x >> level, p->DstPoint.y >> level, 0, 0};
++      dr.right = dr.left + (sr.right - sr.left);
++      dr.bottom = dr.top + (sr.bottom - sr.top);
++      hr = nddi_blt(dev->nine, src->nine, face * srcLevels + sl, &sr, dst->nine, face * dstLevels + level, &dr,
++                    D3DTEXF_NONE);
++   }
++   D3D9UMD_TRACE("TexBlt %p -> %p face %u levels %u -> 0x%08lx", src, dst, face, dstLevels, hr);
++   return hr;
++}
++
++/* ---- Fixed function ---- */
++
++/* The DDI may name the world matrices with their pre-D3D9 numbers */
++static UINT
++TransformFor(D3DTRANSFORMSTATETYPE type)
++{
++   switch ((UINT)type) {
++   case 1: return D3DTS_WORLDMATRIX(0);
++   case 4: return D3DTS_WORLDMATRIX(1);
++   case 5: return D3DTS_WORLDMATRIX(2);
++   case 6: return D3DTS_WORLDMATRIX(3);
++   default: return type;
++   }
++}
++
++static HRESULT APIENTRY
++SetTransform(HANDLE hDevice, const D3DDDIARG_SETTRANSFORM *p)
++{
++   D3D9UMD_TRACE("SetTransform %u", (UINT)p->TransformType);
++   return nddi_set_transform(D3D9UmdCastDevice(hDevice)->nine, TransformFor(p->TransformType),
++                             (const float *)&p->Matrix, false);
++}
++
++static HRESULT APIENTRY
++MultiplyTransform(HANDLE hDevice, const D3DDDIARG_MULTIPLYTRANSFORM *p)
++{
++   return nddi_set_transform(D3D9UmdCastDevice(hDevice)->nine, TransformFor(p->TransformType),
++                             (const float *)&p->Matrix, true);
++}
++
++static HRESULT APIENTRY
++SetMaterial(HANDLE hDevice, const D3DDDIARG_SETMATERIAL *p)
++{
++   static_assert(sizeof(D3DDDIARG_SETMATERIAL) == sizeof(D3DMATERIAL9), "material layout");
++   return nddi_set_material(D3D9UmdCastDevice(hDevice)->nine, p);
++}
++
++static HRESULT APIENTRY
++SetLight(HANDLE hDevice, const D3DDDIARG_SETLIGHT *p, const D3DDDI_LIGHT *pLight)
++{
++   static_assert(sizeof(D3DDDI_LIGHT) == sizeof(D3DLIGHT9), "light layout");
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   switch (p->DataType) {
++   case D3DDDI_SETLIGHT_ENABLE: return nddi_light_enable(dev->nine, p->Index, true);
++   case D3DDDI_SETLIGHT_DISABLE: return nddi_light_enable(dev->nine, p->Index, false);
++   case D3DDDI_SETLIGHT_DATA: return pLight ? nddi_set_light(dev->nine, p->Index, pLight) : E_INVALIDARG;
++   default: return S_OK;
++   }
++}
++
++static HRESULT APIENTRY
++CreateLight(HANDLE hDevice, const D3DDDIARG_CREATELIGHT *p)
++{
++   return S_OK; /* nine creates lights when they're first set */
++}
++
++static HRESULT APIENTRY
++DestroyLight(HANDLE hDevice, const D3DDDIARG_DESTROYLIGHT *p)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++SetClipPlane(HANDLE hDevice, const D3DDDIARG_SETCLIPPLANE *p)
++{
++   return nddi_set_clip_plane(D3D9UmdCastDevice(hDevice)->nine, p->Index, p->Plane);
++}
++
++static HRESULT APIENTRY
++ValidateDevice(HANDLE hDevice, D3DDDIARG_VALIDATETEXTURESTAGESTATE *p)
++{
++   p->NumPasses = 1;
++   return S_OK;
++}
++
++/* ---- Queries ---- */
++
++static HRESULT APIENTRY
++CreateQuery(HANDLE hDevice, D3DDDIARG_CREATEQUERY *p)
++{
++   nddi_object *query = NULL;
++   HRESULT hr = nddi_create_query(D3D9UmdCastDevice(hDevice)->nine, p->QueryType, &query);
++   D3D9UMD_TRACE("CreateQuery type %u -> 0x%08lx", p->QueryType, hr);
++   p->hQuery = query;
++   return hr;
++}
++
++static HRESULT APIENTRY
++DestroyQuery(HANDLE hDevice, const HANDLE hQuery)
++{
++   nddi_object_destroy(Obj(hQuery));
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++IssueQuery(HANDLE hDevice, const D3DDDIARG_ISSUEQUERY *p)
++{
++   DWORD flags = (p->Flags.Begin ? D3DISSUE_BEGIN : 0) | (p->Flags.End ? D3DISSUE_END : 0);
++   return nddi_issue_query(Obj(p->hQuery), flags);
++}
++
++static HRESULT APIENTRY
++GetQueryData(HANDLE hDevice, const D3DDDIARG_GETQUERYDATA *p)
++{
++   nddi_object *query = Obj(p->hQuery);
++   HRESULT hr = nddi_get_query_data(query, p->pData, p->pData ? nddi_get_query_data_size(query) : 0);
++   /* Not ready yet: the DDI says so with WASSTILLDRAWING */
++   return hr == S_FALSE ? D3DERR_WASSTILLDRAWING : hr;
++}
++
++void
++D3D9UmdFillPipelineFuncs(D3DDDI_DEVICEFUNCS *f)
++{
++   f->pfnSetStreamSource = SetStreamSource;
++   f->pfnSetStreamSourceUm = SetStreamSourceUm;
++   f->pfnSetStreamSourceFreq = SetStreamSourceFreq;
++   f->pfnSetIndices = SetIndices;
++   f->pfnSetIndicesUm = SetIndicesUm;
++   f->pfnDrawPrimitive = DrawPrimitive;
++   f->pfnDrawIndexedPrimitive = DrawIndexedPrimitive;
++   f->pfnDrawPrimitive2 = DrawPrimitive2;
++   f->pfnDrawIndexedPrimitive2 = DrawIndexedPrimitive2;
++   f->pfnCreateVertexShaderDecl = CreateVertexShaderDecl;
++   f->pfnSetVertexShaderDecl = SetVertexShaderDecl;
++   f->pfnDeleteVertexShaderDecl = DeleteVertexShaderDecl;
++   f->pfnCreateVertexShaderFunc = CreateVertexShaderFunc;
++   f->pfnSetVertexShaderFunc = SetVertexShaderFunc;
++   f->pfnDeleteVertexShaderFunc = DeleteVertexShaderFunc;
++   f->pfnCreatePixelShader = CreatePixelShader;
++   f->pfnSetPixelShader = SetPixelShader;
++   f->pfnDeletePixelShader = DeletePixelShader;
++   f->pfnSetVertexShaderConst = SetVertexShaderConst;
++   f->pfnSetVertexShaderConstI = SetVertexShaderConstI;
++   f->pfnSetVertexShaderConstB = SetVertexShaderConstB;
++   f->pfnSetPixelShaderConst = SetPixelShaderConst;
++   f->pfnSetPixelShaderConstI = SetPixelShaderConstI;
++   f->pfnSetPixelShaderConstB = SetPixelShaderConstB;
++   f->pfnSetTexture = SetTexture;
++   f->pfnSetTextureStageState = SetTextureStageState;
++   f->pfnGenerateMipSubLevels = GenerateMipSubLevels;
++   f->pfnTexBlt = TexBlt;
++   f->pfnSetTransform = SetTransform;
++   f->pfnMultiplyTransform = MultiplyTransform;
++   f->pfnSetMaterial = SetMaterial;
++   f->pfnSetLight = SetLight;
++   f->pfnCreateLight = CreateLight;
++   f->pfnDestroyLight = DestroyLight;
++   f->pfnSetClipPlane = SetClipPlane;
++   f->pfnValidateDevice = ValidateDevice;
++   f->pfnCreateQuery = CreateQuery;
++   f->pfnDestroyQuery = DestroyQuery;
++   f->pfnIssueQuery = IssueQuery;
++   f->pfnGetQueryData = GetQueryData;
++}
+diff --git a/src/gallium/frontends/nine/buffer9.c b/src/gallium/frontends/nine/buffer9.c
+index 965f29d..8e6a0fc 100644
+--- a/src/gallium/frontends/nine/buffer9.c
++++ b/src/gallium/frontends/nine/buffer9.c
+@@ -177,7 +177,7 @@ NineBuffer9_dtor( struct NineBuffer9 *This )
+     }
+ 
+     if (This->base.pool != D3DPOOL_DEFAULT) {
+-        if (This->managed.data)
++        if (This->managed.data && !This->managed.data_external)
+             align_free(This->managed.data);
+         if (list_is_linked(&This->managed.list))
+             list_del(&This->managed.list);
+@@ -645,7 +645,7 @@ NineBuffer9_Upload( struct NineBuffer9 *This )
+                     required_valid_region->x,
+                     required_valid_region->width,
+                     64,
+-                    This->managed.data + required_valid_region->x,
++                    (uint8_t *)This->managed.data + required_valid_region->x,
+                     &buffer_offset,
+                     &resource);
+                 buffer_offset -= required_valid_region->x;
+@@ -697,3 +697,16 @@ NineBuffer9_Upload( struct NineBuffer9 *This )
+                               (int8_t *)This->managed.data + box_upload.x);
+     This->managed.dirty = false;
+ }
++
++void
++NineBuffer9_SetExternalMemory( struct NineBuffer9 *This, void *data )
++{
++    assert(This->base.pool != D3DPOOL_DEFAULT);
++    if (This->managed.data && !This->managed.data_external)
++        align_free(This->managed.data);
++    This->managed.data = data;
++    This->managed.data_external = true;
++    /* Everything needs uploading from the new memory */
++    This->managed.dirty = true;
++    u_box_1d(0, This->size, &This->managed.dirty_box);
++}
+diff --git a/src/gallium/frontends/nine/buffer9.h b/src/gallium/frontends/nine/buffer9.h
+index a783550..52a9313 100644
+--- a/src/gallium/frontends/nine/buffer9.h
++++ b/src/gallium/frontends/nine/buffer9.h
+@@ -48,6 +48,7 @@ struct NineBuffer9
+     /* Specific to managed buffers */
+     struct {
+         void *data;
++        bool data_external; /* data isn't nine's to free */
+         bool dirty;
+         struct pipe_box dirty_box; /* region in the resource to update */
+         struct pipe_box upload_pending_regions; /* region with uploads pending */
+@@ -126,4 +127,9 @@ NineBuffer9_SetDirty( struct NineBuffer9 *This );
+             list_add(&(b)->managed.list, &(b)->base.base.device->update_buffers); \
+     }
+ 
++/* Makes a non-DEFAULT pool buffer use memory owned by someone else (the D3D9 runtime's system memory buffers in
++ * the d3d9umd driver) instead of nine's own copy. The owner keeps the memory alive for the buffer's lifetime. */
++void
++NineBuffer9_SetExternalMemory( struct NineBuffer9 *This, void *data );
++
+ #endif /* _NINE_BUFFER9_H_ */
+diff --git a/src/gallium/frontends/nine/device9.c b/src/gallium/frontends/nine/device9.c
+index 1ce6d3d..4057164 100644
+--- a/src/gallium/frontends/nine/device9.c
++++ b/src/gallium/frontends/nine/device9.c
+@@ -125,6 +125,11 @@ NineDevice9_SetDefaultState( struct NineDevice9 *This, bool is_reset )
+ 
+     nine_state_set_defaults(This, &This->caps, is_reset);
+ 
++    /* A headless device has no back buffer: its user sets the render target,
++     * viewport and scissor */
++    if (!This->nswapchains)
++        return;
++
+     refSurf = This->swapchains[0]->buffers[0];
+     assert(refSurf);
+ 
+@@ -198,8 +203,12 @@ NineDevice9_ctor( struct NineDevice9 *This,
+     This->gpu_priority = 0;
+     This->max_frame_latency = 3;
+ 
+-    IDirect3D9_AddRef(This->d3d9);
+-    ID3DPresentGroup_AddRef(This->present);
++    if (This->d3d9)
++        IDirect3D9_AddRef(This->d3d9);
++    /* No present group: a headless device for the d3d9umd WDDM driver, where
++     * the D3D9 runtime owns swapchains and presentation */
++    if (This->present)
++        ID3DPresentGroup_AddRef(This->present);
+ 
+     if (!(This->params.BehaviorFlags & D3DCREATE_FPU_PRESERVE)) {
+         nine_setup_fpu();
+@@ -272,8 +281,8 @@ NineDevice9_ctor( struct NineDevice9 *This,
+     This->frame_count = 0; /* Used to check if events occur the same frame */
+ 
+     /* create implicit swapchains */
+-    This->nswapchains = ID3DPresentGroup_GetMultiheadCount(This->present);
+-    This->swapchains = CALLOC(This->nswapchains,
++    This->nswapchains = This->present ? ID3DPresentGroup_GetMultiheadCount(This->present) : 0;
++    This->swapchains = CALLOC(MAX2(This->nswapchains, 1),
+                               sizeof(struct NineSwapChain9 *));
+     if (!This->swapchains) { return E_OUTOFMEMORY; }
+ 
+@@ -411,7 +420,8 @@ NineDevice9_ctor( struct NineDevice9 *This,
+     This->cursor.hotspot.y = -1;
+     This->cursor.w = This->cursor.h = 0;
+     This->cursor.visible = false;
+-    if (ID3DPresent_GetCursorPos(This->swapchains[0]->present, &This->cursor.pos) != S_OK) {
++    if (!This->nswapchains ||
++        ID3DPresent_GetCursorPos(This->swapchains[0]->present, &This->cursor.pos) != S_OK) {
+         This->cursor.pos.x = 0;
+         This->cursor.pos.y = 0;
+     }
+@@ -487,7 +497,10 @@ NineDevice9_ctor( struct NineDevice9 *This,
+         This->context.vs_const_f = CALLOC(This->vs_const_size, 1);
+         This->state.ps_const_f = CALLOC(This->ps_const_size, 1);
+         This->context.ps_const_f = CALLOC(This->ps_const_size, 1);
++        This->context.vs_const_user = CALLOC(This->vs_const_size, 1);
++        This->context.ps_const_user = CALLOC(This->ps_const_size, 1);
+         if (!This->state.vs_const_f || !This->context.vs_const_f ||
++            !This->context.vs_const_user || !This->context.ps_const_user ||
+             !This->state.ps_const_f || !This->context.ps_const_f ||
+             !This->state.vs_lconstf_temp || !This->context.vs_lconstf_temp ||
+             !This->state.vs_const_i || !This->context.vs_const_i ||
+@@ -602,7 +615,8 @@ NineDevice9_ctor( struct NineDevice9 *This,
+ 
+     nine_state_init_sw(This);
+ 
+-    ID3DPresentGroup_Release(This->present);
++    if (This->present)
++        ID3DPresentGroup_Release(This->present);
+     nine_context_update_state(This); /* Some drivers needs states to be initialized */
+     nine_csmt_process(This);
+ 
+@@ -648,6 +662,8 @@ NineDevice9_dtor( struct NineDevice9 *This )
+     FREE(This->context.vs_const_f);
+     FREE(This->state.ps_const_f);
+     FREE(This->context.ps_const_f);
++    FREE(This->context.vs_const_user);
++    FREE(This->context.ps_const_user);
+     FREE(This->state.vs_lconstf_temp);
+     FREE(This->context.vs_lconstf_temp);
+     FREE(This->state.vs_const_i);
+@@ -2967,7 +2983,7 @@ update_managed_buffers(struct NineDevice9 *device)
+     }
+ }
+ 
+-static void
++void
+ NineBeforeDraw( struct NineDevice9 *This )
+ {
+     /* Upload Managed dirty content */
+@@ -2975,7 +2991,7 @@ NineBeforeDraw( struct NineDevice9 *This )
+     update_managed_buffers(This);
+ }
+ 
+-static void
++void
+ NineAfterDraw( struct NineDevice9 *This )
+ {
+     unsigned i;
+diff --git a/src/gallium/frontends/nine/device9.h b/src/gallium/frontends/nine/device9.h
+index e6a736f..f99b48c 100644
+--- a/src/gallium/frontends/nine/device9.h
++++ b/src/gallium/frontends/nine/device9.h
+@@ -120,6 +120,10 @@ struct NineDevice9
+         bool always_output_pointsize;
+         bool emulate_ucp;
+         bool shader_emulate_features;
++        /* Shader constants go to the driver as user data instead of uploaded buffers (virgl: a buffer in
++         * constant buffer slot 0 becomes a UBO that the host's GL shaders don't read). Set by the frontend that
++         * creates the device. */
++        bool user_constbufs;
+     } driver_caps;
+ 
+     struct {
+@@ -845,4 +849,12 @@ NineDevice9_CreateQuery( struct NineDevice9 *This,
+                          D3DQUERYTYPE Type,
+                          IDirect3DQuery9 **ppQuery );
+ 
++/* Around draws that bypass NineDevice9_Draw* (the d3d9umd driver's user memory draws): uploads managed content
++ * before, flags autogenmipmap render targets after */
++void
++NineBeforeDraw( struct NineDevice9 *This );
++
++void
++NineAfterDraw( struct NineDevice9 *This );
++
+ #endif /* _NINE_DEVICE9_H_ */
+diff --git a/src/gallium/frontends/nine/iunknown.c b/src/gallium/frontends/nine/iunknown.c
+index 25a86f0..a39236d 100644
+--- a/src/gallium/frontends/nine/iunknown.c
++++ b/src/gallium/frontends/nine/iunknown.c
+@@ -214,7 +214,7 @@ NineUnknown_SetPrivateData( struct NineUnknown *This,
+     }
+ 
+     header->size = SizeOfData;
+-    header_data = (void *)header + sizeof(*header);
++    header_data = (void *)((uint8_t *)header + sizeof(*header));
+     memcpy(header_data, user_data, header->size);
+     memcpy(&header->guid, refguid, sizeof(header->guid));
+ 
+@@ -260,7 +260,7 @@ NineUnknown_GetPrivateData( struct NineUnknown *This,
+         return D3DERR_MOREDATA;
+     }
+ 
+-    header_data = (void *)header + sizeof(*header);
++    header_data = (void *)((uint8_t *)header + sizeof(*header));
+     if (header->unknown) { IUnknown_AddRef(*(IUnknown **)header_data); }
+     memcpy(pData, header_data, header->size);
+     DBG("Returning D3D_OK\n");
+diff --git a/src/gallium/frontends/nine/meson.build b/src/gallium/frontends/nine/meson.build
+index 8352a2e..12e3ba0 100644
+--- a/src/gallium/frontends/nine/meson.build
++++ b/src/gallium/frontends/nine/meson.build
+@@ -43,9 +43,29 @@ nine_st_files = files(
+   'volumetexture9.c',
+ )
+ 
++nine_c_args = []
++if host_machine.system() == 'windows'
++  # Built for the d3d9umd WDDM driver, where the D3D9 runtime owns swapchains: the threadpool only serves the Linux
++  # swapchain's DRI3 present path
++  nine_st_files = files(
++    'adapter9.c', 'authenticatedchannel9.c', 'basetexture9.c', 'buffer9.c', 'cryptosession9.c',
++    'cubetexture9.c', 'device9.c', 'device9ex.c', 'device9video.c', 'guid.c', 'indexbuffer9.c',
++    'iunknown.c', 'nine_buffer_upload.c', 'nine_debug.c', 'nine_dump.c', 'nineexoverlayextension.c',
++    'nine_ff.c', 'nine_helpers.c', 'nine_lock.c', 'nine_memory_helper.c', 'nine_pipe.c', 'nine_quirk.c',
++    'nine_queue.c', 'nine_shader.c', 'nine_state.c', 'pixelshader9.c', 'query9.c', 'resource9.c',
++    'stateblock9.c', 'surface9.c', 'swapchain9.c', 'swapchain9ex.c', 'texture9.c', 'vertexbuffer9.c',
++    'vertexdeclaration9.c', 'vertexshader9.c', 'volume9.c', 'volumetexture9.c',
++  )
++  if cc.get_argument_syntax() == 'msvc'
++    # nine_csmt_helper.h counts macro arguments, which needs the standard-conforming preprocessor
++    nine_c_args += ['/Zc:preprocessor']
++  endif
++endif
++
+ libnine_st = static_library(
+   'nine_st',
+   nine_st_files,
++  c_args : nine_c_args,
+   gnu_symbol_visibility : 'hidden',
+   include_directories : [
+     inc_d3d9, inc_gallium, inc_include, inc_src, inc_gallium_aux,
+diff --git a/src/gallium/frontends/nine/nine_csmt_helper.h b/src/gallium/frontends/nine/nine_csmt_helper.h
+index fa840f5..229a5d6 100644
+--- a/src/gallium/frontends/nine/nine_csmt_helper.h
++++ b/src/gallium/frontends/nine/nine_csmt_helper.h
+@@ -132,7 +132,7 @@
+ 
+ #define ARGS_FOR_ASSIGN(...) _BFUNC(__NARG__(__VA_ARGS__)) (__VA_ARGS__)
+ 
+-#define _args_for_struct_1(a) a;
++#define _args_for_struct_1(a) a
+ #define _args_for_struct_7(a, b, c, d, e, f, g) a;
+ #define _args_for_struct_14(a, b, c, d, e, f, g, ...) a; _args_for_struct_7(__VA_ARGS__)
+ #define _args_for_struct_21(a, b, c, d, e, f, g, ...) a; _args_for_struct_14(__VA_ARGS__)
+@@ -306,9 +306,10 @@ name( struct NineDevice9 *device ARGS_FOR_DECLARATION( __VA_ARGS__ ) ) \
+ static void \
+ name##_priv( struct NineDevice9 *device ARGS_FOR_DECLARATION( __VA_ARGS__ ) )
+ 
+-/* ARGS_FOR_STRUCT, ARGS_FOR_ASSIGN, ARGS_FOR_DECLARATION, ARGS_FOR_CALL, ARGS_FOR_UNBIND, ARGS_FOR_MEM, ARGS_FOR_BYPASS */
++/* ARGS_FOR_STRUCT, ARGS_FOR_ASSIGN, ARGS_FOR_DECLARATION, ARGS_FOR_CALL, ARGS_FOR_UNBIND, ARGS_FOR_MEM, ARGS_FOR_BYPASS
++ * The struct part has no trailing ';': ARGS_FOR_STRUCT adds it (an empty member declaration is a GNU extension) */
+ #define ARG_VAL(x, y) \
+-        x _##y ; ,\
++        x _##y ,\
+         args->_##y = y ; ,\
+         x y ,\
+         args->_##y ,\
+@@ -317,7 +318,7 @@ name##_priv( struct NineDevice9 *device ARGS_FOR_DECLARATION( __VA_ARGS__ ) )
+         y
+ 
+ #define ARG_REF(x, y) \
+-        x* _##y ; ,\
++        x* _##y ,\
+         args->_##y = y; ,\
+         x *y ,\
+         args->_##y ,\
+@@ -326,7 +327,7 @@ name##_priv( struct NineDevice9 *device ARGS_FOR_DECLARATION( __VA_ARGS__ ) )
+         y
+ 
+ #define ARG_COPY_REF(x, y) \
+-        x * _##y ; x __##y ; ,\
++        x * _##y ; x __##y ,\
+         if ( y ) { args->_##y = &args->__##y ; args->__##y = *y ; } else { args->_##y = NULL; } ,\
+         const x *y ,\
+         (const x *)args->_##y ,\
+@@ -361,7 +362,7 @@ name##_priv( struct NineDevice9 *device ARGS_FOR_DECLARATION( __VA_ARGS__ ) )
+ 
+ #define ARG_MEM(x, y) \
+         x * _##y ,\
+-        args->_##y = (void *)args + memsize;\
++        args->_##y = (void *)((uint8_t *)args + memsize);\
+         memcpy(args->_##y, y, memsize2); ,\
+         const x *y ,\
+         (const x *)args->_##y ,\
+diff --git a/src/gallium/frontends/nine/nine_dump.c b/src/gallium/frontends/nine/nine_dump.c
+index cfa65b8..e850d08 100644
+--- a/src/gallium/frontends/nine/nine_dump.c
++++ b/src/gallium/frontends/nine/nine_dump.c
+@@ -415,7 +415,7 @@ nine_dump_D3DADAPTER_IDENTIFIER9(unsigned ch, const D3DADAPTER_IDENTIFIER9 *id)
+              id->WHQLLevel);
+ }
+ 
+-#define C2S(args...) p += snprintf(&s[p],c-p,args)
++#define C2S(...) p += snprintf(&s[p],c-p,__VA_ARGS__)
+ 
+ #define CAP_CASE(m,p,n) \
+     do {                     \
+diff --git a/src/gallium/frontends/nine/nine_ff.h b/src/gallium/frontends/nine/nine_ff.h
+index d41cb9f..392f78a 100644
+--- a/src/gallium/frontends/nine/nine_ff.h
++++ b/src/gallium/frontends/nine/nine_ff.h
+@@ -71,7 +71,7 @@ nine_ff_get_projected_key(struct nine_context *context, unsigned num_stages)
+ {
+     unsigned s, i;
+     uint16_t projected = 0;
+-    int8_t input_texture_coord[num_stages];
++    int8_t input_texture_coord[8]; /* num_stages <= 8; no VLA, for MSVC */
+     memset(&input_texture_coord, 0, sizeof(input_texture_coord));
+ 
+     if (context->vdecl) {
+diff --git a/src/gallium/frontends/nine/nine_memory_helper.c b/src/gallium/frontends/nine/nine_memory_helper.c
+index 67febdd..c614333 100644
+--- a/src/gallium/frontends/nine/nine_memory_helper.c
++++ b/src/gallium/frontends/nine/nine_memory_helper.c
+@@ -67,17 +67,20 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
++#include <stdio.h>
++#ifndef _WIN32
+ #include <linux/memfd.h>
+ #include <pthread.h>
+-#include <stdio.h>
+ #include <sys/mman.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <ulimit.h>
+ #include <unistd.h>
++#endif
+ 
+ #include "util/list.h"
+ #include "util/u_memory.h"
++#include "util/simple_mtx.h"
+ #include "util/slab.h"
+ 
+ #include "nine_debug.h"
+@@ -1050,7 +1053,7 @@ struct nine_allocation {
+ 
+ struct nine_allocator {
+     struct slab_mempool external_allocation_pool;
+-    pthread_mutex_t mutex_slab;
++    simple_mtx_t mutex_slab;
+ };
+ 
+ struct nine_allocation *
+@@ -1068,9 +1071,9 @@ nine_allocate(struct nine_allocator *allocator, unsigned size)
+ void nine_free(struct nine_allocator *allocator, struct nine_allocation *allocation)
+ {
+     if (allocation->is_external) {
+-        pthread_mutex_lock(&allocator->mutex_slab);
++        simple_mtx_lock(&allocator->mutex_slab);
+         slab_free_st(&allocator->external_allocation_pool, allocation);
+-        pthread_mutex_unlock(&allocator->mutex_slab);
++        simple_mtx_unlock(&allocator->mutex_slab);
+     } else
+         align_free(allocation);
+ }
+@@ -1113,9 +1116,9 @@ struct nine_allocation *
+ nine_suballocate(struct nine_allocator* allocator, struct nine_allocation *allocation, int offset)
+ {
+     struct nine_allocation *new_allocation;
+-    pthread_mutex_lock(&allocator->mutex_slab);
++    simple_mtx_lock(&allocator->mutex_slab);
+     new_allocation = slab_alloc_st(&allocator->external_allocation_pool);
+-    pthread_mutex_unlock(&allocator->mutex_slab);
++    simple_mtx_unlock(&allocator->mutex_slab);
+     new_allocation->is_external = true;
+     new_allocation->external = (uint8_t *)allocation + NINE_ALLOCATION_ALIGNMENT + offset;
+     return new_allocation;
+@@ -1125,9 +1128,9 @@ struct nine_allocation *
+ nine_wrap_external_pointer(struct nine_allocator* allocator, void* data)
+ {
+     struct nine_allocation *new_allocation;
+-    pthread_mutex_lock(&allocator->mutex_slab);
++    simple_mtx_lock(&allocator->mutex_slab);
+     new_allocation = slab_alloc_st(&allocator->external_allocation_pool);
+-    pthread_mutex_unlock(&allocator->mutex_slab);
++    simple_mtx_unlock(&allocator->mutex_slab);
+     new_allocation->is_external = true;
+     new_allocation->external = data;
+     return new_allocation;
+@@ -1144,7 +1147,7 @@ nine_allocator_create(struct NineDevice9 *device, int memfd_virtualsizelimit)
+         return NULL;
+ 
+     slab_create(&allocator->external_allocation_pool, sizeof(struct nine_allocation), 4096);
+-    pthread_mutex_init(&allocator->mutex_slab, NULL);
++    simple_mtx_init(&allocator->mutex_slab, mtx_plain);
+ 
+     return allocator;
+ }
+@@ -1153,7 +1156,7 @@ void
+ nine_allocator_destroy(struct nine_allocator *allocator)
+ {
+     slab_destroy(&allocator->external_allocation_pool);
+-    pthread_mutex_destroy(&allocator->mutex_slab);
++    simple_mtx_destroy(&allocator->mutex_slab);
+ }
+ 
+ #endif /* NINE_ENABLE_MEMFD */
+diff --git a/src/gallium/frontends/nine/nine_pdata.h b/src/gallium/frontends/nine/nine_pdata.h
+index c0a5b47..a44fa56 100644
+--- a/src/gallium/frontends/nine/nine_pdata.h
++++ b/src/gallium/frontends/nine/nine_pdata.h
+@@ -39,7 +39,7 @@ static void
+ ht_guid_delete( struct hash_entry *entry )
+ {
+     struct pheader *header = entry->data;
+-    void *header_data = (void *)header + sizeof(*header);
++    void *header_data = (void *)((uint8_t *)header + sizeof(*header));
+ 
+     if (header->unknown) { IUnknown_Release(*(IUnknown **)header_data); }
+     FREE(header);
+diff --git a/src/gallium/frontends/nine/nine_queue.c b/src/gallium/frontends/nine/nine_queue.c
+index cd73516..132bd8e 100644
+--- a/src/gallium/frontends/nine/nine_queue.c
++++ b/src/gallium/frontends/nine/nine_queue.c
+@@ -110,7 +110,7 @@ nine_queue_get(struct nine_queue_pool* ctx)
+     cmdbuf->offset += cmdbuf->instr_size[ctx->cur_instr];
+     ctx->cur_instr ++;
+ 
+-    return cmdbuf->mem_pool + offset;
++    return (uint8_t *)cmdbuf->mem_pool + offset;
+ }
+ 
+ /* Producer functions: */
+@@ -184,7 +184,7 @@ nine_queue_alloc(struct nine_queue_pool* ctx, unsigned space)
+     cmdbuf->instr_size[cmdbuf->num_instr] = space;
+     cmdbuf->num_instr ++;
+ 
+-    return cmdbuf->mem_pool + offset;
++    return (uint8_t *)cmdbuf->mem_pool + offset;
+ }
+ 
+ /* Returns the current queue flush state.
+diff --git a/src/gallium/frontends/nine/nine_shader.c b/src/gallium/frontends/nine/nine_shader.c
+index af1a0cc..3c6c8f3 100644
+--- a/src/gallium/frontends/nine/nine_shader.c
++++ b/src/gallium/frontends/nine/nine_shader.c
+@@ -22,7 +22,7 @@
+ 
+ #define DBG_CHANNEL DBG_SHADER
+ 
+-#define DUMP(args...) _nine_debug_printf(DBG_CHANNEL, NULL, args)
++#define DUMP(...) _nine_debug_printf(DBG_CHANNEL, NULL, __VA_ARGS__)
+ 
+ 
+ struct shader_translator;
+diff --git a/src/gallium/frontends/nine/nine_state.c b/src/gallium/frontends/nine/nine_state.c
+index 8b8e1a9..3a5b308 100644
+--- a/src/gallium/frontends/nine/nine_state.c
++++ b/src/gallium/frontends/nine/nine_state.c
+@@ -519,15 +519,18 @@ prepare_vs_constants_userbuf(struct NineDevice9 *device)
+      * to have efficient WC. Thus for this case we really want
+      * that intermediate buffer. */
+ 
+-    u_upload_alloc(context->pipe->const_uploader,
+-                  0,
+-                  cb.buffer_size,
+-                  256, /* Be conservative about alignment */
+-                  &(cb.buffer_offset),
+-                  &(cb.buffer),
+-                  (void**)&upload_ptr);
++    if (device->driver_caps.user_constbufs)
++        upload_ptr = (uint8_t *)context->vs_const_user;
++    else
++        u_upload_alloc(context->pipe->const_uploader,
++                      0,
++                      cb.buffer_size,
++                      256, /* Be conservative about alignment */
++                      &(cb.buffer_offset),
++                      &(cb.buffer),
++                      (void**)&upload_ptr);
+ 
+-    assert(cb.buffer && upload_ptr);
++    assert((cb.buffer || device->driver_caps.user_constbufs) && upload_ptr);
+ 
+     if (!context->cso_shader.vs_const_ranges) {
+         memcpy(upload_ptr, cb.user_buffer, cb.buffer_size);
+@@ -543,8 +546,12 @@ prepare_vs_constants_userbuf(struct NineDevice9 *device)
+         }
+     }
+ 
+-    u_upload_unmap(context->pipe->const_uploader);
+-    cb.user_buffer = NULL;
++    if (device->driver_caps.user_constbufs) {
++        cb.user_buffer = context->vs_const_user;
++    } else {
++        u_upload_unmap(context->pipe->const_uploader);
++        cb.user_buffer = NULL;
++    }
+ 
+     /* Free previous resource */
+     pipe_resource_reference(&context->pipe_data.cb_vs.buffer, NULL);
+@@ -601,15 +608,18 @@ prepare_ps_constants_userbuf(struct NineDevice9 *device)
+     if (!cb.buffer_size)
+         return;
+ 
+-    u_upload_alloc(context->pipe->const_uploader,
+-                  0,
+-                  cb.buffer_size,
+-                  256, /* Be conservative about alignment */
+-                  &(cb.buffer_offset),
+-                  &(cb.buffer),
+-                  (void**)&upload_ptr);
++    if (device->driver_caps.user_constbufs)
++        upload_ptr = (uint8_t *)context->ps_const_user;
++    else
++        u_upload_alloc(context->pipe->const_uploader,
++                      0,
++                      cb.buffer_size,
++                      256, /* Be conservative about alignment */
++                      &(cb.buffer_offset),
++                      &(cb.buffer),
++                      (void**)&upload_ptr);
+ 
+-    assert(cb.buffer && upload_ptr);
++    assert((cb.buffer || device->driver_caps.user_constbufs) && upload_ptr);
+ 
+     if (!context->cso_shader.ps_const_ranges) {
+         memcpy(upload_ptr, cb.user_buffer, cb.buffer_size);
+@@ -625,8 +635,12 @@ prepare_ps_constants_userbuf(struct NineDevice9 *device)
+         }
+     }
+ 
+-    u_upload_unmap(context->pipe->const_uploader);
+-    cb.user_buffer = NULL;
++    if (device->driver_caps.user_constbufs) {
++        cb.user_buffer = context->ps_const_user;
++    } else {
++        u_upload_unmap(context->pipe->const_uploader);
++        cb.user_buffer = NULL;
++    }
+ 
+     /* Free previous resource */
+     pipe_resource_reference(&context->pipe_data.cb_ps.buffer, NULL);
+@@ -724,6 +738,15 @@ update_framebuffer(struct NineDevice9 *device, bool is_clear)
+     struct pipe_framebuffer_state *fb = &context->pipe_data.fb;
+     unsigned i;
+     struct NineSurface9 *rt0 = context->rt[0];
++
++    /* A headless device (d3d9umd) has no render target until its user binds one */
++    if (!rt0) {
++        memset(fb, 0, sizeof(*fb));
++        context->rt_mask = 0x0;
++        pipe->set_framebuffer_state(pipe, fb);
++        return;
++    }
++
+     unsigned w = rt0->desc.Width;
+     unsigned h = rt0->desc.Height;
+     unsigned nr_samples = rt0->base.info.nr_samples;
+@@ -1312,7 +1335,7 @@ nine_update_state(struct NineDevice9 *device)
+             pipe->set_blend_color(pipe, &color);
+         }
+         if (group & NINE_STATE_SAMPLE_MASK) {
+-            if (context->rt[0]->desc.MultiSampleType <= D3DMULTISAMPLE_NONMASKABLE) {
++            if (!context->rt[0] || context->rt[0]->desc.MultiSampleType <= D3DMULTISAMPLE_NONMASKABLE) {
+                 pipe->set_sample_mask(pipe, ~0);
+             } else {
+                 pipe->set_sample_mask(pipe, context->rs[D3DRS_MULTISAMPLEMASK]);
+@@ -3115,7 +3138,7 @@ update_vertex_elements_sw(struct NineDevice9 *device)
+     unsigned n, b, i, j;
+     int index;
+     int8_t vdecl_index_map[16]; /* vs->num_inputs <= 16 */
+-    int8_t used_streams[device->caps.MaxStreams];
++    int8_t used_streams[PIPE_MAX_ATTRIBS]; /* caps.MaxStreams <= 16; no VLA, for MSVC */
+     BOOL need_dummy_vbo = false;
+     int dummy_vbo_stream = -1;
+     struct cso_velems_state ve;
+diff --git a/src/gallium/frontends/nine/nine_state.h b/src/gallium/frontends/nine/nine_state.h
+index e4f6df3..5044a07 100644
+--- a/src/gallium/frontends/nine/nine_state.h
++++ b/src/gallium/frontends/nine/nine_state.h
+@@ -259,6 +259,9 @@ struct nine_context {
+     int   *vs_const_i;
+     BOOL  *vs_const_b;
+     float *vs_lconstf_temp;
++    /* The constants for the shaders, with user_constbufs (they're compacted, so can't be vs_const_f/ps_const_f) */
++    float *vs_const_user;
++    float *ps_const_user;
+ 
+     struct NinePixelShader9 *ps;
+     float *ps_const_f;
+diff --git a/src/gallium/frontends/nine/surface9.c b/src/gallium/frontends/nine/surface9.c
+index e5f2d01..12fe8a0 100644
+--- a/src/gallium/frontends/nine/surface9.c
++++ b/src/gallium/frontends/nine/surface9.c
+@@ -43,7 +43,9 @@ NineSurface9_ctor( struct NineSurface9 *This,
+                    D3DSURFACE_DESC *pDesc )
+ {
+     HRESULT hr;
+-    bool allocate = !pContainer && pDesc->Format != D3DFMT_NULL;
++    /* A surface without a container allocates its memory, unless it is given some (system memory surfaces of
++     * the d3d9umd driver wrap the D3D9 runtime's memory) */
++    bool allocate = !pContainer && !user_buffer && pDesc->Format != D3DFMT_NULL;
+     D3DMULTISAMPLE_TYPE multisample_type;
+ 
+     DBG("This=%p pDevice=%p pResource=%p Level=%u Layer=%u pDesc=%p\n",
+diff --git a/src/gallium/frontends/nine/swapchain9.c b/src/gallium/frontends/nine/swapchain9.c
+index de505c1..98c4f2d 100644
+--- a/src/gallium/frontends/nine/swapchain9.c
++++ b/src/gallium/frontends/nine/swapchain9.c
+@@ -96,7 +96,7 @@ D3DWindowBuffer_create(struct NineSwapChain9 *This,
+     }
+     nine_context_get_pipe_release(This->base.device);
+     stride = whandle.stride;
+-    dmaBufFd = whandle.handle;
++    dmaBufFd = (int)(intptr_t)whandle.handle;
+     hr = ID3DPresent_NewD3DWindowBufferFromDmaBuf(This->present,
+                                                   dmaBufFd,
+                                                   resource->width0,
+@@ -785,8 +785,9 @@ present( struct NineSwapChain9 *This,
+     if (!This->present_buffers[0] &&
+         (target_width != resource->width0 || target_height != resource->height0)) {
+         BOOL failure = false;
+-        struct pipe_resource *new_resource[This->num_back_buffers];
+-        D3DWindowBuffer *new_handles[This->num_back_buffers];
++        /* num_back_buffers <= D3DPRESENT_BACK_BUFFERS_MAX_EX + 1; no VLA, for MSVC */
++        struct pipe_resource *new_resource[D3DPRESENT_BACK_BUFFERS_MAX_EX + 1];
++        D3DWindowBuffer *new_handles[D3DPRESENT_BACK_BUFFERS_MAX_EX + 1];
+         for (i = 0; i < This->num_back_buffers; i++) {
+             /* Note: if (!new_handles[i]), new_resource[i]
+              * gets released and contains NULL */
+diff --git a/src/gallium/frontends/nine/threadpool.h b/src/gallium/frontends/nine/threadpool.h
+index 57d3769..df1163b 100644
+--- a/src/gallium/frontends/nine/threadpool.h
++++ b/src/gallium/frontends/nine/threadpool.h
+@@ -6,10 +6,29 @@
+ #ifndef _THREADPOOL_H_
+ #define _THREADPOOL_H_
+ 
+-#include <pthread.h>
+-
+ struct NineSwapChain9;
+ 
++#ifdef _WIN32
++/* The threadpool only serves the DRI3 present path (thread_submit). The Windows
++ * WDDM driver (d3d9umd) never enables it: creating one fails, so the swapchain
++ * presents synchronously. */
++struct threadpool;
++struct threadpool_task;
++typedef void (*threadpool_task_func)(void *data);
++
++static inline struct threadpool *
++_mesa_threadpool_create(struct NineSwapChain9 *swapchain) { (void)swapchain; return NULL; }
++static inline void
++_mesa_threadpool_destroy(struct NineSwapChain9 *swapchain, struct threadpool *pool) { (void)swapchain; (void)pool; }
++static inline struct threadpool_task *
++_mesa_threadpool_queue_task(struct threadpool *pool, threadpool_task_func func, void *data)
++{ (void)pool; (void)func; (void)data; return NULL; }
++static inline void
++_mesa_threadpool_wait_for_task(struct threadpool *pool, struct threadpool_task **task) { (void)pool; (void)task; }
++#else
++
++#include <pthread.h>
++
+ #define MAXTHREADS 1
+ 
+ struct threadpool {
+@@ -39,4 +58,5 @@ struct threadpool_task *_mesa_threadpool_queue_task(struct threadpool *pool,
+                                                     void *data);
+ void _mesa_threadpool_wait_for_task(struct threadpool *pool,
+                                     struct threadpool_task **task);
++#endif /* _WIN32 */
+ #endif
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+index 21ec35d..c655271 100644
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -243,6 +243,11 @@ if with_gallium_st_d3d10umd
+   subdir('frontends/d3d10umd')
+   subdir('targets/d3d10umd')
+ endif
++if with_gallium_st_d3d9umd
++  subdir('frontends/nine')
++  subdir('frontends/d3d9umd')
++  subdir('targets/d3d9umd')
++endif
+ if with_platform_windows
+   if with_opengl
+     subdir('frontends/wgl')
+diff --git a/src/gallium/targets/d3d9umd/d3d9.def.in b/src/gallium/targets/d3d9umd/d3d9.def.in
+new file mode 100644
+index 0000000..6761c34
+--- /dev/null
++++ b/src/gallium/targets/d3d9umd/d3d9.def.in
+@@ -0,0 +1,2 @@
++; stdcall calling convention have @number suffix on 32 bits architecture for gcc
++OpenAdapter@4
+diff --git a/src/gallium/targets/d3d9umd/meson.build b/src/gallium/targets/d3d9umd/meson.build
+new file mode 100644
+index 0000000..f7b00c9
+--- /dev/null
++++ b/src/gallium/targets/d3d9umd/meson.build
+@@ -0,0 +1,27 @@
++# Copyright 2026 WinBoat contributors
++# SPDX-License-Identifier: MIT
++
++# The Direct3D 9 WDDM user-mode driver: the D3D9 DDI (d3d9umd) on top of gallium nine and virgl
++libgallium_d3d9_def = custom_target(
++  'd3d9.def',
++  input : 'd3d9.def.in',
++  output : 'd3d9.def',
++  command : gen_vs_module_defs_normal_command,
++)
++
++# A linker map, to turn the crash addresses d3d9umd logs (when tracing) into function names
++_d3d9umd_link_args = []
++if cc.get_argument_syntax() == 'msvc'
++  _d3d9umd_link_args += ['/MAP']
++endif
++
++libgallium_d3d9 = shared_library(
++  get_option('gallium-d3d9-dll-name'),
++  vs_module_defs : libgallium_d3d9_def,
++  link_args : _d3d9umd_link_args,
++  link_whole : [libd3d9umd, libd3d9umd_nine],
++  link_with : [libnine_st, libgallium, libgalliumvl, libwsgdi],
++  dependencies : [dep_ws2_32, idep_nir, driver_virgl, idep_mesautil],
++  name_prefix : '',
++  install : true,
++)
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_public.h b/src/gallium/winsys/virgl/gdi/virgl_gdi_public.h
+index a5443ae..a18ec9a 100644
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_public.h
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_public.h
+@@ -31,7 +31,15 @@ struct pipe_context;
+ struct pipe_resource;
+ struct sw_winsys;
+ 
++#ifdef __cplusplus
++extern "C" {
++#endif
++
+ struct pipe_screen *virgl_gdi_screen_create(struct gdikmt_device *device);
+ 
++#ifdef __cplusplus
++}
++#endif
++
+                   
+ #endif

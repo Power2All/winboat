@@ -1,0 +1,36 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: declare indexable temps as TGSI arrays
+
+Indexable temps (x#[], e.g. a constant array indexed by SV_VertexID) were plain temporaries addressed relatively.
+virgl, which translates TGSI to GLSL on the host, doesn't handle relative addressing of plain temporaries: such
+draws rendered nothing. Declare each indexable temp as a TGSI temporary array, as the GL frontend does.
+---
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index 6f5006b..54bf42c 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -2128,9 +2128,7 @@ Shader_tgsi_translate(const unsigned *code,
+       case D3D10_SB_OPCODE_DCL_INDEXABLE_TEMP:
+          {
+             uint i;
+-
+-            /* XXX: Add true indexable temps to gallium.
+-             */
++            struct ureg_dst array;
+ 
+             assert(opcode.specific.dcl_indexable_temp.index <
+                    SHADER_MAX_INDEXABLE_TEMPS);
+@@ -2140,8 +2138,12 @@ Shader_tgsi_translate(const unsigned *code,
+             sx.indexable_temp_offsets[opcode.specific.dcl_indexable_temp.index] =
+                sx.declared_temps;
+ 
++            /* A TGSI temporary array, so relative addressing is declared as such. virgl (TGSI translated to
++             * GLSL on the host) doesn't handle relative addressing of plain temporaries: draws that index an
++             * array, e.g. by SV_VertexID, rendered nothing. */
++            array = ureg_DECL_array_temporary(ureg, opcode.specific.dcl_indexable_temp.count, true);
+             for (i = 0; i < opcode.specific.dcl_indexable_temp.count; i++) {
+-               sx.temps[sx.declared_temps + i] = ureg_DECL_temporary(ureg);
++               sx.temps[sx.declared_temps + i] = ureg_dst_array_offset(array, i);
+             }
+             sx.declared_temps += opcode.specific.dcl_indexable_temp.count;
+          }

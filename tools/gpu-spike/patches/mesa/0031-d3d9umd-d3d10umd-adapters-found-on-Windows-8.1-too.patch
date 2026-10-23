@@ -1,0 +1,193 @@
+From: WinBoat
+Subject: [PATCH] d3d9umd, d3d10umd: adapters found on Windows 8.1 too
+
+Both drivers find the virtio-gpu adapter with D3DKMTEnumAdapters2, which Windows 8.1's gdi32 doesn't have (Windows 10's):
+the Direct3D 9 driver refused the adapter ("no virtio-gpu adapter found": GetDeviceCaps(HAL) failed) and the Direct3D
+10/11 driver found no host caps (feature level 10_0 at most, no 10_1/11_0). gdikmt_enum_adapters does the enumeration:
+D3DKMTEnumAdapters2 where it exists, else the desktop's displays' adapters (D3DKMTOpenAdapterFromGdiDisplayName, once
+per LUID). Windows 8.1 on a stock host: dx-test 76 -> 280 passed.
+---
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt.h b/src/gallium/auxiliary/gdikmt/gdikmt.h
+index 40574a1..0cc1af4 100644
+--- a/src/gallium/auxiliary/gdikmt/gdikmt.h
++++ b/src/gallium/auxiliary/gdikmt/gdikmt.h
+@@ -112,6 +112,10 @@ void
+ gdikmt_wddm2_make_resident(struct gdikmt_wddm2_residency *residency, const struct _D3DDDI_DEVICECALLBACKS *cb,
+                            HANDLE hRTDevice, const D3DKMT_HANDLE *handles, UINT count);
+ 
++/* The adapters, opened (the caller closes each hAdapter), at most max: D3DKMTEnumAdapters2 from Windows 10 on, else
++ * (Windows 8.1) the desktop's displays' adapters. Returns how many */
++UINT gdikmt_enum_adapters(D3DKMT_ADAPTERINFO *adapters, UINT max);
++
+ struct gdikmt_device *gdikmt_create_from_hdc(HDC hDC);
+ /* Opens the adapter with this LUID through the D3DKMT* functions */
+ struct gdikmt_device *gdikmt_create_from_luid(LUID luid);
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+index dd8627c..b3218bd 100644
+--- a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
++++ b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+@@ -546,3 +546,71 @@ gdikmt_create_from_luid(LUID luid)
+    }
+    return gdikmt_create_on_adapter(device, openFromLuid.hAdapter);
+ }
++
++UINT
++gdikmt_enum_adapters(D3DKMT_ADAPTERINFO *adapters, UINT max)
++{
++   HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
++   PFND3DKMT_ENUMADAPTERS2 enumAdapters2 =
++      gdi32 ? (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gdi32, "D3DKMTEnumAdapters2") : NULL;
++   PFND3DKMT_CLOSEADAPTER closeAdapter =
++      gdi32 ? (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32, "D3DKMTCloseAdapter") : NULL;
++   if (!closeAdapter)
++      return 0;
++
++   if (enumAdapters2) {
++      D3DKMT_ENUMADAPTERS2 enumerate = {0};
++      if (!NT_SUCCESS(enumAdapters2(&enumerate)) || !enumerate.NumAdapters)
++         return 0;
++      D3DKMT_ADAPTERINFO *all = (D3DKMT_ADAPTERINFO *)CALLOC(enumerate.NumAdapters, sizeof(*all));
++      if (!all)
++         return 0;
++      enumerate.pAdapters = all;
++      UINT n = 0;
++      if (NT_SUCCESS(enumAdapters2(&enumerate))) {
++         for (UINT i = 0; i < enumerate.NumAdapters; i++) {
++            if (n < max) {
++               adapters[n++] = all[i];
++            } else {
++               D3DKMT_CLOSEADAPTER close = {all[i].hAdapter};
++               closeAdapter(&close);
++            }
++         }
++      }
++      FREE(all);
++      return n;
++   }
++
++   /* Windows 8.1 has no D3DKMTEnumAdapters2: the adapter of each display on the desktop, once */
++   PFND3DKMT_OPENADAPTERFROMGDIDISPLAYNAME openFromName = (PFND3DKMT_OPENADAPTERFROMGDIDISPLAYNAME)GetProcAddress(
++      gdi32, "D3DKMTOpenAdapterFromGdiDisplayName");
++   HMODULE user32 = LoadLibraryA("user32.dll");
++   typedef BOOL(WINAPI * EnumDisplayDevicesFn)(LPCWSTR, DWORD, PDISPLAY_DEVICEW, DWORD);
++   EnumDisplayDevicesFn enumDisplayDevices =
++      user32 ? (EnumDisplayDevicesFn)GetProcAddress(user32, "EnumDisplayDevicesW") : NULL;
++   UINT n = 0;
++   DISPLAY_DEVICEW display;
++   display.cb = sizeof(display);
++   for (DWORD i = 0; openFromName && enumDisplayDevices && n < max && enumDisplayDevices(NULL, i, &display, 0); i++) {
++      D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME open = {{0}};
++      if (!(display.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
++         continue;
++      memcpy(open.DeviceName, display.DeviceName, sizeof(open.DeviceName));
++      if (!NT_SUCCESS(openFromName(&open)))
++         continue;
++      bool seen = false;
++      for (UINT k = 0; k < n; k++)
++         seen |= !memcmp(&adapters[k].AdapterLuid, &open.AdapterLuid, sizeof(LUID));
++      if (seen) {
++         D3DKMT_CLOSEADAPTER close = {open.hAdapter};
++         closeAdapter(&close);
++         continue;
++      }
++      memset(&adapters[n], 0, sizeof(adapters[n]));
++      adapters[n].hAdapter = open.hAdapter;
++      adapters[n].AdapterLuid = open.AdapterLuid;
++      adapters[n].NumOfSources = 1;
++      n++;
++   }
++   return n;
++}
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index 8adc008..e597888 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include <d3dkmthk.h>
+ #include "virtio/wddm/viogpu_wddm_driver.h"
++#include "gdikmt/gdikmt.h"
+ #include "virtio/virtio-gpu/virgl_hw.h"
+ 
+ 
+@@ -227,33 +228,23 @@ HostSupportsFL11(void)
+    if (!gdi32) {
+       gdi32 = LoadLibraryA("gdi32.dll");
+    }
+-   PFND3DKMT_ENUMADAPTERS2 enumAdapters =
+-      gdi32 ? (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gdi32, "D3DKMTEnumAdapters2") : NULL;
+    PFND3DKMT_QUERYADAPTERINFO queryAdapterInfo =
+       gdi32 ? (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(gdi32, "D3DKMTQueryAdapterInfo") : NULL;
+    PFND3DKMT_ESCAPE escape = gdi32 ? (PFND3DKMT_ESCAPE)GetProcAddress(gdi32, "D3DKMTEscape") : NULL;
+    PFND3DKMT_CLOSEADAPTER closeAdapter =
+       gdi32 ? (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32, "D3DKMTCloseAdapter") : NULL;
+-   if (!enumAdapters || !queryAdapterInfo || !escape || !closeAdapter) {
++   if (!queryAdapterInfo || !escape || !closeAdapter) {
+       supported = 0;
+       return false;
+    }
+ 
+-   D3DKMT_ENUMADAPTERS2 adapters = {};
+-   if (!NT_SUCCESS(enumAdapters(&adapters)) || !adapters.NumAdapters) {
+-      supported = 0;
+-      return false;
+-   }
+-   adapters.pAdapters = (D3DKMT_ADAPTERINFO *)CALLOC(adapters.NumAdapters, sizeof(D3DKMT_ADAPTERINFO));
+-   if (!adapters.pAdapters || !NT_SUCCESS(enumAdapters(&adapters))) {
+-      FREE(adapters.pAdapters);
+-      supported = 0;
+-      return false;
+-   }
++   /* (Windows 8.1 has no D3DKMTEnumAdapters2: gdikmt_enum_adapters goes through the displays there) */
++   D3DKMT_ADAPTERINFO adapters[16];
++   UINT count = gdikmt_enum_adapters(adapters, 16);
+ 
+    bool found = false, fl11 = false;
+-   for (ULONG i = 0; i < adapters.NumAdapters; i++) {
+-      D3DKMT_HANDLE hAdapter = adapters.pAdapters[i].hAdapter;
++   for (ULONG i = 0; i < count; i++) {
++      D3DKMT_HANDLE hAdapter = adapters[i].hAdapter;
+       VIOGPU_ADAPTERINFO info = {};
+       D3DKMT_QUERYADAPTERINFO query = {};
+       query.hAdapter = hAdapter;
+@@ -289,7 +280,6 @@ HostSupportsFL11(void)
+       close.hAdapter = hAdapter;
+       closeAdapter(&close);
+    }
+-   FREE(adapters.pAdapters);
+ 
+    supported = fl11;
+    return fl11;
+diff --git a/src/gallium/frontends/d3d9umd/adapter.cpp b/src/gallium/frontends/d3d9umd/adapter.cpp
+index d3599b6..e5695d7 100644
+--- a/src/gallium/frontends/d3d9umd/adapter.cpp
++++ b/src/gallium/frontends/d3d9umd/adapter.cpp
+@@ -25,23 +25,17 @@ static bool
+ FindVioGpuAdapter(LUID *luid, bool *wddm2)
+ {
+    HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
+-   auto enumAdapters2 = (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gdi32, "D3DKMTEnumAdapters2");
+    auto queryAdapterInfo = (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(gdi32, "D3DKMTQueryAdapterInfo");
+    auto closeAdapter = (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32, "D3DKMTCloseAdapter");
+-   if (!enumAdapters2 || !queryAdapterInfo || !closeAdapter)
++   if (!queryAdapterInfo || !closeAdapter)
+       return false;
+ 
+-   D3DKMT_ENUMADAPTERS2 enumerate;
+-   memset(&enumerate, 0, sizeof(enumerate));
+-   if (!NT_SUCCESS(enumAdapters2(&enumerate)) || !enumerate.NumAdapters)
+-      return false;
+-   std::vector<D3DKMT_ADAPTERINFO> adapters(enumerate.NumAdapters);
+-   enumerate.pAdapters = adapters.data();
+-   if (!NT_SUCCESS(enumAdapters2(&enumerate)))
+-      return false;
++   /* (Windows 8.1 has no D3DKMTEnumAdapters2: gdikmt_enum_adapters goes through the displays there) */
++   D3DKMT_ADAPTERINFO adapters[16];
++   UINT count = gdikmt_enum_adapters(adapters, 16);
+ 
+    bool found = false;
+-   for (UINT i = 0; i < enumerate.NumAdapters; i++) {
++   for (UINT i = 0; i < count; i++) {
+       VIOGPU_ADAPTERINFO info;
+       memset(&info, 0, sizeof(info));
+       D3DKMT_QUERYADAPTERINFO query;

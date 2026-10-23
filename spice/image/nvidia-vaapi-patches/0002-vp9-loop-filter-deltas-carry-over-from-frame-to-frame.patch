@@ -1,0 +1,56 @@
+vp9: the loop filter deltas carry over from frame to frame (WinBoat)
+
+A VP9 frame header has only the loop filter deltas it changes
+(mode_ref_delta_update, update_ref_deltas[], update_mode_deltas[]); the others
+keep their values from earlier frames, back to the defaults (ref 1, 0, -1, -1,
+mode 0, 0) with intra and error resilient frames. parseExtraInfo passed NVDEC
+the parsed header's deltas, zero where the frame changes none: inter frames
+were deblocked with the wrong strengths, a small error that grew until the next
+key frame (ffmpeg's own NVDEC path, with the carried-over deltas, is bit-exact).
+Keep the deltas from frame to frame.
+
+diff --git a/src/vp9.c b/src/vp9.c
+index 86960a9..0bdc0cc 100644
+--- a/src/vp9.c
++++ b/src/vp9.c
+@@ -69,6 +69,9 @@ static void copyVP9PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
+ }
+ 
+ static GstVp9Parser *parser;
++//the loop filter deltas carry over from frame to frame: a frame header only has the ones it changes
++static int8_t refLfDeltas[GST_VP9_MAX_REF_LF_DELTAS] = { 1, 0, -1, -1 };
++static int8_t modeLfDeltas[GST_VP9_MAX_MODE_LF_DELTAS] = { 0, 0 };
+ static void parseExtraInfo(void *buf, uint32_t size, CUVIDPICPARAMS *picParams) {
+     //TODO a bit of a hack as we don't have per decoder init/deinit functions atm
+     if (parser == NULL) {
+@@ -94,12 +97,28 @@ static void parseExtraInfo(void *buf, uint32_t size, CUVIDPICPARAMS *picParams)
+ 
+         picParams->CodecSpecific.vp9.segmentFeatureMode = hdr.segmentation.abs_delta;
+ 
++        //back to the defaults with intra and error resilient frames (the spec's setup_past_independence), then
++        //this frame's changes
++        if (hdr.frame_type == GST_VP9_KEY_FRAME || hdr.intra_only || hdr.error_resilient_mode) {
++            static const int8_t refDefaults[GST_VP9_MAX_REF_LF_DELTAS] = { 1, 0, -1, -1 };
++            memcpy(refLfDeltas, refDefaults, sizeof(refLfDeltas));
++            memset(modeLfDeltas, 0, sizeof(modeLfDeltas));
++        }
++        if (hdr.loopfilter.mode_ref_delta_update) {
++            for (int i = 0; i < GST_VP9_MAX_REF_LF_DELTAS; i++)
++                if (hdr.loopfilter.update_ref_deltas[i])
++                    refLfDeltas[i] = hdr.loopfilter.ref_deltas[i];
++            for (int i = 0; i < GST_VP9_MAX_MODE_LF_DELTAS; i++)
++                if (hdr.loopfilter.update_mode_deltas[i])
++                    modeLfDeltas[i] = hdr.loopfilter.mode_deltas[i];
++        }
++
+         picParams->CodecSpecific.vp9.modeRefLfEnabled = hdr.loopfilter.mode_ref_delta_enabled;
+         for (int i = 0; i < 2; i++)
+-            picParams->CodecSpecific.vp9.mbModeLfDelta[i] = hdr.loopfilter.mode_deltas[i];
++            picParams->CodecSpecific.vp9.mbModeLfDelta[i] = modeLfDeltas[i];
+ 
+         for (int i = 0; i < 4; i++)
+-            picParams->CodecSpecific.vp9.mbRefLfDelta[i] = hdr.loopfilter.ref_deltas[i];
++            picParams->CodecSpecific.vp9.mbRefLfDelta[i] = refLfDeltas[i];
+ 
+         picParams->CodecSpecific.vp9.qpYAc = hdr.quant_indices.y_ac_qi;
+         picParams->CodecSpecific.vp9.qpYDc = hdr.quant_indices.y_dc_delta;

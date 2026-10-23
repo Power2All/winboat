@@ -1,0 +1,307 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: motion-adaptive deinterlacing in the video processor
+
+Bob halves each field's vertical resolution even where the picture stands
+still. The rate conversion caps now offer adaptive deinterlacing with one
+past and one future frame (bob stays offered: it is used when those frames
+are missing, as at the start of a stream).
+
+For an interlaced stream with the frames around it, a draw on the video
+context makes a picture of the full height: the field the output index
+names keeps its rows, and each missing row comes from the opposite fields
+just before and after it (the first field's are the frame before's second
+field and its own frame's second; the second field's are its own frame's
+first and the frame after's first), their mean where they match, else the
+mean of the rows above and below. The motion is the larger of the opposite
+fields' difference and the field's own rows' difference between the frames;
+vl_deint_filter's thresholds (6/255 weave, 14/255 interpolate) mix the two.
+vl_deint_filter itself isn't used: it is made for field sequences, and in
+its frame mode weaves the missing field from the frame before.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index 384fce0..4683381 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -839,8 +839,9 @@ VideoDecoderEndFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder)
+ struct VideoCompositor {
+    struct vl_compositor compositor;
+    struct vl_compositor_state state;
+-   /* bob deinterlacing: one field's rows of a picture into a picture of half the height (FieldPicture) */
+-   void *field_vs, *field_fs, *blend, *dsa, *rasterizer, *sampler, *velems;
++   /* deinterlacing (FieldPicture): bob, one field's rows of a picture into a picture of half the height, and
++    * motion-adaptive, the missing field's rows from the frames around it where nothing moved */
++   void *field_vs, *field_fs, *adaptive_fs, *blend, *dsa, *rasterizer, *sampler, *velems;
+ };
+ 
+ struct VideoProcessorEnum {
+@@ -858,7 +859,7 @@ struct VideoProcessor {
+       RECT src, dst;
+       D3D11_1DDI_VIDEO_FRAME_FORMAT frame_format;
+    } stream;
+-   /* bob deinterlacing's field picture (the input's width, half its height) */
++   /* deinterlacing's picture (the input's width; half its height for bob) */
+    struct pipe_video_buffer *field;
+ };
+ 
+@@ -912,8 +913,8 @@ static void APIENTRY
+ GetVideoProcessorCaps(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
+                       D3D11_1DDI_VIDEO_PROCESSOR_CAPS *pCaps)
+ {
+-   /* one stream, color conversion (BT.601/709, both ranges), scaling and bob deinterlacing (the rate conversion
+-    * caps): no filters or other rate conversion */
++   /* one stream, color conversion (BT.601/709, both ranges), scaling and bob or motion-adaptive deinterlacing (the
++    * rate conversion caps): no filters or other rate conversion */
+    memset(pCaps, 0, sizeof *pCaps);
+    pCaps->DeviceCaps = D3D11_1DDI_VIDEO_PROCESSOR_DEVICE_CAPS_YCbCr_MATRIX_CONVERSION |
+                        D3D11_1DDI_VIDEO_PROCESSOR_DEVICE_CAPS_NOMINAL_RANGE;
+@@ -927,8 +928,12 @@ GetVideoProcessorRateConversionCaps(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOP
+                                     D3D11_1DDI_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS *pCaps)
+ {
+    memset(pCaps, 0, sizeof *pCaps);
+-   /* bob: each field on its own, line-doubled (no past or future frames) */
+-   pCaps->ConversionCaps = D3D11_1DDI_VIDEO_PROCESSOR_CONVERSION_CAPS_DEINTERLACE_BOB;
++   /* adaptive with the frame before and the one after (the opposite fields around each field), else bob: each
++    * field on its own, line-doubled */
++   pCaps->PastFrames = 1;
++   pCaps->FutureFrames = 1;
++   pCaps->ConversionCaps = D3D11_1DDI_VIDEO_PROCESSOR_CONVERSION_CAPS_DEINTERLACE_BOB |
++                           D3D11_1DDI_VIDEO_PROCESSOR_CONVERSION_CAPS_DEINTERLACE_ADAPTIVE;
+ }
+ 
+ static void APIENTRY
+@@ -1160,8 +1165,10 @@ Compositor(Device *pDevice)
+ }
+ 
+ /*
+- * Bob deinterlacing: an interlaced picture's field (every other row of each plane: 4:2:0 chroma rows alternate
+- * between the fields too) into a picture of half the height, which the compositor then scales like any picture
++ * Deinterlacing: an interlaced picture's field (every other row of each plane: 4:2:0 chroma rows alternate between
++ * the fields too). Bob: into a picture of half the height, which the compositor then scales like any picture.
++ * Motion-adaptive: a picture of the full height, the field's rows kept and each missing row from the opposite fields
++ * just before and after it (their mean) where they match, else from the rows above and below
+  */
+ 
+ /* A triangle over the whole target, from the vertex index alone */
+@@ -1197,12 +1204,70 @@ static const char FIELD_FS[] = "FRAG\n"
+                                "MOV OUT[0], TEMP[0]\n"
+                                "END\n";
+ 
++/* Row y of the picture: kept if its parity is the field's (CONST[0].x); else, with the rows above and below it
++ * (clamped to the field's first and last row: CONST[0].x, CONST[0].y) of the picture (SVIEW 0), the opposite fields
++ * around it (SVIEW 1 before, SVIEW 2 after) and the picture's field in the frame one of them is from (SVIEW 3), the
++ * motion (the larger difference of the opposite fields and of the field's rows between the frames) mixes the
++ * opposite fields' mean below 6/255 with the rows' mean above 14/255 (vl_deint_filter's thresholds) */
++static const char ADAPTIVE_FS[] = "FRAG\n"
++                                  "PROPERTY FS_COORD_ORIGIN UPPER_LEFT\n"
++                                  "PROPERTY FS_COORD_PIXEL_CENTER HALF_INTEGER\n"
++                                  "DCL IN[0], POSITION, LINEAR\n"
++                                  "DCL OUT[0], COLOR\n"
++                                  "DCL CONST[0]\n"
++                                  "DCL SAMP[0]\n"
++                                  "DCL SAMP[1]\n"
++                                  "DCL SAMP[2]\n"
++                                  "DCL SAMP[3]\n"
++                                  "DCL SVIEW[0], 2D, FLOAT\n"
++                                  "DCL SVIEW[1], 2D, FLOAT\n"
++                                  "DCL SVIEW[2], 2D, FLOAT\n"
++                                  "DCL SVIEW[3], 2D, FLOAT\n"
++                                  "DCL TEMP[0..7]\n"
++                                  "IMM[0] INT32 {0, 1, -1, 0}\n"
++                                  "IMM[1] FLT32 {0.5, 0.0235294, 31.875, 0.0}\n"
++                                  "MOV TEMP[0], IMM[0].xxxx\n"
++                                  "F2I TEMP[0].xy, IN[0].xyyy\n"
++                                  "AND TEMP[1].x, TEMP[0].yyyy, IMM[0].yyyy\n"
++                                  "USEQ TEMP[1].x, TEMP[1].xxxx, CONST[0].xxxx\n"
++                                  "UIF TEMP[1].xxxx\n"
++                                  "  TXF TEMP[2], TEMP[0], SAMP[0], 2D\n"
++                                  "ELSE\n"
++                                  "  MOV TEMP[3], TEMP[0]\n"
++                                  "  UADD TEMP[3].y, TEMP[0].yyyy, IMM[0].zzzz\n"
++                                  "  IMAX TEMP[3].y, TEMP[3].yyyy, CONST[0].xxxx\n"
++                                  "  MOV TEMP[4], TEMP[0]\n"
++                                  "  UADD TEMP[4].y, TEMP[0].yyyy, IMM[0].yyyy\n"
++                                  "  IMIN TEMP[4].y, TEMP[4].yyyy, CONST[0].yyyy\n"
++                                  "  TXF TEMP[5], TEMP[3], SAMP[0], 2D\n"
++                                  "  TXF TEMP[6], TEMP[4], SAMP[0], 2D\n"
++                                  "  ADD TEMP[7], TEMP[5], TEMP[6]\n"
++                                  "  MUL TEMP[7], TEMP[7], IMM[1].xxxx\n"
++                                  "  TXF TEMP[1], TEMP[3], SAMP[3], 2D\n"
++                                  "  ADD TEMP[1], TEMP[1], -TEMP[5]\n"
++                                  "  TXF TEMP[2], TEMP[4], SAMP[3], 2D\n"
++                                  "  ADD TEMP[2], TEMP[2], -TEMP[6]\n"
++                                  "  ADD TEMP[1], |TEMP[1]|, |TEMP[2]|\n"
++                                  "  MUL TEMP[1], TEMP[1], IMM[1].xxxx\n"
++                                  "  TXF TEMP[5], TEMP[0], SAMP[1], 2D\n"
++                                  "  TXF TEMP[6], TEMP[0], SAMP[2], 2D\n"
++                                  "  ADD TEMP[2], TEMP[5], -TEMP[6]\n"
++                                  "  MAX TEMP[1], TEMP[1], |TEMP[2]|\n"
++                                  "  ADD TEMP[2], TEMP[5], TEMP[6]\n"
++                                  "  MUL TEMP[2], TEMP[2], IMM[1].xxxx\n"
++                                  "  ADD TEMP[1], TEMP[1], -IMM[1].yyyy\n"
++                                  "  MUL_SAT TEMP[1], TEMP[1], IMM[1].zzzz\n"
++                                  "  LRP TEMP[2], TEMP[1], TEMP[7], TEMP[2]\n"
++                                  "ENDIF\n"
++                                  "MOV OUT[0], TEMP[2]\n"
++                                  "END\n";
++
+ static void *
+ FieldShader(struct pipe_context *pipe, const char *text, bool vertex)
+ {
+    struct tgsi_token tokens[512];
+    if (!tgsi_text_translate(text, tokens, ARRAY_SIZE(tokens))) {
+-      VideoLog("bob: the %s shader doesn't translate\n", vertex ? "vertex" : "fragment");
++      VideoLog("deinterlacing: the %s shader doesn't translate\n", vertex ? "vertex" : "fragment");
+       return NULL;
+    }
+    struct pipe_shader_state state = {};
+@@ -1235,19 +1300,23 @@ FieldPassReady(struct pipe_context *pipe, VideoCompositor *c)
+    c->velems = pipe->create_vertex_elements_state(pipe, 0, NULL);
+    c->field_fs = c->field_vs && c->blend && c->dsa && c->rasterizer && c->sampler ? FieldShader(pipe, FIELD_FS, false)
+                                                                                    : NULL;
++   /* without it, bob alone */
++   c->adaptive_fs = c->field_fs ? FieldShader(pipe, ADAPTIVE_FS, false) : NULL;
+    return c->field_fs != NULL;
+ }
+ 
+-/* The field (0: top, 1: bottom) of picture src (width x height) into vp->field */
++/* The field (0: top, 1: bottom) of picture src (width x height) into vp->field: bob, or motion-adaptive with the
++ * frames holding the opposite fields before and after it (around: src is one of them; NULL for bob) */
+ static struct pipe_video_buffer *
+-FieldPicture(Device *pDevice, VideoCompositor *c, VideoProcessor *vp, struct pipe_video_buffer *src, unsigned width,
+-             unsigned height, unsigned field)
++FieldPicture(Device *pDevice, VideoCompositor *c, VideoProcessor *vp, struct pipe_video_buffer *src,
++             struct pipe_video_buffer *const *around, unsigned width, unsigned height, unsigned field)
+ {
+    struct pipe_context *pipe = pDevice->video_pipe;
+    if (!FieldPassReady(pipe, c)) {
+       return NULL;
+    }
+-   unsigned field_height = (height + 1) / 2;
++   bool adaptive = around && c->adaptive_fs;
++   unsigned field_height = adaptive ? height : (height + 1) / 2;
+    if (vp->field && (vp->field->width != width || vp->field->height != field_height ||
+                      vp->field->buffer_format != src->buffer_format)) {
+       vp->field->destroy(vp->field);
+@@ -1263,28 +1332,46 @@ FieldPicture(Device *pDevice, VideoCompositor *c, VideoProcessor *vp, struct pip
+          return NULL;
+       }
+    }
+-   struct vl_video_buffer *in = (struct vl_video_buffer *)src, *out = (struct vl_video_buffer *)vp->field;
++   /* the pictures read: src, then (adaptive) the frames around it and the one of them src isn't */
++   struct pipe_video_buffer *from_pictures[4] = {src};
++   unsigned views = 1;
++   if (adaptive) {
++      from_pictures[1] = around[0];
++      from_pictures[2] = around[1];
++      from_pictures[3] = around[0] == src ? around[1] : around[0];
++      views = 4;
++   }
++   struct vl_video_buffer *out = (struct vl_video_buffer *)vp->field;
+    uint32_t consts[4] = {field, 0, 0, 0};
+    struct pipe_constant_buffer cb = {};
+    cb.user_buffer = consts;
+    cb.buffer_size = sizeof(consts);
++   void *samplers[4] = {c->sampler, c->sampler, c->sampler, c->sampler};
+    pipe->bind_blend_state(pipe, c->blend);
+    pipe->bind_depth_stencil_alpha_state(pipe, c->dsa);
+    pipe->bind_rasterizer_state(pipe, c->rasterizer);
+    pipe->bind_vertex_elements_state(pipe, c->velems);
+    pipe->bind_vs_state(pipe, c->field_vs);
+-   pipe->bind_fs_state(pipe, c->field_fs);
+-   pipe->bind_sampler_states(pipe, PIPE_SHADER_FRAGMENT, 0, 1, &c->sampler);
+-   pipe->set_constant_buffer(pipe, PIPE_SHADER_FRAGMENT, 0, false, &cb);
++   pipe->bind_fs_state(pipe, adaptive ? c->adaptive_fs : c->field_fs);
++   pipe->bind_sampler_states(pipe, PIPE_SHADER_FRAGMENT, 0, views, samplers);
+    for (unsigned p = 0; p < 2; p++) {
+-      struct pipe_resource *from = in->resources[p], *to = out->resources[p];
+-      struct pipe_sampler_view vtmpl;
+-      u_sampler_view_default_template(&vtmpl, from, from->format);
+-      struct pipe_sampler_view *view = pipe->create_sampler_view(pipe, from, &vtmpl);
++      struct pipe_resource *to = out->resources[p];
++      struct pipe_sampler_view *view[4] = {};
++      bool ready = true;
++      for (unsigned i = 0; i < views; i++) {
++         struct pipe_resource *from = ((struct vl_video_buffer *)from_pictures[i])->resources[p];
++         struct pipe_sampler_view vtmpl;
++         u_sampler_view_default_template(&vtmpl, from, from->format);
++         view[i] = pipe->create_sampler_view(pipe, from, &vtmpl);
++         ready = ready && view[i];
++      }
++      /* the field's last row in the plane */
++      consts[1] = to->height0 - 1 - ((to->height0 - 1 - field) & 1);
++      pipe->set_constant_buffer(pipe, PIPE_SHADER_FRAGMENT, 0, false, &cb);
+       struct pipe_surface stmpl;
+       u_surface_default_template(&stmpl, to);
+       struct pipe_surface *surface = pipe->create_surface(pipe, to, &stmpl);
+-      if (view && surface) {
++      if (ready && surface) {
+          struct pipe_framebuffer_state fb = {};
+          fb.width = to->width0;
+          fb.height = to->height0;
+@@ -1302,11 +1389,13 @@ FieldPicture(Device *pDevice, VideoCompositor *c, VideoProcessor *vp, struct pip
+          viewport.swizzle_z = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Z;
+          viewport.swizzle_w = PIPE_VIEWPORT_SWIZZLE_POSITIVE_W;
+          pipe->set_viewport_states(pipe, 0, 1, &viewport);
+-         pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 1, 0, false, &view);
++         pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, views, 0, false, view);
+          util_draw_arrays(pipe, MESA_PRIM_TRIANGLES, 0, 3);
+       }
+-      pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 0, 1, false, NULL);
+-      pipe_sampler_view_reference(&view, NULL);
++      pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 0, views, false, NULL);
++      for (unsigned i = 0; i < views; i++) {
++         pipe_sampler_view_reference(&view[i], NULL);
++      }
+       pipe_surface_reference(&surface, NULL);
+    }
+    return vp->field;
+@@ -1356,15 +1445,34 @@ VideoProcessorBlt(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcesso
+       struct u_rect dst_area = vp->stream.dst_enabled ? Rect(vp->stream.dst) : target;
+       struct pipe_video_buffer *picture = v ? v->buffers[in->slice] : NULL;
+       if (v && vp->stream.frame_format != D3D11_1DDI_VIDEO_FRAME_FORMAT_PROGRESSIVE) {
+-         /* bob: OutputIndex 0 the first field, 1 the second (the frame rate doubled); its rows halved */
+-         unsigned field = (pStreams[i].OutputIndex & 1) ^
+-                          (vp->stream.frame_format == D3D11_1DDI_VIDEO_FRAME_FORMAT_INTERLACED_BOTTOM_FIELD_FIRST);
+-         struct pipe_video_buffer *f = FieldPicture(pDevice, c, vp, picture, v->width, v->height, field);
+-         if (f) {
+-            picture = f;
++         /* OutputIndex 0 the first field, 1 the second (the frame rate doubled). Motion-adaptive with the opposite
++          * fields around it: the first field's are the frame before's second and its own, the second's its own
++          * first and the frame after's (the past frames oldest first); else bob, its rows halved */
++         unsigned second = pStreams[i].OutputIndex & 1;
++         unsigned field = second ^ (vp->stream.frame_format == D3D11_1DDI_VIDEO_FRAME_FORMAT_INTERLACED_BOTTOM_FIELD_FIRST);
++         D3D11_1DDI_HVIDEOPROCESSORINPUTVIEW other = {};
++         if (!second && pStreams[i].PastFrames && pStreams[i].pPastSurfaces) {
++            other = pStreams[i].pPastSurfaces[pStreams[i].PastFrames - 1];
++         } else if (second && pStreams[i].FutureFrames && pStreams[i].pFutureSurfaces) {
++            other = pStreams[i].pFutureSurfaces[0];
++         }
++         VideoProcessorInputView *nv = static_cast<VideoProcessorInputView *>(other.pDrvPrivate);
++         VideoSurface *n = nv ? nv->resource->video : NULL;
++         struct pipe_video_buffer *around[2] = {second ? picture : NULL, second ? NULL : picture};
++         around[second] = n && n->width == v->width && n->height == v->height &&
++                                n->buffers[nv->slice]->buffer_format == picture->buffer_format
++                             ? n->buffers[nv->slice]
++                             : NULL;
++         bool adaptive = around[second] != NULL;
++         struct pipe_video_buffer *f = FieldPicture(pDevice, c, vp, picture, adaptive ? around : NULL, v->width,
++                                                    v->height, field);
++         if (f && f->height != v->height) {
+             src.y0 /= 2;
+             src.y1 = (src.y1 + 1) / 2;
+          }
++         if (f) {
++            picture = f;
++         }
+       }
+       if (v) {
+          /* YCbCr_Matrix: 0 BT.601, 1 BT.709; Nominal_Range 2: full range (0-255) input */
+@@ -1531,6 +1639,8 @@ VideoDestroyDevice(D3D10DDI_HDEVICE hDevice)
+          pipe->delete_vs_state(pipe, c->field_vs);
+       if (c->field_fs)
+          pipe->delete_fs_state(pipe, c->field_fs);
++      if (c->adaptive_fs)
++         pipe->delete_fs_state(pipe, c->adaptive_fs);
+       if (c->blend)
+          pipe->delete_blend_state(pipe, c->blend);
+       if (c->dsa)

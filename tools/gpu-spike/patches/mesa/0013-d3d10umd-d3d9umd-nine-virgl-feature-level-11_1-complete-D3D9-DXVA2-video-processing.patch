@@ -1,0 +1,3031 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd, d3d9umd, nine, virgl: feature level 11_1, complete Direct3D 9 driver, DXVA2 video processing
+
+Part 1: Direct3D 11 optional features (stage A of docs/gpu-roadmap-todo.md)
+- Doubles: the DXBC double instructions (dadd, dmul, dmin, dmax, comparisons, dmov/dmovc, dtof/ftod, and 11.1's
+  ddiv, dfma, drcp, dtoi/dtou/itod/utod) and 64-bit immediates, reported when the host's GL has
+  ARB_gpu_shader_fp64. virglrenderer translates one double per instruction and negates their 32-bit halves, so
+  each double goes through a temporary (DNEG/DABS for modifiers, immediates moved first: it applies an immediate's
+  swizzle twice), and every double is computed before the destination is written (in-place ftod).
+  32-bit results go to the enabled components in order.
+- Logic operations in the output merger (11.1 blend states).
+- Feature level 11_1 when the host can: target-independent rasterization and UAV-only rendering with a forced
+  sample count (gallium's new pipe_rasterizer_state::forced_sample_count; virgl sends it with
+  VIRGL_CCMD_SET_RASTER_SAMPLES when the host announces VIRGL_CAP_V2_RASTER_SAMPLES: WinBoat's virglrenderer
+  patch 0004), the output merger's UAVs in every graphics stage, ClearView on typed UAVs. A framebuffer without
+  views (UAV-only rendering) gets D3D's largest size (GL calls it incomplete otherwise).
+  WINBOAT_D3D_FL11_1=0 leaves 11_1 out. Direct2D uses it: geometry is rendered with 16 forced samples into an
+  R16_UINT target with logic op XOR, then composited.
+
+Fixes found on the way:
+- SV_ClipDistance was never applied: clip_plane_enable stayed 0, and one declaration (o1.xyzw) counted as one
+  distance. The properties count components now, and every draw binds a rasterizer variant enabling the last
+  vertex stage's clip distances (GL must not enable unwritten ones). Direct2D clips each geometry of a batch to
+  its rectangle that way.
+- GDI drawing through IDXGISurface1::GetDC was lost when the app's drawing on the surface wasn't submitted yet:
+  the runtime calls DXGI's ResolveSharedResource (a stub) instead of flushing. It flushes now.
+- The parser accepts 4-component 64-bit immediates.
+- DXGI_FORMAT_B4G4R4A4_UNORM (11.1), the host has it.
+
+Part 2: Direct3D 9 and 10 as complete drivers (stage A2)
+- Flip model presents (D3DSWAPEFFECT_FLIPEX) crashed in the runtime (DdBltLH, NULL kernel handle): without a 16-bit
+  display mode format the runtime's DirectX 8 HAL check (GetDX8HALCaps) marks the adapter as having no hardware
+  primary and makes no driver surface for the desktop. R5G6B5 is a display mode now (only one 16-bit format may
+  be: with X1R5G5B5 too, FetchDirectDrawData refuses the driver).
+- Exclusive full screen: SetDisplayMode; flip chains are one resource with a surface per subresource; only the
+  first allocation of a CreateResource joins the runtime's resource (a second AllocateCb on it bugchecks 0x113/7).
+- Shared surfaces opened by a second D3D9 device read black: nine cleared the opened render target at creation.
+- virgl: READ|WRITE maps of staged textures became read-only staging maps and dropped the writes (LockRect on render
+  targets, GetDC drawing on D3D9 surfaces, D3D10/11 Map(READ_WRITE) after GPU work).
+- DXVA2 video processing (video.cpp): progressive and bob processors, YUY2/UYVY/NV12/RGB input, BT.601/709/240M,
+  studio and full range, scaling, background; YUV surfaces are textures holding the bytes as they are (packed
+  formats as A8R8G8B8 of half width, NV12 as L8 with the chroma rows below), converted by a shader model 3 pass
+  and scaled with StretchRect; StretchRect from YUV surfaces, ColorFill and locks on them.
+- DepthFill, ResolveSharedResource, UpdateSubresourceUP, GetInfo and the VCACHE query, counter queries (none),
+  the Windows 8.1 interface's entry points; ATOC (alpha to coverage) offered.
+- The user-mode DLLs carry the driver package's version (meson option winboat-driver-version): the runtimes
+  reported 0.0.0.0 to applications.
+---
+diff --git a/meson_options.txt b/meson_options.txt
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -207,6 +207,13 @@
+ )
+ 
+ option(
++  'winboat-driver-version',
++  type : 'string',
++  value : '0.0.0.0',
++  description : 'version of the WinBoat driver package, written into the user-mode driver DLLs (a.b.c.d)',
++)
++
++option(
+   'gallium-d3d9-dll-name',
+   type : 'string',
+   value : 'libgallium_d3d9',
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -482,6 +482,14 @@
+       handle = vrs->handle;
+    }
+    virgl_encode_bind_object(vctx, handle, VIRGL_OBJECT_RASTERIZER);
++
++   /* Rasterization samples apart from the framebuffer's (D3D's ForcedSampleCount), when the host takes them */
++   unsigned samples = rs_state ? ((struct virgl_rasterizer_state *)rs_state)->rs.forced_sample_count : 0;
++   if (samples != vctx->raster_samples &&
++       (virgl_screen(ctx->screen)->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_RASTER_SAMPLES)) {
++      virgl_encode_set_raster_samples(vctx, samples);
++      vctx->raster_samples = samples;
++   }
+ }
+ 
+ static void virgl_delete_rasterizer_state(struct pipe_context *ctx,
+diff --git a/src/gallium/drivers/virgl/virgl_context.h b/src/gallium/drivers/virgl/virgl_context.h
+--- a/src/gallium/drivers/virgl/virgl_context.h
++++ b/src/gallium/drivers/virgl/virgl_context.h
+@@ -91,6 +91,7 @@
+    bool vertex_array_dirty;
+ 
+    struct virgl_rasterizer_state rs_state;
++   unsigned raster_samples;   /* the host's, VIRGL_CCMD_SET_RASTER_SAMPLES */
+    struct virgl_so_target so_targets[PIPE_MAX_SO_BUFFERS];
+    unsigned num_so_targets;
+ 
+diff --git a/src/gallium/drivers/virgl/virgl_encode.c b/src/gallium/drivers/virgl/virgl_encode.c
+--- a/src/gallium/drivers/virgl/virgl_encode.c
++++ b/src/gallium/drivers/virgl/virgl_encode.c
+@@ -535,6 +535,14 @@
+    return 0;
+ }
+ 
++/* WinBoat: rasterization samples apart from the framebuffer's (VIRGL_CAP_V2_RASTER_SAMPLES) */
++int virgl_encode_set_raster_samples(struct virgl_context *ctx, uint32_t samples)
++{
++   virgl_encoder_write_cmd_dword(ctx, VIRGL_CMD0(VIRGL_CCMD_SET_RASTER_SAMPLES, 0, VIRGL_SET_RASTER_SAMPLES_SIZE));
++   virgl_encoder_write_dword(ctx->cbuf, samples);
++   return 0;
++}
++
+ int virgl_encode_delete_object(struct virgl_context *ctx,
+                               uint32_t handle, uint32_t object)
+ {
+diff --git a/src/gallium/drivers/virgl/virgl_encode.h b/src/gallium/drivers/virgl/virgl_encode.h
+--- a/src/gallium/drivers/virgl/virgl_encode.h
++++ b/src/gallium/drivers/virgl/virgl_encode.h
+@@ -125,6 +125,8 @@
+                                const struct pipe_box *box,
+                                const void *data);
+ 
++int virgl_encode_set_raster_samples(struct virgl_context *ctx, uint32_t samples);
++
+ int virgl_encode_bind_object(struct virgl_context *ctx,
+                             uint32_t handle, uint32_t object);
+ int virgl_encode_delete_object(struct virgl_context *ctx,
+diff --git a/src/gallium/drivers/virgl/virgl_resource.c b/src/gallium/drivers/virgl/virgl_resource.c
+--- a/src/gallium/drivers/virgl/virgl_resource.c
++++ b/src/gallium/drivers/virgl/virgl_resource.c
+@@ -250,7 +250,9 @@
+        * copy_transfer_from_host, then we can return here with proper map.
+        */
+       if (res->use_staging) {
+-         if (xfer->base.usage & PIPE_MAP_READ)
++         /* READ|WRITE maps read back and write the staging copy back at unmap (a read-only staging map drops the
++          * writes: Direct3D 9 LockRect on a render target, D3D11 Map(READ_WRITE)) */
++         if ((xfer->base.usage & PIPE_MAP_READ) && !(xfer->base.usage & PIPE_MAP_WRITE))
+             return VIRGL_TRANSFER_MAP_READ_FROM_STAGING;
+          else
+             return VIRGL_TRANSFER_MAP_WRITE_TO_STAGING_WITH_READBACK;
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -201,6 +201,9 @@
+  * virgl caps are read here, through the first VioGPU adapter with 3D. WINBOAT_D3D_FL11=0 reports 10_0 anyway,
+  * =1 reports 11_0 anyway.
+  */
++static union virgl_caps host_caps;   /* read by HostSupportsFL11 */
++static bool host_caps_valid;
++
+ static bool
+ HostSupportsFL11(void)
+ {
+@@ -268,6 +271,8 @@
+          esc.PrivateDriverDataSize = sizeof args;
+          found = true;
+          if (NT_SUCCESS(escape(&esc))) {
++            host_caps = caps;
++            host_caps_valid = true;
+             fl11 = caps.v1.bset.has_tessellation_shaders &&
+                    (caps.v2.capability_bits & VIRGL_CAP_COMPUTE_SHADER) &&
+                    caps.v1.bset.texture_multisample && caps.v1.max_samples >= 4 &&
+@@ -287,6 +292,31 @@
+ 
+ 
+ /*
++ * Feature level 11_1 on top of 11_0: target-independent rasterization (rasterization samples apart from the
++ * framebuffer's: WinBoat's virglrenderer patch, VIRGL_CAP_V2_RASTER_SAMPLES, from GL_EXT_raster_multisample) and
++ * UAVs in every shader stage. Logic ops and the 11.1 interface are there anyway. WINBOAT_D3D_FL11_1=0 leaves it out.
++ */
++static bool
++HostSupportsFL11_1(void)
++{
++   char env[4] = "";
++   if (GetEnvironmentVariableA("WINBOAT_D3D_FL11_1", env, sizeof env) && env[0] == '0') {
++      return false;
++   }
++   return HostSupportsFL11() && host_caps_valid &&
++          (host_caps.v2.capability_bits_v2 & VIRGL_CAP_V2_RASTER_SAMPLES) &&
++          host_caps.v2.max_shader_image_other_stages >= 8 && host_caps.v2.max_shader_buffer_other_stages >= 8;
++}
++
++/* Doubles in shaders: the host's GL has them (ARB_gpu_shader_fp64), with feature level 11_0 */
++static bool
++HostSupportsDoubles(void)
++{
++   return HostSupportsFL11() && host_caps_valid && host_caps.v1.bset.has_fp64;
++}
++
++
++/*
+  * ----------------------------------------------------------------------
+  *
+  * GetCaps --
+@@ -308,10 +338,12 @@
+    switch (pData->Type) {
+    case D3D11DDICAPS_SHADER:
+       /* Compute (with raw and structured buffers) also in shader model 4.x, which the runtime requires for feature
+-       * level 11_0 too. No doubles (not translated). */
++       * level 11_0 too; doubles when the host has them (the 11.1 runtime adds its extended doubles: ddiv, dfma,
++       * drcp and the integer conversions, translated as well) */
+       if (pData->DataSize >= sizeof(D3D11DDI_SHADER_CAPS) && HostSupportsFL11()) {
+          static_cast<D3D11DDI_SHADER_CAPS *>(pData->pData)->Caps =
+-            D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X;
++            D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X |
++            (HostSupportsDoubles() ? D3D11DDICAPS_SHADER_DOUBLES : 0);
+       }
+       break;
+    case D3D11DDICAPS_3DPIPELINESUPPORT:
+@@ -321,11 +353,18 @@
+          static_cast<D3D11DDI_3DPIPELINESUPPORT_CAPS *>(pData->pData)->Caps =
+             D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0) |
+             (HostSupportsFL11() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1) |
+-                                  D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0) : 0);
++                                  D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0) : 0) |
++            (HostSupportsFL11_1() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11_1DDI_3DPIPELINELEVEL_11_1) : 0);
++      }
++      break;
++   case D3D11_1DDICAPS_D3D11_OPTIONS:
++      /* Logic ops in the output merger (GL's glLogicOp; virglrenderer emulates them on GLES hosts) */
++      if (pData->DataSize >= sizeof(D3D11_1DDI_D3D11_OPTIONS_DATA) && HostSupportsFL11()) {
++         static_cast<D3D11_1DDI_D3D11_OPTIONS_DATA *>(pData->pData)->OutputMergerLogicOp = TRUE;
+       }
+       break;
+    default:
+-      /* No threading, shader or 11.1 option caps: none of them (logic ops, debug binaries) is offered */
++      /* No threading caps (the runtime emulates deferred contexts), no debug binaries */
+       break;
+    }
+    return S_OK;
+diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/Draw.cpp
+@@ -34,6 +34,8 @@
+ #include "Draw.h"
+ #include "State.h"
+ #include "Shader.h"
++#include "Rasterizer.h"
++#include "tgsi/tgsi_scan.h"
+ 
+ #include "Debug.h"
+ 
+@@ -75,10 +77,42 @@
+  * translation of it with the declaration's registers mapped to its outputs, made for the pair and bound for the
+  * draw.
+  */
++/* Clip distances (not cull distances) a shader writes */
++static unsigned
++ShaderClipDistances(Shader *shader)
++{
++   if (!shader || !shader->state.tokens) {
++      return 0;
++   }
++   if (shader->clip_scanned != shader->state.tokens) {
++      struct tgsi_shader_info info;
++      tgsi_scan_shader(shader->state.tokens, &info);
++      shader->num_clip_distances = info.properties[TGSI_PROPERTY_NUM_CLIPDIST_ENABLED];
++      shader->clip_scanned = shader->state.tokens;
++   }
++   return shader->num_clip_distances;
++}
++
+ static void
+ ResolveState(Device *pDevice)
+ {
+    struct pipe_context *pipe = pDevice->pipe;
++
++   /* The last vertex stage's clip distances, applied (RasterizerState) */
++   if (pDevice->bound_rasterizer) {
++      Shader *last = pDevice->bound_shader[PIPE_SHADER_GEOMETRY];
++      if (!last || !last->state.tokens) {
++         last = pDevice->bound_shader[PIPE_SHADER_TESS_EVAL];
++      }
++      if (!last || !last->state.tokens) {
++         last = pDevice->bound_vs;
++      }
++      void *handle = RasterizerStateForClipDistances(pipe, pDevice->bound_rasterizer, ShaderClipDistances(last));
++      if (handle != pDevice->bound_rasterizer_handle) {
++         pipe->bind_rasterizer_state(pipe, handle);
++         pDevice->bound_rasterizer_handle = handle;
++      }
++   }
+    Shader *vs = pDevice->bound_vs;
+    if (pDevice->bound_empty_gs && vs && vs->state.tokens) {
+       Shader *gs = pDevice->bound_empty_gs;
+diff --git a/src/gallium/frontends/d3d10umd/Format.cpp b/src/gallium/frontends/d3d10umd/Format.cpp
+--- a/src/gallium/frontends/d3d10umd/Format.cpp
++++ b/src/gallium/frontends/d3d10umd/Format.cpp
+@@ -255,6 +255,8 @@
+ 
+    case DXGI_FORMAT_B5G6R5_UNORM:
+       return PIPE_FORMAT_B5G6R5_UNORM;
++   case DXGI_FORMAT_B4G4R4A4_UNORM:   /* 11.1 */
++      return PIPE_FORMAT_B4G4R4A4_UNORM;
+    case DXGI_FORMAT_B5G5R5A1_UNORM:
+       return PIPE_FORMAT_B5G5R5A1_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+@@ -440,6 +442,8 @@
+ 
+    case PIPE_FORMAT_B5G6R5_UNORM:
+       return DXGI_FORMAT_B5G6R5_UNORM;
++   case PIPE_FORMAT_B4G4R4A4_UNORM:
++      return DXGI_FORMAT_B4G4R4A4_UNORM;
+    case PIPE_FORMAT_B5G5R5A1_UNORM:
+       return DXGI_FORMAT_B5G5R5A1_UNORM;
+    case PIPE_FORMAT_B8G8R8A8_UNORM:
+@@ -552,6 +556,7 @@
+    CASE(DXGI_FORMAT_BC5_UNORM);
+    CASE(DXGI_FORMAT_BC5_SNORM);
+    CASE(DXGI_FORMAT_B5G6R5_UNORM);
++   CASE(DXGI_FORMAT_B4G4R4A4_UNORM);
+    CASE(DXGI_FORMAT_B5G5R5A1_UNORM);
+    CASE(DXGI_FORMAT_B8G8R8A8_UNORM);
+    CASE(DXGI_FORMAT_B8G8R8X8_UNORM);
+diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+--- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
++++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+@@ -653,10 +653,22 @@
+                   D3D10DDI_HBLENDSTATE hBlendState,             // IN
+                   D3D10DDI_HRTBLENDSTATE hRTBlendState)         // IN
+ {
+-   unsigned i;
+-
+    LOG_ENTRYPOINT();
+ 
++   CreateBlendStateLogicOp(hDevice, pBlendDesc, false, PIPE_LOGICOP_COPY, hBlendState);
++}
++
++
++/*
++ * A blend state, with 11.1's logic operation (render target 0's applies to all; blending is off with it).
++ * logicop_func is a PIPE_LOGICOP_*.
++ */
++void
++CreateBlendStateLogicOp(D3D10DDI_HDEVICE hDevice, const D3D10_1_DDI_BLEND_DESC *pBlendDesc, bool logicop_enable,
++                        unsigned logicop_func, D3D10DDI_HBLENDSTATE hBlendState)
++{
++   unsigned i;
++
+    Device *pDevice = CastDevice(hDevice);
+    struct pipe_context *pipe = pDevice->pipe;
+    BlendState *pBlendState = CastBlendState(hBlendState);
+@@ -666,6 +678,8 @@
+ 
+    state.alpha_to_coverage = pBlendDesc->AlphaToCoverageEnable;
+    state.independent_blend_enable = pBlendDesc->IndependentBlendEnable;
++   state.logicop_enable = logicop_enable;
++   state.logicop_func = logicop_func;
+ 
+    for (i = 0; i < MIN2(PIPE_MAX_COLOR_BUFS, D3D10_DDI_SIMULTANEOUS_RENDER_TARGET_COUNT); ++i) {
+       state.rt[i].blend_enable = pBlendDesc->RenderTarget[i].BlendEnable;
+@@ -802,6 +816,12 @@
+     */
+    unsigned width, height;
+    util_framebuffer_min_size(&pDevice->fb, &width, &height);
++   /* UAV-only rendering (no views): the viewport limits it. GL needs a size for a framebuffer without
++    * attachments (else it's incomplete and draws fail): D3D's largest. */
++   if (!pDevice->fb.nr_cbufs && !pDevice->fb.zsbuf) {
++      width = height = 16384;   /* D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION */
++      pDevice->fb.layers = 1;
++   }
+    pDevice->fb.width = width;
+    pDevice->fb.height = height;
+ 
+diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.h b/src/gallium/frontends/d3d10umd/OutputMerger.h
+--- a/src/gallium/frontends/d3d10umd/OutputMerger.h
++++ b/src/gallium/frontends/d3d10umd/OutputMerger.h
+@@ -82,6 +82,9 @@
+                       D3D10DDI_HBLENDSTATE hBlendState,
+                       D3D10DDI_HRTBLENDSTATE hRTBlendState);
+ 
++void CreateBlendStateLogicOp(D3D10DDI_HDEVICE hDevice, const D3D10_1_DDI_BLEND_DESC *pBlendDesc,
++                             bool logicop_enable, unsigned logicop_func, D3D10DDI_HBLENDSTATE hBlendState);
++
+ void APIENTRY CreateBlendState1(D3D10DDI_HDEVICE hDevice,
+                       __in const D3D10_1_DDI_BLEND_DESC *pBlendDesc,
+                       D3D10DDI_HBLENDSTATE hBlendState,
+diff --git a/src/gallium/frontends/d3d10umd/Rasterizer.cpp b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+--- a/src/gallium/frontends/d3d10umd/Rasterizer.cpp
++++ b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+@@ -204,6 +204,18 @@
+ {
+    LOG_ENTRYPOINT();
+ 
++   CreateRasterizerStateForced(hDevice, pRasterizerDesc, 0, hRasterizerState);
++}
++
++
++/*
++ * A rasterizer state with 11.1's ForcedSampleCount (target-independent rasterization and UAV-only rendering with
++ * a sample count: rasterized with that many samples whatever the render targets have; 0 for theirs)
++ */
++void
++CreateRasterizerStateForced(D3D10DDI_HDEVICE hDevice, const D3D10_DDI_RASTERIZER_DESC *pRasterizerDesc,
++                            UINT ForcedSampleCount, D3D10DDI_HRASTERIZERSTATE hRasterizerState)
++{
+    struct pipe_context *pipe = CastPipeContext(hDevice);
+    RasterizerState *pRasterizerState = CastRasterizerState(hRasterizerState);
+ 
+@@ -236,11 +248,31 @@
+ 
+    state.line_width = 1.0f;
+    state.line_rectangular = 0;
++   state.forced_sample_count = ForcedSampleCount > 1 ? ForcedSampleCount : 0;
+ 
++   pRasterizerState->state = state;
++   memset(pRasterizerState->clip_handles, 0, sizeof pRasterizerState->clip_handles);
+    pRasterizerState->handle = pipe->create_rasterizer_state(pipe, &state);
+ }
+ 
+ 
++/* The rasterizer state's handle with the first num_clip clip distances applied (ResolveState) */
++void *
++RasterizerStateForClipDistances(struct pipe_context *pipe, RasterizerState *pRasterizerState, unsigned num_clip)
++{
++   if (!num_clip) {
++      return pRasterizerState->handle;
++   }
++   num_clip = MIN2(num_clip, 8);
++   if (!pRasterizerState->clip_handles[num_clip - 1]) {
++      struct pipe_rasterizer_state state = pRasterizerState->state;
++      state.clip_plane_enable = (1u << num_clip) - 1;
++      pRasterizerState->clip_handles[num_clip - 1] = pipe->create_rasterizer_state(pipe, &state);
++   }
++   return pRasterizerState->clip_handles[num_clip - 1];
++}
++
++
+ /*
+  * ----------------------------------------------------------------------
+  *
+@@ -259,9 +291,20 @@
+ {
+    LOG_ENTRYPOINT();
+ 
++   Device *pDevice = CastDevice(hDevice);
+    struct pipe_context *pipe = CastPipeContext(hDevice);
+    RasterizerState *pRasterizerState = CastRasterizerState(hRasterizerState);
+ 
++   if (pDevice->bound_rasterizer == pRasterizerState) {
++      pipe->bind_rasterizer_state(pipe, NULL);
++      pDevice->bound_rasterizer = NULL;
++      pDevice->bound_rasterizer_handle = NULL;
++   }
++   for (unsigned i = 0; i < ARRAY_SIZE(pRasterizerState->clip_handles); i++) {
++      if (pRasterizerState->clip_handles[i]) {
++         pipe->delete_rasterizer_state(pipe, pRasterizerState->clip_handles[i]);
++      }
++   }
+    pipe->delete_rasterizer_state(pipe, pRasterizerState->handle);
+ }
+ 
+@@ -282,8 +325,12 @@
+ {
+    LOG_ENTRYPOINT();
+ 
++   Device *pDevice = CastDevice(hDevice);
+    struct pipe_context *pipe = CastPipeContext(hDevice);
+    void *state = CastPipeRasterizerState(hRasterizerState);
+ 
++   /* ResolveState swaps in the variant for the clip distances the draw's shaders write */
++   pDevice->bound_rasterizer = CastRasterizerState(hRasterizerState);
++   pDevice->bound_rasterizer_handle = state;
+    pipe->bind_rasterizer_state(pipe, state);
+ }
+diff --git a/src/gallium/frontends/d3d10umd/Rasterizer.h b/src/gallium/frontends/d3d10umd/Rasterizer.h
+--- a/src/gallium/frontends/d3d10umd/Rasterizer.h
++++ b/src/gallium/frontends/d3d10umd/Rasterizer.h
+@@ -47,6 +47,12 @@
+    D3D10DDI_HDEVICE hDevice,
+    __in const D3D10_DDI_RASTERIZER_DESC *pRasterizerDesc);
+ 
++void *RasterizerStateForClipDistances(struct pipe_context *pipe, struct RasterizerState *pRasterizerState,
++                                      unsigned num_clip);
++
++void CreateRasterizerStateForced(D3D10DDI_HDEVICE hDevice, const D3D10_DDI_RASTERIZER_DESC *pRasterizerDesc,
++                                 UINT ForcedSampleCount, D3D10DDI_HRASTERIZERSTATE hRasterizerState);
++
+ void APIENTRY CreateRasterizerState(
+    D3D10DDI_HDEVICE hDevice,
+    __in const D3D10_DDI_RASTERIZER_DESC *pRasterizerDesc,
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.c b/src/gallium/frontends/d3d10umd/ShaderParse.c
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.c
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.c
+@@ -649,12 +649,13 @@
+                opcode->src[i].swizzle[2] =
+                opcode->src[i].swizzle[3] = DECODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(*curr);
+          } else {
+-            /* This case apparently happens only for 4-component 32-bit
+-             * immediate operands.
++            /* This case apparently happens only for 4-component 32-bit and
++             * 64-bit immediate operands.
+              */
+             assert(selection_mode == D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE);
+             assert(DECODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(*curr) == 0);
+-            assert(DECODE_D3D10_SB_OPERAND_TYPE(*curr) == D3D10_SB_OPERAND_TYPE_IMMEDIATE32);
++            assert(DECODE_D3D10_SB_OPERAND_TYPE(*curr) == D3D10_SB_OPERAND_TYPE_IMMEDIATE32 ||
++                   DECODE_D3D10_SB_OPERAND_TYPE(*curr) == D3D10_SB_OPERAND_TYPE_IMMEDIATE64);
+ 
+ 
+             opcode->src[i].swizzle[0] = D3D10_SB_4_COMPONENT_X;
+@@ -721,6 +722,18 @@
+              */
+             assert(0);
+          }
++      } else if (opcode->src[i].base.type == D3D10_SB_OPERAND_TYPE_IMMEDIATE64) {
++         /* Doubles, as two 32-bit halves each: imm[0..1] the first (.xy), imm[2..3] the second (.zw). One
++          * component is one double (for both); four are two doubles (four dwords). */
++         if (num_components == D3D10_SB_OPERAND_1_COMPONENT) {
++            opcode->src[i].imm[0].u32 = opcode->src[i].imm[2].u32 = *curr++;
++            opcode->src[i].imm[1].u32 = opcode->src[i].imm[3].u32 = *curr++;
++         } else {
++            opcode->src[i].imm[0].u32 = *curr++;
++            opcode->src[i].imm[1].u32 = *curr++;
++            opcode->src[i].imm[2].u32 = *curr++;
++            opcode->src[i].imm[3].u32 = *curr++;
++         }
+       }
+    }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -38,6 +38,7 @@
+ #include "tgsi/tgsi_ureg.h"
+ #include "tgsi/tgsi_dump.h"
+ #include "util/u_memory.h"
++#include "util/bitscan.h"
+ #include "util/format/u_format.h"
+ 
+ #include "ShaderDump.h"
+@@ -259,18 +260,18 @@
+    {D3D11_SB_OPCODE_IMM_ATOMIC_UMAX,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+    {D3D11_SB_OPCODE_IMM_ATOMIC_UMIN,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+    {D3D11_SB_OPCODE_SYNC,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DADD,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DMAX,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DMIN,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DMUL,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DEQ,                               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DGE,                               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DLT,                               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DNE,                               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DMOV,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DMOVC,                             OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_DTOF,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_SB_OPCODE_FTOD,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DADD,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DMAX,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DMIN,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DMUL,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DEQ,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DGE,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DLT,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DNE,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DMOV,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DMOVC,                             OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DTOF,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_FTOD,                              OF_FLOAT, TGSI_EXPAND},
+    {D3D11_SB_OPCODE_EVAL_SNAPPED,                      OF_FLOAT, TGSI_EXPAND},
+    {D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX,                 OF_FLOAT, TGSI_EXPAND},
+    {D3D11_SB_OPCODE_EVAL_CENTROID,                     OF_FLOAT, TGSI_EXPAND},
+@@ -278,14 +279,14 @@
+    {D3D11_SB_OPCODE_ABORT,                             OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+    {D3D11_SB_OPCODE_DEBUG_BREAK,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+    {D3D11_SB_OPCODE_RESERVED0,                         OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_1_SB_OPCODE_DDIV,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_1_SB_OPCODE_DFMA,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_1_SB_OPCODE_DRCP,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_DDIV,                            OF_FLOAT, TGSI_EXPAND},
++   {D3D11_1_SB_OPCODE_DFMA,                            OF_FLOAT, TGSI_EXPAND},
++   {D3D11_1_SB_OPCODE_DRCP,                            OF_FLOAT, TGSI_EXPAND},
+    {D3D11_1_SB_OPCODE_MSAD,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_1_SB_OPCODE_DTOI,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_1_SB_OPCODE_DTOU,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_1_SB_OPCODE_ITOD,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D11_1_SB_OPCODE_UTOD,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_DTOI,                            OF_FLOAT, TGSI_EXPAND},
++   {D3D11_1_SB_OPCODE_DTOU,                            OF_FLOAT, TGSI_EXPAND},
++   {D3D11_1_SB_OPCODE_ITOD,                            OF_FLOAT, TGSI_EXPAND},
++   {D3D11_1_SB_OPCODE_UTOD,                            OF_FLOAT, TGSI_EXPAND},
+    {D3D11_1_SB_OPCODE_RESERVED0,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+    {D3DWDDM1_3_SB_OPCODE_GATHER4_FEEDBACK,             OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+    {D3DWDDM1_3_SB_OPCODE_GATHER4_C_FEEDBACK,           OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+@@ -418,6 +419,7 @@
+       uint tgsi;
+    } clip_distance_mapping[2], cull_distance_mapping[2];
+    uint num_clip_distances_declared;
++   uint num_clip_cull_registers;   /* clip_distance_mapping's */
+    uint num_cull_distances_declared;
+ 
+    struct Shader_label *labels;            /* (Shader_scan_control_flow) */
+@@ -1277,6 +1279,12 @@
+       }
+       break;
+ 
++   case D3D10_SB_OPERAND_TYPE_IMMEDIATE64:
++      /* Two doubles' bits (ShaderParse) */
++      reg = ureg_imm4u(sx->ureg, operand->imm[0].u32, operand->imm[1].u32, operand->imm[2].u32,
++                       operand->imm[3].u32);
++      break;
++
+    case D3D10_SB_OPERAND_TYPE_SAMPLER:
+       assert(operand->base.index_dim == 1);
+       assert(operand->base.index[0].index_rep == D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+@@ -3478,6 +3486,148 @@
+    }
+ }
+ 
++/*
++ * Doubles (D3D11_FEATURE_DOUBLES and 11.1's extended doubles). A double takes two 32-bit components: the first
++ * is .xy, the second .zw, positionally in double results and their sources. 32-bit results (comparisons, dtof,
++ * dtoi, dtou) go to the destination's enabled components in order (the first gets double .xy's, the second .zw's:
++ * "deq r2.z, ..." compares one double); 32-bit sources of double results (ftod, itod, utod, dmovc's condition)
++ * are .x for the .xy result and .y for the .zw one.
++ * virglrenderer translates one double per instruction (from a source's first two components; comparisons write
++ * .x), and its negate would apply to the 32-bit halves: each double goes through a temporary of its own, and
++ * negation and absolute values are DNEG/DABS.
++ */
++enum double_kind {
++   DOUBLE_TO_DOUBLE,   /* double sources, double result */
++   DOUBLE_TO_32,       /* double sources, 32-bit result */
++   DOUBLE_FROM_32,     /* 32-bit source, double result */
++   DOUBLE_MOVC,        /* 32-bit condition, double sources, double result */
++};
++
++static struct ureg_src
++double_src(struct Shader_xlate *sx, const struct Shader_src_operand *operand, unsigned k, struct ureg_dst *scratch,
++           unsigned *num_scratch)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct ureg_src src = translate_src_operand(sx, operand, OF_UINT);
++   bool neg = src.Negate, abs = src.Absolute;
++   src.Negate = 0;
++   src.Absolute = 0;
++   src = ureg_swizzle(src, 2 * k, 2 * k + 1, 2 * k, 2 * k + 1);
++   /* virglrenderer applies an immediate's swizzle twice for doubles (uvec4(x,z,x,z).xzxz), and the immediate pool
++    * puts a double's halves wherever its values already are: through a temporary, moved as 32-bit values */
++   if (src.File == TGSI_FILE_IMMEDIATE) {
++      struct ureg_dst tmp = scratch[(*num_scratch)++] = ureg_DECL_temporary(ureg);
++      ureg_MOV(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_XY), src);
++      src = ureg_swizzle(ureg_src(tmp), 0, 1, 0, 1);
++   }
++   if (abs || neg) {
++      struct ureg_dst tmp = scratch[(*num_scratch)++] = ureg_DECL_temporary(ureg);
++      struct ureg_dst xy = ureg_writemask(tmp, TGSI_WRITEMASK_XY);
++      if (abs) {
++         ureg_insn(ureg, TGSI_OPCODE_DABS, &xy, 1, &src, 1, 0);
++         src = ureg_swizzle(ureg_src(tmp), 0, 1, 0, 1);
++      }
++      if (neg) {
++         ureg_insn(ureg, TGSI_OPCODE_DNEG, &xy, 1, &src, 1, 0);
++         src = ureg_swizzle(ureg_src(tmp), 0, 1, 0, 1);
++      }
++   }
++   return src;
++}
++
++static void
++translate_double(struct Shader_xlate *sx, const struct Shader_opcode *opcode)
++{
++   struct ureg_program *ureg = sx->ureg;
++   enum double_kind kind = DOUBLE_TO_DOUBLE;
++   enum dx10_opcode_format src_format = OF_FLOAT;
++   unsigned op = TGSI_OPCODE_MOV;
++
++   switch (opcode->type) {
++   case D3D11_SB_OPCODE_DADD: op = TGSI_OPCODE_DADD; break;
++   case D3D11_SB_OPCODE_DMAX: op = TGSI_OPCODE_DMAX; break;
++   case D3D11_SB_OPCODE_DMIN: op = TGSI_OPCODE_DMIN; break;
++   case D3D11_SB_OPCODE_DMUL: op = TGSI_OPCODE_DMUL; break;
++   case D3D11_1_SB_OPCODE_DDIV: op = TGSI_OPCODE_DDIV; break;
++   /* virglrenderer has no DFMA; DMAD is a*b+c in GLSL, which the GLSL compiler may fuse */
++   case D3D11_1_SB_OPCODE_DFMA: op = TGSI_OPCODE_DMAD; break;
++   case D3D11_1_SB_OPCODE_DRCP: op = TGSI_OPCODE_DRCP; break;
++   case D3D11_SB_OPCODE_DMOV: op = TGSI_OPCODE_MOV; break;
++   case D3D11_SB_OPCODE_DEQ: op = TGSI_OPCODE_DSEQ; kind = DOUBLE_TO_32; break;
++   case D3D11_SB_OPCODE_DGE: op = TGSI_OPCODE_DSGE; kind = DOUBLE_TO_32; break;
++   case D3D11_SB_OPCODE_DLT: op = TGSI_OPCODE_DSLT; kind = DOUBLE_TO_32; break;
++   case D3D11_SB_OPCODE_DNE: op = TGSI_OPCODE_DSNE; kind = DOUBLE_TO_32; break;
++   case D3D11_SB_OPCODE_DTOF: op = TGSI_OPCODE_D2F; kind = DOUBLE_TO_32; break;
++   case D3D11_1_SB_OPCODE_DTOI: op = TGSI_OPCODE_D2I; kind = DOUBLE_TO_32; break;
++   case D3D11_1_SB_OPCODE_DTOU: op = TGSI_OPCODE_D2U; kind = DOUBLE_TO_32; break;
++   case D3D11_SB_OPCODE_FTOD: op = TGSI_OPCODE_F2D; kind = DOUBLE_FROM_32; break;
++   case D3D11_1_SB_OPCODE_ITOD: op = TGSI_OPCODE_I2D; kind = DOUBLE_FROM_32; src_format = OF_INT; break;
++   case D3D11_1_SB_OPCODE_UTOD: op = TGSI_OPCODE_U2D; kind = DOUBLE_FROM_32; src_format = OF_UINT; break;
++   case D3D11_SB_OPCODE_DMOVC: op = TGSI_OPCODE_UCMP; kind = DOUBLE_MOVC; break;
++   default:
++      LOG_UNSUPPORTED(true);
++      return;
++   }
++
++   unsigned mask = opcode->dst[0].mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
++   bool double_result = kind != DOUBLE_TO_32;
++   /* Every double is computed before the destination is written: it may be a source ("ftod r1.xyzw, r1.xyxx") */
++   struct ureg_dst result_tmp[2];
++   unsigned result_part[2], num_results = 0;
++   struct ureg_dst scratch[12];
++   unsigned num_scratch = 0;
++   for (unsigned k = 0; k < 2; k++) {
++      unsigned part;
++      if (double_result) {
++         part = k ? TGSI_WRITEMASK_ZW : TGSI_WRITEMASK_XY;
++         if (!(mask & part))
++            continue;
++      } else {
++         /* the k-th enabled component */
++         unsigned m = mask;
++         for (unsigned skip = 0; skip < k && m; skip++)
++            m &= m - 1;
++         if (!m)
++            break;
++         part = m & -m;
++      }
++
++      struct ureg_src src[3];
++      unsigned num_src = opcode->num_src;
++      for (unsigned i = 0; i < num_src; i++) {
++         if (kind == DOUBLE_FROM_32 || (kind == DOUBLE_MOVC && i == 0)) {
++            src[i] = ureg_swizzle(translate_src_operand(sx, &opcode->src[i], kind == DOUBLE_MOVC ? OF_UINT : src_format),
++                                  k, k, k, k);
++         } else {
++            src[i] = double_src(sx, &opcode->src[i], k, scratch, &num_scratch);
++         }
++      }
++
++      struct ureg_dst tmp = ureg_DECL_temporary(ureg);
++      struct ureg_dst result = ureg_writemask(tmp, double_result ? TGSI_WRITEMASK_XY : TGSI_WRITEMASK_X);
++      ureg_insn(ureg, op, &result, 1, src, num_src, 0);
++
++      if (opcode->saturate && double_result) {
++         /* _sat: clamped to [0, 1] */
++         struct ureg_src v[2] = {ureg_src(tmp), ureg_imm4u(ureg, 0, 0, 0, 0)};
++         ureg_insn(ureg, TGSI_OPCODE_DMAX, &result, 1, v, 2, 0);
++         v[1] = ureg_imm4u(ureg, 0, 0x3ff00000, 0, 0x3ff00000);
++         ureg_insn(ureg, TGSI_OPCODE_DMIN, &result, 1, v, 2, 0);
++      }
++      result_tmp[num_results] = tmp;
++      result_part[num_results++] = part;
++   }
++
++   for (unsigned r = 0; r < num_results; r++) {
++      struct ureg_dst dst = ureg_writemask(translate_dst_operand(sx, &opcode->dst[0], false), result_part[r]);
++      struct ureg_src value = ureg_src(result_tmp[r]);
++      ureg_MOV(ureg, dst, double_result ? ureg_swizzle(value, 0, 1, 0, 1) : ureg_scalar(value, 0));
++      ureg_release_temporary(ureg, result_tmp[r]);
++   }
++   for (unsigned i = 0; i < num_scratch; i++)
++      ureg_release_temporary(ureg, scratch[i]);
++}
++
+ const struct tgsi_token *
+ Shader_tgsi_translate(const unsigned *code,
+                       unsigned *output_mapping,
+@@ -3629,6 +3779,28 @@
+ 
+          break;
+ 
++      case D3D11_SB_OPCODE_DADD:
++      case D3D11_SB_OPCODE_DMAX:
++      case D3D11_SB_OPCODE_DMIN:
++      case D3D11_SB_OPCODE_DMUL:
++      case D3D11_SB_OPCODE_DEQ:
++      case D3D11_SB_OPCODE_DGE:
++      case D3D11_SB_OPCODE_DLT:
++      case D3D11_SB_OPCODE_DNE:
++      case D3D11_SB_OPCODE_DMOV:
++      case D3D11_SB_OPCODE_DMOVC:
++      case D3D11_SB_OPCODE_DTOF:
++      case D3D11_SB_OPCODE_FTOD:
++      case D3D11_1_SB_OPCODE_DDIV:
++      case D3D11_1_SB_OPCODE_DFMA:
++      case D3D11_1_SB_OPCODE_DRCP:
++      case D3D11_1_SB_OPCODE_DTOI:
++      case D3D11_1_SB_OPCODE_DTOU:
++      case D3D11_1_SB_OPCODE_ITOD:
++      case D3D11_1_SB_OPCODE_UTOD:
++         translate_double(sx, &opcode);
++         break;
++
+       case D3D10_SB_OPCODE_FTOI: {
+          /* XXX: tgsi (and just about everybody else, c, opencl, glsl) has
+           * out-of-range (and NaN) values undefined for f2i/f2u, but d3d10
+@@ -4405,18 +4577,27 @@
+              * simply determined by by number of clip/cull dists (that is,
+              * all clip dists must come first).
+              */
+-            unsigned numcliporcull = sx->num_clip_distances_declared +
+-                                     sx->num_cull_distances_declared;
+-            sx->clip_distance_mapping[numcliporcull].d3d =
+-               opcode.dst[0].base.index[0].imm;
+-            sx->clip_distance_mapping[numcliporcull].tgsi = numcliporcull;
++            /* One register holds up to four distances (o1.xyzw): the properties count components, the
++             * semantic index counts registers (a register may hold clip and cull distances, clip ones first) */
++            unsigned reg = opcode.dst[0].base.index[0].imm, slot;
++            for (slot = 0; slot < sx->num_clip_cull_registers; slot++) {
++               if (sx->clip_distance_mapping[slot].d3d == reg)
++                  break;
++            }
++            if (slot == sx->num_clip_cull_registers && slot < 2) {
++               sx->clip_distance_mapping[slot].d3d = reg;
++               sx->clip_distance_mapping[slot].tgsi = slot;
++               sx->num_clip_cull_registers++;
++            }
++            unsigned components =
++               util_bitcount(opcode.dst[0].mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT);
+             if (opcode.dcl_siv_name == D3D10_SB_NAME_CLIP_DISTANCE) {
+-               ++sx->num_clip_distances_declared;
++               sx->num_clip_distances_declared += components;
+                /* re-emit should be safe... */
+                ureg_property(ureg, TGSI_PROPERTY_NUM_CLIPDIST_ENABLED,
+                              sx->num_clip_distances_declared);
+             } else {
+-               ++sx->num_cull_distances_declared;
++               sx->num_cull_distances_declared += components;
+                ureg_property(ureg, TGSI_PROPERTY_NUM_CULLDIST_ENABLED,
+                              sx->num_cull_distances_declared);
+             }
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -83,6 +83,9 @@
+    unsigned num_variants;
+    enum pipe_format bound_formats[SHADER_MAX_IMAGE_SLOTS];   /* the bound translation's: all NONE for the first */
+    unsigned bound_tess_key;   /* domain shaders: the hull shader tessellation the bound translation has (0: none) */
++   /* clip distances it writes (ShaderClipDistances), for the tokens scanned */
++   const struct tgsi_token *clip_scanned;
++   unsigned num_clip_distances;
+ };
+ 
+ struct Query;
+@@ -116,6 +119,8 @@
+    struct pipe_stream_output_target *draw_so_target;
+    Shader *bound_empty_gs;
+    Shader *bound_vs;
++   struct RasterizerState *bound_rasterizer;
++   void *bound_rasterizer_handle;   /* the variant bound (ResolveState) */
+    /* Stream output without a geometry shader (an "empty" one, with only the declaration): the vertex shader with
+     * the declaration, made at draw time for that pair (ResolveState) */
+    void *so_vs_handle;
+@@ -344,6 +349,10 @@
+ struct RasterizerState
+ {
+    void *handle;
++   /* D3D applies every clip distance the last vertex stage writes; gallium only those clip_plane_enable names (GL
++    * must not enable unwritten ones): variants for 1-8 distances, made when first needed (ResolveState) */
++   struct pipe_rasterizer_state state;
++   void *clip_handles[8];
+ };
+ 
+ 
+diff --git a/src/gallium/frontends/nine/device9.h b/src/gallium/frontends/nine/device9.h
+--- a/src/gallium/frontends/nine/device9.h
++++ b/src/gallium/frontends/nine/device9.h
+@@ -33,6 +33,11 @@
+ {
+     struct NineUnknown base;
+     bool ex;
++    /* WinBoat's d3d9umd (a D3D9 driver on nine), around one resource creation: bind flags to add (shared
++     * resources), or the pipe resource to use instead of allocating one (a resource opened from another device) */
++    unsigned winboat_extra_bind;
++    struct pipe_resource *winboat_import;
++    bool winboat_opening;      /* OpenResource: the surfaces wrap the other device's content, no initial clear */
+     bool may_swvp;
+ 
+     /* G3D context */
+diff --git a/src/gallium/frontends/nine/resource9.c b/src/gallium/frontends/nine/resource9.c
+--- a/src/gallium/frontends/nine/resource9.c
++++ b/src/gallium/frontends/nine/resource9.c
+@@ -76,7 +76,14 @@
+         }
+ 
+         DBG("(%p) Creating pipe_resource.\n", This);
+-        This->resource = nine_resource_create_with_retry(This->base.device, screen, &This->info);
++        if (This->base.device->winboat_import) {
++            /* d3d9umd's OpenResource: the resource another device made */
++            pipe_resource_reference(&This->resource, This->base.device->winboat_import);
++            This->base.device->winboat_import = NULL;
++        } else {
++            This->info.bind |= This->base.device->winboat_extra_bind;
++            This->resource = nine_resource_create_with_retry(This->base.device, screen, &This->info);
++        }
+         if (!This->resource)
+             return D3DERR_OUTOFVIDEOMEMORY;
+     }
+diff --git a/src/gallium/frontends/nine/surface9.c b/src/gallium/frontends/nine/surface9.c
+--- a/src/gallium/frontends/nine/surface9.c
++++ b/src/gallium/frontends/nine/surface9.c
+@@ -186,7 +186,7 @@
+         NineSurface9_CreatePipeSurfaces(This);
+ 
+     /* TODO: investigate what else exactly needs to be cleared */
+-    if (This->base.resource && (pDesc->Usage & D3DUSAGE_RENDERTARGET))
++    if (This->base.resource && (pDesc->Usage & D3DUSAGE_RENDERTARGET) && !pParams->device->winboat_opening)
+         nine_context_clear_render_target(pParams->device, This, 0, 0, 0, pDesc->Width, pDesc->Height);
+ 
+     NineSurface9_Dump(This);
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -219,6 +219,13 @@
+    float offset_scale;
+    float offset_clamp;
+    float conservative_raster_dilate;
++
++   /**
++    * Rasterization samples independent of the framebuffer's (D3D 11.1's ForcedSampleCount: target-independent
++    * rasterization, UAV-only rendering): 0 for the framebuffer's. Only drivers that offer it look at it (virgl,
++    * VIRGL_CAP_V2_RASTER_SAMPLES).
++    */
++   unsigned forced_sample_count;
+ };
+ 
+ 
+diff --git a/src/gallium/targets/d3d10umd/meson.build b/src/gallium/targets/d3d10umd/meson.build
+--- a/src/gallium/targets/d3d10umd/meson.build
++++ b/src/gallium/targets/d3d10umd/meson.build
+@@ -10,9 +10,24 @@
+ )
+ 
+ gallium_d3d10_name = get_option('gallium-d3d10-dll-name')
++
++# The DLL's version resource (the driver package's version: the runtime reports it to applications)
++_winboat_version = get_option('winboat-driver-version')
++_umd_rc = configure_file(
++  input : '../winboat_umd_version.rc.in',
++  output : '@0@_version.rc'.format(gallium_d3d10_name),
++  configuration : {
++    'VERSION' : _winboat_version,
++    'VERSION_COMMAS' : _winboat_version.replace('.', ','),
++    'DESCRIPTION' : 'Direct3D 10/11 user-mode driver',
++    'FILENAME' : gallium_d3d10_name,
++  },
++)
++_umd_res = cc.get_argument_syntax() == 'msvc' ? import('windows').compile_resources(_umd_rc) : []
++
+ libgallium_d3d10 = shared_library(
+   gallium_d3d10_name,
+-  ['d3d10_gdi.c'],
++  ['d3d10_gdi.c', _umd_res],
+   vs_module_defs : libgallium_d3d10_def,
+   include_directories : [
+     inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux, inc_d3d10umd, inc_gallium_winsys, inc_gallium_winsys_sw, inc_gallium_drivers, inc_winddk
+diff --git a/src/virtio/virtio-gpu/virgl_hw.h b/src/virtio/virtio-gpu/virgl_hw.h
+--- a/src/virtio/virtio-gpu/virgl_hw.h
++++ b/src/virtio/virtio-gpu/virgl_hw.h
+@@ -587,6 +587,9 @@
+ #define VIRGL_CAP_V2_GROUP_VOTE           (1 << 15)
+ #define VIRGL_CAP_V2_MIRROR_CLAMP_TO_EDGE (1 << 16)
+ #define VIRGL_CAP_V2_MIRROR_CLAMP         (1 << 17)
++#define VIRGL_CAP_V2_RESOURCE_LAYOUT      (1 << 18)
++/* WinBoat's virglrenderer patches (from the top down, away from upstream's bits) */
++#define VIRGL_CAP_V2_RASTER_SAMPLES       (1u << 31)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+diff --git a/src/virtio/virtio-gpu/virgl_protocol.h b/src/virtio/virtio-gpu/virgl_protocol.h
+--- a/src/virtio/virtio-gpu/virgl_protocol.h
++++ b/src/virtio/virtio-gpu/virgl_protocol.h
+@@ -130,6 +130,9 @@
+    VIRGL_CCMD_END_FRAME,
+ 
+    VIRGL_CCMD_CLEAR_SURFACE,
++   VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT,   /* virglrenderer 1.x; not sent */
++   /* WinBoat's virglrenderer patches; sent only when the host's caps announce them */
++   VIRGL_CCMD_SET_RASTER_SAMPLES,         /* VIRGL_CAP_V2_RASTER_SAMPLES */
+ 
+    VIRGL_MAX_COMMANDS
+ };
+@@ -780,4 +783,8 @@
+ #define VIRGL_CLEAR_SURFACE_WIDTH                  9
+ #define VIRGL_CLEAR_SURFACE_HEIGHT                 10
+ 
++/* VIRGL_CCMD_SET_RASTER_SAMPLES: rasterization samples independent of the framebuffer's (0: the framebuffer's) */
++#define VIRGL_SET_RASTER_SAMPLES_SIZE 1
++#define VIRGL_SET_RASTER_SAMPLES_COUNT 1
++
+ #endif
+diff --git a/src/gallium/frontends/d3d10umd/Compute.cpp b/src/gallium/frontends/d3d10umd/Compute.cpp
+--- a/src/gallium/frontends/d3d10umd/Compute.cpp
++++ b/src/gallium/frontends/d3d10umd/Compute.cpp
+@@ -147,6 +147,17 @@
+       }
+    }
+    pDevice->bindings_dirty[type] = true;
++
++   /* The output merger's UAVs are every graphics stage's (feature level 11_1: UAVs in all shader stages; before
++    * it, only pixel shaders declare them) */
++   if (type == PIPE_SHADER_FRAGMENT) {
++      static const enum pipe_shader_type others[] = {PIPE_SHADER_VERTEX, PIPE_SHADER_TESS_CTRL,
++                                                      PIPE_SHADER_TESS_EVAL, PIPE_SHADER_GEOMETRY};
++      for (enum pipe_shader_type other : others) {
++         memcpy(pDevice->uavs[other], pDevice->uavs[type], sizeof pDevice->uavs[type]);
++         pDevice->bindings_dirty[other] = true;
++      }
++   }
+ }
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -25,10 +25,12 @@
+ 
+ #include "DxgiFns.h"
+ #include "OutputMerger.h"
++#include "Rasterizer.h"
+ #include "Shader.h"
+ #include "State.h"
+ 
+ #include "util/format/u_format.h"
++#include "util/u_inlines.h"
+ 
+ #include <type_traits>
+ #include <vector>
+@@ -272,7 +274,7 @@
+ }
+ 
+ 
+-/* Blend states: 11.1 adds logic ops (not offered: OutputMergerLogicOp is FALSE) */
++/* Blend states: 11.1 adds logic ops (render target 0's, D3D11_1_DDICAPS_D3D11_OPTIONS) */
+ static D3D10_1_DDI_BLEND_DESC
+ BlendDesc10_1(const D3D11_1_DDI_BLEND_DESC *pDesc)
+ {
+@@ -305,11 +307,20 @@
+ CreateBlendState11_1(D3D10DDI_HDEVICE hDevice, const D3D11_1_DDI_BLEND_DESC *pDesc, D3D10DDI_HBLENDSTATE hState,
+                      D3D10DDI_HRTBLENDSTATE hRTState)
+ {
++   /* D3D's order (CLEAR, SET, COPY, ...) to gallium's (GL's) */
++   static const unsigned logic_ops[] = {
++      PIPE_LOGICOP_CLEAR, PIPE_LOGICOP_SET, PIPE_LOGICOP_COPY, PIPE_LOGICOP_COPY_INVERTED,
++      PIPE_LOGICOP_NOOP, PIPE_LOGICOP_INVERT, PIPE_LOGICOP_AND, PIPE_LOGICOP_NAND,
++      PIPE_LOGICOP_OR, PIPE_LOGICOP_NOR, PIPE_LOGICOP_XOR, PIPE_LOGICOP_EQUIV,
++      PIPE_LOGICOP_AND_REVERSE, PIPE_LOGICOP_AND_INVERTED, PIPE_LOGICOP_OR_REVERSE, PIPE_LOGICOP_OR_INVERTED,
++   };
+    D3D10_1_DDI_BLEND_DESC desc = BlendDesc10_1(pDesc);
+-   CreateBlendState1(hDevice, &desc, hState, hRTState);
++   const D3D11_1_DDI_RENDER_TARGET_BLEND_DESC &rt0 = pDesc->RenderTarget[0];
++   bool logic = rt0.LogicOpEnable && (unsigned)rt0.LogicOp < ARRAY_SIZE(logic_ops);
++   CreateBlendStateLogicOp(hDevice, &desc, logic, logic ? logic_ops[rt0.LogicOp] : PIPE_LOGICOP_COPY, hState);
+ }
+ 
+-/* Rasterizer states: 11.1 adds ForcedSampleCount after the 10 fields (0 unless target independent rasterization) */
++/* Rasterizer states: 11.1 adds ForcedSampleCount after the 10 fields (target-independent rasterization) */
+ static SIZE_T APIENTRY
+ CalcPrivateRasterizerStateSize11_1(D3D10DDI_HDEVICE hDevice, const D3D11_1_DDI_RASTERIZER_DESC *pDesc)
+ {
+@@ -321,8 +332,8 @@
+ CreateRasterizerState11_1(D3D10DDI_HDEVICE hDevice, const D3D11_1_DDI_RASTERIZER_DESC *pDesc,
+                           D3D10DDI_HRASTERIZERSTATE hState, D3D10DDI_HRTRASTERIZERSTATE hRTState)
+ {
+-   funcs10.pfnCreateRasterizerState(hDevice, reinterpret_cast<const D3D10_DDI_RASTERIZER_DESC *>(pDesc), hState,
+-                                    hRTState);
++   CreateRasterizerStateForced(hDevice, reinterpret_cast<const D3D10_DDI_RASTERIZER_DESC *>(pDesc),
++                               pDesc->ForcedSampleCount, hState);
+ }
+ 
+ 
+@@ -439,10 +450,76 @@
+ 
+ 
+ /* ClearView: a render target view, all of it or some rectangles (other views: feature level 11 or video) */
++/* ClearView on a typed UAV: the color converted to the view's format, in the rectangles (all the view's layers) */
++static void
++ClearUnorderedAccessViewRects(Device *pDevice, UnorderedAccessView *uav, const FLOAT Color[4],
++                              const D3D10_DDI_RECT *pRect, UINT NumRects)
++{
++   struct pipe_context *pipe = pDevice->pipe;
++   const struct pipe_image_view *view = &uav->image;
++   if (!uav->typed || !view->resource || view->format == PIPE_FORMAT_NONE) {
++      return;
++   }
++   enum pipe_format format = view->format;
++   union pipe_color_union color = {};
++   for (unsigned i = 0; i < 4; i++) {
++      if (util_format_is_pure_sint(format)) {
++         color.i[i] = (int)Color[i];
++      } else if (util_format_is_pure_uint(format)) {
++         color.ui[i] = Color[i] > 0.0f ? (unsigned)Color[i] : 0;
++      } else {
++         color.f[i] = Color[i];
++      }
++   }
++   uint8_t packed[16] = {};
++   util_format_pack_rgba(format, packed, color.ui, 1);
++   unsigned size = util_format_get_blocksize(format);
++
++   if (view->resource->target == PIPE_BUFFER) {
++      /* Rectangles are element ranges in x */
++      unsigned first = view->u.buf.offset / size, count = view->u.buf.size / size;
++      for (UINT r = 0; r < MAX2(NumRects, 1); r++) {
++         unsigned left = pRect && NumRects ? MAX2(pRect[r].left, 0) : 0;
++         unsigned right = pRect && NumRects ? MIN2((unsigned)MAX2(pRect[r].right, 0), count) : count;
++         if (right > left) {
++            pipe->clear_buffer(pipe, view->resource, (first + left) * size, (right - left) * size, packed, size);
++         }
++      }
++      return;
++   }
++
++   unsigned level = view->u.tex.level;
++   unsigned width = u_minify(view->resource->width0, level), height = u_minify(view->resource->height0, level);
++   unsigned first_layer = view->u.tex.first_layer, layers = view->u.tex.last_layer - first_layer + 1;
++   if (view->resource->target == PIPE_TEXTURE_3D) {
++      first_layer = 0;
++      layers = u_minify(view->resource->depth0, level);
++   }
++   for (UINT r = 0; r < MAX2(NumRects, 1); r++) {
++      LONG left = 0, top = 0, right = width, bottom = height;
++      if (pRect && NumRects) {
++         left = MAX2(pRect[r].left, 0);
++         top = MAX2(pRect[r].top, 0);
++         right = MIN2(pRect[r].right, (LONG)width);
++         bottom = MIN2(pRect[r].bottom, (LONG)height);
++      }
++      if (right > left && bottom > top) {
++         struct pipe_box box;
++         u_box_3d(left, top, first_layer, right - left, bottom - top, layers, &box);
++         pipe->clear_texture(pipe, view->resource, level, &box, packed);
++      }
++   }
++}
++
+ static void APIENTRY
+ ClearView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE viewType, VOID *hView, const FLOAT Color[4],
+           const D3D10_DDI_RECT *pRect, UINT NumRects)
+ {
++   if (viewType == D3D11DDI_HT_UNORDEREDACCESSVIEW && hView) {
++      ClearUnorderedAccessViewRects(CastDevice(hDevice), static_cast<UnorderedAccessView *>(hView), Color, pRect,
++                                    NumRects);
++      return;
++   }
+    if (viewType != D3D10DDI_HT_RENDERTARGETVIEW || !hView) {
+       return;
+    }
+@@ -752,9 +829,17 @@
+    return S_OK;
+ }
+ 
++/*
++ * The runtime asks before another user reads or writes the resource without this device: GDI drawing through
++ * IDXGISurface1::GetDC (CGdiInterop::GetDeviceBitmapDC calls this instead of flushing when the driver has it), shared
++ * surfaces. Pending work on it is submitted, so that it happens first (the kernel driver keeps GDI's pages and the
++ * host texture the same around submissions).
++ */
+ static HRESULT APIENTRY
+ ResolveSharedResource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *pResolve)
+ {
++   Device *pDevice = CastDevice(pResolve->hDevice);
++   pDevice->pipe->flush(pDevice->pipe, NULL, 0);
+    return S_OK;
+ }
+ 
+diff --git a/src/gallium/frontends/d3d9umd/adapter.cpp b/src/gallium/frontends/d3d9umd/adapter.cpp
+--- a/src/gallium/frontends/d3d9umd/adapter.cpp
++++ b/src/gallium/frontends/d3d9umd/adapter.cpp
+@@ -70,10 +70,14 @@
+    D3DDDIFMT_Q8W8V8U8, D3DDDIFMT_V16U16, D3DDDIFMT_A2W10V10U10, D3DDDIFMT_Q16W16V16U16, D3DDDIFMT_G16R16,
+    D3DDDIFMT_A16B16G16R16, D3DDDIFMT_R16F, D3DDDIFMT_G16R16F, D3DDDIFMT_A16B16G16R16F, D3DDDIFMT_R32F,
+    D3DDDIFMT_G32R32F, D3DDDIFMT_A32B32G32R32F, D3DDDIFMT_DXT1, D3DDDIFMT_DXT2, D3DDDIFMT_DXT3, D3DDDIFMT_DXT4,
+-   D3DDDIFMT_DXT5, D3DDDIFMT_UYVY, D3DDDIFMT_YUY2, D3DDDIFMT_R8G8_B8G8, D3DDDIFMT_G8R8_G8B8,
++   D3DDDIFMT_DXT5, D3DDDIFMT_UYVY, D3DDDIFMT_YUY2, (D3DDDIFORMAT)MAKEFOURCC('N', 'V', '1', '2'),
++   D3DDDIFMT_R8G8_B8G8, D3DDDIFMT_G8R8_G8B8,
+    (D3DDDIFORMAT)MAKEFOURCC('A', 'T', 'I', '1'), (D3DDDIFORMAT)MAKEFOURCC('A', 'T', 'I', '2'),
+    (D3DDDIFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z'), (D3DDDIFORMAT)MAKEFOURCC('N', 'U', 'L', 'L'),
+    (D3DDDIFORMAT)MAKEFOURCC('D', 'F', '1', '6'), (D3DDDIFORMAT)MAKEFOURCC('D', 'F', '2', '4'),
++   /* The vendor hacks nine implements: alpha to coverage (render state D3DRS_ADAPTIVETESS_Y = ATOC) and resolving a
++    * multisampled depth buffer (D3DRS_POINTSIZE = RESZ code, RESZ needs host support) */
++   (D3DDDIFORMAT)MAKEFOURCC('A', 'T', 'O', 'C'), (D3DDDIFORMAT)MAKEFOURCC('R', 'E', 'S', 'Z'),
+    D3DDDIFMT_D16, D3DDDIFMT_D16_LOCKABLE, D3DDDIFMT_D24S8, D3DDDIFMT_D24X8, D3DDDIFMT_D24X4S4,
+    D3DDDIFMT_D15S1, D3DDDIFMT_D32, D3DDDIFMT_D32F_LOCKABLE, D3DDDIFMT_D24FS8, D3DDDIFMT_S8_LOCKABLE,
+    D3DDDIFMT_D32_LOCKABLE,
+@@ -95,6 +99,12 @@
+       FORMATOP op;
+       memset(&op, 0, sizeof(op));
+       op.Format = f;
++      if (nddi_format_is_video((uint32_t)f)) {
++         /* Video surfaces (video.cpp): offscreen plain, converted to RGB by StretchRect and video processing */
++         op.Operations = FORMATOP_OFFSCREENPLAIN | FORMATOP_CONVERT_TO_ARGB;
++         list.push_back(op);
++         continue;
++      }
+       auto check = [&](DWORD usage, D3DRESOURCETYPE rtype) {
+          return nddi_adapter_check_format(adapter->nine, display, usage, rtype, f);
+       };
+@@ -119,7 +129,11 @@
+          op.Operations |= FORMATOP_ZSTENCIL | FORMATOP_ZSTENCIL_WITH_ARBITRARY_COLOR_DEPTH;
+       if (IsArgbGroup(f) && (op.Operations & FORMATOP_TEXTURE))
+          op.Operations |= FORMATOP_MEMBEROFGROUP_ARGB;
+-      if (f == D3DDDIFMT_X8R8G8B8 && rt)
++      /* Display modes: X8R8G8B8 and R5G6B5, as every D3D9 driver lists them. The runtime needs a 16-bit one: without
++       * it, its DirectX 8 HAL check (GetDX8HALCaps) marks the adapter as having no hardware primary, makes no driver
++       * surface for the desktop, and flip-model presents (D3DSWAPEFFECT_FLIPEX) crash on its missing kernel handle.
++       * Only one 16-bit format may be a display mode: with X1R5G5B5 too, FetchDirectDrawData refuses the driver. */
++      if ((f == D3DDDIFMT_X8R8G8B8 || f == D3DDDIFMT_R5G6B5) && rt)
+          op.Operations |= FORMATOP_DISPLAYMODE | FORMATOP_3DACCELERATION;
+       if (op.Operations & FORMATOP_TEXTURE) {
+          if (check(D3DUSAGE_QUERY_SRGBREAD, D3DRTYPE_TEXTURE))
+@@ -269,6 +283,7 @@
+    pOpenData->pAdapterFuncs->pfnGetCaps = D3D9UmdGetCaps;
+    pOpenData->pAdapterFuncs->pfnCreateDevice = CreateDevice;
+    pOpenData->pAdapterFuncs->pfnCloseAdapter = CloseAdapter;
+-   pOpenData->DriverVersion = D3D_UMD_INTERFACE_VERSION_WIN7;
++   /* Windows 8.1's interface (WDDM 1.3, the kernel driver's) */
++   pOpenData->DriverVersion = D3D_UMD_INTERFACE_VERSION_WDDM1_3;
+    return S_OK;
+ }
+diff --git a/src/gallium/frontends/d3d9umd/caps.cpp b/src/gallium/frontends/d3d9umd/caps.cpp
+--- a/src/gallium/frontends/d3d9umd/caps.cpp
++++ b/src/gallium/frontends/d3d9umd/caps.cpp
+@@ -158,12 +158,12 @@
+       return S_OK;
+    }
+    case D3DDDICAPS_GETD3DQUERYCOUNT:
+-      return Put(p, (UINT)(nddi_adapter_has_timestamps(adapter->nine) ? 5 : 2));
++      return Put(p, (UINT)(nddi_adapter_has_timestamps(adapter->nine) ? 6 : 3));
+    case D3DDDICAPS_GETD3DQUERYDATA: {
+-      const D3DDDIQUERYTYPE queries[] = {D3DDDIQUERYTYPE_EVENT, D3DDDIQUERYTYPE_OCCLUSION,
++      const D3DDDIQUERYTYPE queries[] = {D3DDDIQUERYTYPE_EVENT, D3DDDIQUERYTYPE_OCCLUSION, D3DDDIQUERYTYPE_VCACHE,
+                                          D3DDDIQUERYTYPE_TIMESTAMP, D3DDDIQUERYTYPE_TIMESTAMPDISJOINT,
+                                          D3DDDIQUERYTYPE_TIMESTAMPFREQ};
+-      UINT count = nddi_adapter_has_timestamps(adapter->nine) ? 5 : 2;
++      UINT count = nddi_adapter_has_timestamps(adapter->nine) ? 6 : 3;
+       if (!p->pData || p->DataSize < count * sizeof(queries[0]))
+          return E_INVALIDARG;
+       memcpy(p->pData, queries, count * sizeof(queries[0]));
+@@ -190,11 +190,16 @@
+       return Put(p, c);
+    case D3DDDICAPS_GETD3D5CAPS:
+    case D3DDDICAPS_GETD3D6CAPS:
+-   default:
+-      /* Video decode/processing, overlays, content protection, ...: nothing to report. Counts are zero. */
++   default: {
++      /* DXVA2 video processing (video.cpp) */
++      HRESULT hr;
++      if (D3D9UmdVideoGetCaps(p, &hr))
++         return hr;
++      /* Video decoding, overlays, content protection, ...: nothing to report. Counts are zero. */
+       if (p->pData && p->DataSize)
+          memset(p->pData, 0, p->DataSize);
+       D3D9UMD_TRACE("GetCaps: nothing for type %d", (int)p->Type);
+       return S_OK;
+    }
++   }
+ }
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd.h b/src/gallium/frontends/d3d9umd/d3d9umd.h
+--- a/src/gallium/frontends/d3d9umd/d3d9umd.h
++++ b/src/gallium/frontends/d3d9umd/d3d9umd.h
+@@ -84,6 +84,10 @@
+ void D3D9UmdFillStubs(D3DDDI_DEVICEFUNCS *funcs);
+ void D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *funcs);
+ void D3D9UmdFillPipelineFuncs(D3DDDI_DEVICEFUNCS *funcs);
++void D3D9UmdFillVideoFuncs(D3DDDI_DEVICEFUNCS *funcs);
++
++/* DXVA2 video processor caps (video.cpp): true if it answered the GetCaps type, with the result in *hr */
++bool D3D9UmdVideoGetCaps(const D3DDDIARG_GETCAPS *p, HRESULT *hr);
+ 
+ HRESULT APIENTRY D3D9UmdGetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *pData);
+ 
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h b/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
+--- a/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
++++ b/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
+@@ -87,6 +87,7 @@
+    uint32_t height;
+    uint32_t depth;
+    uint32_t levels;
++   uint32_t surfaces;       /* surfaces, render targets, depth: how many (a full-screen flip chain is one resource) */
+    uint32_t usage;          /* D3DUSAGE_* */
+    uint32_t multisample;    /* D3DMULTISAMPLE_TYPE */
+    uint32_t multisample_quality;
+@@ -97,8 +98,19 @@
+    void *const *sysmem;
+    const uint32_t *sysmem_pitch;
+    const uint32_t *sysmem_slice_pitch; /* volume textures */
++   bool shared;             /* other devices open it (OpenResource) */
+ };
+ 
++/* A shared resource another device made, opened through its kernel handle (the kernel interface has the
++ * allocations' private data meanwhile): wrapped as a texture, render target or depth buffer */
++struct nddi_opened_resource {
++   enum nddi_resource_kind kind;
++   uint32_t format;         /* D3DFORMAT */
++   uint32_t width, height, levels, samples;
++};
++int32_t nddi_resource_open(struct nddi_device *dev, uint32_t km_handle, struct nddi_resource **out,
++                           struct nddi_opened_resource *info);
++
+ int32_t nddi_resource_create(struct nddi_device *dev, const struct nddi_resource_desc *desc,
+                              struct nddi_resource **out);
+ void nddi_resource_destroy(struct nddi_resource *res);
+@@ -122,6 +134,9 @@
+ int32_t nddi_volume_blt(struct nddi_device *dev, struct nddi_resource *src, unsigned src_level,
+                         const struct nddi_box *src_box, struct nddi_resource *dst, unsigned dst_level, uint32_t dst_x,
+                         uint32_t dst_y, uint32_t dst_z);
++/* BufBlt: a byte range of one buffer into another (system memory ones too) */
++int32_t nddi_buffer_copy(struct nddi_device *dev, struct nddi_resource *src, uint32_t src_offset, uint32_t size,
++                         struct nddi_resource *dst, uint32_t dst_offset);
+ int32_t nddi_color_fill(struct nddi_device *dev, struct nddi_resource *res, unsigned subresource,
+                         const struct nddi_rect *rect, uint32_t color);
+ 
+@@ -183,6 +198,8 @@
+ int32_t nddi_issue_query(struct nddi_object *query, uint32_t flags);
+ int32_t nddi_get_query_data(struct nddi_object *query, void *data, uint32_t size);
+ uint32_t nddi_get_query_data_size(struct nddi_object *query);
++/* D3DDDIDEVINFO_VCACHE (GetInfo, the VCACHE query) */
++void nddi_vcache_info(void *data, uint32_t size);
+ 
+ /* ---- Commands ---- */
+ 
+@@ -199,6 +216,32 @@
+ /* Flushes pending rendering to the GPU; the pipe_context is returned for presentation */
+ struct pipe_context *nddi_flush(struct nddi_device *dev);
+ 
++/* DepthFill (depth in the format's native units) and UpdateSubresourceUP */
++int32_t nddi_depth_fill(struct nddi_device *dev, struct nddi_resource *res, unsigned subresource,
++                        const struct nddi_rect *rect, uint32_t depth);
++int32_t nddi_update_subresource(struct nddi_resource *res, unsigned subresource, const struct nddi_box *box,
++                                const void *data, uint32_t row_pitch, uint32_t depth_pitch);
++
++/* ---- Video processing (DXVA2) ---- */
++
++/* YUV formats the driver keeps as video surfaces (YUY2, UYVY, NV12) */
++bool nddi_format_is_video(uint32_t format);
++
++struct nddi_video_sample {
++   struct nddi_resource *src;
++   unsigned src_sub;
++   struct nddi_rect src_rect, dst_rect;
++   uint32_t matrix;         /* DXVA2 transfer matrix: 1 BT.709, 2 BT.601, 3 SMPTE 240M, 0 unknown */
++   uint32_t range;          /* DXVA2 nominal range: 1 0-255, 2 16-235, 3 48-208 */
++   int32_t field;           /* field to show (0 even lines, 1 odd), -1 for frames */
++};
++
++/* VideoProcessBlt: the target rectangle filled with the background (Y, Cb, Cr; 16 bits each), then the samples
++ * converted to RGB and scaled into their rectangles. dest_range: 2 for studio range RGB. */
++int32_t nddi_video_blt(struct nddi_device *dev, struct nddi_resource *target, unsigned target_sub,
++                       const struct nddi_rect *target_rect, const uint16_t background[3], uint32_t dest_range,
++                       const struct nddi_video_sample *samples, unsigned count);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/gallium/frontends/d3d9umd/device.cpp b/src/gallium/frontends/d3d9umd/device.cpp
+--- a/src/gallium/frontends/d3d9umd/device.cpp
++++ b/src/gallium/frontends/d3d9umd/device.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "pipe/p_context.h"
+ #include "pipe/p_screen.h"
++#include "frontend/winsys_handle.h"
+ 
+ /* ---- Device ---- */
+ 
+@@ -98,10 +99,12 @@
+    desc.depth = s0.Depth;
+    desc.levels = desc.kind == NDDI_CUBE_TEXTURE ? p->SurfCount / 6
+                  : (desc.kind == NDDI_TEXTURE || desc.kind == NDDI_VOLUME_TEXTURE) ? p->SurfCount : 1;
++   desc.surfaces = p->SurfCount;
+    desc.usage = UsageFromFlags(f);
+    desc.multisample = p->MultisampleType;
+    desc.multisample_quality = p->MultisampleQuality;
+    desc.lockable = !f.NotLockable;
++   desc.shared = f.SharedResource;
+    desc.fvf = p->Fvf;
+ 
+    std::vector<void *> sysmem;
+@@ -146,6 +149,48 @@
+    return S_OK;
+ }
+ 
++/* A shared resource another device (D3D9Ex, D3D10/11) made: the runtime opened its allocations */
++static HRESULT APIENTRY
++OpenResource(HANDLE hDevice, D3DDDIARG_OPENRESOURCE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *res = new (std::nothrow) D3D9UmdResource();
++   if (!res)
++      return E_OUTOFMEMORY;
++   nddi_opened_resource info;
++   memset(&info, 0, sizeof(info));
++   dev->kmt.pOpenResource = p;
++   HRESULT hr = nddi_resource_open(dev->nine, p->hKMResource, &res->nine, &info);
++   dev->kmt.pOpenResource = NULL;
++   D3D9UMD_TRACE("OpenResource kernel 0x%x, %u allocations -> 0x%08lx (format %u, %ux%u, %u levels, kind %u)",
++                 p->hKMResource, p->NumAllocations, hr, info.format, info.width, info.height, info.levels,
++                 (UINT)info.kind);
++   if (FAILED(hr)) {
++      delete res;
++      return hr;
++   }
++   res->hRTResource = p->hResource;
++   res->format = (D3DDDIFORMAT)info.format;
++   res->pool = D3DDDIPOOL_VIDEOMEMORY;
++   res->flags.Value = 0;
++   res->flags.SharedResource = 1;
++   res->flags.Texture = info.kind == NDDI_TEXTURE;
++   res->flags.RenderTarget = info.kind == NDDI_RENDER_TARGET;
++   res->flags.ZBuffer = info.kind == NDDI_DEPTH_STENCIL;
++   res->surfCount = info.kind == NDDI_TEXTURE ? info.levels : 1;
++   res->width = info.width;
++   res->height = info.height;
++   p->hResource = res;
++   return S_OK;
++}
++
++/* IDirect3DDevice9Ex::CheckResourceResidency: virgl resources live on the host, always resident */
++static HRESULT APIENTRY
++QueryResourceResidency(HANDLE hDevice, const D3DDDIARG_QUERYRESOURCERESIDENCY *p)
++{
++   return S_OK;
++}
++
+ static HRESULT APIENTRY
+ DestroyResource(HANDLE hDevice, HANDLE hResource)
+ {
+@@ -411,6 +456,183 @@
+    return S_OK;
+ }
+ 
++/* Exclusive full screen: the subresource becomes the scanout (the kernel driver's primary); flips then go through
++ * Present with Flags.Flip */
++static HRESULT APIENTRY
++SetDisplayMode(HANDLE hDevice, const D3DDDIARG_SETDISPLAYMODE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
++   unsigned level = 0, layer = 0;
++   struct pipe_resource *resource = nddi_resource_get_pipe(res->nine, p->SubResourceIndex, &level, &layer);
++   if (!resource || !dev->screen->resource_get_handle)
++      return E_INVALIDARG;
++
++   struct winsys_handle handle;
++   memset(&handle, 0, sizeof(handle));
++   handle.type = WINSYS_HANDLE_TYPE_D3DKMT_ALLOC;
++   if (!dev->screen->resource_get_handle(dev->screen, NULL, resource, &handle, 0))
++      return E_INVALIDARG;
++   NTSTATUS status = dev->kmt.base.setDisplayMode(&dev->kmt.base, (D3DKMT_HANDLE)handle.handle);
++   D3D9UMD_TRACE("SetDisplayMode %p[%u]: allocation 0x%x -> 0x%lx", res, p->SubResourceIndex,
++                 (unsigned)handle.handle, status);
++   return NT_SUCCESS(status) ? S_OK : E_FAIL;
++}
++
++/* ---- The Windows 8 / WDDM 1.3 interface (adapter.cpp's DriverVersion) ---- */
++
++static HRESULT APIENTRY
++Flush1(HANDLE hDevice, UINT FlushFlags)
++{
++   return Flush(hDevice);
++}
++
++/* Presents with a list of sources (one, without multiplane overlays) and dirty rectangles (the whole surface goes) */
++static HRESULT APIENTRY
++Present1(HANDLE hDevice, D3DDDIARG_PRESENT1 *p)
++{
++   if (!p->SrcResources)
++      return E_INVALIDARG;
++   D3DDDIARG_PRESENT one;
++   memset(&one, 0, sizeof(one));
++   one.hSrcResource = p->phSrcResources[0].hResource;
++   one.SrcSubResourceIndex = p->phSrcResources[0].SubResourceIndex;
++   one.hDstResource = p->hDstResource;
++   one.DstSubResourceIndex = p->DstSubResourceIndex;
++   one.Flags = p->Flags;
++   one.FlipInterval = p->FlipInterval;
++   p->BackBufferMultiplicity = 1;
++   return Present(hDevice, &one);
++}
++
++static HRESULT APIENTRY
++DepthFill(HANDLE hDevice, const D3DDDIARG_DEPTHFILL *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   nddi_rect r = {p->DstRect.left, p->DstRect.top, p->DstRect.right, p->DstRect.bottom};
++   return nddi_depth_fill(dev->nine, D3D9UmdCastResource(p->hResource)->nine, p->SubResourceIndex, &r, p->Depth);
++}
++
++/* Another process' device is about to use a shared resource: what this device rendered into it goes first */
++static HRESULT APIENTRY
++ResolveSharedResource(HANDLE hDevice, const D3DDDIARG_RESOLVESHAREDRESOURCE *p)
++{
++   return Flush(hDevice);
++}
++
++static HRESULT APIENTRY
++UpdateSubresourceUP(HANDLE hDevice, const D3DDDIARG_UPDATESUBRESOURCEUP *p)
++{
++   nddi_box box = {p->DstBox.Left, p->DstBox.Top, p->DstBox.Right, p->DstBox.Bottom, p->DstBox.Front,
++                   p->DstBox.Back};
++   return nddi_update_subresource(D3D9UmdCastResource(p->hResource)->nine, p->SubResourceIndex, &box, p->pSysMemUP,
++                                  p->RowPitch, p->DepthPitch);
++}
++
++/* No performance counters */
++static VOID APIENTRY
++CheckCounterInfo(HANDLE hDevice, D3DDDIARG_COUNTER_INFO *p)
++{
++   p->LastDeviceDependentCounter = (D3DDDIQUERYTYPE)0;
++   p->NumSimultaneousCounters = 0;
++}
++
++static HRESULT APIENTRY
++CheckCounter(HANDLE hDevice, D3DDDIQUERYTYPE, D3DDDI_COUNTER_TYPE *, UINT *, LPSTR, UINT *, LPSTR, UINT *, LPSTR,
++             UINT *)
++{
++   return E_INVALIDARG;
++}
++
++/* ---- WDDM 2.0 / 2.1 additions ---- */
++
++/* The kernel driver is WDDM 1.3: the video memory manager keeps residency itself, nothing to trim */
++static HRESULT APIENTRY
++TrimResidencySet(HANDLE hDevice, D3DDDIARG_TRIMRESIDENCYSET *p)
++{
++   return S_OK;
++}
++
++/* Keyed-mutex-like sync tokens of shared resources (DirectComposition): virgl serializes all use on the host */
++static VOID APIENTRY
++AcquireResource(HANDLE hDevice, CONST D3DDDIARG_SYNCTOKEN *p)
++{
++}
++
++static VOID APIENTRY
++ReleaseResource(HANDLE hDevice, CONST D3DDDIARG_SYNCTOKEN *p)
++{
++}
++
++/* CreateResource with Windows 8's second flags word (IsDisplayable, ...): nothing of it changes how it's made */
++static HRESULT APIENTRY
++CreateResource2(HANDLE hDevice, D3DDDIARG_CREATERESOURCE2 *p)
++{
++   static_assert(offsetof(D3DDDIARG_CREATERESOURCE2, Rotation) == offsetof(D3DDDIARG_CREATERESOURCE, Rotation),
++                 "CREATERESOURCE2 extends CREATERESOURCE");
++   return CreateResource(hDevice, reinterpret_cast<D3DDDIARG_CREATERESOURCE *>(p));
++}
++
++/* The app doesn't need the contents anymore: a hint */
++static HRESULT APIENTRY
++Discard(HANDLE hDevice, const D3DDDIARG_DISCARD *p)
++{
++   return S_OK;
++}
++
++/* Offered resources may lose their contents under memory pressure; virgl keeps them on the host: never lost */
++static HRESULT APIENTRY
++OfferResources(HANDLE hDevice, const D3DDDIARG_OFFERRESOURCES *p)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++ReclaimResources(HANDLE hDevice, const D3DDDIARG_RECLAIMRESOURCES *p)
++{
++   if (p->pDiscarded) {
++      for (UINT i = 0; i < p->Resources; i++)
++         p->pDiscarded[i] = FALSE;
++   }
++   return S_OK;
++}
++
++/* No direct flip, no multiplane overlays, no custom present durations: DWM composes */
++static HRESULT APIENTRY
++CheckDirectFlipSupport(HANDLE hDevice, D3DDDIARG_CHECKDIRECTFLIPSUPPORT *p)
++{
++   p->Supported = FALSE;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++CheckMultiPlaneOverlaySupport(HANDLE hDevice, D3DDDIARG_CHECKMULTIPLANEOVERLAYSUPPORT *p)
++{
++   p->Supported = FALSE;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++CheckPresentDurationSupport(HANDLE hDevice, D3DDDIARG_CHECKPRESENTDURATIONSUPPORT *p)
++{
++   p->ClosestSmallerDuration = 0;
++   p->ClosestLargerDuration = 0;
++   return S_OK;
++}
++
++/* GPU markers for performance tools (WDDM 1.3): none */
++static HRESULT APIENTRY
++SetMarker(HANDLE hDevice)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++SetMarkerMode(HANDLE hDevice, D3DDDI_MARKERTYPE Type, UINT Flags)
++{
++   return S_OK;
++}
++
+ void
+ D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *f)
+ {
+@@ -418,6 +640,8 @@
+    f->pfnFlush = Flush;
+    f->pfnCreateResource = CreateResource;
+    f->pfnDestroyResource = DestroyResource;
++   f->pfnOpenResource = OpenResource;
++   f->pfnQueryResourceResidency = QueryResourceResidency;
+    f->pfnLock = Lock;
+    f->pfnUnlock = Unlock;
+    f->pfnLockAsync = LockAsync;
+@@ -432,5 +656,34 @@
+    f->pfnSetScissorRect = SetScissorRect;
+    f->pfnClear = Clear;
+    f->pfnPresent = Present;
++   f->pfnSetDisplayMode = SetDisplayMode;
++   f->pfnFlush1 = Flush1;
++   f->pfnPresent1 = Present1;
++   f->pfnCreateResource2 = CreateResource2;
++   f->pfnDiscard = Discard;
++   f->pfnOfferResources = OfferResources;
++   f->pfnReclaimResources = ReclaimResources;
++   f->pfnCheckDirectFlipSupport = CheckDirectFlipSupport;
++   f->pfnCheckMultiPlaneOverlaySupport = CheckMultiPlaneOverlaySupport;
++   f->pfnCheckPresentDurationSupport = CheckPresentDurationSupport;
++   f->pfnSetMarker = SetMarker;
++   f->pfnSetMarkerMode = SetMarkerMode;
++   f->pfnTrimResidencySet = TrimResidencySet;
++   f->pfnDepthFill = DepthFill;
++   f->pfnResolveSharedResource = ResolveSharedResource;
++   f->pfnUpdateSubresourceUP = UpdateSubresourceUP;
++   f->pfnCheckCounterInfo = CheckCounterInfo;
++   f->pfnCheckCounter = CheckCounter;
++   f->pfnAcquireResource = AcquireResource;
++   f->pfnReleaseResource = ReleaseResource;
+    D3D9UmdFillPipelineFuncs(f);
++   D3D9UmdFillVideoFuncs(f);
++
++   /* The Windows 8 interface replaces these: the runtime refuses a driver that has both (ValidateUMDeviceFuncs) */
++   f->pfnCreateResource = NULL;
++   f->pfnFlush = NULL;
++   f->pfnPresent = NULL;
++   f->pfnTexBlt = NULL;
++   f->pfnVolBlt = NULL;
++   f->pfnBufBlt = NULL;
+ }
+diff --git a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
+--- a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
++++ b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
+@@ -8,6 +8,7 @@
+ #include <string.h>
+ 
+ #include "gdikmt_d3d9.h"
++#include "d3d9umd.h"
+ #include "util/u_memory.h"
+ 
+ struct gdikmt_context_d3d9 {
+@@ -142,9 +143,15 @@
+    allocate.pAllocationInfo = options->pAllocationInfo;
+    allocate.pPrivateDriverData = options->pPrivateDriverData;
+    allocate.PrivateDriverDataSize = options->PrivateDriverDataSize;
++   /* Only the first allocation of a CreateResource joins the runtime's resource: dxgkrnl bugchecks (0x113, 7) when a
++    * resource gets allocations from a second call. A flip chain's other surfaces (nddi_create_more_surfaces) are
++    * allocations of their own; presents and SetDisplayMode name allocations directly. */
+    allocate.hResource = device->hRTResource;
++   device->hRTResource = NULL;
+    NTSTATUS status = device->callbacks.pfnAllocateCb(device->hRTDevice, &allocate);
+    options->hResource = (HANDLE)(uintptr_t)allocate.hKMResource;
++   D3D9UMD_TRACE("  AllocateCb: %u allocation(s) for runtime resource %p -> 0x%lx, kernel resource 0x%x",
++                 allocate.NumAllocations, allocate.hResource, status, allocate.hKMResource);
+    return status;
+ }
+ 
+@@ -173,17 +180,30 @@
+    return status;
+ }
+ 
+-/* Shared resources (OpenResource) aren't supported yet */
++/* Shared resources: the runtime opened the allocations (OpenResource), the winsys reads their private data */
+ static NTSTATUS
+-queryallocation(struct gdikmt_device *, struct gdikmt_openallocation *)
++queryallocation(struct gdikmt_device *_device, struct gdikmt_openallocation *options)
+ {
+-   return STATUS_NOT_SUPPORTED;
++   const D3DDDIARG_OPENRESOURCE *open = device_d3d9(_device)->pOpenResource;
++   if (!open)
++      return STATUS_NOT_SUPPORTED;
++   options->NumAllocations = open->NumAllocations;
++   options->PrivateDriverDataSize = open->PrivateDriverDataSize;
++   options->TotalBufferSize = 1;
++   return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS
+-openallocation(struct gdikmt_device *, struct gdikmt_openallocation *)
+-{
+-   return STATUS_NOT_SUPPORTED;
++openallocation(struct gdikmt_device *_device, struct gdikmt_openallocation *options)
++{
++   const D3DDDIARG_OPENRESOURCE *open = device_d3d9(_device)->pOpenResource;
++   if (!open)
++      return STATUS_NOT_SUPPORTED;
++   for (UINT i = 0; i < options->NumAllocations; i++)
++      options->pOpenAllocation[i] = open->pOpenAllocationInfo[i];
++   memcpy(options->pPrivateDriverData, open->pPrivateDriverData, open->PrivateDriverDataSize);
++   options->PrivateDriverDataSize = open->PrivateDriverDataSize;
++   return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS
+diff --git a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h
+--- a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h
++++ b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h
+@@ -23,6 +23,8 @@
+ 
+    /* Set while the driver creates a resource, so its allocations belong to the runtime's resource */
+    HANDLE hRTResource;
++   /* Set while the driver opens a shared resource: its allocations and private data */
++   const D3DDDIARG_OPENRESOURCE *pOpenResource;
+ };
+ 
+ /* What flush_frontbuffer passes as its drawable handle when presenting */
+diff --git a/src/gallium/frontends/d3d9umd/meson.build b/src/gallium/frontends/d3d9umd/meson.build
+--- a/src/gallium/frontends/d3d9umd/meson.build
++++ b/src/gallium/frontends/d3d9umd/meson.build
+@@ -14,6 +14,7 @@
+     'device.cpp',
+     'gdikmt_d3d9.cpp',
+     'pipeline.cpp',
++    'video.cpp',
+   ),
+   include_directories : [
+     inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_gallium_winsys, inc_winddk,
+diff --git a/src/gallium/frontends/d3d9umd/nine_bridge.c b/src/gallium/frontends/d3d9umd/nine_bridge.c
+--- a/src/gallium/frontends/d3d9umd/nine_bridge.c
++++ b/src/gallium/frontends/d3d9umd/nine_bridge.c
+@@ -17,6 +17,7 @@
+ #include "indexbuffer9.h"
+ #include "pixelshader9.h"
+ #include "query9.h"
++#include "stateblock9.h"
+ #include "vertexdeclaration9.h"
+ #include "vertexshader9.h"
+ #include "nine_memory_helper.h"
+@@ -28,7 +29,10 @@
+ #include "volume9.h"
+ #include "volumetexture9.h"
+ 
++#include "nine_video_shaders.h"
++
+ #include "pipe/p_screen.h"
++#include "frontend/winsys_handle.h"
+ #include "util/format/u_format.h"
+ #include "util/u_debug.h"
+ #include "util/u_memory.h"
+@@ -62,6 +66,14 @@
+    } memory_stream[NDDI_MAX_STREAMS];
+    const void *memory_indices;
+    uint32_t memory_index_size;
++
++   /* Video processing (DXVA2, StretchRect from YUV): the conversion shaders, made at first use, and an RGB
++    * render target texture the conversion draws into before the scaling StretchRect */
++   IDirect3DVertexShader9 *video_vs;
++   IDirect3DPixelShader9 *video_ps;
++   IDirect3DVertexDeclaration9 *video_decl;
++   struct NineTexture9 *video_tmp;
++   unsigned video_tmp_width, video_tmp_height;
+ };
+ 
+ struct nddi_object {
+@@ -72,10 +84,18 @@
+    struct nddi_device *dev;
+    enum nddi_resource_kind kind;
+    struct NineUnknown *obj;          /* the nine object, NULL for system memory resources */
++   struct NineSurface9 **surfaces;   /* surfaces/render targets/depth of more than one subresource (flip chains):
++                                      * one each, [0] is obj */
++   /* YUV video surfaces (YUY2, UYVY, NV12; DXVA2 and StretchRect sources): one texture per surface holding the
++    * bytes as they are (packed formats as A8R8G8B8 of half the width, NV12 as L8 with the chroma rows below) */
++   uint32_t video_fourcc;
++   unsigned video_width, video_height;
++   struct NineTexture9 **video_textures;
+    unsigned levels;
+    unsigned subresource_count;
+    struct NineSurface9 **sysmem;     /* system memory: one surface wrapping runtime memory per subresource */
+    struct NineVolume9 **sysmem_volumes; /* system memory volume textures: one volume per level */
++   void *sysmem_buffer;              /* system memory buffers: the runtime's memory */
+ };
+ 
+ static void
+@@ -197,6 +217,14 @@
+ {
+    if (!dev)
+       return;
++   if (dev->video_vs)
++      NineUnknown_Release((struct NineUnknown *)dev->video_vs);
++   if (dev->video_ps)
++      NineUnknown_Release((struct NineUnknown *)dev->video_ps);
++   if (dev->video_decl)
++      NineUnknown_Release((struct NineUnknown *)dev->video_decl);
++   if (dev->video_tmp)
++      NineUnknown_Release(NineUnknown(dev->video_tmp));
+    NineUnknown_Release(NineUnknown(dev->device));
+    FREE(dev);
+ }
+@@ -212,6 +240,8 @@
+    case NDDI_SURFACE:
+    case NDDI_RENDER_TARGET:
+    case NDDI_DEPTH_STENCIL:
++      if (res->surfaces)
++         return subresource < res->subresource_count ? res->surfaces[subresource] : NULL;
+       return subresource == 0 ? NineSurface9(res->obj) : NULL;
+    case NDDI_TEXTURE:
+       return subresource < res->levels ? NineTexture9(res->obj)->surfaces[subresource] : NULL;
+@@ -254,6 +284,7 @@
+          return hr;
+       NineBuffer9_SetExternalMemory(NineBuffer9(obj), desc->sysmem[0]);
+       res->obj = obj;
++      res->sysmem_buffer = desc->sysmem[0];
+       return D3D_OK;
+    }
+    if (desc->kind == NDDI_VOLUME_TEXTURE) {
+@@ -312,6 +343,85 @@
+    return D3D_OK;
+ }
+ 
++#define NDDI_FOURCC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
++#define NDDI_YUY2 NDDI_FOURCC('Y', 'U', 'Y', '2')
++#define NDDI_UYVY NDDI_FOURCC('U', 'Y', 'V', 'Y')
++#define NDDI_NV12 NDDI_FOURCC('N', 'V', '1', '2')
++
++bool
++nddi_format_is_video(uint32_t format)
++{
++   return format == NDDI_YUY2 || format == NDDI_UYVY || format == NDDI_NV12;
++}
++
++/* YUV surfaces: one dynamic (lockable) texture per surface, in a format the GPU has, with the same bytes per row as
++ * the YUV format: what the application writes through a lock is what the conversion shader reads */
++static int32_t
++nddi_create_video(struct nddi_device *dev, const struct nddi_resource_desc *desc, struct nddi_resource *res)
++{
++   unsigned count = MAX2(desc->surfaces, 1);
++   bool planar = desc->format == NDDI_NV12;
++   unsigned tw = planar ? desc->width : (desc->width + 1) / 2;
++   unsigned th = planar ? desc->height + (desc->height + 1) / 2 : desc->height;
++   D3DFORMAT tf = planar ? D3DFMT_L8 : D3DFMT_A8R8G8B8;
++
++   res->kind = NDDI_SURFACE;
++   res->video_fourcc = desc->format;
++   res->video_width = desc->width;
++   res->video_height = desc->height;
++   res->subresource_count = count;
++   res->video_textures = CALLOC(count, sizeof(*res->video_textures));
++   res->surfaces = CALLOC(count, sizeof(*res->surfaces));
++   if (!res->video_textures || !res->surfaces)
++      return E_OUTOFMEMORY;
++   for (unsigned i = 0; i < count; i++) {
++      IDirect3DTexture9 *tex = NULL;
++      HRESULT hr = NineDevice9_CreateTexture(dev->device, tw, th, 1, D3DUSAGE_DYNAMIC, tf, D3DPOOL_DEFAULT, &tex, NULL);
++      if (FAILED(hr))
++         return hr;
++      res->video_textures[i] = NineTexture9(tex);
++      res->surfaces[i] = res->video_textures[i]->surfaces[0];
++      NineUnknown_AddRef(NineUnknown(res->surfaces[i]));
++   }
++   res->obj = NineUnknown(res->video_textures[0]);
++   NineUnknown_AddRef(res->obj);
++   return D3D_OK;
++}
++
++/* The other surfaces of a surface resource of several (a full-screen flip chain: front and back buffers), made like
++ * the first */
++static int32_t
++nddi_create_more_surfaces(struct nddi_device *dev, const struct nddi_resource_desc *desc, struct nddi_resource *res)
++{
++   struct NineDevice9 *d = dev->device;
++   D3DFORMAT format = (D3DFORMAT)desc->format;
++   res->surfaces = CALLOC(desc->surfaces, sizeof(*res->surfaces));
++   if (!res->surfaces)
++      return E_OUTOFMEMORY;
++   res->subresource_count = desc->surfaces;
++   res->surfaces[0] = NineSurface9(res->obj);
++   NineUnknown_AddRef(res->obj);
++   for (unsigned i = 1; i < desc->surfaces; i++) {
++      HRESULT hr;
++      IDirect3DSurface9 *surf = NULL;
++      if (desc->kind == NDDI_SURFACE)
++         hr = NineDevice9_CreateOffscreenPlainSurface(d, desc->width, desc->height, format, D3DPOOL_DEFAULT, &surf,
++                                                      NULL);
++      else if (desc->kind == NDDI_RENDER_TARGET)
++         hr = NineDevice9_CreateRenderTarget(d, desc->width, desc->height, format,
++                                             (D3DMULTISAMPLE_TYPE)desc->multisample, desc->multisample_quality,
++                                             desc->lockable, &surf, NULL);
++      else
++         hr = NineDevice9_CreateDepthStencilSurface(d, desc->width, desc->height, format,
++                                                    (D3DMULTISAMPLE_TYPE)desc->multisample,
++                                                    desc->multisample_quality, FALSE, &surf, NULL);
++      if (FAILED(hr))
++         return hr;
++      res->surfaces[i] = NineSurface9(surf);
++   }
++   return D3D_OK;
++}
++
+ int32_t
+ nddi_resource_create(struct nddi_device *dev, const struct nddi_resource_desc *desc, struct nddi_resource **out)
+ {
+@@ -327,8 +437,12 @@
+    D3DFORMAT format = (D3DFORMAT)desc->format;
+    void *obj = NULL;
+    HRESULT hr;
++   /* Shared resources: allocations other devices can open */
++   d->winboat_extra_bind = desc->shared ? PIPE_BIND_SHARED : 0;
+    if (desc->system_memory) {
+       hr = nddi_create_sysmem(dev, desc, res);
++   } else if (nddi_format_is_video(desc->format)) {
++      hr = nddi_create_video(dev, desc, res);
+    } else {
+       switch (desc->kind) {
+       case NDDI_SURFACE:
+@@ -373,7 +487,84 @@
+          hr = D3DERR_INVALIDCALL;
+       }
+       res->obj = obj;
++      if (SUCCEEDED(hr) && desc->surfaces > 1 &&
++          (desc->kind == NDDI_SURFACE || desc->kind == NDDI_RENDER_TARGET || desc->kind == NDDI_DEPTH_STENCIL))
++         hr = nddi_create_more_surfaces(dev, desc, res);
++   }
++   d->winboat_extra_bind = 0;
++   if (FAILED(hr)) {
++      nddi_resource_destroy(res);
++      return hr;
++   }
++   *out = res;
++   return D3D_OK;
++}
++
++int32_t
++nddi_resource_open(struct nddi_device *dev, uint32_t km_handle, struct nddi_resource **out,
++                   struct nddi_opened_resource *info)
++{
++   struct NineDevice9 *d = dev->device;
++   struct pipe_screen *screen = d->screen;
++   struct winsys_handle whandle;
++   memset(&whandle, 0, sizeof(whandle));
++   whandle.type = WINSYS_HANDLE_TYPE_WIN32_HANDLE;
++   whandle.handle = (HANDLE)(uintptr_t)km_handle;
++   struct pipe_resource *pres = screen->resource_from_handle ?
++      screen->resource_from_handle(screen, NULL, &whandle, 0) : NULL;
++   if (!pres) {
++      _debug_printf("d3d9umd: opening shared resource 0x%x failed\n", km_handle);
++      return E_INVALIDARG;
++   }
++   D3DFORMAT format = pipe_to_d3d9_format(pres->format);
++   if (format == D3DFMT_UNKNOWN || pres->target != PIPE_TEXTURE_2D) {
++      _debug_printf("d3d9umd: shared resource of format %s, target %u: no D3D9 equivalent\n",
++                    util_format_name(pres->format), pres->target);
++      pipe_resource_reference(&pres, NULL);
++      return E_INVALIDARG;
+    }
++   struct nddi_resource *res = CALLOC_STRUCT(nddi_resource);
++   if (!res) {
++      pipe_resource_reference(&pres, NULL);
++      return E_OUTOFMEMORY;
++   }
++   res->dev = dev;
++   res->levels = pres->last_level + 1;
++   res->subresource_count = 1;
++   info->format = format;
++   info->width = pres->width0;
++   info->height = pres->height0;
++   info->levels = res->levels;
++   info->samples = pres->nr_samples > 1 ? pres->nr_samples : 0;
++
++   /* nine wraps it instead of allocating (NineResource9_ctor) */
++   void *obj = NULL;
++   HRESULT hr;
++   d->winboat_import = pres;
++   d->winboat_opening = true;
++   if (util_format_is_depth_or_stencil(pres->format)) {
++      res->kind = NDDI_DEPTH_STENCIL;
++      hr = NineDevice9_CreateDepthStencilSurface(d, pres->width0, pres->height0, format,
++                                                 (D3DMULTISAMPLE_TYPE)info->samples, 0, FALSE,
++                                                 (IDirect3DSurface9 **)&obj, NULL);
++   } else if ((pres->bind & PIPE_BIND_SAMPLER_VIEW) && pres->nr_samples <= 1) {
++      res->kind = NDDI_TEXTURE;
++      res->subresource_count = res->levels;
++      hr = NineDevice9_CreateTexture(d, pres->width0, pres->height0, res->levels,
++                                     (pres->bind & PIPE_BIND_RENDER_TARGET) ? D3DUSAGE_RENDERTARGET : 0, format,
++                                     D3DPOOL_DEFAULT, (IDirect3DTexture9 **)&obj, NULL);
++   } else {
++      res->kind = NDDI_RENDER_TARGET;
++      hr = NineDevice9_CreateRenderTarget(d, pres->width0, pres->height0, format,
++                                          (D3DMULTISAMPLE_TYPE)info->samples, 0, FALSE,
++                                          (IDirect3DSurface9 **)&obj, NULL);
++   }
++   /* not consumed when creation failed early */
++   d->winboat_import = NULL;
++   d->winboat_opening = false;
++   pipe_resource_reference(&pres, NULL);
++   res->obj = obj;
++   info->kind = res->kind;
+    if (FAILED(hr)) {
+       nddi_resource_destroy(res);
+       return hr;
+@@ -404,6 +595,20 @@
+       }
+       FREE(res->sysmem_volumes);
+    }
++   if (res->video_textures) {
++      for (unsigned i = 0; i < res->subresource_count; i++) {
++         if (res->video_textures[i])
++            NineUnknown_Release(NineUnknown(res->video_textures[i]));
++      }
++      FREE(res->video_textures);
++   }
++   if (res->surfaces) {
++      for (unsigned i = 0; i < res->subresource_count; i++) {
++         if (res->surfaces[i])
++            NineUnknown_Release(NineUnknown(res->surfaces[i]));
++      }
++      FREE(res->surfaces);
++   }
+    if (res->obj)
+       NineUnknown_Release(res->obj);
+    FREE(res);
+@@ -548,6 +753,277 @@
+    return D3D_OK;
+ }
+ 
++/* ---- Video processing (DXVA2 VideoProcessBlt, StretchRect from YUV surfaces) ---- */
++
++/* RGB = M * (Y, Cb, Cr) + offset for a transfer matrix (DXVA2: 1 BT.709, 2 BT.601, 3 SMPTE 240M, 0 unknown: by
++ * height) and nominal range (1 0-255, 2 16-235, 3 48-208) of the video; into studio range RGB if dest_range is 2 */
++static void
++nddi_video_matrix(uint32_t matrix, uint32_t range, uint32_t dest_range, unsigned height, float m[12])
++{
++   if (!matrix)
++      matrix = height > 576 ? 1 : 2;
++   float kr = 0.299f, kb = 0.114f;
++   if (matrix == 1) {
++      kr = 0.2126f;
++      kb = 0.0722f;
++   } else if (matrix == 3) {
++      kr = 0.212f;
++      kb = 0.087f;
++   }
++   float kg = 1.0f - kr - kb;
++   float ys = 255.0f / 219.0f, yo = -16.0f / 255.0f * ys, cs = 255.0f / 224.0f;
++   if (range == 1) {
++      ys = cs = 1.0f;
++      yo = 0.0f;
++   } else if (range == 3) {
++      ys = cs = 255.0f / 160.0f;
++      yo = -48.0f / 255.0f * ys;
++   }
++   float rv = 2.0f * (1.0f - kr) * cs, bu = 2.0f * (1.0f - kb) * cs;
++   float gu = -2.0f * kb * (1.0f - kb) / kg * cs, gv = -2.0f * kr * (1.0f - kr) / kg * cs;
++   float c = 128.0f / 255.0f;
++   const float rows[12] = {ys, 0.0f, rv, yo - rv * c, ys, gu, gv, yo - (gu + gv) * c, ys, bu, 0.0f, yo - bu * c};
++   for (unsigned i = 0; i < 12; i++)
++      m[i] = rows[i];
++   if (dest_range == 2) {
++      for (unsigned i = 0; i < 12; i++)
++         m[i] *= 219.0f / 255.0f;
++      m[3] += 16.0f / 255.0f;
++      m[7] += 16.0f / 255.0f;
++      m[11] += 16.0f / 255.0f;
++   }
++}
++
++static HRESULT
++nddi_video_shaders(struct nddi_device *dev)
++{
++   if (dev->video_ps)
++      return D3D_OK;
++   static const D3DVERTEXELEMENT9 decl[] = {
++      {0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
++      D3DDECL_END(),
++   };
++   HRESULT hr = D3D_OK;
++   if (!dev->video_decl)
++      hr = NineDevice9_CreateVertexDeclaration(dev->device, decl, &dev->video_decl);
++   if (SUCCEEDED(hr) && !dev->video_vs)
++      hr = NineDevice9_CreateVertexShader(dev->device, nddi_video_vs, &dev->video_vs);
++   if (SUCCEEDED(hr))
++      hr = NineDevice9_CreatePixelShader(dev->device, nddi_video_ps, &dev->video_ps);
++   return hr;
++}
++
++/* One video surface's rectangle to RGB: converted pixel for pixel into a render target texture (shader), then
++ * scaled into the destination rectangle (StretchRect, linear). field: the field to show (bob), or -1. The device
++ * state is the runtime's: everything changed here is put back. */
++static HRESULT
++nddi_video_convert(struct nddi_device *dev, struct nddi_resource *src, unsigned sub, const RECT *sr, int field,
++                   const float m[12], struct NineSurface9 *dst, const RECT *dr)
++{
++   struct NineDevice9 *d = dev->device;
++   if (!src->video_textures || sub >= src->subresource_count)
++      return D3DERR_INVALIDCALL;
++   unsigned w = sr->right - sr->left, h = sr->bottom - sr->top;
++   if (sr->right <= sr->left || sr->bottom <= sr->top || dr->right <= dr->left || dr->bottom <= dr->top)
++      return D3D_OK;
++   HRESULT hr = nddi_video_shaders(dev);
++   if (FAILED(hr))
++      return hr;
++   if (!dev->video_tmp || dev->video_tmp_width < w || dev->video_tmp_height < h) {
++      unsigned tw = MAX2(w, dev->video_tmp_width), th = MAX2(h, dev->video_tmp_height);
++      if (dev->video_tmp)
++         NineUnknown_Release(NineUnknown(dev->video_tmp));
++      dev->video_tmp = NULL;
++      IDirect3DTexture9 *t = NULL;
++      hr = NineDevice9_CreateTexture(d, tw, th, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &t, NULL);
++      if (FAILED(hr))
++         return hr;
++      dev->video_tmp = NineTexture9(t);
++      dev->video_tmp_width = tw;
++      dev->video_tmp_height = th;
++   }
++   struct NineSurface9 *tmp = dev->video_tmp->surfaces[0];
++
++   /* The runtime's state: a state block, and the render targets it doesn't cover */
++   IDirect3DStateBlock9 *sb = NULL;
++   hr = NineDevice9_CreateStateBlock(d, D3DSBT_ALL, &sb);
++   if (FAILED(hr))
++      return hr;
++   IDirect3DSurface9 *rts[NINE_MAX_SIMULTANEOUS_RENDERTARGETS] = {NULL}, *zs = NULL;
++   unsigned nrt = MIN2(d->caps.NumSimultaneousRTs, NINE_MAX_SIMULTANEOUS_RENDERTARGETS);
++   for (unsigned i = 0; i < nrt; i++)
++      NineDevice9_GetRenderTarget(d, i, &rts[i]);
++   NineDevice9_GetDepthStencilSurface(d, &zs);
++
++   NineDevice9_SetRenderTarget(d, 0, (IDirect3DSurface9 *)tmp);
++   for (unsigned i = 1; i < nrt; i++)
++      NineDevice9_SetRenderTarget(d, i, NULL);
++   NineDevice9_SetDepthStencilSurface(d, NULL);
++   D3DVIEWPORT9 vp = {0, 0, w, h, 0.0f, 1.0f};
++   NineDevice9_SetViewport(d, &vp);
++   static const struct {
++      D3DRENDERSTATETYPE state;
++      DWORD value;
++   } rs[] = {
++      {D3DRS_ZENABLE, D3DZB_FALSE}, {D3DRS_ZWRITEENABLE, FALSE}, {D3DRS_ALPHATESTENABLE, FALSE},
++      {D3DRS_ALPHABLENDENABLE, FALSE}, {D3DRS_SEPARATEALPHABLENDENABLE, FALSE}, {D3DRS_STENCILENABLE, FALSE},
++      {D3DRS_TWOSIDEDSTENCILMODE, FALSE}, {D3DRS_CULLMODE, D3DCULL_NONE}, {D3DRS_FILLMODE, D3DFILL_SOLID},
++      {D3DRS_SCISSORTESTENABLE, FALSE}, {D3DRS_COLORWRITEENABLE, 0xf}, {D3DRS_SRGBWRITEENABLE, FALSE},
++      {D3DRS_CLIPPLANEENABLE, 0}, {D3DRS_FOGENABLE, FALSE}, {D3DRS_MULTISAMPLEANTIALIAS, FALSE},
++   };
++   for (unsigned i = 0; i < ARRAY_SIZE(rs); i++)
++      NineDevice9_SetRenderState(d, rs[i].state, rs[i].value);
++   static const struct {
++      D3DSAMPLERSTATETYPE state;
++      DWORD value;
++   } ss[] = {
++      {D3DSAMP_MINFILTER, D3DTEXF_POINT}, {D3DSAMP_MAGFILTER, D3DTEXF_POINT}, {D3DSAMP_MIPFILTER, D3DTEXF_NONE},
++      {D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP}, {D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP}, {D3DSAMP_SRGBTEXTURE, FALSE},
++      {D3DSAMP_MAXMIPLEVEL, 0}, {D3DSAMP_MIPMAPLODBIAS, 0},
++   };
++   for (unsigned i = 0; i < ARRAY_SIZE(ss); i++)
++      NineDevice9_SetSamplerState(d, 0, ss[i].state, ss[i].value);
++   NineDevice9_SetVertexDeclaration(d, dev->video_decl);
++   NineDevice9_SetVertexShader(d, dev->video_vs);
++   NineDevice9_SetPixelShader(d, dev->video_ps);
++   struct NineTexture9 *tex = src->video_textures[sub];
++   NineDevice9_SetTexture(d, 0, (IDirect3DBaseTexture9 *)tex);
++   float kind = src->video_fourcc == NDDI_YUY2 ? 0.0f : src->video_fourcc == NDDI_UYVY ? 1.0f : 2.0f;
++   const float constants[20] = {
++      (float)src->video_width, (float)src->video_height,
++      1.0f / tex->surfaces[0]->desc.Width, 1.0f / tex->surfaces[0]->desc.Height,
++      m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
++      kind, (float)sr->left, (float)sr->top, (float)field,
++   };
++   NineDevice9_SetPixelShaderConstantF(d, 0, constants, 5);
++   static const float quad[16] = {-1, 1, 0, 1, 1, 1, 0, 1, -1, -1, 0, 1, 1, -1, 0, 1};
++   hr = NineDevice9_DrawPrimitiveUP(d, D3DPT_TRIANGLESTRIP, 2, quad, 4 * sizeof(float));
++
++   for (unsigned i = 0; i < nrt; i++) {
++      if (rts[i] || i > 0)
++         NineDevice9_SetRenderTarget(d, i, rts[i]);
++      if (rts[i])
++         NineUnknown_Release(NineUnknown(rts[i]));
++   }
++   NineDevice9_SetDepthStencilSurface(d, zs);
++   if (zs)
++      NineUnknown_Release(NineUnknown(zs));
++   NineStateBlock9_Apply(NineStateBlock9(sb));
++   NineUnknown_Release(NineUnknown(sb));
++
++   if (SUCCEEDED(hr)) {
++      RECT tr = {0, 0, (LONG)w, (LONG)h};
++      hr = NineDevice9_StretchRect(d, (IDirect3DSurface9 *)tmp, &tr, (IDirect3DSurface9 *)dst, dr, D3DTEXF_LINEAR);
++   }
++   return hr;
++}
++
++/* ColorFill on a YUV surface: the color as BT.601 studio range YCbCr, written through a lock */
++static HRESULT
++nddi_video_fill(struct nddi_resource *res, struct NineSurface9 *surf, const RECT *r, uint32_t color)
++{
++   float R = (color >> 16 & 0xff) / 255.0f, G = (color >> 8 & 0xff) / 255.0f, B = (color & 0xff) / 255.0f;
++   uint8_t y = (uint8_t)(16.0f + 65.481f * R + 128.553f * G + 24.966f * B + 0.5f);
++   uint8_t u = (uint8_t)(128.0f - 37.797f * R - 74.203f * G + 112.0f * B + 0.5f);
++   uint8_t v = (uint8_t)(128.0f + 112.0f * R - 93.786f * G - 18.214f * B + 0.5f);
++   unsigned x0 = MAX2(r->left, 0) & ~1u, x1 = MIN2((unsigned)MAX2(r->right, 0), res->video_width);
++   unsigned y0 = MAX2(r->top, 0), y1 = MIN2((unsigned)MAX2(r->bottom, 0), res->video_height);
++   if (x1 <= x0 || y1 <= y0)
++      return D3D_OK;
++   D3DLOCKED_RECT lr;
++   HRESULT hr = NineSurface9_LockRect(surf, &lr, NULL, 0);
++   if (FAILED(hr))
++      return hr;
++   uint8_t *base = (uint8_t *)lr.pBits;
++   if (res->video_fourcc == NDDI_NV12) {
++      for (unsigned row = y0; row < y1; row++)
++         memset(base + row * lr.Pitch + x0, y, x1 - x0);
++      for (unsigned row = y0 / 2; row < (y1 + 1) / 2; row++) {
++         uint8_t *p = base + (res->video_height + row) * lr.Pitch;
++         for (unsigned x = x0; x + 1 < x1 + 1; x += 2) {
++            p[x] = u;
++            p[x + 1] = v;
++         }
++      }
++   } else {
++      const uint8_t px[4] = {y, u, y, v}, uyvy[4] = {u, y, v, y};
++      const uint8_t *pattern = res->video_fourcc == NDDI_UYVY ? uyvy : px;
++      for (unsigned row = y0; row < y1; row++)
++         for (unsigned x = x0 / 2; x < (x1 + 1) / 2; x++)
++            memcpy(base + row * lr.Pitch + 4 * x, pattern, 4);
++   }
++   NineSurface9_UnlockRect(surf);
++   return D3D_OK;
++}
++
++int32_t
++nddi_video_blt(struct nddi_device *dev, struct nddi_resource *target, unsigned target_sub,
++               const struct nddi_rect *target_rect, const uint16_t background[3], uint32_t dest_range,
++               const struct nddi_video_sample *samples, unsigned count)
++{
++   struct NineSurface9 *dst = nddi_surface(target, target_sub);
++   if (!dst)
++      return D3DERR_INVALIDCALL;
++
++   /* The background (Y, Cb, Cr, studio range, as the first video's matrix) where no video goes */
++   float m[12];
++   nddi_video_matrix(count ? samples[0].matrix : 0, 2, dest_range,
++                     count && samples[0].src ? samples[0].src->video_height : 0, m);
++   float yuv[3] = {background[0] / 65535.0f, background[1] / 65535.0f, background[2] / 65535.0f};
++   uint32_t color = 0xff000000;
++   for (unsigned i = 0; i < 3; i++) {
++      float v = m[4 * i] * yuv[0] + m[4 * i + 1] * yuv[1] + m[4 * i + 2] * yuv[2] + m[4 * i + 3];
++      v = CLAMP(v, 0.0f, 1.0f);
++      color |= (uint32_t)(v * 255.0f + 0.5f) << (16 - 8 * i);
++   }
++   RECT tr = {target_rect->left, target_rect->top, target_rect->right, target_rect->bottom};
++   HRESULT hr = NineDevice9_ColorFill(dev->device, (IDirect3DSurface9 *)dst, &tr, color);
++
++   for (unsigned i = 0; i < count && SUCCEEDED(hr); i++) {
++      const struct nddi_video_sample *v = &samples[i];
++      RECT sr = {v->src_rect.left, v->src_rect.top, v->src_rect.right, v->src_rect.bottom};
++      RECT dr = {v->dst_rect.left, v->dst_rect.top, v->dst_rect.right, v->dst_rect.bottom};
++      if (!v->src->video_fourcc) {
++         /* RGB video: only scaling */
++         struct NineSurface9 *s = nddi_surface(v->src, v->src_sub);
++         if (!s)
++            return D3DERR_INVALIDCALL;
++         hr = NineDevice9_StretchRect(dev->device, (IDirect3DSurface9 *)s, &sr, (IDirect3DSurface9 *)dst, &dr,
++                                      D3DTEXF_LINEAR);
++         continue;
++      }
++      nddi_video_matrix(v->matrix, v->range, dest_range, v->src->video_height, m);
++      hr = nddi_video_convert(dev, v->src, v->src_sub, &sr, v->field, m, dst, &dr);
++   }
++   return hr;
++}
++
++/* Whole video surfaces between system memory and the GPU (UpdateSurface, readback): the bytes as they are */
++static HRESULT
++nddi_video_copy(struct NineSurface9 *s, struct nddi_resource *src, struct NineSurface9 *d, struct nddi_resource *dst)
++{
++   struct nddi_resource *video = src->video_fourcc ? src : dst;
++   struct NineSurface9 *packed = src->video_fourcc ? s : d;
++   unsigned rows = packed->desc.Height;
++   unsigned row_bytes = util_format_get_stride(packed->base.info.format, packed->desc.Width);
++   if (video->video_fourcc == NDDI_NV12)
++      row_bytes = video->video_width;
++   D3DLOCKED_RECT ls, ld;
++   HRESULT hr = NineSurface9_LockRect(s, &ls, NULL, D3DLOCK_READONLY);
++   if (FAILED(hr))
++      return hr;
++   hr = NineSurface9_LockRect(d, &ld, NULL, 0);
++   if (FAILED(hr)) {
++      NineSurface9_UnlockRect(s);
++      return hr;
++   }
++   for (unsigned y = 0; y < rows; y++)
++      memcpy((uint8_t *)ld.pBits + y * ld.Pitch, (const uint8_t *)ls.pBits + y * ls.Pitch, row_bytes);
++   NineSurface9_UnlockRect(d);
++   NineSurface9_UnlockRect(s);
++   return D3D_OK;
++}
++
+ int32_t
+ nddi_blt(struct nddi_device *dev, struct nddi_resource *src, unsigned src_sub, const struct nddi_rect *src_rect,
+          struct nddi_resource *dst, unsigned dst_sub, const struct nddi_rect *dst_rect, uint32_t filter)
+@@ -557,6 +1033,20 @@
+       return D3DERR_INVALIDCALL;
+    RECT sr = {src_rect->left, src_rect->top, src_rect->right, src_rect->bottom};
+    RECT dr = {dst_rect->left, dst_rect->top, dst_rect->right, dst_rect->bottom};
++   if (src->video_fourcc || dst->video_fourcc) {
++      /* YUV to RGB (StretchRect, CheckDeviceFormatConversion); YUV to YUV and to/from system memory: whole
++       * surfaces of one format */
++      if (src->video_fourcc && !dst->video_fourcc && d->desc.Pool != D3DPOOL_SYSTEMMEM) {
++         float m[12];
++         nddi_video_matrix(0, 2, 1, src->video_height, m);
++         return nddi_video_convert(dev, src, src_sub, &sr, -1, m, d, &dr);
++      }
++      uint32_t sf = src->video_fourcc ? src->video_fourcc : (uint32_t)s->desc.Format;
++      uint32_t df = dst->video_fourcc ? dst->video_fourcc : (uint32_t)d->desc.Format;
++      if (sf != df)
++         return D3DERR_INVALIDCALL;
++      return nddi_video_copy(s, src, d, dst);
++   }
+    bool src_sys = s->desc.Pool == D3DPOOL_SYSTEMMEM, dst_sys = d->desc.Pool == D3DPOOL_SYSTEMMEM;
+    bool same_size = sr.right - sr.left == dr.right - dr.left && sr.bottom - sr.top == dr.bottom - dr.top;
+ 
+@@ -615,6 +1105,44 @@
+ }
+ 
+ int32_t
++nddi_buffer_copy(struct nddi_device *dev, struct nddi_resource *src, uint32_t src_offset, uint32_t size,
++                 struct nddi_resource *dst, uint32_t dst_offset)
++{
++   bool src_buffer = src->kind == NDDI_VERTEX_BUFFER || src->kind == NDDI_INDEX_BUFFER;
++   bool dst_buffer = dst->kind == NDDI_VERTEX_BUFFER || dst->kind == NDDI_INDEX_BUFFER;
++   if (!src_buffer || !dst_buffer || !dst->obj || !src->obj)
++      return D3DERR_INVALIDCALL;
++   struct NineBuffer9 *d = NineBuffer9(dst->obj), *s = NineBuffer9(src->obj);
++   if (dst->sysmem_buffer) {
++      /* Into system memory: through nine's lock of the source (reads it back) */
++      void *data;
++      HRESULT hr = NineBuffer9_Lock(s, src_offset, size, &data, D3DLOCK_READONLY);
++      if (FAILED(hr))
++         return hr;
++      memcpy((uint8_t *)dst->sysmem_buffer + dst_offset, data, size);
++      NineBuffer9_Unlock(s);
++      return D3D_OK;
++   }
++   /* Into a video memory buffer: written through nine's lock, which keeps its own bookkeeping right */
++   void *to;
++   HRESULT hr = NineBuffer9_Lock(d, dst_offset, size, &to, 0);
++   if (FAILED(hr))
++      return hr;
++   if (src->sysmem_buffer) {
++      memcpy(to, (const uint8_t *)src->sysmem_buffer + src_offset, size);
++   } else {
++      void *from;
++      hr = NineBuffer9_Lock(s, src_offset, size, &from, D3DLOCK_READONLY);
++      if (SUCCEEDED(hr)) {
++         memcpy(to, from, size);
++         NineBuffer9_Unlock(s);
++      }
++   }
++   NineBuffer9_Unlock(d);
++   return hr;
++}
++
++int32_t
+ nddi_color_fill(struct nddi_device *dev, struct nddi_resource *res, unsigned subresource, const struct nddi_rect *rect,
+                 uint32_t color)
+ {
+@@ -622,6 +1150,8 @@
+    if (!surf)
+       return D3DERR_INVALIDCALL;
+    RECT r = {rect->left, rect->top, rect->right, rect->bottom};
++   if (res->video_fourcc)
++      return nddi_video_fill(res, surf, &r, color);
+    return NineDevice9_ColorFill(dev->device, (IDirect3DSurface9 *)surf, &r, color);
+ }
+ 
+@@ -693,6 +1223,70 @@
+    return nine_context_get_pipe(dev->device);
+ }
+ 
++/* DepthFill: a depth surface's rectangle set to a depth in the format's own units (D32F: float bits) */
++int32_t
++nddi_depth_fill(struct nddi_device *dev, struct nddi_resource *res, unsigned subresource, const struct nddi_rect *rect,
++                uint32_t depth)
++{
++   struct NineSurface9 *surf = nddi_surface(res, subresource);
++   if (!surf || !util_format_has_depth(util_format_description(surf->base.info.format)))
++      return D3DERR_INVALIDCALL;
++   enum pipe_format format = surf->base.info.format;
++   double z;
++   if (util_format_is_float(format) || format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT) {
++      float f;
++      memcpy(&f, &depth, sizeof(f));
++      z = f;
++   } else {
++      unsigned bits = util_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_ZS, 0);
++      if (!bits)
++         bits = util_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_ZS, 1);
++      z = bits >= 32 ? depth / 4294967295.0 : depth / (double)((1u << bits) - 1);
++   }
++   struct pipe_surface *ps = NineSurface9_GetSurface(surf, 0);
++   if (!ps)
++      return D3DERR_INVALIDCALL;
++   int x = MAX2(rect->left, 0), y = MAX2(rect->top, 0);
++   int w = MIN2(rect->right, (int)surf->desc.Width) - x, h = MIN2(rect->bottom, (int)surf->desc.Height) - y;
++   if (w <= 0 || h <= 0)
++      return D3D_OK;
++   struct pipe_context *pipe = nine_context_get_pipe_acquire(dev->device);
++   pipe->clear_depth_stencil(pipe, ps, PIPE_CLEAR_DEPTH, CLAMP(z, 0.0, 1.0), 0, x, y, w, h, false);
++   nine_context_get_pipe_release(dev->device);
++   return D3D_OK;
++}
++
++/* UpdateSubresourceUP: application memory into a box of a subresource */
++int32_t
++nddi_update_subresource(struct nddi_resource *res, unsigned subresource, const struct nddi_box *box,
++                        const void *data, uint32_t row_pitch, uint32_t depth_pitch)
++{
++   void *map = NULL;
++   uint32_t pitch = 0, slice_pitch = 0;
++   HRESULT hr = nddi_resource_lock(res, subresource, box, 0, &map, &pitch, &slice_pitch);
++   if (FAILED(hr))
++      return hr;
++   if (res->kind == NDDI_VERTEX_BUFFER || res->kind == NDDI_INDEX_BUFFER) {
++      memcpy(map, data, box->right - box->left);
++   } else {
++      enum pipe_format format;
++      if (res->kind == NDDI_VOLUME_TEXTURE) {
++         struct NineVolume9 *vol = nddi_volume(res, subresource);
++         format = vol->info.format;
++      } else {
++         format = nddi_surface(res, subresource)->base.info.format;
++      }
++      unsigned rows = util_format_get_nblocksy(format, box->bottom - box->top);
++      unsigned row_bytes = util_format_get_stride(format, box->right - box->left);
++      unsigned depth = MAX2(box->back - box->front, 1);
++      for (unsigned z = 0; z < depth; z++)
++         for (unsigned y = 0; y < rows; y++)
++            memcpy((uint8_t *)map + z * slice_pitch + y * pitch,
++                   (const uint8_t *)data + z * depth_pitch + y * row_pitch, row_bytes);
++   }
++   return nddi_resource_unlock(res, subresource);
++}
++
+ /* ---- Vertex and index data ---- */
+ 
+ int32_t
+@@ -854,7 +1448,8 @@
+ {
+    if (!obj)
+       return;
+-   NineUnknown_Release(obj->obj);
++   if (obj->obj)
++      NineUnknown_Release(obj->obj);
+    FREE(obj);
+ }
+ 
+@@ -1004,26 +1599,48 @@
+ int32_t
+ nddi_create_query(struct nddi_device *dev, uint32_t type, struct nddi_object **out)
+ {
++   /* The vertex cache query (nine has none): an object without a nine query, answered with the cache below */
++   if (type == D3DQUERYTYPE_VCACHE) {
++      *out = CALLOC_STRUCT(nddi_object);
++      return *out ? D3D_OK : E_OUTOFMEMORY;
++   }
+    void *query = NULL;
+    HRESULT hr = NineDevice9_CreateQuery(dev->device, (D3DQUERYTYPE)type, (IDirect3DQuery9 **)&query);
+    return wrap_object(hr, query, out);
+ }
+ 
++/* What mesh optimizers (D3DXOptimizeMesh, ...) tune vertex order for: a vertex cache of 16 entries */
++void
++nddi_vcache_info(void *data, uint32_t size)
++{
++   D3DDEVINFO_VCACHE vc = {MAKEFOURCC('C', 'A', 'C', 'H'), 1, 16, 7};
++   memcpy(data, &vc, MIN2(size, sizeof(vc)));
++}
++
+ int32_t
+ nddi_issue_query(struct nddi_object *query, uint32_t flags)
+ {
++   if (!query->obj)
++      return D3D_OK;
+    return NineQuery9_Issue((struct NineQuery9 *)query->obj, flags);
+ }
+ 
+ int32_t
+ nddi_get_query_data(struct nddi_object *query, void *data, uint32_t size)
+ {
++   if (!query->obj) {
++      if (data)
++         nddi_vcache_info(data, size);
++      return D3D_OK;
++   }
+    return NineQuery9_GetData((struct NineQuery9 *)query->obj, data, size, D3DGETDATA_FLUSH);
+ }
+ 
+ uint32_t
+ nddi_get_query_data_size(struct nddi_object *query)
+ {
++   if (!query->obj)
++      return sizeof(D3DDEVINFO_VCACHE);
+    return NineQuery9_GetDataSize((struct NineQuery9 *)query->obj);
+ }
+ 
+diff --git a/src/gallium/frontends/d3d9umd/nine_video_shaders.h b/src/gallium/frontends/d3d9umd/nine_video_shaders.h
+new file mode 100644
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/nine_video_shaders.h
+@@ -0,0 +1,110 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * Video processing shaders (Direct3D 9 shader model 3 bytecode, comments stripped), compiled from:
++ *
++ *   // d3d9umd video processing: YUV (packed YUY2/UYVY in an A8R8G8B8 texture of half width, NV12 in an L8 texture of
++ *   // 1.5x height) to RGB, one output pixel per video pixel (the scaling is a StretchRect after it)
++ *   sampler2D tex : register(s0);
++ *   float4 info : register(c0);   // x: video width, y: video height, z: 1 / texture width, w: 1 / texture height
++ *   float4 mrow0 : register(c1);  // RGB = M * (Y, U, V) + offset, all 0..1
++ *   float4 mrow1 : register(c2);
++ *   float4 mrow2 : register(c3);
++ *   float4 kind : register(c4);   // x: 0 YUY2, 1 UYVY, 2 NV12, 3 RGB; y, z: source rectangle origin; w: field (bob) or -1
++ *
++ *   float4 vs_main(float4 p : POSITION) : POSITION { return p; }
++ *
++ *   float4 ps_main(float2 vpos : VPOS) : COLOR
++ *   {
++ *      float2 px = floor(vpos) + kind.yz;
++ *      if (kind.w >= 0)
++ *         px.y = min(floor(px.y * 0.5) * 2 + kind.w, info.y - 1);
++ *      float3 yuv;
++ *      if (kind.x < 1.5) {
++ *         float4 c = tex2Dlod(tex, float4((floor(px.x * 0.5) + 0.5) * info.z, (px.y + 0.5) * info.w, 0, 0));
++ *         bool odd = frac(px.x * 0.5) > 0.25;
++ *         if (kind.x < 0.5)
++ *            yuv = float3(odd ? c.r : c.b, c.g, c.a);
++ *         else
++ *            yuv = float3(odd ? c.a : c.g, c.b, c.r);
++ *      } else if (kind.x < 2.5) {
++ *         float y = tex2Dlod(tex, float4((px.x + 0.5) * info.z, (px.y + 0.5) * info.w, 0, 0)).r;
++ *         float ux = floor(px.x * 0.5) * 2;
++ *         float uy = info.y + floor(px.y * 0.5);
++ *         float u = tex2Dlod(tex, float4((ux + 0.5) * info.z, (uy + 0.5) * info.w, 0, 0)).r;
++ *         float v = tex2Dlod(tex, float4((ux + 1.5) * info.z, (uy + 0.5) * info.w, 0, 0)).r;
++ *         yuv = float3(y, u, v);
++ *      } else {
++ *         return float4(tex2Dlod(tex, float4((px.x + 0.5) * info.z, (px.y + 0.5) * info.w, 0, 0)).rgb, 1);
++ *      }
++ *      return float4(saturate(float3(dot(mrow0.xyz, yuv) + mrow0.w, dot(mrow1.xyz, yuv) + mrow1.w,
++ *                                    dot(mrow2.xyz, yuv) + mrow2.w)), 1);
++ *   }
++ *
++ * with D3DCompile (vs_main/vs_3_0, ps_main/ps_3_0).
++ */
++
++#ifndef NINE_VIDEO_SHADERS_H
++#define NINE_VIDEO_SHADERS_H
++
++static const DWORD nddi_video_vs[] = {
++   0xfffe0300, 0x0200001f, 0x80000000, 0x900f0000, 0x0200001f, 0x80000000,
++   0xe00f0000, 0x02000001, 0xe00f0000, 0x90e40000, 0x0000ffff,
++};
++
++static const DWORD nddi_video_ps[] = {
++   0xffff0300, 0x05000051, 0xa00f0005, 0x3f000000, 0x40000000, 0xbf800000,
++   0x3fc00000, 0x05000051, 0xa00f0006, 0x00000000, 0x3e800000, 0xc0200000,
++   0x3f800000, 0x0200001f, 0x80000000, 0x90031000, 0x0200001f, 0x90000000,
++   0xa00f0800, 0x02000013, 0x80030000, 0x90e41000, 0x03000002, 0x80030000,
++   0x81e40000, 0x90e41000, 0x03000002, 0x80030000, 0x80e40000, 0xa0e90004,
++   0x03000005, 0x80040000, 0x80550000, 0xa0000005, 0x02000013, 0x80080000,
++   0x80aa0000, 0x03000002, 0x80040000, 0x81ff0000, 0x80aa0000, 0x02000001,
++   0x800f0001, 0xa0e40005, 0x04000004, 0x80040000, 0x80aa0000, 0x80550001,
++   0xa0ff0004, 0x03000002, 0x80080000, 0x80aa0001, 0xa0550000, 0x0300000a,
++   0x80020001, 0x80ff0000, 0x80aa0000, 0x04000058, 0x80020000, 0xa0ff0004,
++   0x80550001, 0x80550000, 0x02040029, 0xa0000004, 0x80ff0001, 0x03000005,
++   0x80040000, 0x80000000, 0xa0000005, 0x02000013, 0x80080000, 0x80aa0000,
++   0x03000002, 0x80040000, 0x81ff0000, 0x80aa0000, 0x03000002, 0x80040000,
++   0x80aa0000, 0xa0000005, 0x03000005, 0x80010002, 0x80aa0000, 0xa0aa0000,
++   0x03000002, 0x80040000, 0x80550000, 0xa0000005, 0x03000005, 0x80020002,
++   0x80aa0000, 0xa0ff0000, 0x02000001, 0x800c0002, 0xa0000006, 0x0300005f,
++   0x800f0002, 0x80e40002, 0xa0e40800, 0x03000002, 0x80040000, 0x81ff0000,
++   0xa0550006, 0x03000002, 0x80080000, 0x81000001, 0xa0000004, 0x04000058,
++   0x80030001, 0x80aa0000, 0x80e60002, 0x80ec0002, 0x02000001, 0x800c0001,
++   0x80240002, 0x02000001, 0x80010003, 0x80000001, 0x02000001, 0x80060003,
++   0x80f40002, 0x04000058, 0x80070001, 0x80ff0000, 0x80f90001, 0x80e40003,
++   0x02000001, 0x800f0002, 0xa0000006, 0x02000001, 0x80040000, 0xa0000006,
++   0x0000002a, 0x02000001, 0x80040003, 0xa0aa0006, 0x03000002, 0x80080000,
++   0x80aa0003, 0xa0000004, 0x04000058, 0x80040000, 0x80ff0000, 0xa0ff0006,
++   0xa0000006, 0x02040029, 0xa0000004, 0x81aa0003, 0x03000002, 0x80080000,
++   0x80000000, 0xa0000005, 0x03000005, 0x80010003, 0x80ff0000, 0xa0aa0000,
++   0x03000002, 0x80080000, 0x80550000, 0xa0000005, 0x03000005, 0x80020003,
++   0x80ff0000, 0xa0ff0000, 0x02000001, 0x800c0003, 0xa0000006, 0x0300005f,
++   0x800f0001, 0x80e40003, 0xa0e40800, 0x03000005, 0x80080000, 0x80000000,
++   0xa0000005, 0x02000013, 0x80080001, 0x80ff0000, 0x03000002, 0x80080000,
++   0x80ff0000, 0x81ff0001, 0x03000005, 0x80080001, 0x80550000, 0xa0000005,
++   0x02000013, 0x80010003, 0x80ff0001, 0x03000002, 0x80080001, 0x80ff0001,
++   0x81000003, 0x03000002, 0x80080001, 0x80ff0001, 0xa0550000, 0x04000004,
++   0x80030003, 0x80ff0000, 0xa0550005, 0xa0ec0005, 0x03000005, 0x80030003,
++   0x80e40003, 0xa0aa0000, 0x03000002, 0x80080000, 0x80ff0001, 0xa0000005,
++   0x03000005, 0x80040003, 0x80ff0000, 0xa0ff0000, 0x02000001, 0x80080003,
++   0xa0000006, 0x0300005f, 0x800f0004, 0x80f80003, 0xa0e40800, 0x0300005f,
++   0x800f0003, 0x80f90003, 0xa0e40800, 0x02000001, 0x800f0002, 0xa0000006,
++   0x02000001, 0x80020001, 0x80000004, 0x02000001, 0x80040001, 0x80000003,
++   0x0000002a, 0x03000002, 0x80010000, 0x80000000, 0xa0000005, 0x03000005,
++   0x80010003, 0x80000000, 0xa0aa0000, 0x03000002, 0x80010000, 0x80550000,
++   0xa0000005, 0x03000005, 0x80020003, 0x80000000, 0xa0ff0000, 0x02000001,
++   0x800c0003, 0xa0000006, 0x0300005f, 0x800f0003, 0x80e40003, 0xa0e40800,
++   0x04000004, 0x800f0002, 0x80240003, 0xa03f0006, 0xa0c00006, 0x02000001,
++   0x80070001, 0xa0000006, 0x0000002b, 0x0000002b, 0x03000008, 0x80010000,
++   0xa0e40001, 0x80e40001, 0x03000002, 0x80110003, 0x80000000, 0xa0ff0001,
++   0x03000008, 0x80010000, 0xa0e40002, 0x80e40001, 0x03000002, 0x80120003,
++   0x80000000, 0xa0ff0002, 0x03000008, 0x80010000, 0xa0e40003, 0x80e40001,
++   0x03000002, 0x80140003, 0x80000000, 0xa0ff0003, 0x02000001, 0x80080003,
++   0xa1aa0005, 0x04000058, 0x800f0800, 0x81aa0000, 0x80e40003, 0x80e40002,
++   0x0000ffff,
++};
++
++#endif
+diff --git a/src/gallium/frontends/d3d9umd/pipeline.cpp b/src/gallium/frontends/d3d9umd/pipeline.cpp
+--- a/src/gallium/frontends/d3d9umd/pipeline.cpp
++++ b/src/gallium/frontends/d3d9umd/pipeline.cpp
+@@ -362,6 +362,40 @@
+    return hr;
+ }
+ 
++/* The Windows 8 interface's copies: the same with copy flags (D3DDDI_COPY_NO_OVERWRITE/DISCARD, hints here) */
++static HRESULT APIENTRY
++TexBlt1(HANDLE hDevice, const D3DDDIARG_TEXBLT1 *p)
++{
++   D3DDDIARG_TEXBLT b = {p->hDstResource, p->hSrcResource, p->CubeMapFace, p->DstPoint, p->SrcRect};
++   return TexBlt(hDevice, &b);
++}
++
++static HRESULT APIENTRY
++VolBlt1(HANDLE hDevice, const D3DDDIARG_VOLUMEBLT1 *p)
++{
++   D3DDDIARG_VOLUMEBLT b = {p->hDstResource, p->hSrcResource, p->DstX, p->DstY, p->DstZ, p->SrcBox};
++   return VolBlt(hDevice, &b);
++}
++
++/* UpdateTexture-like copies between buffers (the managed pool's copies, for one) */
++static HRESULT APIENTRY
++BufBlt(HANDLE hDevice, const D3DDDIARG_BUFFERBLT *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource), *dst = D3D9UmdCastResource(p->hDstResource);
++   HRESULT hr = nddi_buffer_copy(dev->nine, src->nine, p->SrcRange.Offset, p->SrcRange.Size, dst->nine, p->Offset);
++   D3D9UMD_TRACE("BufBlt %p+%u -> %p+%u, %u bytes -> 0x%08lx", src, p->SrcRange.Offset, dst, p->Offset,
++                 p->SrcRange.Size, hr);
++   return hr;
++}
++
++static HRESULT APIENTRY
++BufBlt1(HANDLE hDevice, const D3DDDIARG_BUFFERBLT1 *p)
++{
++   D3DDDIARG_BUFFERBLT b = {p->hDstResource, p->hSrcResource, p->Offset, p->SrcRange};
++   return BufBlt(hDevice, &b);
++}
++
+ /* ---- Fixed function ---- */
+ 
+ /* The DDI may name the world matrices with their pre-D3D9 numbers */
+@@ -430,6 +464,14 @@
+    return nddi_set_clip_plane(D3D9UmdCastDevice(hDevice)->nine, p->Index, p->Plane);
+ }
+ 
++/* The projection's W range, for W-buffering: not offered (no D3DPRASTERCAPS_WBUFFER), but the runtime reports it
++ * whenever the projection changes */
++static HRESULT APIENTRY
++UpdateWInfo(HANDLE hDevice, const D3DDDIARG_WINFO *p)
++{
++   return S_OK;
++}
++
+ static HRESULT APIENTRY
+ ValidateDevice(HANDLE hDevice, D3DDDIARG_VALIDATETEXTURESTAGESTATE *p)
+ {
+@@ -449,6 +491,16 @@
+    return hr;
+ }
+ 
++/* Device info the runtime asks for (the VCACHE query of Direct3D 8 and 9) */
++static HRESULT APIENTRY
++GetInfo(HANDLE hDevice, UINT DevInfoID, VOID *pDevInfoStruct, UINT DevInfoSize)
++{
++   if (DevInfoID != D3DDDIDEVINFOID_VCACHE || !pDevInfoStruct)
++      return E_FAIL;
++   nddi_vcache_info(pDevInfoStruct, DevInfoSize);
++   return S_OK;
++}
++
+ static HRESULT APIENTRY
+ DestroyQuery(HANDLE hDevice, const HANDLE hQuery)
+ {
+@@ -511,6 +563,10 @@
+    f->pfnGenerateMipSubLevels = GenerateMipSubLevels;
+    f->pfnTexBlt = TexBlt;
+    f->pfnVolBlt = VolBlt;
++   f->pfnTexBlt1 = TexBlt1;
++   f->pfnVolBlt1 = VolBlt1;
++   f->pfnBufBlt = BufBlt;
++   f->pfnBufBlt1 = BufBlt1;
+    f->pfnSetTransform = SetTransform;
+    f->pfnMultiplyTransform = MultiplyTransform;
+    f->pfnSetMaterial = SetMaterial;
+@@ -519,7 +575,9 @@
+    f->pfnDestroyLight = DestroyLight;
+    f->pfnSetClipPlane = SetClipPlane;
+    f->pfnValidateDevice = ValidateDevice;
++   f->pfnUpdateWInfo = UpdateWInfo;
+    f->pfnCreateQuery = CreateQuery;
++   f->pfnGetInfo = GetInfo;
+    f->pfnDestroyQuery = DestroyQuery;
+    f->pfnIssueQuery = IssueQuery;
+    f->pfnGetQueryData = GetQueryData;
+diff --git a/src/gallium/frontends/d3d9umd/video.cpp b/src/gallium/frontends/d3d9umd/video.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/video.cpp
+@@ -0,0 +1,242 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * DXVA2 video processing (what Windows' video renderer EVR, and players through DXVA2, use): the video processor
++ * caps and the VideoProcess* entry points. The work (YUV to RGB, scaling) is nddi_video_blt's.
++ *
++ * Two processors: progressive (frames as they are) and bob (one field of interlaced video, line-doubled). Input
++ * formats YUY2, UYVY, NV12 and RGB; output X8R8G8B8/A8R8G8B8; no substreams, no ProcAmp or filters.
++ */
++
++#include "d3d9umd.h"
++
++#include <new>
++#include <string.h>
++
++/* DXVADDI_VideoProcProgressiveDevice and DXVADDI_VideoProcBobDevice (d3dumddi.h only declares them) */
++static const GUID progressiveDevice = {0x5a54a0c9, 0xc7ec, 0x4bd9, {0x8e, 0xde, 0xf3, 0xc7, 0x5d, 0xc4, 0x39, 0x3b}};
++static const GUID bobDevice = {0x335aa36e, 0x7884, 0x43a4, {0x9c, 0x91, 0x7f, 0x87, 0xfa, 0xf3, 0xe3, 0x7e}};
++static const GUID *const videoProcessors[] = {&progressiveDevice, &bobDevice};
++static const D3DDDIFORMAT videoTargetFormats[] = {D3DDDIFMT_X8R8G8B8, D3DDDIFMT_A8R8G8B8};
++
++struct D3D9UmdVideoProcess {
++   bool bob;
++   D3D9UmdResource *target;
++   UINT targetSub;
++};
++
++static bool
++IsVideoInput(D3DDDIFORMAT f)
++{
++   return nddi_format_is_video((uint32_t)f) || f == D3DDDIFMT_X8R8G8B8 || f == D3DDDIFMT_A8R8G8B8;
++}
++
++static bool
++IsVideoProcessor(const GUID *g)
++{
++   return g && (*g == progressiveDevice || *g == bobDevice);
++}
++
++template <typename T>
++static HRESULT
++PutValue(const D3DDDIARG_GETCAPS *p, const T &value)
++{
++   if (!p->pData || p->DataSize < sizeof(T))
++      return E_INVALIDARG;
++   memcpy(p->pData, &value, sizeof(T));
++   return S_OK;
++}
++
++static DXVADDI_FIXED32
++Fixed(int value, unsigned fraction = 0)
++{
++   DXVADDI_FIXED32 f;
++   f.Value = (SHORT)value;
++   f.Fraction = (USHORT)fraction;
++   return f;
++}
++
++bool
++D3D9UmdVideoGetCaps(const D3DDDIARG_GETCAPS *p, HRESULT *hr)
++{
++   switch (p->Type) {
++   case D3DDDICAPS_GETVIDEOPROCESSORDEVICEGUIDCOUNT: {
++      const DXVADDI_VIDEODESC *desc = (const DXVADDI_VIDEODESC *)p->pInfo;
++      *hr = PutValue(p, (UINT)(desc && IsVideoInput(desc->Format) ? ARRAY_SIZE(videoProcessors) : 0));
++      return true;
++   }
++   case D3DDDICAPS_GETVIDEOPROCESSORDEVICEGUIDS: {
++      const DXVADDI_VIDEODESC *desc = (const DXVADDI_VIDEODESC *)p->pInfo;
++      if (!desc || !IsVideoInput(desc->Format) || !p->pData ||
++          p->DataSize < ARRAY_SIZE(videoProcessors) * sizeof(GUID)) {
++         *hr = E_INVALIDARG;
++         return true;
++      }
++      for (unsigned i = 0; i < ARRAY_SIZE(videoProcessors); i++)
++         ((GUID *)p->pData)[i] = *videoProcessors[i];
++      *hr = S_OK;
++      return true;
++   }
++   case D3DDDICAPS_GETVIDEOPROCESSORRTFORMATCOUNT: {
++      const DXVADDI_VIDEOPROCESSORINPUT *in = (const DXVADDI_VIDEOPROCESSORINPUT *)p->pInfo;
++      bool ok = in && IsVideoProcessor(in->pVideoProcGuid) && IsVideoInput(in->VideoDesc.Format);
++      *hr = PutValue(p, (UINT)(ok ? ARRAY_SIZE(videoTargetFormats) : 0));
++      return true;
++   }
++   case D3DDDICAPS_GETVIDEOPROCESSORRTFORMATS:
++      if (!p->pData || p->DataSize < sizeof(videoTargetFormats)) {
++         *hr = E_INVALIDARG;
++         return true;
++      }
++      memcpy(p->pData, videoTargetFormats, sizeof(videoTargetFormats));
++      *hr = S_OK;
++      return true;
++   case D3DDDICAPS_GETVIDEOPROCESSORRTSUBSTREAMFORMATCOUNT:
++      *hr = PutValue(p, (UINT)0);
++      return true;
++   case D3DDDICAPS_GETVIDEOPROCESSORRTSUBSTREAMFORMATS:
++      *hr = S_OK;
++      return true;
++   case D3DDDICAPS_GETVIDEOPROCESSORCAPS: {
++      const DXVADDI_VIDEOPROCESSORINPUT *in = (const DXVADDI_VIDEOPROCESSORINPUT *)p->pInfo;
++      if (!in || !IsVideoProcessor(in->pVideoProcGuid)) {
++         *hr = E_INVALIDARG;
++         return true;
++      }
++      DXVADDI_VIDEOPROCESSORCAPS caps;
++      memset(&caps, 0, sizeof(caps));
++      caps.InputPool = D3DDDIPOOL_VIDEOMEMORY;
++      caps.OutputFormat = D3DDDIFMT_X8R8G8B8;
++      caps.DeinterlaceTechnology =
++         *in->pVideoProcGuid == bobDevice ? DXVADDI_DEINTERLACETECH_BOBLINEREPLICATE : 0;
++      caps.VideoProcessorOperations = DXVADDI_VIDEOPROCESS_YUV2RGB | DXVADDI_VIDEOPROCESS_YUV2RGBEXTENDED |
++                                      DXVADDI_VIDEOPROCESS_STRETCHX | DXVADDI_VIDEOPROCESS_STRETCHY |
++                                      DXVADDI_VIDEOPROCESS_SUBRECTS;
++      *hr = PutValue(p, caps);
++      return true;
++   }
++   case D3DDDICAPS_GETPROCAMPRANGE: {
++      /* No ProcAmp controls are offered (ProcAmpControlCaps 0); the usual ranges for callers that ask anyway */
++      const DXVADDI_QUERYPROCAMPINPUT *in = (const DXVADDI_QUERYPROCAMPINPUT *)p->pInfo;
++      DXVADDI_VALUERANGE range;
++      memset(&range, 0, sizeof(range));
++      UINT cap = in ? in->ProcAmpCap : 0;
++      if (cap == DXVADDI_PROCAMP_BRIGHTNESS) {
++         range.MinValue = Fixed(-100);
++         range.MaxValue = Fixed(100);
++         range.DefaultValue = Fixed(0);
++         range.StepSize = Fixed(1);
++      } else if (cap == DXVADDI_PROCAMP_HUE) {
++         range.MinValue = Fixed(-180);
++         range.MaxValue = Fixed(180);
++         range.DefaultValue = Fixed(0);
++         range.StepSize = Fixed(1);
++      } else {
++         range.MinValue = Fixed(0);
++         range.MaxValue = Fixed(10);
++         range.DefaultValue = Fixed(1);
++         range.StepSize = Fixed(0, 0x028f); /* 0.01 */
++      }
++      *hr = PutValue(p, range);
++      return true;
++   }
++   case D3DDDICAPS_FILTERPROPERTYRANGE:
++      *hr = E_INVALIDARG;
++      return true;
++   default:
++      return false;
++   }
++}
++
++static HRESULT APIENTRY
++CreateVideoProcessDevice(HANDLE hDevice, D3DDDIARG_CREATEVIDEOPROCESSDEVICE *p)
++{
++   D3D9UMD_TRACE("CreateVideoProcessDevice format 0x%x %ux%u -> RT format %u", p->VideoDesc.Format,
++                 p->VideoDesc.SampleWidth, p->VideoDesc.SampleHeight, p->RenderTargetFormat);
++   if (!IsVideoProcessor(p->pVideoProcGuid) || !IsVideoInput(p->VideoDesc.Format))
++      return E_INVALIDARG;
++   D3D9UmdVideoProcess *vp = new (std::nothrow) D3D9UmdVideoProcess();
++   if (!vp)
++      return E_OUTOFMEMORY;
++   vp->bob = *p->pVideoProcGuid == bobDevice;
++   p->hVideoProcess = vp;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++DestroyVideoProcessDevice(HANDLE hDevice, HANDLE hVideoProcess)
++{
++   delete (D3D9UmdVideoProcess *)hVideoProcess;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++VideoProcessBeginFrame(HANDLE hDevice, HANDLE hVideoProcess)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++VideoProcessEndFrame(HANDLE hDevice, D3DDDIARG_VIDEOPROCESSENDFRAME *p)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++SetVideoProcessRenderTarget(HANDLE hDevice, const D3DDDIARG_SETVIDEOPROCESSRENDERTARGET *p)
++{
++   D3D9UmdVideoProcess *vp = (D3D9UmdVideoProcess *)p->hVideoProcess;
++   vp->target = D3D9UmdCastResource(p->hRenderTarget);
++   vp->targetSub = p->SubResourceIndex;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++VideoProcessBlt(HANDLE hDevice, const D3DDDIARG_VIDEOPROCESSBLT *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdVideoProcess *vp = (D3D9UmdVideoProcess *)p->hVideoProcess;
++   if (!vp || !vp->target)
++      return E_INVALIDARG;
++   nddi_video_sample samples[8];
++   UINT count = MIN2(p->NumSrcSurfaces, (UINT)ARRAY_SIZE(samples));
++   for (UINT i = 0; i < count; i++) {
++      const DXVADDI_VIDEOSAMPLE &s = p->pSrcSurfaces[i];
++      nddi_video_sample &v = samples[i];
++      v.src = D3D9UmdCastResource(s.SrcResource)->nine;
++      v.src_sub = s.SrcSubResourceIndex;
++      v.src_rect = {s.SrcRect.left, s.SrcRect.top, s.SrcRect.right, s.SrcRect.bottom};
++      v.dst_rect = {s.DstRect.left, s.DstRect.top, s.DstRect.right, s.DstRect.bottom};
++      v.matrix = s.SampleFormat.VideoTransferMatrix;
++      v.range = s.SampleFormat.NominalRange;
++      /* Bob: the first field in the first half of the frame's time, the second after */
++      v.field = -1;
++      UINT sf = s.SampleFormat.SampleFormat;
++      if (vp->bob && (sf == DXVADDI_SampleFieldInterleavedEvenFirst || sf == DXVADDI_SampleFieldInterleavedOddFirst)) {
++         bool second = p->TargetFrame >= s.Start + (s.End - s.Start) / 2;
++         int first = sf == DXVADDI_SampleFieldInterleavedEvenFirst ? 0 : 1;
++         v.field = second ? 1 - first : first;
++      }
++   }
++   const uint16_t background[3] = {p->BackgroundColor.Y, p->BackgroundColor.Cb, p->BackgroundColor.Cr};
++   nddi_rect target = {p->TargetRect.left, p->TargetRect.top, p->TargetRect.right, p->TargetRect.bottom};
++   HRESULT hr = nddi_video_blt(dev->nine, vp->target->nine, vp->targetSub, &target, background,
++                               p->DestFormat.NominalRange, samples, count);
++   D3D9UMD_TRACE("VideoProcessBlt %u sample(s) -> %p[%u] -> 0x%08lx", p->NumSrcSurfaces, vp->target, vp->targetSub,
++                 hr);
++   return hr;
++}
++
++void
++D3D9UmdFillVideoFuncs(D3DDDI_DEVICEFUNCS *f)
++{
++   f->pfnCreateVideoProcessDevice = CreateVideoProcessDevice;
++   f->pfnDestroyVideoProcessDevice = DestroyVideoProcessDevice;
++   f->pfnVideoProcessBeginFrame = VideoProcessBeginFrame;
++   f->pfnVideoProcessEndFrame = VideoProcessEndFrame;
++   f->pfnSetVideoProcessRenderTarget = SetVideoProcessRenderTarget;
++   f->pfnVideoProcessBlt = VideoProcessBlt;
++}
+diff --git a/src/gallium/targets/d3d9umd/meson.build b/src/gallium/targets/d3d9umd/meson.build
+--- a/src/gallium/targets/d3d9umd/meson.build
++++ b/src/gallium/targets/d3d9umd/meson.build
+@@ -15,8 +15,24 @@
+   _d3d9umd_link_args += ['/MAP']
+ endif
+ 
++
++# The DLL's version resource (the driver package's version: the runtime reports it to applications)
++_winboat_version = get_option('winboat-driver-version')
++_umd_rc = configure_file(
++  input : '../winboat_umd_version.rc.in',
++  output : '@0@_version.rc'.format(get_option('gallium-d3d9-dll-name')),
++  configuration : {
++    'VERSION' : _winboat_version,
++    'VERSION_COMMAS' : _winboat_version.replace('.', ','),
++    'DESCRIPTION' : 'Direct3D 9 user-mode driver',
++    'FILENAME' : get_option('gallium-d3d9-dll-name'),
++  },
++)
++_umd_res = cc.get_argument_syntax() == 'msvc' ? import('windows').compile_resources(_umd_rc) : []
++
+ libgallium_d3d9 = shared_library(
+   get_option('gallium-d3d9-dll-name'),
++  _umd_res,
+   vs_module_defs : libgallium_d3d9_def,
+   link_args : _d3d9umd_link_args,
+   link_whole : [libd3d9umd, libd3d9umd_nine],
+diff --git a/src/gallium/targets/winboat_umd_version.rc.in b/src/gallium/targets/winboat_umd_version.rc.in
+new file mode 100644
+--- /dev/null
++++ b/src/gallium/targets/winboat_umd_version.rc.in
+@@ -0,0 +1,35 @@
++// Copyright 2026 WinBoat contributors
++// SPDX-License-Identifier: MIT
++//
++// The version of WinBoat's user-mode drivers (meson option winboat-driver-version, the driver package's version):
++// the Direct3D runtimes report it to applications (IDirect3D9::GetAdapterIdentifier's DriverVersion)
++
++#include <winver.h>
++
++VS_VERSION_INFO VERSIONINFO
++ FILEVERSION @VERSION_COMMAS@
++ PRODUCTVERSION @VERSION_COMMAS@
++ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
++ FILEFLAGS 0
++ FILEOS VOS_NT_WINDOWS32
++ FILETYPE VFT_DRV
++ FILESUBTYPE VFT2_DRV_DISPLAY
++BEGIN
++  BLOCK "StringFileInfo"
++  BEGIN
++    BLOCK "040904b0"
++    BEGIN
++      VALUE "CompanyName", "WinBoat contributors (Mesa)"
++      VALUE "FileDescription", "@DESCRIPTION@"
++      VALUE "FileVersion", "@VERSION@"
++      VALUE "InternalName", "@FILENAME@"
++      VALUE "OriginalFilename", "@FILENAME@.dll"
++      VALUE "ProductName", "WinBoat virtio-gpu 3D driver"
++      VALUE "ProductVersion", "@VERSION@"
++    END
++  END
++  BLOCK "VarFileInfo"
++  BEGIN
++    VALUE "Translation", 0x409, 1200
++  END
++END

@@ -1,0 +1,2225 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: compute shaders and unordered access views (feature level 11_0, stage 2)
+
+- Compute shaders: thread group size, the thread IDs (vThreadID as group * size + in group), group shared memory
+  (every g# region in TGSI's one shared block, its size the compute state's), sync as MEMBAR + BARRIER.
+  CreateComputeShader, CsSet*, Dispatch and DispatchIndirect; a memory barrier after each dispatch and after draws
+  whose pixel shader writes UAVs (D3D orders UAV writes before later work, GL needs barriers).
+- UAVs: typed ones are TGSI images, raw and structured ones TGSI buffers (byte addresses; structured: index *
+  stride + offset), as are raw and structured shader resource views; loads, stores, atomics with and without the
+  old value, append/consume through a hidden counter buffer per UAV (initial counts, CopyStructureCount),
+  bufinfo/resinfo, UAV clears (uint bits per channel, float converted; buffers filled: virgl has no buffer
+  clears). Pixel shader UAVs from SetRenderTargets.
+- What a shader uses is bound at draw/dispatch time (Shader_bindings: textures, images, buffers).
+- Typed UAV images get the bound view's format: virglrenderer declares format-less (store-only) images rgba32f,
+  a format mismatch with any other format, so shaders are translated again for the bound formats (a few variants
+  kept per shader). UAVs are coherent where the shader has UAV barriers (GLSL makes other invocations' writes
+  visible to coherent accesses only).
+- Resources: the structured stride from the 11 creation arguments; UAV textures carry a sampler view bind
+  (virgl passes no image bind and virglrenderer refuses textures without one), buffers a shader buffer bind.
+- Fixes found on the way, also for D3D10:
+  - integer negate modifiers (iadd r0, -r1, l(3)) became float negations in virglrenderer: INEG now.
+  - read maps of 3D textures read each slice separately: virglrenderer reads back only a box's first slice.
+- The parser takes zero-component operands of shader model 5 (UAVs, group shared memory, streams).
+---
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -213,7 +213,7 @@
+    switch (pData->Type) {
+    case D3D11DDICAPS_SHADER: {
+       /* The runtime refuses feature level 11_0 without compute (and raw/structured buffers) in shader model 4.x
+-       * too. XXX development: compute shaders are stage 2 of feature level 11_0; only with the switch below. */
++       * too. Reported with feature level 11_0, so for now only with the development switch below. */
+       char fl11[4] = "";
+       if (pData->DataSize >= sizeof(D3D11DDI_SHADER_CAPS) &&
+           GetEnvironmentVariableA("WINBOAT_D3D_FL11", fl11, sizeof fl11) && fl11[0] == '1') {
+diff --git a/src/gallium/frontends/d3d10umd/Compute.cpp b/src/gallium/frontends/d3d10umd/Compute.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/Compute.cpp
+@@ -0,0 +1,336 @@
++/*
++ * Compute.cpp --
++ *    Feature level 11: unordered access views, compute dispatches, UAV clears and counters.
++ *
++ *    Typed UAVs are images, raw and structured ones shader buffers (byte ranges); append/consume and counter
++ *    UAVs get a 4-byte counter buffer. The shaders bind them through Shader_bindings (ShaderBindStage). D3D
++ *    orders UAV writes before later work implicitly, GL needs barriers: after every dispatch, and after draws
++ *    whose pixel shader writes UAVs.
++ */
++
++#include "Compute.h"
++#include "Shader.h"
++#include "State.h"
++#include "Format.h"
++
++#include "Debug.h"
++
++#include "util/format/u_format.h"
++#include "util/u_inlines.h"
++#include "util/u_memory.h"
++
++#include <cstdlib>
++
++
++SIZE_T APIENTRY
++CalcPrivateUnorderedAccessViewSize(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *pView)
++{
++   return sizeof(UnorderedAccessView);
++}
++
++
++void APIENTRY
++CreateUnorderedAccessView(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *pView,
++                          D3D11DDI_HUNORDEREDACCESSVIEW hView, D3D11DDI_HRTUNORDEREDACCESSVIEW hRTView)
++{
++   LOG_ENTRYPOINT();
++
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   UnorderedAccessView *uav = CastUnorderedAccessView(hView);
++   Resource *res = CastResource(pView->hDrvResource);
++
++   memset(uav, 0, sizeof *uav);
++   uav->resource = res;
++
++   if (pView->ResourceDimension == D3D10DDIRESOURCE_BUFFER) {
++      bool raw = pView->Buffer.Flags & D3D11_DDI_BUFFER_UAV_FLAG_RAW;
++      if (raw || pView->Format == DXGI_FORMAT_UNKNOWN) {
++         /* raw: 4-byte elements; structured: the buffer's stride */
++         unsigned elem = raw ? 4 : res->ByteStride;
++         uav->buffer.buffer_offset = pView->Buffer.FirstElement * elem;
++         uav->buffer.buffer_size = pView->Buffer.NumElements * elem;
++      } else {
++         uav->typed = true;
++         uav->image.format = FormatTranslate(pView->Format, false);
++         unsigned elem = util_format_get_blocksize(uav->image.format);
++         uav->image.u.buf.offset = pView->Buffer.FirstElement * elem;
++         uav->image.u.buf.size = pView->Buffer.NumElements * elem;
++      }
++      if (pView->Buffer.Flags & (D3D11_DDI_BUFFER_UAV_FLAG_APPEND | D3D11_DDI_BUFFER_UAV_FLAG_COUNTER)) {
++         static const uint32_t zero = 0;
++         uav->counter = pipe_buffer_create(pipe->screen, PIPE_BIND_SHADER_BUFFER, PIPE_USAGE_DEFAULT, 4);
++         if (uav->counter) {
++            pipe->buffer_subdata(pipe, uav->counter, PIPE_MAP_WRITE, 0, 4, &zero);
++         }
++      }
++   } else {
++      uav->typed = true;
++      uav->image.format = FormatTranslate(pView->Format, false);
++      switch (pView->ResourceDimension) {
++      case D3D10DDIRESOURCE_TEXTURE1D:
++         uav->image.u.tex.level = pView->Tex1D.MipSlice;
++         uav->image.u.tex.first_layer = pView->Tex1D.FirstArraySlice;
++         uav->image.u.tex.last_layer = pView->Tex1D.FirstArraySlice + pView->Tex1D.ArraySize - 1;
++         break;
++      case D3D10DDIRESOURCE_TEXTURE2D:
++         uav->image.u.tex.level = pView->Tex2D.MipSlice;
++         uav->image.u.tex.first_layer = pView->Tex2D.FirstArraySlice;
++         uav->image.u.tex.last_layer = pView->Tex2D.FirstArraySlice + pView->Tex2D.ArraySize - 1;
++         break;
++      case D3D10DDIRESOURCE_TEXTURE3D:
++         uav->image.u.tex.level = pView->Tex3D.MipSlice;
++         uav->image.u.tex.first_layer = pView->Tex3D.FirstW;
++         uav->image.u.tex.last_layer = pView->Tex3D.FirstW + pView->Tex3D.WSize - 1;
++         break;
++      default:
++         LOG_UNSUPPORTED(true);
++         break;
++      }
++   }
++   if (uav->typed && res->resource->target != PIPE_BUFFER) {
++      /* sizes of ~0 mean all layers or slices (and the bitfields are 16 bits): clamp to the resource's */
++      const struct pipe_resource *pr = res->resource;
++      unsigned layers = pr->target == PIPE_TEXTURE_3D ? u_minify(pr->depth0, uav->image.u.tex.level) :
++                        pr->array_size;
++      unsigned first = MIN2(uav->image.u.tex.first_layer, layers - 1);
++      uint64_t last = pView->ResourceDimension == D3D10DDIRESOURCE_TEXTURE3D ?
++                      (uint64_t)pView->Tex3D.FirstW + pView->Tex3D.WSize - 1 :
++                      pView->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D ?
++                      (uint64_t)pView->Tex2D.FirstArraySlice + pView->Tex2D.ArraySize - 1 :
++                      (uint64_t)pView->Tex1D.FirstArraySlice + pView->Tex1D.ArraySize - 1;
++      uav->image.u.tex.first_layer = first;
++      uav->image.u.tex.last_layer = (unsigned)MIN2(last, (uint64_t)layers - 1);
++   }
++   uav->image.resource = res->resource;
++   uav->image.access = PIPE_IMAGE_ACCESS_READ_WRITE;
++   uav->image.shader_access = PIPE_IMAGE_ACCESS_READ_WRITE;
++   uav->buffer.buffer = res->resource;
++}
++
++
++void APIENTRY
++DestroyUnorderedAccessView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hView)
++{
++   LOG_ENTRYPOINT();
++
++   Device *pDevice = CastDevice(hDevice);
++   UnorderedAccessView *uav = CastUnorderedAccessView(hView);
++
++   for (unsigned s = 0; s < PIPE_SHADER_TYPES; s++) {
++      for (unsigned i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++) {
++         if (pDevice->uavs[s][i] == uav) {
++            pDevice->uavs[s][i] = NULL;
++            pDevice->bindings_dirty[s] = true;
++         }
++      }
++   }
++   pipe_resource_reference(&uav->counter, NULL);
++}
++
++
++/* Binds UAVs of a stage: slots Start.. (the rest of [RangeStart, RangeStart + RangeSize) unbound), counters set
++ * to the initial counts unless ~0 */
++void
++SetUnorderedAccessViews(Device *pDevice, enum pipe_shader_type type, UINT RangeStart, UINT RangeSize, UINT Start,
++                        UINT NumViews, const D3D11DDI_HUNORDEREDACCESSVIEW *phViews, const UINT *pInitialCounts)
++{
++   struct pipe_context *pipe = pDevice->pipe;
++
++   for (UINT i = RangeStart; i < RangeStart + RangeSize && i < D3D11_1_UAV_SLOT_COUNT; i++) {
++      pDevice->uavs[type][i] = NULL;
++   }
++   for (UINT i = 0; i < NumViews && Start + i < D3D11_1_UAV_SLOT_COUNT; i++) {
++      UnorderedAccessView *uav = CastUnorderedAccessView(phViews[i]);
++      pDevice->uavs[type][Start + i] = uav;
++      if (uav && uav->counter && pInitialCounts && pInitialCounts[i] != ~0u) {
++         pipe->buffer_subdata(pipe, uav->counter, PIPE_MAP_WRITE, 0, 4, &pInitialCounts[i]);
++      }
++   }
++   pDevice->bindings_dirty[type] = true;
++}
++
++
++void APIENTRY
++CsSetUnorderedAccessViews(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumViews,
++                          const D3D11DDI_HUNORDEREDACCESSVIEW *phViews, const UINT *pInitialCounts)
++{
++   LOG_ENTRYPOINT();
++
++   SetUnorderedAccessViews(CastDevice(hDevice), PIPE_SHADER_COMPUTE, StartSlot, NumViews, StartSlot, NumViews,
++                           phViews, pInitialCounts);
++}
++
++
++static void
++LaunchGrid(Device *pDevice, const UINT grid[3], struct pipe_resource *indirect, UINT indirect_offset)
++{
++   struct pipe_context *pipe = pDevice->pipe;
++   const Shader *shader = pDevice->bound_shader[PIPE_SHADER_COMPUTE];
++   struct pipe_grid_info info;
++
++   if (!shader || !shader->handle) {
++      return;
++   }
++   ShaderBindStage(pDevice, PIPE_SHADER_COMPUTE);
++
++   memset(&info, 0, sizeof info);
++   for (unsigned i = 0; i < 3; i++) {
++      info.block[i] = MAX2(shader->bindings.block[i], 1);
++      info.grid[i] = grid ? grid[i] : 1;
++      info.last_block[i] = 0;
++   }
++   info.indirect = indirect;
++   info.indirect_offset = indirect_offset;
++   if (!indirect && (!info.grid[0] || !info.grid[1] || !info.grid[2])) {
++      return;
++   }
++   pipe->launch_grid(pipe, &info);
++   pipe->memory_barrier(pipe, PIPE_BARRIER_ALL);
++}
++
++
++void APIENTRY
++Dispatch(D3D10DDI_HDEVICE hDevice, UINT X, UINT Y, UINT Z)
++{
++   LOG_ENTRYPOINT();
++
++   const UINT grid[3] = {X, Y, Z};
++   LaunchGrid(CastDevice(hDevice), grid, NULL, 0);
++}
++
++
++void APIENTRY
++DispatchIndirect(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hBuffer, UINT AlignedByteOffset)
++{
++   LOG_ENTRYPOINT();
++
++   LaunchGrid(CastDevice(hDevice), NULL, CastPipeResource(hBuffer), AlignedByteOffset);
++}
++
++
++/* Fills a buffer range with a repeated pattern (virgl has no buffer clears) */
++static void
++FillBuffer(struct pipe_context *pipe, struct pipe_resource *res, unsigned offset, unsigned size,
++           const void *pattern, unsigned pattern_size)
++{
++   if (!size || !pattern_size) {
++      return;
++   }
++   char *data = (char *)malloc(size);
++   if (!data) {
++      return;
++   }
++   for (unsigned i = 0; i < size; i += pattern_size) {
++      memcpy(data + i, pattern, MIN2(pattern_size, size - i));
++   }
++   pipe->buffer_subdata(pipe, res, PIPE_MAP_WRITE, offset, size, data);
++  free(data);
++}
++
++
++/* A typed UAV's clear value in its format: Uint clears put each value's low bits into the channels as they are,
++ * Float clears convert */
++static void
++PackClearValue(enum pipe_format format, const void *values, bool is_float, uint8_t packed[16])
++{
++   const struct util_format_description *desc = util_format_description(format);
++
++   memset(packed, 0, 16);
++   if (is_float || util_format_is_pure_integer(format)) {
++      util_format_pack_rgba(format, packed, values, 1);
++      return;
++   }
++   /* bits into the channels */
++   const uint32_t *v = (const uint32_t *)values;
++   uint64_t bits = 0;
++   for (unsigned c = 0; c < desc->nr_channels; c++) {
++      unsigned size = desc->channel[c].size;
++      for (unsigned j = 0; j < 4; j++) {
++         if (desc->swizzle[j] == c && size && size <= 32) {
++            uint64_t mask = size == 32 ? 0xffffffffull : ((1ull << size) - 1);
++            bits |= ((uint64_t)v[j] & mask) << desc->channel[c].shift;
++            break;
++         }
++      }
++   }
++   if (desc->block.bits <= 64) {
++      memcpy(packed, &bits, desc->block.bits / 8);
++   } else {
++      memcpy(packed, v, MIN2(desc->block.bits / 8, 16));
++   }
++}
++
++
++static void
++ClearUnorderedAccessView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hView, const void *values,
++                         bool is_float)
++{
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   UnorderedAccessView *uav = CastUnorderedAccessView(hView);
++   struct pipe_resource *res = uav->resource->resource;
++
++   if (!uav->typed) {
++      /* raw and structured: every dword gets the first value (as bits for float clears) */
++      uint32_t v;
++      memcpy(&v, values, 4);
++      FillBuffer(pipe, res, uav->buffer.buffer_offset, uav->buffer.buffer_size, &v, 4);
++      return;
++   }
++
++   uint8_t packed[16];
++   PackClearValue(uav->image.format, values, is_float, packed);
++   if (res->target == PIPE_BUFFER) {
++      FillBuffer(pipe, res, uav->image.u.buf.offset, uav->image.u.buf.size, packed,
++                 util_format_get_blocksize(uav->image.format));
++      return;
++   }
++   struct pipe_box box;
++   unsigned level = uav->image.u.tex.level;
++   u_box_3d(0, 0, uav->image.u.tex.first_layer, u_minify(res->width0, level),
++            res->target == PIPE_TEXTURE_1D || res->target == PIPE_TEXTURE_1D_ARRAY ? 1 : u_minify(res->height0, level),
++            uav->image.u.tex.last_layer - uav->image.u.tex.first_layer + 1, &box);
++   if (res->target == PIPE_TEXTURE_1D_ARRAY) {
++      box.y = uav->image.u.tex.first_layer;
++      box.height = box.depth;
++      box.z = 0;
++      box.depth = 1;
++   }
++   pipe->clear_texture(pipe, res, level, &box, packed);
++}
++
++
++void APIENTRY
++ClearUnorderedAccessViewUint(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hView, const UINT values[4])
++{
++   LOG_ENTRYPOINT();
++
++   ClearUnorderedAccessView(hDevice, hView, values, false);
++}
++
++
++void APIENTRY
++ClearUnorderedAccessViewFloat(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hView, const FLOAT values[4])
++{
++   LOG_ENTRYPOINT();
++
++   ClearUnorderedAccessView(hDevice, hView, values, true);
++}
++
++
++void APIENTRY
++CopyStructureCount(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDstBuffer, UINT DstAlignedByteOffset,
++                   D3D11DDI_HUNORDEREDACCESSVIEW hSrcView)
++{
++   LOG_ENTRYPOINT();
++
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   UnorderedAccessView *uav = CastUnorderedAccessView(hSrcView);
++   struct pipe_box box;
++
++   if (!uav || !uav->counter) {
++      return;
++   }
++   u_box_1d(0, 4, &box);
++   pipe->resource_copy_region(pipe, CastPipeResource(hDstBuffer), 0, DstAlignedByteOffset, 0, 0, uav->counter, 0,
++                              &box);
++}
+diff --git a/src/gallium/frontends/d3d10umd/Compute.h b/src/gallium/frontends/d3d10umd/Compute.h
+new file mode 100644
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/Compute.h
+@@ -0,0 +1,47 @@
++/*
++ * Compute.h --
++ *    Feature level 11: unordered access views, compute dispatches, UAV clears and counters.
++ */
++
++#ifndef COMPUTE_H
++#define COMPUTE_H
++
++#include "DriverIncludes.h"
++
++struct Device;
++
++SIZE_T APIENTRY
++CalcPrivateUnorderedAccessViewSize(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *pView);
++
++void APIENTRY
++CreateUnorderedAccessView(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *pView,
++                          D3D11DDI_HUNORDEREDACCESSVIEW hView, D3D11DDI_HRTUNORDEREDACCESSVIEW hRTView);
++
++void APIENTRY
++DestroyUnorderedAccessView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hView);
++
++void
++SetUnorderedAccessViews(Device *pDevice, enum pipe_shader_type type, UINT RangeStart, UINT RangeSize, UINT Start,
++                        UINT NumViews, const D3D11DDI_HUNORDEREDACCESSVIEW *phViews, const UINT *pInitialCounts);
++
++void APIENTRY
++CsSetUnorderedAccessViews(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumViews,
++                          const D3D11DDI_HUNORDEREDACCESSVIEW *phViews, const UINT *pInitialCounts);
++
++void APIENTRY
++Dispatch(D3D10DDI_HDEVICE hDevice, UINT X, UINT Y, UINT Z);
++
++void APIENTRY
++DispatchIndirect(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hBuffer, UINT AlignedByteOffset);
++
++void APIENTRY
++ClearUnorderedAccessViewUint(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hView, const UINT values[4]);
++
++void APIENTRY
++ClearUnorderedAccessViewFloat(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hView, const FLOAT values[4]);
++
++void APIENTRY
++CopyStructureCount(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDstBuffer, UINT DstAlignedByteOffset,
++                   D3D11DDI_HUNORDEREDACCESSVIEW hSrcView);
++
++#endif /* COMPUTE_H */
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "D3D11_1.h"
++#include "Compute.h"
+ 
+ #include "DxgiFns.h"
+ #include "OutputMerger.h"
+@@ -93,6 +94,13 @@
+ }
+ 
+ static void APIENTRY
++CsSetConstantBuffers1(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers,
++                      const UINT *pFirstConstant, const UINT *pNumConstants)
++{
++   SetConstantBuffers1(PIPE_SHADER_COMPUTE, hDevice, StartSlot, NumBuffers, phBuffers, pFirstConstant, pNumConstants);
++}
++
++static void APIENTRY
+ PsSetConstantBuffers1(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers,
+                       const UINT *pFirstConstant, const UINT *pNumConstants)
+ {
+@@ -158,6 +166,8 @@
+ {
+    funcs10.pfnCreateResource(hDevice, reinterpret_cast<const D3D10DDIARG_CREATERESOURCE *>(pCreateResource),
+                              hResource, hRTResource);
++   /* structured buffers' views count in elements of this size */
++   CastResource(hResource)->ByteStride = pCreateResource->ByteStride;
+ }
+ 
+ 
+@@ -174,6 +184,32 @@
+ CreateShaderResourceView11(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *pView,
+                            D3D10DDI_HSHADERRESOURCEVIEW hView, D3D10DDI_HRTSHADERRESOURCEVIEW hRTView)
+ {
++   bool bufferex = pView->ResourceDimension == D3D11DDIRESOURCE_BUFFEREX;
++   bool raw = bufferex && (pView->BufferEx.Flags & D3D11_DDI_BUFFEREX_SRV_FLAG_RAW);
++   bool structured = (bufferex || pView->ResourceDimension == D3D10DDIRESOURCE_BUFFER) &&
++                     pView->Format == DXGI_FORMAT_UNKNOWN;
++
++   if (raw || structured) {
++      /* shader buffers (ShaderBindStage): raw views in dwords, structured ones in the buffer's elements */
++      ShaderResourceView *v = CastShaderResourceView(hView);
++      Resource *res = CastResource(pView->hDrvResource);
++      unsigned elem = raw ? 4 : res->ByteStride;
++      memset(v, 0, sizeof *v);
++      v->resource = res;
++      v->buffer_offset = pView->BufferEx.FirstElement * elem;
++      v->buffer_size = pView->BufferEx.NumElements * elem;
++      return;
++   }
++   if (bufferex) {
++      /* a typed buffer view: as in 10.1 */
++      D3D11DDIARG_CREATESHADERRESOURCEVIEW view = *pView;
++      view.ResourceDimension = D3D10DDIRESOURCE_BUFFER;
++      view.Buffer.FirstElement = pView->BufferEx.FirstElement;
++      view.Buffer.NumElements = pView->BufferEx.NumElements;
++      CreateShaderResourceView1(hDevice, reinterpret_cast<const D3D10_1DDIARG_CREATESHADERRESOURCEVIEW *>(&view),
++                                hView, hRTView);
++      return;
++   }
+    CreateShaderResourceView1(hDevice, reinterpret_cast<const D3D10_1DDIARG_CREATESHADERRESOURCEVIEW *>(pView), hView,
+                              hRTView);
+ }
+@@ -212,6 +248,9 @@
+                    UINT UAVStartSlot, UINT NumUAVs, UINT UAVRangeStart, UINT UAVRangeSize)
+ {
+    funcs10.pfnSetRenderTargets(hDevice, phRenderTargetView, NumRTVs, ClearSlots, hDepthStencilView);
++   /* pixel shader UAVs */
++   SetUnorderedAccessViews(CastDevice(hDevice), PIPE_SHADER_FRAGMENT, UAVRangeStart, UAVRangeSize, UAVStartSlot,
++                           NumUAVs, phUnorderedAccessView, pUAVInitialCounts);
+ }
+ 
+ 
+@@ -350,6 +389,13 @@
+                       const UINT *pPointerData, const D3D11DDIARG_POINTERDATA *pIfaces)
+ {
+    funcs10.pfnGsSetShader(hDevice, hShader);
++}
++
++static void APIENTRY
++CsSetShaderWithIfaces(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader, UINT NumClassInstances,
++                      const UINT *pPointerData, const D3D11DDIARG_POINTERDATA *pIfaces)
++{
++   CsSetShader(hDevice, hShader);
+ }
+ 
+ static void APIENTRY
+@@ -565,22 +611,23 @@
+    STUB(pfnCalcPrivateTessellationShaderSize);
+    STUB(pfnHsSetShaderWithIfaces);
+    STUB(pfnDsSetShaderWithIfaces);
+-   STUB(pfnCsSetShaderWithIfaces);
+-   STUB(pfnCreateComputeShader);
+-   STUB(pfnCsSetShader);
+-   STUB(pfnCsSetShaderResources);
+-   STUB(pfnCsSetSamplers);
+-   STUB(pfnCsSetConstantBuffers);
+-   STUB(pfnCalcPrivateUnorderedAccessViewSize);
+-   STUB(pfnCreateUnorderedAccessView);
+-   STUB(pfnDestroyUnorderedAccessView);
+-   STUB(pfnClearUnorderedAccessViewUint);
+-   STUB(pfnClearUnorderedAccessViewFloat);
+-   STUB(pfnCsSetUnorderedAccessViews);
+-   STUB(pfnDispatch);
+-   STUB(pfnDispatchIndirect);
++   /* Compute and UAVs (Compute.cpp) */
++   pFuncs->pfnCsSetShaderWithIfaces = CsSetShaderWithIfaces;
++   pFuncs->pfnCreateComputeShader = CreateComputeShader;
++   pFuncs->pfnCsSetShader = CsSetShader;
++   pFuncs->pfnCsSetShaderResources = CsSetShaderResources;
++   pFuncs->pfnCsSetSamplers = CsSetSamplers;
++   pFuncs->pfnCsSetConstantBuffers = CsSetConstantBuffers1;
++   pFuncs->pfnCalcPrivateUnorderedAccessViewSize = CalcPrivateUnorderedAccessViewSize;
++   pFuncs->pfnCreateUnorderedAccessView = CreateUnorderedAccessView;
++   pFuncs->pfnDestroyUnorderedAccessView = DestroyUnorderedAccessView;
++   pFuncs->pfnClearUnorderedAccessViewUint = ClearUnorderedAccessViewUint;
++   pFuncs->pfnClearUnorderedAccessViewFloat = ClearUnorderedAccessViewFloat;
++   pFuncs->pfnCsSetUnorderedAccessViews = CsSetUnorderedAccessViews;
++   pFuncs->pfnDispatch = Dispatch;
++   pFuncs->pfnDispatchIndirect = DispatchIndirect;
++   pFuncs->pfnCopyStructureCount = CopyStructureCount;
+    STUB(pfnSetResourceMinLOD);
+-   STUB(pfnCopyStructureCount);
+    STUB(pfnRecycleCommandList);
+    STUB(pfnRecycleCreateCommandList);
+    STUB(pfnRecycleCreateDeferredContext);
+diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/Draw.cpp
+@@ -112,6 +112,19 @@
+ }
+ 
+ 
++/*
++ * UAV writes of a draw (pixel shader UAVs) are seen by later draws, dispatches and copies in D3D; GL needs a
++ * barrier.
++ */
++static void
++PostDraw(Device *pDevice)
++{
++   const Shader *ps = pDevice->bound_shader[PIPE_SHADER_FRAGMENT];
++   if (ps && (ps->bindings.num_images || ps->bindings.num_buffers)) {
++      pDevice->pipe->memory_barrier(pDevice->pipe, PIPE_BARRIER_ALL);
++   }
++}
++
+ static struct pipe_resource *
+ create_null_index_buffer(struct pipe_context *ctx, uint num_indices,
+                          unsigned *restart_index, unsigned *index_size,
+@@ -162,6 +175,7 @@
+                     pDevice->primitive,
+                     StartVertexLocation,
+                     VertexCount);
++   PostDraw(pDevice);
+ }
+ 
+ 
+@@ -214,6 +228,7 @@
+    info.restart_index = restart_index;
+ 
+    pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, NULL, &draw, 1);
++   PostDraw(pDevice);
+ 
+    if (null_ib) {
+       pipe_resource_reference(&null_ib, NULL);
+@@ -256,6 +271,7 @@
+                               VertexCountPerInstance,
+                               StartInstanceLocation,
+                               InstanceCount);
++   PostDraw(pDevice);
+ }
+ 
+ 
+@@ -317,6 +333,7 @@
+    info.restart_index = restart_index;
+ 
+    pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, NULL, &draw, 1);
++   PostDraw(pDevice);
+ 
+    if (null_ib) {
+       pipe_resource_reference(&null_ib, NULL);
+@@ -364,4 +381,5 @@
+    indirect.count_from_stream_output = pDevice->draw_so_target;
+ 
+    pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, &indirect, NULL, 1);
+-}
++   PostDraw(pDevice);
++}
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -121,6 +121,9 @@
+ 
+    if (flags & D3D10_DDI_BIND_PRESENT)
+       bind |= PIPE_BIND_DISPLAY_TARGET;
++
++   if (flags & D3D11_DDI_BIND_UNORDERED_ACCESS)
++      bind |= PIPE_BIND_SHADER_IMAGE | PIPE_BIND_SHADER_BUFFER;
+ 
+    return bind;
+ }
+@@ -306,14 +309,26 @@
+    if ((pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED)) {
+       templat.bind |= PIPE_BIND_SHARED;
+    }
++   if (templat.target == PIPE_BUFFER && (templat.bind & PIPE_BIND_SAMPLER_VIEW)) {
++      /* raw and structured views are shader buffers */
++      templat.bind |= PIPE_BIND_SHADER_BUFFER;
++   }
++   if (templat.target != PIPE_BUFFER && (templat.bind & PIPE_BIND_SHADER_IMAGE)) {
++      /* UAV textures: virgl passes no image bind flag to the host, and virglrenderer refuses textures with only
++       * buffer bind flags or none (the resource is missing then, and its first use fails the context): a texture
++       * one can sample, not a buffer */
++      templat.bind &= ~PIPE_BIND_SHADER_BUFFER;
++      templat.bind |= PIPE_BIND_SAMPLER_VIEW;
++   }
+ 
+    if (templat.target != PIPE_BUFFER) {
++      /* (as an image: whether a UAV format works as one shows when it's bound) */
+       if (!screen->is_format_supported(screen,
+                                        templat.format,
+                                        templat.target,
+                                        templat.nr_samples,
+                                        templat.nr_storage_samples,
+-                                       templat.bind)) {
++                                       templat.bind & ~(PIPE_BIND_SHADER_IMAGE | PIPE_BIND_SHADER_BUFFER))) {
+          debug_printf("%s: unsupported format %s\n",
+                      __func__, util_format_name(templat.format));
+          SetError(hDevice, E_OUTOFMEMORY);
+@@ -517,6 +532,13 @@
+       }
+    }
+    free(pResource->transfers);
++   if (pResource->shadows) {
++      for (UINT SubResource = 0; SubResource < pResource->NumSubResources; ++SubResource) {
++         free(pResource->shadows[SubResource].data);
++      }
++      free(pResource->shadows);
++      pResource->shadows = NULL;
++   }
+ 
+    pipe_resource_reference(&pResource->resource, NULL);
+ }
+@@ -581,6 +603,45 @@
+ 
+    assert(!pResource->transfers[SubResource]);
+ 
++   if (!pResource->buffer && resource->target == PIPE_TEXTURE_3D && box.depth > 1 && (usage & PIPE_MAP_READ)) {
++      /* virglrenderer reads back only the box's first slice: one slice at a time into memory */
++      unsigned rows = util_format_get_nblocksy(resource->format, box.height);
++      struct ResourceShadow *shadow;
++      if (!pResource->shadows) {
++         pResource->shadows = (struct ResourceShadow *)calloc(pResource->NumSubResources, sizeof *pResource->shadows);
++      }
++      shadow = pResource->shadows ? &pResource->shadows[SubResource] : NULL;
++      for (int z = 0; shadow && z < box.depth; z++) {
++         struct pipe_box slice = box;
++         struct pipe_transfer *transfer;
++         slice.z = box.z + z;
++         slice.depth = 1;
++         void *map = pipe->texture_map(pipe, resource, level, PIPE_MAP_READ, &slice, &transfer);
++         if (!map) {
++            break;
++         }
++         if (!shadow->data) {
++            shadow->stride = transfer->stride;
++            shadow->layer_stride = transfer->stride * rows;
++            shadow->data = malloc((size_t)shadow->layer_stride * box.depth);
++         }
++         if (shadow->data) {
++            for (unsigned y = 0; y < rows; y++) {
++               memcpy((char *)shadow->data + z * shadow->layer_stride + y * shadow->stride,
++                      (const char *)map + y * transfer->stride, MIN2(transfer->stride, shadow->stride));
++            }
++         }
++         pipe_texture_unmap(pipe, transfer);
++      }
++      if (shadow && shadow->data) {
++         shadow->usage = usage;
++         pMappedSubResource->pData = shadow->data;
++         pMappedSubResource->RowPitch = shadow->stride;
++         pMappedSubResource->DepthPitch = shadow->layer_stride;
++         return;
++      }
++   }
++
+    void *map;
+    if (pResource->buffer) {
+       map = pipe->buffer_map(pipe,
+@@ -630,6 +691,20 @@
+    Resource *pResource = CastResource(hResource);
+ 
+    assert(SubResource < pResource->NumSubResources);
++
++   if (pResource->shadows && pResource->shadows[SubResource].data) {
++      struct ResourceShadow *shadow = &pResource->shadows[SubResource];
++      if (shadow->usage & PIPE_MAP_WRITE) {
++         unsigned level;
++         struct pipe_box box;
++         subResourceBox(pResource->resource, SubResource, &level, &box);
++         pipe->texture_subdata(pipe, pResource->resource, level, PIPE_MAP_WRITE, &box, shadow->data, shadow->stride,
++                               shadow->layer_stride);
++      }
++      free(shadow->data);
++      memset(shadow, 0, sizeof *shadow);
++      return;
++   }
+ 
+    if (pResource->transfers[SubResource]) {
+       if (pResource->buffer) {
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -43,7 +43,7 @@
+ 
+ extern "C" bool use_old_tex_ops;
+ 
+-/* virgl: shaders sample through slots of their own (Shader_tex_slots), bound at draw time */
++/* virgl: shaders sample through slots of their own (Shader_bindings), bound at draw time */
+ static bool
+ UseTexSlots(void)
+ {
+@@ -54,40 +54,129 @@
+ /*
+  * ----------------------------------------------------------------------
+  *
+- * ShaderBindTexSlots --
+- *
+- *    virgl: binds each slot of the bound shaders to its view and sampler state, where a shader, view or sampler
+- *    changed since the last draw.
+- *
+- * ----------------------------------------------------------------------
+- */
++ * ShaderBindStage --
++ *
++ *    Binds what the stage's shader uses (Shader_bindings), if the shader or something it may use changed since:
++ *    virgl's texture slots (view and sampler state each), typed UAVs as images, raw/structured UAVs and views and
++ *    append counters as shader buffers. Resources are looked up now: they may have been rotated.
++ *
++ * ----------------------------------------------------------------------
++ */
++
++/* Shaders with typed UAVs keep their bytecode for translations with other image formats */
++static void
++ShaderKeepCode(Shader *pShader, const UINT *pCode)
++{
++   pShader->code = NULL;
++   pShader->num_variants = 0;
++   memset(pShader->bound_formats, 0, sizeof pShader->bound_formats);
++   if (pShader->bindings.num_images && pCode) {
++      pShader->code = (UINT *)malloc(pCode[1] * sizeof(UINT));
++      if (pShader->code) {
++         memcpy(pShader->code, pCode, pCode[1] * sizeof(UINT));
++      }
++   }
++}
++
++
++/*
++ * Typed UAVs are images with a format in GLSL (virglrenderer declares format-less ones rgba32f), so the shader is
++ * translated again for the formats of the bound views where they differ (a few variants per shader are kept).
++ */
++static void
++ShaderSelectImageVariant(Device *pDevice, enum pipe_shader_type type, Shader *shader)
++{
++   struct pipe_context *pipe = pDevice->pipe;
++   enum pipe_format want[SHADER_MAX_IMAGE_SLOTS];
++   unsigned v;
++
++   memset(want, 0, sizeof want);
++   for (unsigned k = 0; k < shader->bindings.num_images; k++) {
++      const UnorderedAccessView *uav = pDevice->uavs[type][shader->bindings.image_uav[k]];
++      want[k] = uav && uav->typed ? uav->image.format : PIPE_FORMAT_NONE;
++   }
++   if (!memcmp(want, shader->bound_formats, sizeof want)) {
++      return;
++   }
++   for (v = 0; v < shader->num_variants; v++) {
++      if (!memcmp(want, shader->variants[v].formats, sizeof want)) {
++         break;
++      }
++   }
++   if (v == shader->num_variants) {
++      struct Shader_bindings bindings;
++      unsigned mapping[PIPE_MAX_SHADER_OUTPUTS];
++      const struct tgsi_token *tokens;
++      void *handle = NULL;
++
++      memset(&bindings, 0, sizeof bindings);
++      tokens = Shader_tgsi_translate_images(shader->code, mapping, &bindings, want);
++      if (!tokens) {
++         return;
++      }
++      if (type == PIPE_SHADER_COMPUTE) {
++         struct pipe_compute_state cs;
++         memset(&cs, 0, sizeof cs);
++         cs.ir_type = PIPE_SHADER_IR_TGSI;
++         cs.prog = tokens;
++         cs.static_shared_mem = bindings.shared_mem;
++         handle = pipe->create_compute_state(pipe, &cs);
++      } else {
++         struct pipe_shader_state state;
++         memset(&state, 0, sizeof state);
++         state.type = PIPE_SHADER_IR_TGSI;
++         state.tokens = tokens;
++         handle = pipe->create_fs_state(pipe, &state);
++      }
++      if (!handle) {
++         ureg_free_tokens(tokens);
++         return;
++      }
++      if (shader->num_variants == ARRAY_SIZE(shader->variants)) {
++         /* replace the last one */
++         v = shader->num_variants - 1;
++         if (type == PIPE_SHADER_COMPUTE) {
++            pipe->delete_compute_state(pipe, shader->variants[v].handle);
++         } else {
++            pipe->delete_fs_state(pipe, shader->variants[v].handle);
++         }
++         ureg_free_tokens(shader->variants[v].tokens);
++      } else {
++         shader->num_variants++;
++      }
++      memcpy(shader->variants[v].formats, want, sizeof want);
++      shader->variants[v].handle = handle;
++      shader->variants[v].tokens = tokens;
++   }
++   if (type == PIPE_SHADER_COMPUTE) {
++      pipe->bind_compute_state(pipe, shader->variants[v].handle);
++   } else {
++      pipe->bind_fs_state(pipe, shader->variants[v].handle);
++   }
++   memcpy(shader->bound_formats, want, sizeof want);
++}
++
+ 
+ void
+-ShaderBindTexSlots(Device *pDevice)
+-{
+-   static const enum pipe_shader_type stages[] = {
+-      PIPE_SHADER_VERTEX, PIPE_SHADER_GEOMETRY, PIPE_SHADER_FRAGMENT
+-   };
++ShaderBindStage(Device *pDevice, enum pipe_shader_type type)
++{
+    struct pipe_context *pipe = pDevice->pipe;
+-
+-   if (!UseTexSlots()) {
++   Shader *shader = pDevice->bound_shader[type];
++   const struct Shader_bindings *b = shader ? &shader->bindings : NULL;
++
++   if (!pDevice->bindings_dirty[type]) {
+       return;
+    }
+-   for (unsigned s = 0; s < ARRAY_SIZE(stages); s++) {
+-      enum pipe_shader_type type = stages[s];
+-      const Shader *shader = pDevice->bound_shader[type];
++   pDevice->bindings_dirty[type] = false;
++
++   if (UseTexSlots()) {
+       struct pipe_sampler_view *views[PIPE_MAX_SAMPLERS];
+       void *samplers[PIPE_MAX_SAMPLERS];
+ 
+-      if (!pDevice->tex_slots_dirty[type]) {
+-         continue;
+-      }
+-      pDevice->tex_slots_dirty[type] = false;
+-
+       memset(views, 0, sizeof views);
+       memset(samplers, 0, sizeof samplers);
+-      for (unsigned i = 0; shader && i < shader->tex_slots.count; i++) {
+-         const struct Shader_tex_slot *slot = &shader->tex_slots.slot[i];
++      for (unsigned i = 0; b && i < b->count; i++) {
++         const struct Shader_tex_slot *slot = &b->slot[i];
+          views[i] = pDevice->sampler_views[type][slot->view];
+          if (slot->sampler != SHADER_TEX_SLOT_NO_SAMPLER) {
+             samplers[i] = pDevice->samplers[type][slot->sampler];
+@@ -96,6 +185,64 @@
+       pipe->set_sampler_views(pipe, type, 0, PIPE_MAX_SAMPLERS, 0, false, views);
+       pipe->bind_sampler_states(pipe, type, 0, PIPE_MAX_SAMPLERS, samplers);
+    }
++
++   unsigned num_images = b ? b->num_images : 0, num_buffers = b ? b->num_buffers : 0;
++   if (num_images && shader->code && (type == PIPE_SHADER_COMPUTE || type == PIPE_SHADER_FRAGMENT)) {
++      ShaderSelectImageVariant(pDevice, type, shader);
++   }
++   if (num_images || pDevice->bound_images[type]) {
++      struct pipe_image_view images[SHADER_MAX_IMAGE_SLOTS];
++      memset(images, 0, sizeof images);
++      for (unsigned i = 0; i < num_images; i++) {
++         const UnorderedAccessView *uav = pDevice->uavs[type][b->image_uav[i]];
++         if (uav && uav->typed) {
++            images[i] = uav->image;
++            images[i].resource = uav->resource->resource;
++         }
++      }
++      pipe->set_shader_images(pipe, type, 0, num_images, pDevice->bound_images[type] > num_images ?
++                              pDevice->bound_images[type] - num_images : 0, images);
++      pDevice->bound_images[type] = num_images;
++   }
++   if (num_buffers || pDevice->bound_buffers[type]) {
++      struct pipe_shader_buffer buffers[SHADER_MAX_BUFFER_SLOTS];
++      unsigned writable = 0;
++      memset(buffers, 0, sizeof buffers);
++      for (unsigned i = 0; i < num_buffers; i++) {
++         const struct Shader_buffer_slot *slot = &b->buffer[i];
++         if (slot->kind == SHADER_BUFFER_SRV) {
++            const ShaderResourceView *srv = pDevice->srvs[type][slot->index];
++            if (srv && !srv->handle) {
++               buffers[i].buffer = srv->resource->resource;
++               buffers[i].buffer_offset = srv->buffer_offset;
++               buffers[i].buffer_size = srv->buffer_size;
++            }
++         } else {
++            const UnorderedAccessView *uav = pDevice->uavs[type][slot->index];
++            if (uav && !uav->typed && slot->kind == SHADER_BUFFER_UAV) {
++               buffers[i] = uav->buffer;
++               buffers[i].buffer = uav->resource->resource;
++            } else if (uav && uav->counter) {
++               buffers[i].buffer = uav->counter;
++               buffers[i].buffer_size = 4;
++            }
++            writable |= 1u << i;
++         }
++      }
++      unsigned n = MAX2(num_buffers, pDevice->bound_buffers[type]);
++      pipe->set_shader_buffers(pipe, type, 0, n, buffers, writable);
++      pDevice->bound_buffers[type] = num_buffers;
++   }
++}
++
++
++/* Before draws: the graphics stages */
++void
++ShaderBindTexSlots(Device *pDevice)
++{
++   ShaderBindStage(pDevice, PIPE_SHADER_VERTEX);
++   ShaderBindStage(pDevice, PIPE_SHADER_GEOMETRY);
++   ShaderBindStage(pDevice, PIPE_SHADER_FRAGMENT);
+ }
+ #include "util/u_gen_mipmap.h"
+ #include "util/u_sampler.h"
+@@ -112,6 +259,9 @@
+    // If it is not (resource rotated) then recreate view
+    struct pipe_sampler_view *currentSurface = pShaderResourceView->handle;
+    Resource *res = pShaderResourceView->resource;
++   if (!currentSurface) {
++      return NULL;   /* raw and structured buffer views (ShaderBindStage) */
++   }
+    if (currentSurface->texture != res->resource) {
+       struct pipe_context *pipe = currentSurface->context;
+       struct pipe_sampler_view *newView = pipe->create_sampler_view(pipe, res->resource, currentSurface);
+@@ -284,7 +434,7 @@
+    }
+ 
+    if (UseTexSlots()) {
+-      pDevice->tex_slots_dirty[shader_type] = true;
++      pDevice->bindings_dirty[shader_type] = true;
+       return;
+    }
+    pipe->bind_sampler_states(pipe, shader_type, 0, PIPE_MAX_SAMPLERS, samplers);
+@@ -319,6 +469,7 @@
+             GetPipeShaderResourceView(phShaderResourceViews[i]);
+       if (Offset + i < PIPE_MAX_SHADER_SAMPLER_VIEWS) {
+          sampler_views[Offset + i] = sampler_view;
++         pDevice->srvs[shader_type][Offset + i] = CastShaderResourceView(phShaderResourceViews[i]);
+       } else {
+          if (sampler_view) {
+             LOG_UNSUPPORTED(true);
+@@ -327,8 +478,8 @@
+       }
+    }
+ 
++   pDevice->bindings_dirty[shader_type] = true;
+    if (UseTexSlots()) {
+-      pDevice->tex_slots_dirty[shader_type] = true;
+       return;
+    }
+ 
+@@ -395,6 +546,9 @@
+       case PIPE_SHADER_GEOMETRY:
+          pipe->delete_gs_state(pipe, pShader->handle);
+          break;
++      case PIPE_SHADER_COMPUTE:
++         pipe->delete_compute_state(pipe, pShader->handle);
++         break;
+       default:
+          assert(0);
+       }
+@@ -403,6 +557,17 @@
+    if (pShader->state.tokens) {
+       ureg_free_tokens(pShader->state.tokens);
+    }
++   for (unsigned v = 0; v < pShader->num_variants; v++) {
++      if (pShader->type == PIPE_SHADER_COMPUTE) {
++         pipe->delete_compute_state(pipe, pShader->variants[v].handle);
++      } else {
++         pipe->delete_fs_state(pipe, pShader->variants[v].handle);
++      }
++      ureg_free_tokens(pShader->variants[v].tokens);
++   }
++   pShader->num_variants = 0;
++   free(pShader->code);
++   pShader->code = NULL;
+ }
+ 
+ 
+@@ -634,8 +799,10 @@
+    pShader->output_resolved = true;
+ 
+    memset(&pShader->state, 0, sizeof pShader->state);
+-   memset(&pShader->tex_slots, 0, sizeof pShader->tex_slots);
+-   pShader->state.tokens = Shader_tgsi_translate(pCode, pShader->output_mapping, &pShader->tex_slots);
++   memset(&pShader->bindings, 0, sizeof pShader->bindings);
++   pShader->code = NULL;
++   pShader->num_variants = 0;
++   pShader->state.tokens = Shader_tgsi_translate(pCode, pShader->output_mapping, &pShader->bindings);
+ 
+    pShader->handle = pipe->create_vs_state(pipe, &pShader->state);
+ 
+@@ -666,7 +833,7 @@
+ 
+    pDevice->bound_vs = pShader;
+    pDevice->bound_shader[PIPE_SHADER_VERTEX] = pShader;
+-   pDevice->tex_slots_dirty[PIPE_SHADER_VERTEX] = true;
++   pDevice->bindings_dirty[PIPE_SHADER_VERTEX] = true;
+    if (!state) {
+       state = pDevice->empty_vs;
+    }
+@@ -773,8 +940,10 @@
+    pShader->output_resolved = true;
+ 
+    memset(&pShader->state, 0, sizeof pShader->state);
+-   memset(&pShader->tex_slots, 0, sizeof pShader->tex_slots);
+-   pShader->state.tokens = Shader_tgsi_translate(pShaderCode, pShader->output_mapping, &pShader->tex_slots);
++   memset(&pShader->bindings, 0, sizeof pShader->bindings);
++   pShader->code = NULL;
++   pShader->num_variants = 0;
++   pShader->state.tokens = Shader_tgsi_translate(pShaderCode, pShader->output_mapping, &pShader->bindings);
+ 
+    pShader->handle = pipe->create_gs_state(pipe, &pShader->state);
+ }
+@@ -805,7 +974,7 @@
+    assert(pipe->bind_gs_state);
+ 
+    pDevice->bound_shader[PIPE_SHADER_GEOMETRY] = pShader;
+-   pDevice->tex_slots_dirty[PIPE_SHADER_GEOMETRY] = true;
++   pDevice->bindings_dirty[PIPE_SHADER_GEOMETRY] = true;
+    if (pShader && !pShader->state.tokens) {
+       pDevice->bound_empty_gs = pShader;
+    } else {
+@@ -939,11 +1108,13 @@
+    pShader->type = PIPE_SHADER_GEOMETRY;
+ 
+    memset(&pShader->state, 0, sizeof pShader->state);
+-   memset(&pShader->tex_slots, 0, sizeof pShader->tex_slots);
++   memset(&pShader->bindings, 0, sizeof pShader->bindings);
++   pShader->code = NULL;
++   pShader->num_variants = 0;
+    if (pData->pShaderCode) {
+       pShader->state.tokens = Shader_tgsi_translate(pData->pShaderCode,
+                                                     pShader->output_mapping,
+-                                                    &pShader->tex_slots);
++                                                    &pShader->bindings);
+    }
+    pShader->output_resolved = (pShader->state.tokens != NULL);
+ 
+@@ -1094,10 +1265,13 @@
+    pShader->output_resolved = true;
+ 
+    memset(&pShader->state, 0, sizeof pShader->state);
+-   memset(&pShader->tex_slots, 0, sizeof pShader->tex_slots);
++   memset(&pShader->bindings, 0, sizeof pShader->bindings);
++   pShader->code = NULL;
++   pShader->num_variants = 0;
+    pShader->state.tokens = Shader_tgsi_translate(pShaderCode,
+                                                  pShader->output_mapping,
+-                                                 &pShader->tex_slots);
++                                                 &pShader->bindings);
++   ShaderKeepCode(pShader, pShaderCode);
+ 
+    pShader->handle = pipe->create_fs_state(pipe, &pShader->state);
+ 
+@@ -1126,7 +1300,11 @@
+    void *state = CastPipeShader(hShader);
+ 
+    pDevice->bound_shader[PIPE_SHADER_FRAGMENT] = CastShader(hShader);
+-   pDevice->tex_slots_dirty[PIPE_SHADER_FRAGMENT] = true;
++   pDevice->bindings_dirty[PIPE_SHADER_FRAGMENT] = true;
++   if (CastShader(hShader)) {
++      /* the first translation is bound below */
++      memset(CastShader(hShader)->bound_formats, 0, sizeof CastShader(hShader)->bound_formats);
++   }
+    if (!state) {
+       state = pDevice->empty_fs;
+    }
+@@ -1512,3 +1690,67 @@
+    }
+    return registerIndex;
+ }
++
++
++/*
++ * ----------------------------------------------------------------------
++ *
++ * Compute shaders (feature level 11) --
++ *
++ * ----------------------------------------------------------------------
++ */
++
++void APIENTRY
++CreateComputeShader(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                    D3D10DDI_HRTSHADER hRTShader)
++{
++   LOG_ENTRYPOINT();
++
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   Shader *pShader = CastShader(hShader);
++   struct pipe_compute_state cs;
++
++   pShader->type = PIPE_SHADER_COMPUTE;
++   pShader->output_resolved = true;
++   memset(&pShader->state, 0, sizeof pShader->state);
++   memset(&pShader->bindings, 0, sizeof pShader->bindings);
++   pShader->code = NULL;
++   pShader->num_variants = 0;
++   pShader->state.tokens = Shader_tgsi_translate(pShaderCode, pShader->output_mapping, &pShader->bindings);
++
++   memset(&cs, 0, sizeof cs);
++   cs.ir_type = PIPE_SHADER_IR_TGSI;
++   cs.prog = pShader->state.tokens;
++   cs.static_shared_mem = pShader->bindings.shared_mem;
++   pShader->handle = pShader->state.tokens ? pipe->create_compute_state(pipe, &cs) : NULL;
++   ShaderKeepCode(pShader, pShaderCode);
++}
++
++void APIENTRY
++CsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
++{
++   LOG_ENTRYPOINT();
++
++   Device *pDevice = CastDevice(hDevice);
++   struct pipe_context *pipe = pDevice->pipe;
++
++   pDevice->bound_shader[PIPE_SHADER_COMPUTE] = CastShader(hShader);
++   pDevice->bindings_dirty[PIPE_SHADER_COMPUTE] = true;
++   if (CastShader(hShader)) {
++      memset(CastShader(hShader)->bound_formats, 0, sizeof CastShader(hShader)->bound_formats);
++   }
++   pipe->bind_compute_state(pipe, CastPipeShader(hShader));
++}
++
++void APIENTRY
++CsSetShaderResources(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
++                     const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews)
++{
++   SetShaderResources(PIPE_SHADER_COMPUTE, hDevice, Offset, NumViews, phShaderResourceViews);
++}
++
++void APIENTRY
++CsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers, const D3D10DDI_HSAMPLER *phSamplers)
++{
++   SetSamplers(PIPE_SHADER_COMPUTE, hDevice, Offset, NumSamplers, phSamplers);
++}
+diff --git a/src/gallium/frontends/d3d10umd/Shader.h b/src/gallium/frontends/d3d10umd/Shader.h
+--- a/src/gallium/frontends/d3d10umd/Shader.h
++++ b/src/gallium/frontends/d3d10umd/Shader.h
+@@ -51,6 +51,23 @@
+ 
+ void
+ ShaderBindTexSlots(Device *pDevice);
++
++void
++ShaderBindStage(Device *pDevice, enum pipe_shader_type type);
++
++void APIENTRY
++CreateComputeShader(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                    D3D10DDI_HRTSHADER hRTShader);
++
++void APIENTRY
++CsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader);
++
++void APIENTRY
++CsSetShaderResources(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
++                     const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews);
++
++void APIENTRY
++CsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers, const D3D10DDI_HSAMPLER *phSamplers);
+ 
+ SIZE_T APIENTRY
+ CalcPrivateShaderSize(D3D10DDI_HDEVICE hDevice,
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.c b/src/gallium/frontends/d3d10umd/ShaderParse.c
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.c
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.c
+@@ -668,11 +668,8 @@
+             opcode->src[i].swizzle[2] =
+             opcode->src[i].swizzle[3] = D3D10_SB_4_COMPONENT_X;
+       } else {
+-         /* Samplers only?
+-          */
++         /* Samplers, labels, and in shader model 5 UAVs, group shared memory and streams */
+          assert(num_components == D3D10_SB_OPERAND_0_COMPONENT);
+-         assert(DECODE_D3D10_SB_OPERAND_TYPE(*curr) == D3D10_SB_OPERAND_TYPE_SAMPLER ||
+-                DECODE_D3D10_SB_OPERAND_TYPE(*curr) == D3D10_SB_OPERAND_TYPE_LABEL);
+ 
+          opcode->src[i].swizzle[0] = D3D10_SB_4_COMPONENT_X;
+          opcode->src[i].swizzle[1] = D3D10_SB_4_COMPONENT_Y;
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.h b/src/gallium/frontends/d3d10umd/ShaderParse.h
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.h
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.h
+@@ -34,6 +34,7 @@
+ #define SHADER_PARSE_H
+ 
+ #include "DriverIncludes.h"
++#include "util/format/u_formats.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -193,11 +194,17 @@
+ Shader_opcode_free(struct Shader_opcode *opcode);
+ 
+ 
+-/* virgl: the shader samples through TGSI samplers of its own, one per texture (t#), sampler (s#) and comparison
+- * combination it uses; slot i is bound to view tex_slot[i].view and sampler state tex_slot[i].sampler at draw time.
++/* What the driver binds for a shader, slot by slot (its TGSI register numbers):
++ * - virgl: textures through TGSI samplers of their own, one per texture (t#), sampler (s#) and comparison
++ *   combination the shader uses; sampler i is bound to view tex[i].view and sampler state tex[i].sampler.
++ * - typed UAVs as TGSI images (image[i] = u#), raw and structured UAVs and shader resource views as TGSI buffers
++ *   (buffer[i]), an append/consume UAV's counter as a buffer of its own.
++ * - compute shaders: the thread group size and the group shared memory (bytes).
+  */
+ #define SHADER_MAX_TEX_SLOTS 32
+ #define SHADER_TEX_SLOT_NO_SAMPLER 0xff
++#define SHADER_MAX_IMAGE_SLOTS 16
++#define SHADER_MAX_BUFFER_SLOTS 32
+ 
+ struct Shader_tex_slot {
+    unsigned char view;
+@@ -205,15 +212,39 @@
+    unsigned char shadow;      /* sampled with a comparison */
+ };
+ 
+-struct Shader_tex_slots {
+-   unsigned count;
++enum Shader_buffer_kind {
++   SHADER_BUFFER_SRV,         /* t#: raw or structured shader resource view */
++   SHADER_BUFFER_UAV,         /* u#: raw or structured */
++   SHADER_BUFFER_UAV_COUNTER, /* u#'s hidden append/consume counter */
++};
++
++struct Shader_buffer_slot {
++   unsigned char kind;
++   unsigned char index;
++};
++
++struct Shader_bindings {
++   unsigned count;            /* textures */
+    struct Shader_tex_slot slot[SHADER_MAX_TEX_SLOTS];
++   unsigned num_images;
++   unsigned char image_uav[SHADER_MAX_IMAGE_SLOTS];
++   unsigned num_buffers;
++   struct Shader_buffer_slot buffer[SHADER_MAX_BUFFER_SLOTS];
++   unsigned shared_mem;
++   unsigned block[3];
+ };
+ 
+ const struct tgsi_token *
+ Shader_tgsi_translate(const unsigned *code,
+                       unsigned *output_mapping,
+-                      struct Shader_tex_slots *tex_slots);
++                      struct Shader_bindings *bindings);
++
++/* The same, typed UAV images declared with these formats (per image slot; PIPE_FORMAT_NONE: as declared) */
++const struct tgsi_token *
++Shader_tgsi_translate_images(const unsigned *code,
++                             unsigned *output_mapping,
++                             struct Shader_bindings *bindings,
++                             const enum pipe_format *image_formats);
+ 
+ 
+ #ifdef __cplusplus
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -38,6 +38,7 @@
+ #include "tgsi/tgsi_ureg.h"
+ #include "tgsi/tgsi_dump.h"
+ #include "util/u_memory.h"
++#include "util/format/u_format.h"
+ 
+ #include "ShaderDump.h"
+ 
+@@ -344,6 +345,22 @@
+    bool has_default;
+ };
+ 
++/* Shader model 5 memory: UAVs (u#), raw/structured shader resource views (t#), group shared memory (g#) */
++#define SHADER_MAX_UAVS 64
++#define SHADER_MAX_TGSM 32
++
++struct Shader_uav {
++   bool declared;
++   bool typed;
++   unsigned stride;            /* structured: bytes per element; raw: 0 */
++   uint target;                /* typed: TGSI_TEXTURE_x */
++   enum pipe_format format;    /* typed: the image declaration's */
++   unsigned qualifier;         /* TGSI_MEMORY_COHERENT for globally coherent UAVs */
++   struct ureg_src reg;        /* IMAGE or BUFFER */
++   bool has_counter;
++   struct ureg_src counter;    /* BUFFER: append/consume count */
++};
++
+ struct Shader_cf {
+    bool is_switch;
+    bool lowered;           /* loop: runs its body in an inner loop (it has a continue) */
+@@ -360,6 +377,9 @@
+    struct ureg_dst temps[SHADER_MAX_TEMPS];
+    struct ureg_dst output_depth;
+    struct ureg_dst addrs[SHADER_MAX_ADDRS];
++   struct ureg_dst neg_temps[SHADER_MAX_SRC_OPERANDS];   /* integer negations (translate_src_operand) */
++   unsigned neg_cur;
++   bool integer_op;            /* the instruction is an integer one: its negate modifiers are integer negations */
+    struct Shader_resource resources[SHADER_MAX_RESOURCES];
+    struct ureg_src sv[SHADER_MAX_RESOURCES];
+    struct ureg_src samplers[SHADER_MAX_SAMPLERS];
+@@ -399,7 +419,27 @@
+    uint num_labels;
+    uint max_labels;
+ 
+-   struct Shader_tex_slots tex_slots;
++   struct Shader_bindings bindings;
++
++   struct Shader_uav uavs[SHADER_MAX_UAVS];
++   bool uav_read[SHADER_MAX_UAVS];          /* typed UAVs loaded or used atomically (Shader_scan_control_flow) */
++   bool uav_sync;                           /* a sync with a UAV memory barrier (Shader_scan_control_flow) */
++   const enum pipe_format *image_formats;   /* the bound views' formats per image slot, or NULL */
++   struct {
++      bool declared;
++      unsigned stride;                      /* structured: bytes per element; raw: 0 */
++      struct ureg_src reg;                  /* BUFFER */
++   } srv_buffers[SHADER_MAX_RESOURCES];
++   struct {
++      unsigned base, stride;                /* in the shader's one shared memory block */
++      bool structured;
++   } tgsm[SHADER_MAX_TGSM];
++   struct ureg_src memory;
++
++   /* compute: thread IDs (operand types D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID and on) */
++   bool cs_input_wanted[5];
++   bool cs_input_done[5];
++   struct ureg_src cs_input[5];
+ 
+    struct Shader_cf cf[SHADER_MAX_CF_DEPTH];
+    uint cf_depth;
+@@ -1259,6 +1299,13 @@
+       reg = sx->coverage;
+       break;
+ 
++   case D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID:
++   case D3D11_SB_OPERAND_TYPE_INPUT_THREAD_GROUP_ID:
++   case D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP:
++   case D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED:
++      reg = sx->cs_input[operand->base.type - D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID];
++      break;
++
+    default:
+       reg = ureg_src(translate_operand(sx, &operand->base, 0));
+    }
+@@ -1273,7 +1320,18 @@
+    case D3D10_SB_OPERAND_MODIFIER_NONE:
+       break;
+    case D3D10_SB_OPERAND_MODIFIER_NEG:
+-      reg = ureg_negate(reg);
++      if (format != OF_FLOAT && sx->integer_op) {
++         /* two's complement: virglrenderer negates the float a TGSI negate modifier is on, also for integer
++          * instructions (iadd r0, -r1, l(3) gave 0x80000004 for r1 = 1) */
++         struct ureg_dst t = sx->neg_temps[sx->neg_cur++ % SHADER_MAX_SRC_OPERANDS];
++         if (ureg_dst_is_undef(t)) {
++            t = sx->neg_temps[(sx->neg_cur - 1) % SHADER_MAX_SRC_OPERANDS] = ureg_DECL_temporary(sx->ureg);
++         }
++         ureg_INEG(sx->ureg, t, reg);
++         reg = ureg_src(t);
++      } else {
++         reg = ureg_negate(reg);
++      }
+       break;
+    case D3D10_SB_OPERAND_MODIFIER_ABS:
+       reg = ureg_abs(reg);
+@@ -1459,7 +1517,7 @@
+  * which the host binds to the view and sampler state of the same index. D3D samples texture t# with sampler s#, any
+  * pair, so each (t#, s#, comparison) combination a shader uses gets a TGSI sampler of its own (tex_slot), declared
+  * with the texture's target and return type (an integer texture needs an integer sampler in GLSL), and the driver
+- * binds view t# and sampler state s# to it (Shader_tex_slots). A comparison needs a shadow sampler in GLSL.
++ * binds view t# and sampler state s# to it (Shader_bindings). A comparison needs a shadow sampler in GLSL.
+  * D3D selects the result's components with the texture operand's swizzle, so the instructions write a temporary
+  * that is then moved to the destination swizzled.
+  */
+@@ -1510,7 +1568,7 @@
+ static struct ureg_src
+ tex_slot(struct Shader_xlate *sx, unsigned view, unsigned sampler, bool shadow)
+ {
+-   struct Shader_tex_slots *slots = &sx->tex_slots;
++   struct Shader_bindings *slots = &sx->bindings;
+    const struct Shader_resource *res;
+    unsigned i;
+ 
+@@ -2142,6 +2200,536 @@
+    }
+ }
+ 
++/*
++ * Shader model 5 memory: typed UAVs are TGSI images, raw and structured UAVs and views TGSI buffers (byte
++ * addresses: raw ones as given, structured ones index * stride + offset), group shared memory one TGSI shared
++ * memory block holding every g# region. The driver binds them by Shader_bindings.
++ */
++static struct ureg_src
++buffer_slot(struct Shader_xlate *sx, enum Shader_buffer_kind kind, unsigned index)
++{
++   struct Shader_bindings *b = &sx->bindings;
++   unsigned k;
++
++   if (b->num_buffers == SHADER_MAX_BUFFER_SLOTS) {
++      LOG_UNSUPPORTED(true);
++      k = 0;
++   } else {
++      k = b->num_buffers++;
++      b->buffer[k].kind = kind;
++      b->buffer[k].index = index;
++   }
++   return ureg_DECL_buffer(sx->ureg, k, false);
++}
++
++static void
++dcl_uav(struct Shader_xlate *sx, const struct Shader_opcode *opcode)
++{
++   unsigned u = opcode->dst[0].base.index[0].imm;
++   struct Shader_uav *uav;
++
++   if (u >= SHADER_MAX_UAVS) {
++      LOG_UNSUPPORTED(true);
++      return;
++   }
++   uav = &sx->uavs[u];
++   memset(uav, 0, sizeof *uav);
++   uav->declared = true;
++   /* GLSL makes other invocations' writes visible to coherent accesses only, D3D's UAV barriers do it for all */
++   uav->qualifier = (opcode->specific.dcl_uav.flags & D3D11_SB_GLOBALLY_COHERENT_ACCESS) || sx->uav_sync ?
++                    TGSI_MEMORY_COHERENT : 0;
++   if (opcode->type == D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED) {
++      struct Shader_bindings *b = &sx->bindings;
++      enum tgsi_return_type ret = trans_dcl_ret_type(opcode->dcl_resource_ret_type[0]);
++      unsigned k;
++      /* Loads and atomics need the format in GLSL; D3D allows them on single 32-bit channels only. Stores alone
++       * don't, but the GLSL image type comes from it: integer images get the 32-bit integer formats. */
++      uav->typed = true;
++      uav->target = translate_resource_dimension(opcode->specific.dcl_uav.dimension);
++      uav->format = ret == TGSI_RETURN_TYPE_SINT ? PIPE_FORMAT_R32_SINT :
++                    ret == TGSI_RETURN_TYPE_UINT ? PIPE_FORMAT_R32_UINT :
++                    sx->uav_read[u] ? PIPE_FORMAT_R32_FLOAT : PIPE_FORMAT_NONE;
++      if (b->num_images == SHADER_MAX_IMAGE_SLOTS) {
++         LOG_UNSUPPORTED(true);
++         return;
++      }
++      k = b->num_images++;
++      if (sx->image_formats && sx->image_formats[k] != PIPE_FORMAT_NONE) {
++         /* a variant for the bound view's format (virglrenderer declares format-less images rgba32f, which
++          * mismatches other formats): when its kind (float, signed, unsigned) is the declared one */
++         enum pipe_format f = sx->image_formats[k];
++         bool f_sint = util_format_is_pure_sint(f), f_uint = util_format_is_pure_uint(f);
++         if ((ret == TGSI_RETURN_TYPE_SINT && f_sint) || (ret == TGSI_RETURN_TYPE_UINT && f_uint) ||
++             (ret != TGSI_RETURN_TYPE_SINT && ret != TGSI_RETURN_TYPE_UINT && !f_sint && !f_uint)) {
++            uav->format = f;
++         }
++      }
++      b->image_uav[k] = u;
++      uav->reg = ureg_DECL_image(sx->ureg, k, uav->target, uav->format, true, false);
++   } else {
++      uav->stride = opcode->type == D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED ?
++                    opcode->specific.dcl_uav.stride : 0;
++      uav->reg = buffer_slot(sx, SHADER_BUFFER_UAV, u);
++   }
++}
++
++static void
++dcl_srv_buffer(struct Shader_xlate *sx, const struct Shader_opcode *opcode)
++{
++   unsigned t = opcode->dst[0].base.index[0].imm;
++
++   if (t >= SHADER_MAX_RESOURCES) {
++      LOG_UNSUPPORTED(true);
++      return;
++   }
++   sx->resources[t].target = TGSI_TEXTURE_BUFFER;
++   sx->srv_buffers[t].declared = true;
++   sx->srv_buffers[t].stride = opcode->type == D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED ?
++                               opcode->specific.dcl_structure_stride : 0;
++   sx->srv_buffers[t].reg = buffer_slot(sx, SHADER_BUFFER_SRV, t);
++}
++
++static void
++dcl_tgsm(struct Shader_xlate *sx, const struct Shader_opcode *opcode)
++{
++   unsigned g = opcode->dst[0].base.index[0].imm;
++
++   if (g >= SHADER_MAX_TGSM) {
++      LOG_UNSUPPORTED(true);
++      return;
++   }
++   if (!sx->bindings.shared_mem) {
++      sx->memory = ureg_DECL_memory(sx->ureg, TGSI_MEMORY_TYPE_SHARED);
++   }
++   sx->tgsm[g].base = sx->bindings.shared_mem;
++   sx->tgsm[g].stride = opcode->specific.dcl_tgsm.stride;
++   sx->tgsm[g].structured = opcode->type == D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_STRUCTURED;
++   sx->bindings.shared_mem += align(opcode->specific.dcl_tgsm.stride * opcode->specific.dcl_tgsm.count, 4);
++}
++
++/* The thread IDs a compute shader declared, once the thread group size is known too: in group and group IDs are
++ * TGSI's, the ID in the dispatch is group * size + in group, the flattened one z * w * h + y * w + x. */
++static void
++cs_inputs(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   const unsigned *bs = sx->bindings.block;
++   struct ureg_src tid, gid;
++
++   if (!bs[0]) {
++      return;
++   }
++   /* GLSL's IDs are 3-component: never read .w */
++   tid = ureg_swizzle(ureg_DECL_system_value(ureg, TGSI_SEMANTIC_THREAD_ID, 0),
++                      TGSI_SWIZZLE_X, TGSI_SWIZZLE_Y, TGSI_SWIZZLE_Z, TGSI_SWIZZLE_Z);
++   gid = ureg_swizzle(ureg_DECL_system_value(ureg, TGSI_SEMANTIC_BLOCK_ID, 0),
++                      TGSI_SWIZZLE_X, TGSI_SWIZZLE_Y, TGSI_SWIZZLE_Z, TGSI_SWIZZLE_Z);
++   for (unsigned i = 0; i < 5; i++) {
++      struct ureg_dst t;
++      if (!sx->cs_input_wanted[i] || sx->cs_input_done[i]) {
++         continue;
++      }
++      sx->cs_input_done[i] = true;
++      switch (i + D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID) {
++      case D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID:
++         t = ureg_DECL_temporary(ureg);
++         ureg_UMAD(ureg, ureg_writemask(t, TGSI_WRITEMASK_XYZ), gid, ureg_imm4u(ureg, bs[0], bs[1], bs[2], 0), tid);
++         sx->cs_input[i] = ureg_src(t);
++         break;
++      case D3D11_SB_OPERAND_TYPE_INPUT_THREAD_GROUP_ID:
++         sx->cs_input[i] = gid;
++         break;
++      case D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP:
++         sx->cs_input[i] = tid;
++         break;
++      case D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED:
++         t = ureg_DECL_temporary(ureg);
++         ureg_UMAD(ureg, ureg_writemask(t, TGSI_WRITEMASK_X), ureg_scalar(tid, TGSI_SWIZZLE_Y),
++                   ureg_imm1u(ureg, bs[0]), ureg_scalar(tid, TGSI_SWIZZLE_X));
++         ureg_UMAD(ureg, ureg_writemask(t, TGSI_WRITEMASK_X), ureg_scalar(tid, TGSI_SWIZZLE_Z),
++                   ureg_imm1u(ureg, bs[0] * bs[1]), ureg_scalar(ureg_src(t), TGSI_SWIZZLE_X));
++         sx->cs_input[i] = ureg_scalar(ureg_src(t), TGSI_SWIZZLE_X);
++         break;
++      default:
++         break;
++      }
++   }
++}
++
++enum mem_kind {
++   MEM_NONE,
++   MEM_TYPED,
++   MEM_BUFFER,
++   MEM_SHARED,
++};
++
++struct mem_ref {
++   enum mem_kind kind;
++   struct ureg_src reg;
++   bool structured;
++   unsigned stride;            /* structured */
++   unsigned base;              /* shared memory region */
++   uint target;                /* typed */
++   enum pipe_format format;
++   unsigned qualifier;
++   const struct Shader_uav *uav;
++};
++
++static struct mem_ref
++mem_ref(struct Shader_xlate *sx, const struct Shader_operand *op)
++{
++   struct mem_ref m;
++   unsigned i = op->index[0].imm;
++
++   memset(&m, 0, sizeof m);
++   switch (op->type) {
++   case D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW:
++      if (i < SHADER_MAX_UAVS && sx->uavs[i].declared) {
++         const struct Shader_uav *uav = &sx->uavs[i];
++         m.kind = uav->typed ? MEM_TYPED : MEM_BUFFER;
++         m.reg = uav->reg;
++         m.stride = uav->stride;
++         m.structured = uav->stride != 0;
++         m.target = uav->target;
++         m.format = uav->format;
++         m.qualifier = uav->qualifier;
++         m.uav = uav;
++      }
++      break;
++   case D3D10_SB_OPERAND_TYPE_RESOURCE:
++      if (i < SHADER_MAX_RESOURCES && sx->srv_buffers[i].declared) {
++         m.kind = MEM_BUFFER;
++         m.reg = sx->srv_buffers[i].reg;
++         m.stride = sx->srv_buffers[i].stride;
++         m.structured = m.stride != 0;
++      }
++      break;
++   case D3D11_SB_OPERAND_TYPE_THREAD_GROUP_SHARED_MEMORY:
++      if (i < SHADER_MAX_TGSM) {
++         m.kind = MEM_SHARED;
++         m.reg = sx->memory;
++         m.stride = sx->tgsm[i].stride;
++         m.structured = sx->tgsm[i].structured;
++         m.base = sx->tgsm[i].base;
++      }
++      break;
++   default:
++      break;
++   }
++   return m;
++}
++
++/* addr.x = the byte address: raw: the address; structured: index * stride + byte offset (offset NULL: the
++ * address operand's .y); plus the shared memory region's start. Typed: the coordinates as they are. */
++static struct ureg_src
++mem_address(struct Shader_xlate *sx, const struct mem_ref *m, struct ureg_dst addr,
++            const struct Shader_src_operand *a, const struct Shader_src_operand *offset)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct ureg_src index = translate_src_operand(sx, a, OF_UINT);
++
++   if (m->kind == MEM_TYPED) {
++      return index;
++   }
++   addr = ureg_writemask(addr, TGSI_WRITEMASK_X);
++   if (offset || m->structured) {
++      struct ureg_src off = offset ? ureg_scalar(translate_src_operand(sx, offset, OF_UINT), TGSI_SWIZZLE_X) :
++                                     ureg_scalar(index, TGSI_SWIZZLE_Y);
++      ureg_UMAD(ureg, addr, ureg_scalar(index, TGSI_SWIZZLE_X), ureg_imm1u(ureg, m->stride), off);
++   } else {
++      ureg_MOV(ureg, addr, ureg_scalar(index, TGSI_SWIZZLE_X));
++   }
++   if (m->base) {
++      ureg_UADD(ureg, addr, ureg_scalar(ureg_src(addr), TGSI_SWIZZLE_X), ureg_imm1u(ureg, m->base));
++   }
++   return ureg_scalar(ureg_src(addr), TGSI_SWIZZLE_X);
++}
++
++static enum tgsi_opcode
++atomic_opcode(D3D10_SB_OPCODE_TYPE type)
++{
++   switch (type) {
++   case D3D11_SB_OPCODE_ATOMIC_AND:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_AND:
++      return TGSI_OPCODE_ATOMAND;
++   case D3D11_SB_OPCODE_ATOMIC_OR:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_OR:
++      return TGSI_OPCODE_ATOMOR;
++   case D3D11_SB_OPCODE_ATOMIC_XOR:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_XOR:
++      return TGSI_OPCODE_ATOMXOR;
++   case D3D11_SB_OPCODE_ATOMIC_CMP_STORE:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH:
++      return TGSI_OPCODE_ATOMCAS;
++   case D3D11_SB_OPCODE_ATOMIC_IADD:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_IADD:
++      return TGSI_OPCODE_ATOMUADD;
++   case D3D11_SB_OPCODE_ATOMIC_IMAX:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_IMAX:
++      return TGSI_OPCODE_ATOMIMAX;
++   case D3D11_SB_OPCODE_ATOMIC_IMIN:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_IMIN:
++      return TGSI_OPCODE_ATOMIMIN;
++   case D3D11_SB_OPCODE_ATOMIC_UMAX:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_UMAX:
++      return TGSI_OPCODE_ATOMUMAX;
++   case D3D11_SB_OPCODE_ATOMIC_UMIN:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_UMIN:
++      return TGSI_OPCODE_ATOMUMIN;
++   case D3D11_SB_OPCODE_IMM_ATOMIC_EXCH:
++      return TGSI_OPCODE_ATOMXCHG;
++   default:
++      return TGSI_OPCODE_LAST;
++   }
++}
++
++/* Translates the shader model 5 memory instructions; false: not one of them */
++static bool
++translate_sm5_memory(struct Shader_xlate *sx, struct Shader_opcode *opcode)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct ureg_dst t, addr;
++   struct ureg_src src[4];
++   struct mem_ref m;
++   enum tgsi_opcode atom;
++
++   switch (opcode->type) {
++   case D3D11_SB_OPCODE_LD_UAV_TYPED:
++   case D3D11_SB_OPCODE_LD_RAW:
++   case D3D11_SB_OPCODE_LD_STRUCTURED: {
++      /* loads 4 consecutive dwords (or a texel); the resource operand's swizzle picks the components */
++      const struct Shader_src_operand *res = &opcode->src[opcode->num_src - 1];
++      unsigned need = 0, mask = opcode->dst[0].mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
++      m = mem_ref(sx, &res->base);
++      if (m.kind == MEM_NONE) {
++         LOG_UNSUPPORTED(true);
++         return true;
++      }
++      for (unsigned i = 0; i < 4; i++) {
++         if (mask & (1 << i)) {
++            need = MAX2(need, res->swizzle[i] + 1);
++         }
++      }
++      t = ureg_DECL_temporary(ureg);
++      addr = ureg_DECL_temporary(ureg);
++      src[0] = m.reg;
++      src[1] = mem_address(sx, &m, addr, &opcode->src[0],
++                           opcode->type == D3D11_SB_OPCODE_LD_STRUCTURED ? &opcode->src[1] : NULL);
++      if (m.kind == MEM_TYPED) {
++         need = 4;
++      }
++      ureg_MOV(ureg, t, ureg_imm1u(ureg, 0));
++      {
++         struct ureg_dst loaded = ureg_writemask(t, (1 << MAX2(need, 1)) - 1);
++         ureg_memory_insn(ureg, TGSI_OPCODE_LOAD, &loaded, 1, src, 2, m.qualifier,
++                          m.kind == MEM_TYPED ? m.target : 0, m.format);
++      }
++      ureg_MOV(ureg, translate_dst_operand(sx, &opcode->dst[0], opcode->saturate),
++               ureg_swizzle(ureg_src(t), res->swizzle[0], res->swizzle[1], res->swizzle[2], res->swizzle[3]));
++      ureg_release_temporary(ureg, t);
++      ureg_release_temporary(ureg, addr);
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_STORE_UAV_TYPED:
++   case D3D11_SB_OPCODE_STORE_RAW:
++   case D3D11_SB_OPCODE_STORE_STRUCTURED: {
++      /* the written components go to consecutive dwords from the address (raw/structured), the texel (typed) */
++      struct ureg_dst dst;
++      unsigned mask = opcode->dst[0].mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
++      bool structured = opcode->type == D3D11_SB_OPCODE_STORE_STRUCTURED;
++      m = mem_ref(sx, &opcode->dst[0].base);
++      if (m.kind == MEM_NONE) {
++         LOG_UNSUPPORTED(true);
++         return true;
++      }
++      addr = ureg_DECL_temporary(ureg);
++      src[0] = mem_address(sx, &m, addr, &opcode->src[0], structured ? &opcode->src[1] : NULL);
++      src[1] = translate_src_operand(sx, &opcode->src[structured ? 2 : 1], OF_UINT);
++      dst = ureg_writemask(ureg_dst(m.reg), m.kind == MEM_TYPED || !mask ? TGSI_WRITEMASK_XYZW : mask);
++      ureg_memory_insn(ureg, TGSI_OPCODE_STORE, &dst, 1, src, 2, m.qualifier,
++                       m.kind == MEM_TYPED ? m.target : 0, m.format);
++      ureg_release_temporary(ureg, addr);
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_ATOMIC_AND:
++   case D3D11_SB_OPCODE_ATOMIC_OR:
++   case D3D11_SB_OPCODE_ATOMIC_XOR:
++   case D3D11_SB_OPCODE_ATOMIC_CMP_STORE:
++   case D3D11_SB_OPCODE_ATOMIC_IADD:
++   case D3D11_SB_OPCODE_ATOMIC_IMAX:
++   case D3D11_SB_OPCODE_ATOMIC_IMIN:
++   case D3D11_SB_OPCODE_ATOMIC_UMAX:
++   case D3D11_SB_OPCODE_ATOMIC_UMIN:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_IADD:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_AND:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_OR:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_XOR:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_EXCH:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_IMAX:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_IMIN:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_UMAX:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_UMIN: {
++      /* atomic_*: dst0 the resource; imm_atomic_*: dst0 the old value, dst1 the resource; then the address and
++       * the value (compare and value for the compare-exchanges) */
++      bool imm = opcode->num_dst == 2;
++      const struct Shader_dst_operand *res = &opcode->dst[imm ? 1 : 0];
++      unsigned nsrc = opcode->num_src;
++      struct ureg_dst out;
++      m = mem_ref(sx, &res->base);
++      atom = atomic_opcode(opcode->type);
++      if (m.kind == MEM_NONE || atom == TGSI_OPCODE_LAST) {
++         LOG_UNSUPPORTED(true);
++         return true;
++      }
++      t = ureg_DECL_temporary(ureg);
++      addr = ureg_DECL_temporary(ureg);
++      src[0] = m.reg;
++      src[1] = mem_address(sx, &m, addr, &opcode->src[0], NULL);
++      src[2] = ureg_scalar(translate_src_operand(sx, &opcode->src[1], OF_UINT), TGSI_SWIZZLE_X);
++      if (nsrc > 2) {
++         src[3] = ureg_scalar(translate_src_operand(sx, &opcode->src[2], OF_UINT), TGSI_SWIZZLE_X);
++      }
++      out = ureg_writemask(t, TGSI_WRITEMASK_X);
++      ureg_memory_insn(ureg, atom, &out, 1, src, nsrc > 2 ? 4 : 3, m.qualifier,
++                       m.kind == MEM_TYPED ? m.target : 0, m.format);
++      if (imm && opcode->dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
++         ureg_MOV(ureg, translate_dst_operand(sx, &opcode->dst[0], false), ureg_scalar(ureg_src(t), TGSI_SWIZZLE_X));
++      }
++      ureg_release_temporary(ureg, t);
++      ureg_release_temporary(ureg, addr);
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_IMM_ATOMIC_ALLOC:
++   case D3D11_SB_OPCODE_IMM_ATOMIC_CONSUME: {
++      /* append/consume: the UAV's hidden counter; alloc returns the count before, consume the count after */
++      unsigned u = opcode->src[0].base.index[0].imm;   /* imm_atomic_alloc dst, u# */
++      struct Shader_uav *uav = u < SHADER_MAX_UAVS ? &sx->uavs[u] : NULL;
++      struct ureg_dst out;
++      if (!uav || !uav->declared) {
++         LOG_UNSUPPORTED(true);
++         return true;
++      }
++      if (!uav->has_counter) {
++         uav->has_counter = true;
++         uav->counter = buffer_slot(sx, SHADER_BUFFER_UAV_COUNTER, u);
++      }
++      t = ureg_DECL_temporary(ureg);
++      out = ureg_writemask(t, TGSI_WRITEMASK_X);
++      src[0] = uav->counter;
++      src[1] = ureg_imm1u(ureg, 0);
++      src[2] = opcode->type == D3D11_SB_OPCODE_IMM_ATOMIC_ALLOC ? ureg_imm1u(ureg, 1) : ureg_imm1u(ureg, ~0u);
++      ureg_memory_insn(ureg, TGSI_OPCODE_ATOMUADD, &out, 1, src, 3, 0, 0, PIPE_FORMAT_NONE);
++      if (opcode->type == D3D11_SB_OPCODE_IMM_ATOMIC_CONSUME) {
++         ureg_UADD(ureg, out, ureg_scalar(ureg_src(t), TGSI_SWIZZLE_X), ureg_imm1u(ureg, ~0u));
++      }
++      ureg_MOV(ureg, translate_dst_operand(sx, &opcode->dst[0], false), ureg_scalar(ureg_src(t), TGSI_SWIZZLE_X));
++      ureg_release_temporary(ureg, t);
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_SYNC: {
++      unsigned f = opcode->specific.sync_flags, membar = 0;
++      if (f & D3D11_SB_SYNC_THREAD_GROUP_SHARED_MEMORY) {
++         membar |= TGSI_MEMBAR_SHARED;
++      }
++      if (f & D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GROUP) {
++         membar |= TGSI_MEMBAR_SHADER_BUFFER | TGSI_MEMBAR_SHADER_IMAGE | TGSI_MEMBAR_THREAD_GROUP;
++      }
++      if (f & D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL) {
++         membar |= TGSI_MEMBAR_SHADER_BUFFER | TGSI_MEMBAR_SHADER_IMAGE;
++      }
++      if (membar) {
++         ureg_MEMBAR(ureg, ureg_imm1u(ureg, membar));
++      }
++      if (f & D3D11_SB_SYNC_THREADS_IN_GROUP) {
++         ureg_BARRIER(ureg);
++      }
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_BUFINFO:
++   case D3D10_SB_OPCODE_RESINFO: {
++      /* raw: bytes, structured: elements, typed UAVs: their size (resinfo: and one mip level) */
++      const struct Shader_src_operand *res = &opcode->src[opcode->type == D3D11_SB_OPCODE_BUFINFO ? 0 : 1];
++      struct ureg_dst out;
++      if (res->base.type != D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW &&
++          !(res->base.type == D3D10_SB_OPERAND_TYPE_RESOURCE && res->base.index[0].imm < SHADER_MAX_RESOURCES &&
++            sx->srv_buffers[res->base.index[0].imm].declared)) {
++         return false;  /* textures and typed buffer views */
++      }
++      m = mem_ref(sx, &res->base);
++      if (m.kind == MEM_NONE) {
++         LOG_UNSUPPORTED(true);
++         return true;
++      }
++      t = ureg_DECL_temporary(ureg);
++      ureg_MOV(ureg, t, ureg_imm1u(ureg, 0));
++      /* as many components as the GLSL size has (a buffer's length is a scalar) */
++      if (m.kind != MEM_TYPED || m.target == TGSI_TEXTURE_BUFFER || m.target == TGSI_TEXTURE_1D) {
++         out = ureg_writemask(t, TGSI_WRITEMASK_X);
++      } else if (m.target == TGSI_TEXTURE_2D || m.target == TGSI_TEXTURE_1D_ARRAY ||
++                 m.target == TGSI_TEXTURE_2D_MSAA) {
++         out = ureg_writemask(t, TGSI_WRITEMASK_XY);
++      } else {
++         out = ureg_writemask(t, TGSI_WRITEMASK_XYZ);
++      }
++      ureg_memory_insn(ureg, TGSI_OPCODE_RESQ, &out, 1, &m.reg, 1, 0, m.kind == MEM_TYPED ? m.target : 0, m.format);
++      if (m.kind == MEM_BUFFER && m.stride) {
++         ureg_UDIV(ureg, ureg_writemask(t, TGSI_WRITEMASK_X), ureg_scalar(ureg_src(t), TGSI_SWIZZLE_X),
++                   ureg_imm1u(ureg, m.stride));
++      }
++      if (m.kind == MEM_BUFFER) {
++         ureg_MOV(ureg, ureg_writemask(t, TGSI_WRITEMASK_YZW), ureg_imm1u(ureg, 0));
++      }
++      if (opcode->type == D3D10_SB_OPCODE_RESINFO) {
++         unsigned dims = tex_size_dims(m.target);
++         ureg_MOV(ureg, ureg_writemask(t, TGSI_WRITEMASK_W), ureg_imm1u(ureg, 1));
++         if (opcode->specific.resinfo_ret_type != D3D10_SB_RESINFO_INSTRUCTION_RETURN_UINT) {
++            ureg_U2F(ureg, t, ureg_src(t));
++         }
++         if (opcode->specific.resinfo_ret_type == D3D10_SB_RESINFO_INSTRUCTION_RETURN_RCPFLOAT) {
++            for (unsigned i = 0; i < dims; i++) {
++               ureg_RCP(ureg, ureg_writemask(t, 1 << i), ureg_scalar(ureg_src(t), i));
++            }
++         }
++      }
++      ureg_MOV(ureg, translate_dst_operand(sx, &opcode->dst[0], opcode->saturate),
++               ureg_swizzle(ureg_src(t), res->swizzle[0], res->swizzle[1], res->swizzle[2], res->swizzle[3]));
++      ureg_release_temporary(ureg, t);
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
++   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW:
++   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED:
++      dcl_uav(sx, opcode);
++      return true;
++   case D3D11_SB_OPCODE_DCL_RESOURCE_RAW:
++   case D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED:
++      dcl_srv_buffer(sx, opcode);
++      return true;
++   case D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_RAW:
++   case D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_STRUCTURED:
++      dcl_tgsm(sx, opcode);
++      return true;
++   case D3D11_SB_OPCODE_DCL_THREAD_GROUP:
++      for (unsigned i = 0; i < 3; i++) {
++         sx->bindings.block[i] = MAX2(opcode->specific.dcl_thread_group[i], 1);
++      }
++      ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_WIDTH, sx->bindings.block[0]);
++      ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_HEIGHT, sx->bindings.block[1]);
++      ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_DEPTH, sx->bindings.block[2]);
++      cs_inputs(sx);
++      return true;
++   default:
++      return false;
++   }
++}
++
+ /* Finds the loops that have a continue and each switch's case values, ahead of the translation. */
+ static void
+ Shader_scan_control_flow(struct Shader_xlate *sx, const unsigned *code)
+@@ -2194,6 +2782,44 @@
+             }
+          }
+          break;
++      case D3D11_SB_OPCODE_SYNC:
++         if (opcode.specific.sync_flags & (D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GROUP |
++                                           D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL)) {
++            sx->uav_sync = true;
++         }
++         break;
++      case D3D11_SB_OPCODE_LD_UAV_TYPED:
++         if (opcode.src[1].base.type == D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW &&
++             opcode.src[1].base.index[0].imm < SHADER_MAX_UAVS) {
++            sx->uav_read[opcode.src[1].base.index[0].imm] = true;
++         }
++         break;
++      case D3D11_SB_OPCODE_ATOMIC_AND:
++      case D3D11_SB_OPCODE_ATOMIC_OR:
++      case D3D11_SB_OPCODE_ATOMIC_XOR:
++      case D3D11_SB_OPCODE_ATOMIC_CMP_STORE:
++      case D3D11_SB_OPCODE_ATOMIC_IADD:
++      case D3D11_SB_OPCODE_ATOMIC_IMAX:
++      case D3D11_SB_OPCODE_ATOMIC_IMIN:
++      case D3D11_SB_OPCODE_ATOMIC_UMAX:
++      case D3D11_SB_OPCODE_ATOMIC_UMIN:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_IADD:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_AND:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_OR:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_XOR:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_EXCH:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_IMAX:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_IMIN:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_UMAX:
++      case D3D11_SB_OPCODE_IMM_ATOMIC_UMIN: {
++         const struct Shader_dst_operand *res = &opcode.dst[opcode.num_dst - 1];
++         if (res->base.type == D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW &&
++             res->base.index[0].imm < SHADER_MAX_UAVS) {
++            sx->uav_read[res->base.index[0].imm] = true;
++         }
++         break;
++      }
+       case D3D10_SB_OPCODE_CASE:
+       case D3D10_SB_OPCODE_DEFAULT:
+          if (depth && depth <= SHADER_MAX_CF_DEPTH && stack[depth - 1].is_switch) {
+@@ -2389,7 +3015,16 @@
+ const struct tgsi_token *
+ Shader_tgsi_translate(const unsigned *code,
+                       unsigned *output_mapping,
+-                      struct Shader_tex_slots *tex_slots)
++                      struct Shader_bindings *bindings)
++{
++   return Shader_tgsi_translate_images(code, output_mapping, bindings, NULL);
++}
++
++const struct tgsi_token *
++Shader_tgsi_translate_images(const unsigned *code,
++                             unsigned *output_mapping,
++                             struct Shader_bindings *bindings,
++                             const enum pipe_format *image_formats)
+ {
+    /* Large (4096 temporaries): on the heap, a stack frame this size overflowed DWM's shader-creating thread */
+    struct Shader_xlate *sx;
+@@ -2414,6 +3049,7 @@
+       shader_dumped = true;
+    }
+ 
++   sx->image_formats = image_formats;
+    sx->max_calls = 64;
+    sx->calls = (struct Shader_call *)MALLOC(sx->max_calls *
+                                            sizeof(struct Shader_call));
+@@ -2437,6 +3073,9 @@
+    case D3D10_SB_GEOMETRY_SHADER:
+       ureg = ureg_create(PIPE_SHADER_GEOMETRY);
+       break;
++   case D3D11_SB_COMPUTE_SHADER:
++      ureg = ureg_create(PIPE_SHADER_COMPUTE);
++      break;
+    }
+ 
+    assert(ureg);
+@@ -2445,6 +3084,9 @@
+    for(uint i = 0; i < SHADER_MAX_ADDRS; i++) {
+       sx->addrs[i] = ureg_DECL_address(sx->ureg);
+    }
++   for (uint i = 0; i < SHADER_MAX_SRC_OPERANDS; i++) {
++      sx->neg_temps[i] = ureg_dst_undef();
++   }
+    sx->addr_cur = 0;
+ 
+    while (Shader_parse_opcode(&parser, &opcode)) {
+@@ -2452,8 +3094,12 @@
+ 
+       assert(opcode.type < D3D10_SB_NUM_OPCODES);
+       ox = &opcode_xlate[opcode.type];
+-
+-      if ((virgl_tex_ops() && translate_texture_virgl(sx, &opcode)) || translate_sm5_alu(sx, &opcode)) {
++      /* mov, movc and swapc are typeless: modifiers on them are float ones */
++      sx->integer_op = ox->format != OF_FLOAT && opcode.type != D3D10_SB_OPCODE_MOV &&
++                       opcode.type != D3D10_SB_OPCODE_MOVC && opcode.type != D3D11_SB_OPCODE_SWAPC;
++
++      if (translate_sm5_memory(sx, &opcode) || (virgl_tex_ops() && translate_texture_virgl(sx, &opcode)) ||
++          translate_sm5_alu(sx, &opcode)) {
+          Shader_opcode_free(&opcode);
+          continue;
+       }
+@@ -3117,7 +3763,11 @@
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT:
+-         if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK) {
++         if (opcode.dst[0].base.type >= D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID &&
++             opcode.dst[0].base.type <= D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED) {
++            sx->cs_input_wanted[opcode.dst[0].base.type - D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID] = true;
++            cs_inputs(sx);
++         } else if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK) {
+             sx->coverage = ureg_scalar(ureg_DECL_system_value(ureg, TGSI_SEMANTIC_SAMPLEMASK, 0), TGSI_SWIZZLE_X);
+          } else if (parser.header.type == D3D10_SB_PIXEL_SHADER) {
+             /* other input registers without a semantic: none in pixel shaders before compute/tessellation */
+@@ -3508,8 +4158,8 @@
+    FREE(sx->switches);
+    FREE(sx->loop_has_continue);
+ 
+-   if (tex_slots) {
+-      *tex_slots = sx->tex_slots;
++   if (bindings) {
++      *bindings = sx->bindings;
+    }
+ 
+    FREE(sx);
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -41,6 +41,10 @@
+ #include "gdikmt_d3dddi.h"
+ #include "ShaderParse.h"
+ 
++#ifndef D3D11_1_UAV_SLOT_COUNT
++#define D3D11_1_UAV_SLOT_COUNT 64
++#endif
++
+ #define SUPPORT_MSAA 0
+ #define SUPPORT_D3D10_1 0
+ #define SUPPORT_D3D11 0
+@@ -67,7 +71,17 @@
+    struct pipe_shader_state state;
+    unsigned output_mapping[PIPE_MAX_SHADER_OUTPUTS];
+    bool output_resolved;
+-   struct Shader_tex_slots tex_slots;   /* virgl: views and samplers per TGSI sampler (ShaderParse.h) */
++   struct Shader_bindings bindings;   /* what the driver binds for it (ShaderParse.h) */
++
++   /* Typed UAVs: translations for the bound views' formats (ShaderBindStage); the bytecode to make them */
++   UINT *code;
++   struct {
++      enum pipe_format formats[SHADER_MAX_IMAGE_SLOTS];
++      void *handle;
++      const struct tgsi_token *tokens;
++   } variants[8];
++   unsigned num_variants;
++   enum pipe_format bound_formats[SHADER_MAX_IMAGE_SLOTS];   /* the bound translation's: all NONE for the first */
+ };
+ 
+ struct Query;
+@@ -101,8 +115,12 @@
+    struct pipe_stream_output_target *draw_so_target;
+    Shader *bound_empty_gs;
+    Shader *bound_vs;
+-   Shader *bound_shader[PIPE_SHADER_TYPES];      /* virgl: whose tex_slots to bind */
+-   bool tex_slots_dirty[PIPE_SHADER_TYPES];
++   Shader *bound_shader[PIPE_SHADER_TYPES];      /* whose bindings to bind (Shader_bindings) */
++   bool bindings_dirty[PIPE_SHADER_TYPES];
++   struct ShaderResourceView *srvs[PIPE_SHADER_TYPES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
++   struct UnorderedAccessView *uavs[PIPE_SHADER_TYPES][D3D11_1_UAV_SLOT_COUNT];
++   unsigned bound_images[PIPE_SHADER_TYPES];     /* how many were bound last, to unbind */
++   unsigned bound_buffers[PIPE_SHADER_TYPES];
+ 
+    unsigned max_dual_source_render_targets;
+    
+@@ -163,15 +181,27 @@
+ }
+ 
+ 
++/* A mapped 3D subresource's contents in memory: virglrenderer reads only a box's first slice back from the host
++ * (glReadPixels of box->z), so read maps of 3D textures read each slice separately */
++struct ResourceShadow
++{
++   void *data;
++   unsigned usage;
++   unsigned stride, layer_stride;
++};
++
++
+ struct Resource
+ {
+    DXGI_FORMAT Format;
+    UINT MipLevels;
+    UINT NumSubResources;
+    bool buffer;
++   UINT ByteStride;            /* structured buffers (D3D11DDIARG_CREATERESOURCE) */
+    struct pipe_resource *resource;
+    struct pipe_transfer **transfers;
+    struct pipe_stream_output_target *so_target;
++   struct ResourceShadow *shadows;   /* 3D read maps, slice by slice (ResourceMap) */
+ };
+ 
+ 
+@@ -372,10 +402,31 @@
+ }
+ 
+ 
++/* Unordered access views (feature level 11): typed ones are images, raw and structured ones shader buffers;
++ * append/consume and counter UAVs have a counter buffer of their own */
++struct UnorderedAccessView
++{
++   Resource *resource;
++   bool typed;
++   struct pipe_image_view image;
++   struct pipe_shader_buffer buffer;
++   struct pipe_resource *counter;
++};
++
++
++static inline UnorderedAccessView *
++CastUnorderedAccessView(D3D11DDI_HUNORDEREDACCESSVIEW hView)
++{
++   return static_cast<UnorderedAccessView *>(hView.pDrvPrivate);
++}
++
++
+ struct ShaderResourceView
+ {
+-   struct pipe_sampler_view *handle;
++   struct pipe_sampler_view *handle;   /* NULL for raw and structured buffer views */
+    Resource *resource;
++   unsigned buffer_offset;             /* raw and structured buffer views, bytes */
++   unsigned buffer_size;
+ };
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/meson.build b/src/gallium/frontends/d3d10umd/meson.build
+--- a/src/gallium/frontends/d3d10umd/meson.build
++++ b/src/gallium/frontends/d3d10umd/meson.build
+@@ -9,6 +9,7 @@
+   'd3d10umd',
+   files(
+     'Adapter.cpp',
++    'Compute.cpp',
+     'D3D11_1.cpp',
+     'Debug.cpp',
+     'Device.cpp',

@@ -1,0 +1,53 @@
+spice-gstaudio: a smaller audio sink buffer
+
+Audio sinks buffer 200 ms by default, which made the sound of a local guest lag behind by about 170 ms (measured from
+the guest playing a sound to it reaching PipeWire), too much for playing music. SPICE_GTK_AUDIO_BUFFER_MS
+(buffer[,segment], in ms) sets the buffer and its segments on the sink autoaudiosink picks. 30,5 brought it to about
+70 ms, without dropouts with every host core busy.
+
+diff --color -ru a/src/spice-gstaudio.c b/src/spice-gstaudio.c
+--- a/src/spice-gstaudio.c
++++ b/src/spice-gstaudio.c
+@@ -279,6 +279,34 @@
+     return TRUE;
+ }
+ 
++/*
++ * SPICE_GTK_AUDIO_BUFFER_MS[=buffer[,segment]]: the sink's buffer (the latency it adds) and its segments, in
++ * milliseconds. Audio sinks buffer 200 ms by default; a local client can do with much less. Set on whichever sink
++ * autoaudiosink picks (it adds it when it starts).
++ */
++static void playback_sink_added(GstBin *bin, GstBin *sub_bin, GstElement *element, gpointer data)
++{
++    const gchar *setting = g_getenv("SPICE_GTK_AUDIO_BUFFER_MS");
++    GObjectClass *klass = G_OBJECT_GET_CLASS(element);
++    gint64 buffer_ms, segment_ms = 5;
++    gchar **parts;
++
++    if (setting == NULL ||
++        g_object_class_find_property(klass, "buffer-time") == NULL ||
++        g_object_class_find_property(klass, "latency-time") == NULL)
++        return;
++    parts = g_strsplit(setting, ",", 2);
++    buffer_ms = g_ascii_strtoll(parts[0], NULL, 10);
++    if (parts[1] != NULL)
++        segment_ms = g_ascii_strtoll(parts[1], NULL, 10);
++    g_strfreev(parts);
++    if (buffer_ms <= 0 || segment_ms <= 0 || segment_ms > buffer_ms)
++        return;
++    SPICE_DEBUG("audio sink %s: buffer %" G_GINT64_FORMAT " ms, segments %" G_GINT64_FORMAT " ms",
++                GST_ELEMENT_NAME(element), buffer_ms, segment_ms);
++    g_object_set(element, "buffer-time", buffer_ms * 1000, "latency-time", segment_ms * 1000, NULL);
++}
++
+ static void playback_start(SpicePlaybackChannel *channel, gint format, gint channels,
+                            gint frequency, gpointer data)
+ {
+@@ -310,6 +338,7 @@
+             g_warning("Failed to create pipeline: %s", error->message);
+             goto cleanup;
+         }
++        g_signal_connect(p->playback.pipe, "deep-element-added", G_CALLBACK(playback_sink_added), NULL);
+         p->playback.src = gst_bin_get_by_name(GST_BIN(p->playback.pipe), "appsrc");
+         p->playback.sink = gst_bin_get_by_name(GST_BIN(p->playback.pipe), "audiosink");
+         p->playback.rate = frequency;

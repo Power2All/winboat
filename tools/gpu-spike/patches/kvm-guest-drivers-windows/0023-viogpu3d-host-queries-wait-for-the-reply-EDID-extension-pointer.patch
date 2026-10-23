@@ -1,0 +1,145 @@
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index 943b85a..77506dc 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -195,7 +195,6 @@ BOOLEAN CtrlQueue::AskDisplayInfo(PGPU_VBUFFER *buf)
+     PGPU_VBUFFER vbuf;
+     PGPU_RESP_DISP_INFO resp_buf;
+     KEVENT event;
+-    NTSTATUS status;
+ 
+     resp_buf = reinterpret_cast<PGPU_RESP_DISP_INFO>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_DISP_INFO)]);
+ 
+@@ -215,17 +214,11 @@ BOOLEAN CtrlQueue::AskDisplayInfo(PGPU_VBUFFER *buf)
+     vbuf->complete_ctx = &event;
+     vbuf->auto_release = false;
+ 
+-    LARGE_INTEGER timeout = {0};
+-    timeout.QuadPart = Int32x32To64(1000, -10000);
+ 
+     QueueBuffer(vbuf);
+-    status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
+-
+-    if (status == STATUS_TIMEOUT)
+-    {
+-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to ask display info\n"));
+-        VioGpuDbgBreak();
+-    }
++    // No timeout: the host always answers, if slowly while the GPU is busy, and until it does it writes into vbuf
++    // and signals the event on this stack
++    KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+     *buf = vbuf;
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+@@ -243,7 +236,6 @@ BOOLEAN CtrlQueue::AskEdidInfo(PGPU_VBUFFER *buf, UINT id)
+     PGPU_VBUFFER vbuf;
+     PGPU_RESP_EDID resp_buf;
+     KEVENT event;
+-    NTSTATUS status;
+ 
+     resp_buf = reinterpret_cast<PGPU_RESP_EDID>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_EDID)]);
+ 
+@@ -263,18 +255,12 @@ BOOLEAN CtrlQueue::AskEdidInfo(PGPU_VBUFFER *buf, UINT id)
+     vbuf->complete_ctx = &event;
+     vbuf->auto_release = false;
+ 
+-    LARGE_INTEGER timeout = {0};
+-    timeout.QuadPart = Int32x32To64(1000, -10000);
+ 
+     QueueBuffer(vbuf);
+ 
+-    status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
+-
+-    if (status == STATUS_TIMEOUT)
+-    {
+-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to get edid info\n"));
+-        VioGpuDbgBreak();
+-    }
++    // No timeout: the host always answers, if slowly while the GPU is busy, and until it does it writes into vbuf
++    // and signals the event on this stack
++    KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+ 
+     *buf = vbuf;
+ 
+@@ -318,7 +304,6 @@ BOOLEAN CtrlQueue::AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx)
+     PGPU_VBUFFER vbuf;
+     PGPU_RESP_CAPSET_INFO resp_buf;
+     KEVENT event;
+-    NTSTATUS status;
+ 
+     resp_buf = reinterpret_cast<PGPU_RESP_CAPSET_INFO>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_CAPSET_INFO)]);
+ 
+@@ -342,19 +327,12 @@ BOOLEAN CtrlQueue::AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx)
+     vbuf->complete_ctx = &event;
+     vbuf->auto_release = false;
+ 
+-    LARGE_INTEGER timeout = {0};
+-    timeout.QuadPart = Int32x32To64(1000, -10000);
+ 
+     QueueBuffer(vbuf);
+ 
+-    status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
+-
+-    if (status == STATUS_TIMEOUT)
+-    {
+-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to get capset info\n"));
+-        VioGpuDbgBreak();
+-        return FALSE;
+-    }
++    // No timeout: the host always answers, if slowly while the GPU is busy, and until it does it writes into vbuf
++    // and signals the event on this stack
++    KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+ 
+     *buf = vbuf;
+ 
+@@ -373,7 +351,6 @@ BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_si
+     PGPU_VBUFFER vbuf;
+     PGPU_RESP_CAPSET resp_buf;
+     KEVENT event;
+-    NTSTATUS status;
+     int resp_size = sizeof(GPU_RESP_CAPSET) + capset_size;
+ 
+     resp_buf = reinterpret_cast<PGPU_RESP_CAPSET>(new (NonPagedPoolNx) BYTE[resp_size]);
+@@ -395,19 +372,12 @@ BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_si
+     vbuf->complete_ctx = &event;
+     vbuf->auto_release = false;
+ 
+-    LARGE_INTEGER timeout = {0};
+-    timeout.QuadPart = Int32x32To64(1000, -10000);
+ 
+     QueueBuffer(vbuf);
+ 
+-    status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
+-
+-    if (status == STATUS_TIMEOUT)
+-    {
+-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to get capset\n"));
+-        VioGpuDbgBreak();
+-        return FALSE;
+-    }
++    // No timeout: the host always answers, if slowly while the GPU is busy, and until it does it writes into vbuf
++    // and signals the event on this stack
++    KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+ 
+     *buf = vbuf;
+ 
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index d366fac..b9bee27 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -1829,10 +1829,12 @@ PBYTE VioGpuVidPN::GetCTA861Data(void)
+     PAGED_CODE();
+     if (m_bEDID)
+     {
+-        PEDID_DATA_V1 edid_data = (PEDID_DATA_V1)m_EDIDs;
+-        if (edid_data->ExtensionFlag)
++        // The first block's extension count, then the extension right after it (m_EDIDs + 128 would step 128 rows of
++        // the 2D array, 32 KB past it: a page fault at start when that isn't mapped)
++        PEDID_DATA_V1 edid_data = (PEDID_DATA_V1)m_EDIDs[0];
++        if (edid_data->ExtensionFlag[0])
+         {
+-            PEDID_CTA_861 cta_data = (PEDID_CTA_861)(m_EDIDs + EDID_V1_BLOCK_SIZE);
++            PEDID_CTA_861 cta_data = (PEDID_CTA_861)(m_EDIDs[0] + EDID_V1_BLOCK_SIZE);
+             if (cta_data->ExtentionTag[0] >= 2 && cta_data->Revision[0] >= 3)
+             {
+                 return (PBYTE)cta_data;

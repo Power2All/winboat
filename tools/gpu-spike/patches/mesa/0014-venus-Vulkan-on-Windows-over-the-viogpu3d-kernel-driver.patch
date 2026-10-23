@@ -1,0 +1,1470 @@
+From: WinBoat
+Subject: [PATCH] venus: Vulkan on Windows over the viogpu3d kernel driver
+
+Venus (Mesa's Vulkan driver for virtio-gpu) only ran on Linux, over the DRM
+ioctls. Port it to Windows on top of the viogpu3d kernel driver's escapes:
+
+- vn_renderer_wddm.c: a renderer for the viogpu3d driver. It finds the
+  virtio-gpu adapter among all adapters (in an RDP session the desktop's
+  adapter is a remote one), creates a D3DKMT device that carries the Venus
+  context, and uses the escapes VIOGPU_GET_CAPS and VIOGPU_CTX_INIT, then
+  VIOGPU_BLOB_CREATE/MAP/DESTROY for shared memory and host-visible device
+  memory and VIOGPU_EXECBUFFER for command streams. Renderer syncs are
+  emulated with the event the driver sets when a ring's fence signals, the
+  way vn_renderer_virtgpu.c emulates drm_syncobjs with sync files; there are
+  no external memory or syncs, so no fd-based extensions are offered.
+- The escapes' structures in viogpu_wddm_driver.h (same as the driver's).
+- Win32 WSI on its software path: the GPU copies each frame to host-visible
+  memory and GDI draws it into the window (the DXGI path needs a D3D12
+  queue). VK_KHR_win32_surface and the swapchain extensions are offered
+  without external memory.
+- Windows stand-ins: thread ids, no sync files, no Linux nice value for the
+  ring priority, QueryPerformanceCounter for calibrated timestamps, and a
+  types-only branch in drm-uapi/drm.h (drm_fourcc.h needs the types).
+- Build: venus builds on Windows with clang-cl (it needs C11 atomics and
+  typeof, which MSVC 14.38 lacks). u_atomic.h uses the GCC builtins with
+  clang-cl (its intrin.h lacks the lowercase _interlocked* names); the
+  version-script, dynamic-list and -Bsymbolic checks are skipped for
+  MSVC-style compilers (clang-cl hands -Wl, options to lld-link, which took
+  the map for an input file); src/virtio is built for a Vulkan-only build;
+  the DirectX headers (Win32 WSI includes directx/d3d12.h) come in for any
+  Vulkan driver on Windows; the DLL exports through vulkan_api.def, and its
+  manifest names the DLL next to it, both named by the new
+  vulkan-virtio-dll-name option.
+
+Tested on the RTX 3080 host through vhost-user-gpu (WinBoat's image 6.05-8):
+memory, compute, rendering, texture sampling, timeline semaphores and a
+swapchain, 64- and 32-bit (WinBoat's DirectX test, groups vulkan and
+vulkan-32).
+---
+---
+diff --git a/include/drm-uapi/drm.h b/include/drm-uapi/drm.h
+--- a/include/drm-uapi/drm.h
++++ b/include/drm-uapi/drm.h
+@@ -41,6 +41,22 @@
+ #include <asm/ioctl.h>
+ typedef unsigned int drm_handle_t;
+ 
++#elif defined(_WIN32)
++
++/* Windows has no DRM: only the types, for drm_fourcc.h (Venus' format modifiers) */
++#include <stddef.h>
++#include <stdint.h>
++typedef int8_t   __s8;
++typedef uint8_t  __u8;
++typedef int16_t  __s16;
++typedef uint16_t __u16;
++typedef int32_t  __s32;
++typedef uint32_t __u32;
++typedef int64_t  __s64;
++typedef uint64_t __u64;
++typedef size_t   __kernel_size_t;
++typedef unsigned long drm_handle_t;
++
+ #else /* One of the BSDs */
+ 
+ #include <stdint.h>
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -576,7 +576,8 @@
+ endif
+ 
+ dep_dxheaders = null_dep
+-if with_gallium_d3d12 or with_microsoft_clc or with_microsoft_vk
++# Win32 WSI (any Vulkan driver on Windows) includes directx/d3d12.h
++if with_gallium_d3d12 or with_microsoft_clc or with_microsoft_vk or (with_any_vk and with_platform_windows)
+   dep_dxheaders = dependency('directx-headers', required : false)
+   if not dep_dxheaders.found()
+     dep_dxheaders = dependency('DirectX-Headers',
+@@ -1566,18 +1567,19 @@
+ 
+ # Check for some linker flags
+ ld_args_bsymbolic = []
+-if cc.links('int main() { return 0; }', args : '-Wl,-Bsymbolic', name : 'Bsymbolic')
++if cc.get_argument_syntax() != 'msvc' and cc.links('int main() { return 0; }', args : '-Wl,-Bsymbolic', name : 'Bsymbolic')
+   ld_args_bsymbolic += '-Wl,-Bsymbolic'
+ endif
+ with_ld_version_script = false
+-if cc.links('int main() { return 0; }',
++# (clang-cl passes -Wl, options to lld-link, which takes the map for an input file and still links the test)
++if cc.get_argument_syntax() != 'msvc' and cc.links('int main() { return 0; }',
+             args : '-Wl,--version-script=@0@'.format(
+               join_paths(meson.current_source_dir(), 'build-support/conftest.map')),
+             name : 'version-script')
+   with_ld_version_script = true
+ endif
+ with_ld_dynamic_list = false
+-if cc.links('int main() { return 0; }',
++if cc.get_argument_syntax() != 'msvc' and cc.links('int main() { return 0; }',
+             args : '-Wl,--dynamic-list=@0@'.format(
+               join_paths(meson.current_source_dir(), 'build-support/conftest.dyn')),
+             name : 'dynamic-list')
+diff --git a/meson_options.txt b/meson_options.txt
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -214,6 +214,13 @@
+ )
+ 
+ option(
++  'vulkan-virtio-dll-name',
++  type : 'string',
++  value : 'vulkan_virtio',
++  description : 'name of the venus (virtio) Vulkan driver DLL built for Windows, and of its ICD manifest',
++)
++
++option(
+   'gallium-d3d9-dll-name',
+   type : 'string',
+   value : 'libgallium_d3d9',
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -78,7 +78,7 @@
+ if with_gallium_etnaviv
+   subdir('etnaviv')
+ endif
+-if system_has_kms_drm or with_gallium_virgl
++if system_has_kms_drm or with_gallium_virgl or with_virtio_vk
+   subdir('virtio')
+ endif
+ if with_gallium_freedreno or with_freedreno_vk or with_tools.contains('freedreno')
+diff --git a/src/util/u_atomic.h b/src/util/u_atomic.h
+--- a/src/util/u_atomic.h
++++ b/src/util/u_atomic.h
+@@ -22,9 +22,10 @@
+  */
+ #if defined(__sun)
+ #define PIPE_ATOMIC_OS_SOLARIS
+-#elif defined(_MSC_VER)
++#elif defined(_MSC_VER) && !defined(__clang__)
+ #define PIPE_ATOMIC_MSVC_INTRINSIC
+-#elif defined(__GNUC__)
++#elif defined(__GNUC__) || defined(__clang__)
++/* clang-cl too: its intrin.h lacks the lowercase _interlocked* names the MSVC branch uses */
+ #define PIPE_ATOMIC_GCC_INTRINSIC
+ #else
+ #error "Unsupported platform"
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -15,19 +15,33 @@
+   ],
+ )
+ 
++if host_machine.system() == 'windows'
++  # Windows: the manifest sits next to the DLL in the driver package, and the
++  # kernel driver's INF names it (VulkanDriverName)
++  vn_dll_name = get_option('vulkan-virtio-dll-name')
++  vn_icd_name = vn_dll_name + '.json'
++  vn_icd_lib_path = './' + vn_dll_name + '.dll'
++  vn_icd_extra_args = ['--use-backslash']
++else
++  vn_dll_name = 'vulkan_virtio'
++  vn_icd_name = 'virtio_icd.@0@.json'.format(host_machine.cpu())
++  vn_icd_lib_path = join_paths(get_option('prefix'), get_option('libdir'),
++                               'libvulkan_virtio.so')
++  vn_icd_extra_args = []
++endif
++
+ virtio_icd = custom_target(
+   'virtio_icd',
+   input : [vk_icd_gen, vk_api_xml],
+-  output : 'virtio_icd.@0@.json'.format(host_machine.cpu()),
++  output : vn_icd_name,
+   command : [
+     prog_python, '@INPUT0@',
+     '--api-version', '1.3', '--xml', '@INPUT1@',
+-    '--lib-path', join_paths(get_option('prefix'), get_option('libdir'),
+-                             'libvulkan_virtio.so'),
++    '--lib-path', vn_icd_lib_path,
+     '--out', '@OUTPUT@',
+-  ],
++  ] + vn_icd_extra_args,
+   build_by_default : true,
+-  install_dir : with_vulkan_icd_dir,
++  install_dir : host_machine.system() == 'windows' ? get_option('bindir') : with_vulkan_icd_dir,
+   install_tag : 'runtime',
+   install : true,
+ )
+@@ -70,10 +84,14 @@
+   'vn_ring.c',
+   'vn_renderer_internal.c',
+   'vn_renderer_util.c',
+-  'vn_renderer_virtgpu.c',
+-  'vn_renderer_vtest.c',
+ )
+ 
++if host_machine.system() == 'windows'
++  libvn_files += files('vn_renderer_wddm.c')
++else
++  libvn_files += files('vn_renderer_virtgpu.c', 'vn_renderer_vtest.c')
++endif
++
+ vn_deps = [
+   dep_libdrm,
+   dep_thread,
+@@ -92,7 +110,7 @@
+ 
+ vn_libs = []
+ 
+-if with_platform_wayland or with_platform_x11
++if with_platform_wayland or with_platform_x11 or with_platform_windows
+   libvn_files += files('vn_wsi.c')
+   vn_flags += '-DVN_USE_WSI_PLATFORM'
+ endif
+@@ -111,8 +129,10 @@
+ endif
+ 
+ libvulkan_virtio = shared_library(
+-  'vulkan_virtio',
++  vn_dll_name,
+   [libvn_files, vn_entrypoints, sha1_h],
++  vs_module_defs : vulkan_api_def,
++  name_prefix : host_machine.system() == 'windows' ? '' : [],
+   include_directories : [
+     inc_include, inc_src, inc_virtio,
+   ],
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -11,6 +11,8 @@
+ #ifndef VN_COMMON_H
+ #define VN_COMMON_H
+ 
++#include "util/detect_os.h"
++
+ #include <assert.h>
+ #include <inttypes.h>
+ #include <limits.h>
+@@ -20,7 +22,12 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if DETECT_OS_WINDOWS
++#include <io.h>
++#include <windows.h>
++#else
+ #include <sys/syscall.h>
++#endif
+ #include <vulkan/vulkan.h>
+ 
+ #include "c11/threads.h"
+@@ -29,7 +36,22 @@
+ #include "util/bitset.h"
+ #include "util/compiler.h"
+ #include "util/detect_os.h"
++#if DETECT_OS_WINDOWS
++/* no sync files on Windows: vn_renderer_info::has_external_sync is false, so no fd is ever valid */
++static inline int
++sync_wait(int fd, int timeout)
++{
++   return -1;
++}
++
++static inline bool
++sync_valid_fd(int fd)
++{
++   return false;
++}
++#else
+ #include "util/libsync.h"
++#endif
+ #include "util/list.h"
+ #include "util/macros.h"
+ #include "util/os_time.h"
+@@ -549,11 +571,17 @@
+    }
+ }
+ 
++#if DETECT_OS_WINDOWS
++typedef int pid_t;
++#endif
++
+ static inline pid_t
+ vn_gettid(void)
+ {
+ #if DETECT_OS_ANDROID
+    return gettid();
++#elif DETECT_OS_WINDOWS
++   return (pid_t)GetCurrentThreadId();
+ #else
+    return syscall(SYS_gettid);
+ #endif
+diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -635,6 +635,56 @@
+       remoteDeviceIndex, pPeerMemoryFeatures);
+ }
+ 
++#if DETECT_OS_WINDOWS
++VkResult
++vn_GetCalibratedTimestampsEXT(
++   VkDevice device,
++   uint32_t timestampCount,
++   const VkCalibratedTimestampInfoEXT *pTimestampInfos,
++   uint64_t *pTimestamps,
++   uint64_t *pMaxDeviation)
++{
++   /* Windows has the performance counter instead of CLOCK_MONOTONIC */
++   struct vn_device *dev = vn_device_from_handle(device);
++   uint64_t max_clock_period = 0;
++   LARGE_INTEGER qpc;
++
++   const uint64_t begin = os_time_get_nano();
++
++   for (uint32_t domain = 0; domain < timestampCount; domain++) {
++      switch (pTimestampInfos[domain].timeDomain) {
++      case VK_TIME_DOMAIN_DEVICE_EXT: {
++         uint64_t device_max_deviation = 0;
++
++         VkResult ret = vn_call_vkGetCalibratedTimestampsEXT(
++            dev->primary_ring, device, 1, &pTimestampInfos[domain],
++            &pTimestamps[domain], &device_max_deviation);
++
++         if (ret != VK_SUCCESS)
++            return vn_error(dev->instance, ret);
++
++         max_clock_period = MAX2(max_clock_period, device_max_deviation);
++         break;
++      }
++      case VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT:
++         QueryPerformanceCounter(&qpc);
++         pTimestamps[domain] = qpc.QuadPart;
++         max_clock_period = MAX2(max_clock_period, 1);
++         break;
++      default:
++         pTimestamps[domain] = 0;
++         break;
++      }
++   }
++
++   const uint64_t end = os_time_get_nano();
++
++   /* as vk_time_max_deviation: the sampling interval plus the longest clock period */
++   *pMaxDeviation = end - begin + max_clock_period;
++
++   return VK_SUCCESS;
++}
++#else
+ VkResult
+ vn_GetCalibratedTimestampsEXT(
+    VkDevice device,
+@@ -694,3 +744,4 @@
+ 
+    return VK_SUCCESS;
+ }
++#endif
+diff --git a/src/virtio/vulkan/vn_instance.c b/src/virtio/vulkan/vn_instance.c
+--- a/src/virtio/vulkan/vn_instance.c
++++ b/src/virtio/vulkan/vn_instance.c
+@@ -48,7 +48,9 @@
+ #ifdef VK_USE_PLATFORM_XLIB_KHR
+       .KHR_xlib_surface = true,
+ #endif
+-#ifndef VK_USE_PLATFORM_WIN32_KHR
++#ifdef VK_USE_PLATFORM_WIN32_KHR
++      .KHR_win32_surface = true,
++#else
+       .EXT_headless_surface = true,
+ #endif
+    };
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -946,8 +946,14 @@
+    }
+ 
+ #ifdef VN_USE_WSI_PLATFORM
++#if DETECT_OS_WINDOWS
++   /* Win32 WSI's software path copies frames out of the GPU (vn_wsi_init): no memory or syncs shared with a window
++    * system */
++   if (true) {
++#else
+    if (can_external_mem &&
+        physical_dev->renderer_sync_fd.semaphore_importable) {
++#endif
+       exts->KHR_incremental_present = true;
+       exts->KHR_swapchain = true;
+       exts->KHR_swapchain_mutable_format = true;
+@@ -965,7 +971,9 @@
+       physical_dev->renderer_extensions.EXT_pci_bus_info;
+ #endif
+ 
++#if !DETECT_OS_WINDOWS
+    exts->EXT_physical_device_drm = true;
++#endif
+    /* use common implementation */
+    exts->EXT_tooling_info = true;
+    exts->EXT_device_memory_report = true;
+diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
+--- a/src/virtio/vulkan/vn_queue.c
++++ b/src/virtio/vulkan/vn_queue.c
+@@ -10,7 +10,9 @@
+ 
+ #include "vn_queue.h"
+ 
++#if !DETECT_OS_WINDOWS
+ #include "util/libsync.h"
++#endif
+ #include "venus-protocol/vn_protocol_driver_event.h"
+ #include "venus-protocol/vn_protocol_driver_fence.h"
+ #include "venus-protocol/vn_protocol_driver_queue.h"
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -228,11 +228,21 @@
+                          const VkAllocationCallbacks *alloc,
+                          struct vn_renderer **renderer);
+ 
++/* Windows: the viogpu3d kernel driver's escapes */
++VkResult
++vn_renderer_create_wddm(struct vn_instance *instance,
++                        const VkAllocationCallbacks *alloc,
++                        struct vn_renderer **renderer);
++
+ static inline VkResult
+ vn_renderer_create(struct vn_instance *instance,
+                    const VkAllocationCallbacks *alloc,
+                    struct vn_renderer **renderer)
+ {
++#if DETECT_OS_WINDOWS
++   return vn_renderer_create_wddm(instance, alloc, renderer);
++#endif
++
+    if (VN_DEBUG(VTEST)) {
+       VkResult result = vn_renderer_create_vtest(instance, alloc, renderer);
+       if (result == VK_SUCCESS)
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -5,7 +5,9 @@
+ 
+ #include "vn_ring.h"
+ 
++#if !DETECT_OS_WINDOWS
+ #include <sys/resource.h>
++#endif
+ 
+ #include "venus-protocol/vn_protocol_driver_transport.h"
+ 
+@@ -325,11 +327,14 @@
+     * VK_MESA_VENUS_PROTOCOL_SPEC_VERSION >= 2  */
+    int prio = 0;
+    bool ring_priority = false;
++#if !DETECT_OS_WINDOWS
++   /* the host takes a Linux nice value; Windows has no such thing to pass on */
+    if (instance->renderer->info.vk_mesa_venus_protocol_spec_version >= 2) {
+       errno = 0;
+       prio = getpriority(PRIO_PROCESS, 0);
+       ring_priority = is_tls_ring && !(prio == -1 && errno);
+    }
++#endif
+    const struct VkRingPriorityInfoMESA priority_info = {
+       .sType = VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA,
+       .priority = prio,
+diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+--- a/src/virtio/vulkan/vn_wsi.c
++++ b/src/virtio/vulkan/vn_wsi.c
+@@ -63,7 +63,7 @@
+ /* cast a WSI object to a pointer for logging */
+ #define VN_WSI_PTR(obj) ((const void *)(uintptr_t)(obj))
+ 
+-static PFN_vkVoidFunction
++static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ vn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
+ {
+    struct vn_physical_device *physical_dev =
+@@ -81,13 +81,21 @@
+       &physical_dev->wsi_device, vn_physical_device_to_handle(physical_dev),
+       vn_wsi_proc_addr, alloc, -1, &physical_dev->instance->dri_options,
+       &(struct wsi_device_options){
++#if DETECT_OS_WINDOWS
++         /* Win32 WSI's DXGI path presents from a D3D12 queue; without one, the GPU copies each frame to a host-visible
++          * buffer and the CPU draws it into the window with GDI */
++         .sw_device = true,
++#else
+          .sw_device = false,
++#endif
+          .extra_xwayland_image = true,
+       });
+    if (result != VK_SUCCESS)
+       return result;
+ 
++#if !DETECT_OS_WINDOWS
+    physical_dev->wsi_device.supports_modifiers = true;
++#endif
+    physical_dev->base.base.wsi_device = &physical_dev->wsi_device;
+ 
+    return VK_SUCCESS;
+diff --git a/src/virtio/wddm/viogpu_wddm_driver.h b/src/virtio/wddm/viogpu_wddm_driver.h
+--- a/src/virtio/wddm/viogpu_wddm_driver.h
++++ b/src/virtio/wddm/viogpu_wddm_driver.h
+@@ -50,7 +50,8 @@
+     ULONGLONG IamVioGPU; // Should be set by driver to VIOGPU_IAM
+     struct {
+         UINT Supports3d : 1;
+-        UINT Reserved : 31;
++        UINT SupportsBlob : 1; // Venus: blob resources with a host-visible memory window (VIOGPU_BLOB_*)
++        UINT Reserved : 30;
+     } Flags;
+     ULONGLONG SupportedCapsetIDs;
+ } VIOGPU_ADAPTERINFO;
+@@ -65,6 +66,11 @@
+ 
+ #define VIOGPU_CTX_INIT                                   0x200
+ 
++#define VIOGPU_BLOB_CREATE           0x300
++#define VIOGPU_BLOB_MAP              0x301
++#define VIOGPU_BLOB_DESTROY          0x302
++#define VIOGPU_EXECBUFFER            0x303
++
+ 
+ #pragma pack(1)
+ typedef struct _VIOGPU_DISP_MODE {
+@@ -116,6 +122,55 @@
+ #pragma pack()
+ 
+ 
++// Venus (Vulkan): blob resources, mapped into the calling process, and command streams for a Venus context.
++// The device (D3DKMTCreateDevice) owns its blobs: the driver destroys what is left when the device goes away.
++#define VIOGPU_BLOB_MEM_GUEST         0x0001
++#define VIOGPU_BLOB_MEM_HOST3D        0x0002
++#define VIOGPU_BLOB_MEM_HOST3D_GUEST  0x0003
++#define VIOGPU_BLOB_FLAG_USE_MAPPABLE    0x0001
++#define VIOGPU_BLOB_FLAG_USE_SHAREABLE   0x0002
++#define VIOGPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
++
++#pragma pack(1)
++typedef struct _VIOGPU_BLOB_CREATE_REQ
++{
++    ULONG BlobMem;   // VIOGPU_BLOB_MEM_*
++    ULONG BlobFlags; // VIOGPU_BLOB_FLAG_*
++    UINT64 BlobId;   // the context's object (Venus: a VkDeviceMemory's id, 0 for shared memory)
++    UINT64 Size;
++    ULONG ResId;     // out: the host resource
++} VIOGPU_BLOB_CREATE_REQ;
++#pragma pack()
++
++#pragma pack(1)
++typedef struct _VIOGPU_BLOB_MAP_REQ
++{
++    ULONG ResId;
++    ULONG MapInfo;   // out: VIRTIO_GPU_MAP_CACHE_* the host asked for
++    UINT64 Address;  // out: where the blob is in the calling process
++} VIOGPU_BLOB_MAP_REQ;
++#pragma pack()
++
++#pragma pack(1)
++typedef struct _VIOGPU_BLOB_DESTROY_REQ
++{
++    ULONG ResId;     // unmapped too, if it is mapped
++} VIOGPU_BLOB_DESTROY_REQ;
++#pragma pack()
++
++// A command stream for the device's context. With Event, the host answers once the ring's work is done
++// (ring 0: once the host processed the commands) and the driver then sets the event.
++#pragma pack(1)
++typedef struct _VIOGPU_EXECBUFFER_REQ
++{
++    UINT64 Command;  // user-mode address of the commands
++    ULONG Size;      // their size in bytes (at most VIOGPU_EXECBUFFER_MAX_SIZE)
++    ULONG RingIdx;
++    UINT64 Event;    // HANDLE of an event to set when done, or 0
++} VIOGPU_EXECBUFFER_REQ;
++#pragma pack()
++#define VIOGPU_EXECBUFFER_MAX_SIZE (512 * 1024)
++
+ #pragma pack(1)
+ typedef struct  _VIOGPU_ESCAPE{
+     USHORT      Type;
+@@ -130,6 +185,11 @@
+         VIOGPU_RES_BUSY_REQ ResourceBusy;
+         
+         VIOGPU_CTX_INIT_REQ CtxInit;
++
++        VIOGPU_BLOB_CREATE_REQ BlobCreate;
++        VIOGPU_BLOB_MAP_REQ BlobMap;
++        VIOGPU_BLOB_DESTROY_REQ BlobDestroy;
++        VIOGPU_EXECBUFFER_REQ ExecBuffer;
+     } DUMMYUNIONNAME;
+ } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
+ #pragma pack()
+diff --git a/src/virtio/vulkan/vn_renderer_wddm.c b/src/virtio/vulkan/vn_renderer_wddm.c
+new file mode 100644
+--- /dev/null
++++ b/src/virtio/vulkan/vn_renderer_wddm.c
+@@ -0,0 +1,872 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * based in part on vn_renderer_virtgpu.c, which is:
++ * Copyright 2020 Google LLC
++ */
++
++/* Venus on Windows, over the viogpu3d kernel driver. Its escapes (src/virtio/wddm/viogpu_wddm_driver.h) stand in
++ * for the virtio-gpu DRM ioctls: a D3DKMT device carries the Venus context, blobs are created, mapped into this
++ * process and destroyed through it, and command streams go to one of the context's rings, with an event the driver
++ * sets once the ring's fence signals. Renderer syncs are emulated with those events, the way vn_renderer_virtgpu.c
++ * emulates drm_syncobjs with sync files. Nothing is shared with other processes or APIs yet: no external memory, no
++ * external syncs.
++ */
++
++#include <windows.h>
++#include <winternl.h>
++#include <d3dkmthk.h>
++
++#include "util/os_time.h"
++#define VIRGL_RENDERER_UNSTABLE_APIS
++#include "virtio-gpu/virglrenderer_hw.h"
++#include "virtio/wddm/viogpu_wddm_driver.h"
++
++#include "vn_renderer_internal.h"
++
++#define WDDM_PCI_VENDOR_ID 0x1af4
++#define WDDM_PCI_DEVICE_ID 0x1050
++
++/* the timelines a Venus context has (rings 0..63, see VIOGPU_EXECBUFFER_REQ) */
++#define WDDM_MAX_TIMELINE_COUNT 64
++
++struct wddm_shmem {
++   struct vn_renderer_shmem base;
++};
++
++struct wddm_bo {
++   struct vn_renderer_bo base;
++   uint32_t blob_flags;
++};
++
++struct wddm_sync {
++   struct vn_renderer_sync base;
++
++   mtx_t mutex;
++   uint64_t point;
++
++   /* set by the kernel driver once the submission that signals pending_point is done */
++   HANDLE pending_event;
++   uint64_t pending_point;
++   bool pending_cpu;
++};
++
++struct wddm {
++   struct vn_renderer base;
++
++   struct vn_instance *instance;
++
++   PFND3DKMT_ESCAPE escape;
++   PFND3DKMT_DESTROYDEVICE destroy_device;
++   PFND3DKMT_CLOSEADAPTER close_adapter;
++
++   D3DKMT_HANDLE adapter;
++   D3DKMT_HANDLE device;
++
++   struct {
++      enum virgl_renderer_capset id;
++      uint32_t version;
++      struct virgl_renderer_capset_venus data;
++   } capset;
++
++   struct vn_renderer_shmem_cache shmem_cache;
++};
++
++/* ---- kernel driver escapes ---- */
++
++static NTSTATUS
++wddm_escape(struct wddm *gpu, VIOGPU_ESCAPE *esc, USHORT type, USHORT size)
++{
++   esc->Type = type;
++   esc->DataLength = size;
++
++   D3DKMT_ESCAPE args = {
++      .hAdapter = gpu->adapter,
++      .hDevice = gpu->device,
++      .Type = D3DKMT_ESCAPE_DRIVERPRIVATE,
++      .pPrivateDriverData = esc,
++      .PrivateDriverDataSize = sizeof(*esc),
++   };
++   return gpu->escape(&args);
++}
++
++static uint32_t
++wddm_blob_create(struct wddm *gpu,
++                 uint32_t blob_mem,
++                 uint32_t blob_flags,
++                 size_t size,
++                 uint64_t blob_id)
++{
++   VIOGPU_ESCAPE esc = {
++      .BlobCreate = {
++         .BlobMem = blob_mem,
++         .BlobFlags = blob_flags,
++         .BlobId = blob_id,
++         .Size = size,
++      },
++   };
++   if (!NT_SUCCESS(wddm_escape(gpu, &esc, VIOGPU_BLOB_CREATE, sizeof(esc.BlobCreate))))
++      return 0;
++   return esc.BlobCreate.ResId;
++}
++
++static void *
++wddm_blob_map(struct wddm *gpu, uint32_t res_id)
++{
++   VIOGPU_ESCAPE esc = {
++      .BlobMap = {
++         .ResId = res_id,
++      },
++   };
++   if (!NT_SUCCESS(wddm_escape(gpu, &esc, VIOGPU_BLOB_MAP, sizeof(esc.BlobMap))))
++      return NULL;
++   return (void *)(uintptr_t)esc.BlobMap.Address;
++}
++
++static void
++wddm_blob_destroy(struct wddm *gpu, uint32_t res_id)
++{
++   VIOGPU_ESCAPE esc = {
++      .BlobDestroy = {
++         .ResId = res_id,
++      },
++   };
++   wddm_escape(gpu, &esc, VIOGPU_BLOB_DESTROY, sizeof(esc.BlobDestroy));
++}
++
++static bool
++wddm_execbuffer(struct wddm *gpu,
++                const void *data,
++                size_t size,
++                uint32_t ring_idx,
++                HANDLE event)
++{
++   if (size > VIOGPU_EXECBUFFER_MAX_SIZE) {
++      vn_log(gpu->instance, "command stream of %zu bytes is too large", size);
++      return false;
++   }
++
++   VIOGPU_ESCAPE esc = {
++      .ExecBuffer = {
++         .Command = (uintptr_t)data,
++         .Size = (ULONG)size,
++         .RingIdx = ring_idx,
++         .Event = (uintptr_t)event,
++      },
++   };
++   const NTSTATUS status =
++      wddm_escape(gpu, &esc, VIOGPU_EXECBUFFER, sizeof(esc.ExecBuffer));
++   if (!NT_SUCCESS(status)) {
++      vn_log(gpu->instance, "failed to execbuffer: 0x%lx", (unsigned long)status);
++      return false;
++   }
++   return true;
++}
++
++/* ---- syncs ---- */
++
++static DWORD
++wddm_timeout_ms(uint64_t timeout)
++{
++   const uint64_t ns_per_ms = 1000000;
++   const uint64_t ms = (timeout + ns_per_ms - 1) / ns_per_ms;
++   return ms < INFINITE ? (DWORD)ms : INFINITE;
++}
++
++static VkResult
++wddm_wait_event(HANDLE event, DWORD timeout_ms)
++{
++   switch (WaitForSingleObject(event, timeout_ms)) {
++   case WAIT_OBJECT_0:
++      return VK_SUCCESS;
++   case WAIT_TIMEOUT:
++      return VK_TIMEOUT;
++   default:
++      return VK_ERROR_DEVICE_LOST;
++   }
++}
++
++static void
++wddm_sync_set_point_locked(struct wddm_sync *sync, uint64_t point)
++{
++   sync->point = point;
++
++   if (sync->pending_event) {
++      CloseHandle(sync->pending_event);
++      sync->pending_event = NULL;
++      sync->pending_point = point;
++   }
++}
++
++static void
++wddm_sync_update_point_locked(struct wddm_sync *sync, DWORD timeout_ms)
++{
++   if (!sync->pending_event)
++      return;
++
++   VkResult result;
++   if (sync->pending_cpu && timeout_ms == INFINITE) {
++      /* the CPU ring signals as soon as the host processed the commands */
++      const DWORD max_cpu_timeout = 2000;
++      result = wddm_wait_event(sync->pending_event, max_cpu_timeout);
++      if (result == VK_TIMEOUT) {
++         vn_log(NULL, "cpu sync timed out after %lums; ignoring",
++                (unsigned long)max_cpu_timeout);
++         result = VK_SUCCESS;
++      }
++   } else {
++      result = wddm_wait_event(sync->pending_event, timeout_ms);
++   }
++
++   if (result == VK_SUCCESS) {
++      CloseHandle(sync->pending_event);
++      sync->pending_event = NULL;
++      sync->point = sync->pending_point;
++   }
++}
++
++static int
++wddm_sync_submit(struct wddm *gpu,
++                 struct wddm_sync *sync,
++                 HANDLE event,
++                 uint64_t point,
++                 bool cpu)
++{
++   HANDLE pending_event;
++   if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(),
++                        &pending_event, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
++      vn_log(gpu->instance, "failed to duplicate the sync event");
++      return -1;
++   }
++
++   mtx_lock(&sync->mutex);
++
++   if (sync->pending_event) {
++      mtx_unlock(&sync->mutex);
++
++      /* TODO */
++      vn_log(gpu->instance, "sorry, no simulated timeline semaphore");
++      CloseHandle(pending_event);
++      return -1;
++   }
++   if (sync->point >= point)
++      vn_log(gpu->instance, "non-monotonic signaling");
++
++   sync->pending_event = pending_event;
++   sync->pending_point = point;
++   sync->pending_cpu = cpu;
++
++   mtx_unlock(&sync->mutex);
++
++   return 0;
++}
++
++static VkResult
++wddm_sync_write(struct vn_renderer *renderer,
++                struct vn_renderer_sync *_sync,
++                uint64_t val)
++{
++   struct wddm_sync *sync = (struct wddm_sync *)_sync;
++
++   mtx_lock(&sync->mutex);
++   wddm_sync_set_point_locked(sync, val);
++   mtx_unlock(&sync->mutex);
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++wddm_sync_read(struct vn_renderer *renderer,
++               struct vn_renderer_sync *_sync,
++               uint64_t *val)
++{
++   struct wddm_sync *sync = (struct wddm_sync *)_sync;
++
++   mtx_lock(&sync->mutex);
++   wddm_sync_update_point_locked(sync, 0);
++   *val = sync->point;
++   mtx_unlock(&sync->mutex);
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++wddm_sync_reset(struct vn_renderer *renderer,
++                struct vn_renderer_sync *_sync,
++                uint64_t initial_val)
++{
++   return wddm_sync_write(renderer, _sync, initial_val);
++}
++
++static int
++wddm_sync_export_syncobj(struct vn_renderer *renderer,
++                         struct vn_renderer_sync *sync,
++                         bool sync_file)
++{
++   /* no external syncs (vn_renderer_info::has_external_sync) */
++   return -1;
++}
++
++static void
++wddm_sync_destroy(struct vn_renderer *renderer,
++                  struct vn_renderer_sync *_sync)
++{
++   struct wddm_sync *sync = (struct wddm_sync *)_sync;
++
++   if (sync->pending_event)
++      CloseHandle(sync->pending_event);
++   mtx_destroy(&sync->mutex);
++   free(sync);
++}
++
++static VkResult
++wddm_sync_create_from_syncobj(struct vn_renderer *renderer,
++                              int fd,
++                              bool sync_file,
++                              struct vn_renderer_sync **out_sync)
++{
++   return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++}
++
++static VkResult
++wddm_sync_create(struct vn_renderer *renderer,
++                 uint64_t initial_val,
++                 uint32_t flags,
++                 struct vn_renderer_sync **out_sync)
++{
++   if (flags & VN_RENDERER_SYNC_SHAREABLE)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   struct wddm_sync *sync = calloc(1, sizeof(*sync));
++   if (!sync)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   mtx_init(&sync->mutex, mtx_plain);
++   sync->point = initial_val;
++   sync->base.sync_id = 0;
++
++   *out_sync = &sync->base;
++   return VK_SUCCESS;
++}
++
++/* ---- buffer objects (blobs of the context's VkDeviceMemory) ---- */
++
++static void
++wddm_bo_invalidate(struct vn_renderer *renderer,
++                   struct vn_renderer_bo *bo,
++                   VkDeviceSize offset,
++                   VkDeviceSize size)
++{
++   /* nop because the kernel driver maps blobs coherently */
++}
++
++static void
++wddm_bo_flush(struct vn_renderer *renderer,
++              struct vn_renderer_bo *bo,
++              VkDeviceSize offset,
++              VkDeviceSize size)
++{
++   /* nop because the kernel driver maps blobs coherently */
++}
++
++static void *
++wddm_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++   struct wddm_bo *bo = (struct wddm_bo *)_bo;
++   const bool mappable = bo->blob_flags & VIOGPU_BLOB_FLAG_USE_MAPPABLE;
++
++   /* not thread-safe but is fine */
++   if (!bo->base.mmap_ptr && mappable)
++      bo->base.mmap_ptr = wddm_blob_map(gpu, bo->base.res_id);
++
++   return bo->base.mmap_ptr;
++}
++
++static int
++wddm_bo_export_dma_buf(struct vn_renderer *renderer,
++                       struct vn_renderer_bo *bo)
++{
++   return -1;
++}
++
++static bool
++wddm_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++   struct wddm_bo *bo = (struct wddm_bo *)_bo;
++
++   /* unmaps it too */
++   wddm_blob_destroy(gpu, bo->base.res_id);
++   free(bo);
++
++   return true;
++}
++
++static VkResult
++wddm_bo_create_from_dma_buf(struct vn_renderer *renderer,
++                            VkDeviceSize size,
++                            int fd,
++                            VkMemoryPropertyFlags flags,
++                            struct vn_renderer_bo **out_bo)
++{
++   return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++}
++
++static VkResult
++wddm_bo_create_from_device_memory(
++   struct vn_renderer *renderer,
++   VkDeviceSize size,
++   vn_object_id mem_id,
++   VkMemoryPropertyFlags flags,
++   VkExternalMemoryHandleTypeFlags external_handles,
++   struct vn_renderer_bo **out_bo)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++
++   uint32_t blob_flags = 0;
++   if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
++      blob_flags |= VIOGPU_BLOB_FLAG_USE_MAPPABLE;
++   if (external_handles)
++      blob_flags |= VIOGPU_BLOB_FLAG_USE_SHAREABLE;
++
++   if (size > SIZE_MAX)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   const uint32_t res_id = wddm_blob_create(gpu, VIOGPU_BLOB_MEM_HOST3D,
++                                            blob_flags, (size_t)size, mem_id);
++   if (!res_id)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   struct wddm_bo *bo = calloc(1, sizeof(*bo));
++   if (!bo) {
++      wddm_blob_destroy(gpu, res_id);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   *bo = (struct wddm_bo){
++      .base = {
++         .refcount = VN_REFCOUNT_INIT(1),
++         .res_id = res_id,
++         .mmap_size = (size_t)size,
++      },
++      .blob_flags = blob_flags,
++   };
++
++   *out_bo = &bo->base;
++   return VK_SUCCESS;
++}
++
++/* ---- shared memory (rings, replies and indirect commands) ---- */
++
++static void
++wddm_shmem_destroy_now(struct vn_renderer *renderer,
++                       struct vn_renderer_shmem *_shmem)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++   struct wddm_shmem *shmem = (struct wddm_shmem *)_shmem;
++
++   wddm_blob_destroy(gpu, shmem->base.res_id);
++   free(shmem);
++}
++
++static void
++wddm_shmem_destroy(struct vn_renderer *renderer,
++                   struct vn_renderer_shmem *shmem)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++
++   if (vn_renderer_shmem_cache_add(&gpu->shmem_cache, shmem))
++      return;
++
++   wddm_shmem_destroy_now(&gpu->base, shmem);
++}
++
++static struct vn_renderer_shmem *
++wddm_shmem_create(struct vn_renderer *renderer, size_t size)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++
++   struct vn_renderer_shmem *cached_shmem =
++      vn_renderer_shmem_cache_get(&gpu->shmem_cache, size);
++   if (cached_shmem) {
++      cached_shmem->refcount = VN_REFCOUNT_INIT(1);
++      return cached_shmem;
++   }
++
++   /* a mappable HOST3D blob with blob id 0 is host shared memory (supports_blob_id_0) */
++   const uint32_t res_id = wddm_blob_create(
++      gpu, VIOGPU_BLOB_MEM_HOST3D, VIOGPU_BLOB_FLAG_USE_MAPPABLE, size, 0);
++   if (!res_id)
++      return NULL;
++
++   void *ptr = wddm_blob_map(gpu, res_id);
++   if (!ptr) {
++      wddm_blob_destroy(gpu, res_id);
++      return NULL;
++   }
++
++   struct wddm_shmem *shmem = calloc(1, sizeof(*shmem));
++   if (!shmem) {
++      wddm_blob_destroy(gpu, res_id);
++      return NULL;
++   }
++
++   *shmem = (struct wddm_shmem){
++      .base = {
++         .refcount = VN_REFCOUNT_INIT(1),
++         .res_id = res_id,
++         .mmap_size = size,
++         .mmap_ptr = ptr,
++      },
++   };
++
++   return &shmem->base;
++}
++
++/* ---- submissions ---- */
++
++static VkResult
++wddm_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
++{
++   const DWORD timeout_ms = wddm_timeout_ms(wait->timeout);
++
++   /* TODO wait for all events at the same time */
++   for (uint32_t i = 0; i < wait->sync_count; i++) {
++      struct wddm_sync *sync = (struct wddm_sync *)wait->syncs[i];
++      const uint64_t point = wait->sync_values[i];
++
++      mtx_lock(&sync->mutex);
++
++      if (sync->point < point)
++         wddm_sync_update_point_locked(sync, timeout_ms);
++
++      if (sync->point < point) {
++         if (wait->wait_any && i < wait->sync_count - 1 &&
++             !sync->pending_event) {
++            mtx_unlock(&sync->mutex);
++            continue;
++         }
++         mtx_unlock(&sync->mutex);
++         return VK_TIMEOUT;
++      }
++
++      mtx_unlock(&sync->mutex);
++
++      if (wait->wait_any)
++         break;
++
++      /* TODO adjust timeout_ms */
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++wddm_submit(struct vn_renderer *renderer,
++            const struct vn_renderer_submit *submit)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++
++   /* submit->bos need no pinning: blobs stay where they are until destroyed */
++   for (uint32_t i = 0; i < submit->batch_count; i++) {
++      const struct vn_renderer_submit_batch *batch = &submit->batches[i];
++
++      HANDLE event = NULL;
++      if (batch->sync_count) {
++         event = CreateEventW(NULL, TRUE, FALSE, NULL);
++         if (!event)
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++
++      bool ok = wddm_execbuffer(gpu, batch->cs_data, batch->cs_size,
++                                batch->ring_idx, event);
++      for (uint32_t j = 0; ok && j < batch->sync_count; j++) {
++         struct wddm_sync *sync = (struct wddm_sync *)batch->syncs[j];
++         ok = !wddm_sync_submit(gpu, sync, event, batch->sync_values[j],
++                                batch->ring_idx == 0);
++      }
++
++      if (event)
++         CloseHandle(event);
++      if (!ok)
++         return VK_ERROR_DEVICE_LOST;
++   }
++
++   return VK_SUCCESS;
++}
++
++/* ---- setup ---- */
++
++static void
++wddm_init_renderer_info(struct wddm *gpu)
++{
++   struct vn_renderer_info *info = &gpu->base.info;
++
++   /* no DRM nodes on Windows */
++   info->drm.props = (VkPhysicalDeviceDrmPropertiesEXT){
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
++   };
++
++   info->pci.vendor_id = WDDM_PCI_VENDOR_ID;
++   info->pci.device_id = WDDM_PCI_DEVICE_ID;
++   info->pci.has_bus_info = false;
++
++   info->has_dma_buf_import = false;
++   info->has_external_sync = false;
++   info->has_implicit_fencing = false;
++
++   const struct virgl_renderer_capset_venus *capset = &gpu->capset.data;
++   info->wire_format_version = capset->wire_format_version;
++   info->vk_xml_version = capset->vk_xml_version;
++   info->vk_ext_command_serialization_spec_version =
++      capset->vk_ext_command_serialization_spec_version;
++   info->vk_mesa_venus_protocol_spec_version =
++      capset->vk_mesa_venus_protocol_spec_version;
++
++   /* ensure vk_extension_mask is large enough to hold all capset masks */
++   STATIC_ASSERT(sizeof(info->vk_extension_mask) >=
++                 sizeof(capset->vk_extension_mask1));
++   memcpy(info->vk_extension_mask, capset->vk_extension_mask1,
++          sizeof(capset->vk_extension_mask1));
++
++   info->max_timeline_count = WDDM_MAX_TIMELINE_COUNT;
++
++   /* blobs are HOST3D: see virtgpu_init_renderer_info */
++   if (capset->use_guest_vram)
++      info->has_guest_vram = true;
++}
++
++static void
++wddm_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++
++   vn_renderer_shmem_cache_fini(&gpu->shmem_cache);
++
++   /* the kernel driver destroys the device's blobs and its context with it */
++   if (gpu->device) {
++      D3DKMT_DESTROYDEVICE args = { .hDevice = gpu->device };
++      gpu->destroy_device(&args);
++   }
++   if (gpu->adapter) {
++      D3DKMT_CLOSEADAPTER args = { .hAdapter = gpu->adapter };
++      gpu->close_adapter(&args);
++   }
++
++   vk_free(alloc, gpu);
++}
++
++/* Finds the virtio-gpu adapter by asking every adapter for its driver's private data (in an RDP session the desktop
++ * belongs to a different, remote adapter), and keeps it open */
++static VkResult
++wddm_open_adapter(struct wddm *gpu, VIOGPU_ADAPTERINFO *out_info)
++{
++   HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
++   PFND3DKMT_ENUMADAPTERS2 enum_adapters2 =
++      (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gdi32, "D3DKMTEnumAdapters2");
++   PFND3DKMT_QUERYADAPTERINFO query_adapter_info =
++      (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(gdi32, "D3DKMTQueryAdapterInfo");
++   if (!enum_adapters2 || !query_adapter_info)
++      return VK_ERROR_INITIALIZATION_FAILED;
++
++   D3DKMT_ENUMADAPTERS2 enumerate = { 0 };
++   if (!NT_SUCCESS(enum_adapters2(&enumerate)) || !enumerate.NumAdapters)
++      return VK_ERROR_INITIALIZATION_FAILED;
++   D3DKMT_ADAPTERINFO *adapters =
++      calloc(enumerate.NumAdapters, sizeof(*adapters));
++   if (!adapters)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   enumerate.pAdapters = adapters;
++   if (!NT_SUCCESS(enum_adapters2(&enumerate))) {
++      free(adapters);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   for (UINT i = 0; i < enumerate.NumAdapters; i++) {
++      VIOGPU_ADAPTERINFO info = { 0 };
++      D3DKMT_QUERYADAPTERINFO query = {
++         .hAdapter = adapters[i].hAdapter,
++         .Type = KMTQAITYPE_UMDRIVERPRIVATE,
++         .pPrivateDriverData = &info,
++         .PrivateDriverDataSize = sizeof(info),
++      };
++      if (!gpu->adapter && NT_SUCCESS(query_adapter_info(&query)) &&
++          info.IamVioGPU == VIOGPU_IAM) {
++         gpu->adapter = adapters[i].hAdapter;
++         *out_info = info;
++         continue;
++      }
++      D3DKMT_CLOSEADAPTER close = { .hAdapter = adapters[i].hAdapter };
++      gpu->close_adapter(&close);
++   }
++   free(adapters);
++
++   if (!gpu->adapter) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "no virtio-gpu adapter");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   return VK_SUCCESS;
++}
++
++static VkResult
++wddm_open(struct wddm *gpu)
++{
++   HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
++   if (!gdi32)
++      gdi32 = LoadLibraryA("gdi32.dll");
++   PFND3DKMT_CREATEDEVICE create_device =
++      (PFND3DKMT_CREATEDEVICE)GetProcAddress(gdi32, "D3DKMTCreateDevice");
++   gpu->escape = (PFND3DKMT_ESCAPE)GetProcAddress(gdi32, "D3DKMTEscape");
++   gpu->destroy_device =
++      (PFND3DKMT_DESTROYDEVICE)GetProcAddress(gdi32, "D3DKMTDestroyDevice");
++   gpu->close_adapter =
++      (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32, "D3DKMTCloseAdapter");
++   if (!create_device || !gpu->escape || !gpu->destroy_device ||
++       !gpu->close_adapter)
++      return VK_ERROR_INITIALIZATION_FAILED;
++
++   VIOGPU_ADAPTERINFO info;
++   VkResult result = wddm_open_adapter(gpu, &info);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (!info.Flags.Supports3d || !info.Flags.SupportsBlob ||
++       !(info.SupportedCapsetIDs & (1ull << VIRGL_RENDERER_CAPSET_VENUS))) {
++      if (VN_DEBUG(INIT)) {
++         vn_log(gpu->instance,
++                "virtio-gpu without Venus (3d %u, blob %u, capsets 0x%llx)",
++                info.Flags.Supports3d, info.Flags.SupportsBlob,
++                (unsigned long long)info.SupportedCapsetIDs);
++      }
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   D3DKMT_CREATEDEVICE args = { .hAdapter = gpu->adapter };
++   if (!NT_SUCCESS(create_device(&args))) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "failed to create a D3DKMT device");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   gpu->device = args.hDevice;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++wddm_init_capset(struct wddm *gpu)
++{
++   gpu->capset.id = VIRGL_RENDERER_CAPSET_VENUS;
++   gpu->capset.version = 0;
++
++   VIOGPU_ESCAPE esc = {
++      .Capset = {
++         .CapsetId = gpu->capset.id,
++         .Version = gpu->capset.version,
++         .Size = sizeof(gpu->capset.data),
++         .Capset = (uintptr_t)&gpu->capset.data,
++      },
++   };
++   if (!NT_SUCCESS(wddm_escape(gpu, &esc, VIOGPU_GET_CAPS, sizeof(esc.Capset)))) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "failed to get venus v%d capset",
++                gpu->capset.version);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   /* shared memory is a HOST3D blob with blob id 0 (wddm_shmem_create), and there are no other kinds of contexts'
++    * rings than Venus' own */
++   if (!gpu->capset.data.supports_blob_id_0 ||
++       !gpu->capset.data.supports_multiple_timelines) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "the host's venus is too old");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++wddm_init_context(struct wddm *gpu)
++{
++   VIOGPU_ESCAPE esc = {
++      .CtxInit = {
++         .CapsetID = gpu->capset.id,
++      },
++   };
++   if (!NT_SUCCESS(wddm_escape(gpu, &esc, VIOGPU_CTX_INIT, sizeof(esc.CtxInit)))) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "failed to initialize context");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++wddm_init(struct wddm *gpu)
++{
++   VkResult result = wddm_open(gpu);
++   if (result == VK_SUCCESS)
++      result = wddm_init_capset(gpu);
++   if (result == VK_SUCCESS)
++      result = wddm_init_context(gpu);
++   if (result != VK_SUCCESS)
++      return result;
++
++   vn_renderer_shmem_cache_init(&gpu->shmem_cache, &gpu->base,
++                                wddm_shmem_destroy_now);
++
++   wddm_init_renderer_info(gpu);
++
++   gpu->base.ops.destroy = wddm_destroy;
++   gpu->base.ops.submit = wddm_submit;
++   gpu->base.ops.wait = wddm_wait;
++
++   gpu->base.shmem_ops.create = wddm_shmem_create;
++   gpu->base.shmem_ops.destroy = wddm_shmem_destroy;
++
++   gpu->base.bo_ops.create_from_device_memory =
++      wddm_bo_create_from_device_memory;
++   gpu->base.bo_ops.create_from_dma_buf = wddm_bo_create_from_dma_buf;
++   gpu->base.bo_ops.destroy = wddm_bo_destroy;
++   gpu->base.bo_ops.export_dma_buf = wddm_bo_export_dma_buf;
++   gpu->base.bo_ops.map = wddm_bo_map;
++   gpu->base.bo_ops.flush = wddm_bo_flush;
++   gpu->base.bo_ops.invalidate = wddm_bo_invalidate;
++
++   gpu->base.sync_ops.create = wddm_sync_create;
++   gpu->base.sync_ops.create_from_syncobj = wddm_sync_create_from_syncobj;
++   gpu->base.sync_ops.destroy = wddm_sync_destroy;
++   gpu->base.sync_ops.export_syncobj = wddm_sync_export_syncobj;
++   gpu->base.sync_ops.reset = wddm_sync_reset;
++   gpu->base.sync_ops.read = wddm_sync_read;
++   gpu->base.sync_ops.write = wddm_sync_write;
++
++   return VK_SUCCESS;
++}
++
++VkResult
++vn_renderer_create_wddm(struct vn_instance *instance,
++                        const VkAllocationCallbacks *alloc,
++                        struct vn_renderer **renderer)
++{
++   struct wddm *gpu = vk_zalloc(alloc, sizeof(*gpu), VN_DEFAULT_ALIGN,
++                                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
++   if (!gpu)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   gpu->instance = instance;
++
++   VkResult result = wddm_init(gpu);
++   if (result != VK_SUCCESS) {
++      wddm_destroy(&gpu->base, alloc);
++      return result;
++   }
++
++   *renderer = &gpu->base;
++
++   return VK_SUCCESS;
++}

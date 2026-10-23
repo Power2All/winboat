@@ -1,0 +1,162 @@
+From: WinBoat
+Subject: [PATCH] vrend: VC-1 decoding through VA-API
+
+virgl's VC-1 had never decoded anything on NVIDIA: one slice parameter, never filled (no size), for all the
+picture's data. Now:
+- the advanced profile's slices are split at their start codes (00 00 01 0D frame, 0C second field, 0B slice; the
+  guest's DXVA path writes the right ones) and passed without them, as VA-API has them, a slice's row from its
+  SLICE_ADDR; simple/main pictures are one slice
+- the picture parameters VA-API decoders that parse the picture layer themselves (NVDEC) need besides: the stream's
+  profile, the sequence's POSTPROCFLAG (post_processing, as Mesa's VA frontend and NVIDIA's driver read it), the
+  field order and which field, RANGEREDFRM. The guest sends them (and the frame coding mode, which virgl never
+  filled) in fields appended to virgl_vc1_picture_desc (the union's size is H.264's/HEVC's: the wire size stays)
+With nvidia-vaapi-driver 0005, the FATE suite's VC-1 clips decode bit-exact through ffmpeg's d3d11va and dxva2.
+---
+diff --git a/src/virgl_video_hw.h b/src/virgl_video_hw.h
+index 7f3fbae..180ac78 100644
+--- a/src/virgl_video_hw.h
++++ b/src/virgl_video_hw.h
+@@ -681,6 +681,12 @@ struct virgl_vc1_picture_desc
+     uint8_t pquant;
+ 
+     uint32_t ref[2];
++
++    /* (WinBoat) appended: the union's size is H.264's/HEVC's */
++    uint8_t top_field_first;
++    uint8_t is_first_field;
++    uint8_t rangeredfrm;
++    uint8_t vc1_profile;
+ };
+ 
+ struct virgl_vp9_segment_parameter
+diff --git a/src/vrend/virgl_video.c b/src/vrend/virgl_video.c
+index 872b785..5a26dce 100644
+--- a/src/vrend/virgl_video.c
++++ b/src/vrend/virgl_video.c
+@@ -2659,13 +2659,47 @@ static void vc1_fill_picture_param(struct virgl_video_codec *codec,
+     ITEM_SET(&vapp->sequence_fields.bits, desc, rangered);
+     vapp->sequence_fields.bits.max_b_frames = desc->maxbframes;
+     vapp->pic_quantizer_fields.bits.pic_quantizer_scale = desc->pquant;
++    /* (WinBoat) what decoders that parse the picture layer themselves (NVDEC) need besides: the stream's profile,
++     * the sequence's POSTPROCFLAG (Mesa's VA frontend and NVIDIA's driver read post_processing as it), the field
++     * order and RANGEREDFRM */
++    vapp->sequence_fields.bits.profile = desc->vc1_profile;
++    vapp->post_processing = desc->postprocflag;
++    vapp->picture_fields.bits.top_field_first = desc->top_field_first;
++    vapp->picture_fields.bits.is_first_field = desc->is_first_field;
++    vapp->range_reduction_frame = desc->rangeredfrm;
+ }
+ 
+-static void vc1_fill_slice_param(const struct virgl_vc1_picture_desc *desc,
+-                                 VASliceParameterBufferVC1 *vasp)
++/* (WinBoat) The advanced profile's slices, each after a start code (00 00 01, then 0x0D frame, 0x0C field,
++ * 0x0B slice), as VA-API has them: without it, a slice's row from its SLICE_ADDR */
++static int vc1_render_slices(struct virgl_video_codec *codec, unsigned num_buffers,
++                             const void * const *buffers, const unsigned *sizes)
+ {
+-    (void)desc;
+-    (void)vasp;
++    VASliceParameterBufferVC1 slice_param = {0};
++    int err = 0;
++
++    for (unsigned b = 0; b < num_buffers; b++) {
++        const uint8_t *p = buffers[b];
++        unsigned size = sizes[b], start = UINT32_MAX;
++        uint8_t code = 0;
++
++        for (unsigned i = 0; i <= size; i++) {
++            bool start_code = i + 3 < size && !p[i] && !p[i + 1] && p[i + 2] == 1;
++            if (!start_code && i < size)
++                continue;
++            if (start != UINT32_MAX && i > start) {
++                slice_param.slice_vertical_position =
++                    code == 0x0b && i - start >= 2 ? (p[start] << 1 | p[start + 1] >> 7) : 0;
++                if (render_slice(codec, &slice_param, sizeof(slice_param), p + start, i - start))
++                    err = -1;
++            }
++            if (i < size) {
++                code = p[i + 3];
++                start = i + 4;
++                i += 3;
++            }
++        }
++    }
++    return err;
+ }
+ 
+ static int vc1_decode_bitstream(struct virgl_video_codec *codec,
+@@ -2675,63 +2709,29 @@ static int vc1_decode_bitstream(struct virgl_video_codec *codec,
+                                 const void * const *buffers,
+                                 const unsigned *sizes)
+ {
+-    unsigned i;
+-    int err = 0;
+     VAStatus va_stat;
+-    VABufferID *slice_data_buf, pic_param_buf, slice_param_buf;
++    VABufferID pic_param_buf;
+     VAPictureParameterBufferVC1 pic_param = {0};
+     VASliceParameterBufferVC1 slice_param = {0};
+ 
+-    slice_data_buf = calloc(num_buffers, sizeof(VABufferID));
+-    if (!slice_data_buf) {
+-        virgl_error("alloc slice data buffer id failed\n");
+-        return -1;
+-    }
+-
+     vc1_fill_picture_param(codec, target, desc, &pic_param);
+     vaCreateBuffer(va_dpy, codec->va_ctx, VAPictureParameterBufferType,
+                    sizeof(pic_param), 1, &pic_param, &pic_param_buf);
+-
+-    vc1_fill_slice_param(desc, &slice_param);
+-    vaCreateBuffer(va_dpy, codec->va_ctx, VASliceParameterBufferType,
+-                   sizeof(slice_param), 1, &slice_param, &slice_param_buf);
+-
+-    for (i = 0; i < num_buffers; i++) {
+-        vaCreateBuffer(va_dpy, codec->va_ctx, VASliceDataBufferType,
+-                       sizes[i], 1, (void *)(buffers[i]), &slice_data_buf[i]);
+-    }
+-
+     va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &pic_param_buf, 1);
++    vaDestroyBuffer(va_dpy, pic_param_buf);
+     if (VA_STATUS_SUCCESS != va_stat) {
+         virgl_error("render picture param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_param_buf, 1);
+-    if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("render slice param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+-    for (i = 0; i < num_buffers; i++) {
+-        va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_data_buf[i], 1);
+-
+-        if (VA_STATUS_SUCCESS != va_stat) {
+-            virgl_error("render slice data failed, err = 0x%x\n", va_stat);
+-            err = -1;
+-        }
++        return -1;
+     }
+ 
+-err:
+-    vaDestroyBuffer(va_dpy, pic_param_buf);
+-    vaDestroyBuffer(va_dpy, slice_param_buf);
+-    for (i = 0; i < num_buffers; i++)
+-        vaDestroyBuffer(va_dpy, slice_data_buf[i]);
+-    free(slice_data_buf);
+-
+-    return err;
++    /* (WinBoat) The slices with their size (virgl sent one empty slice parameter: NVIDIA's driver decoded
++     * nothing); simple/main: the buffer is the picture */
++    if (desc->vc1_profile == 3)
++        return vc1_render_slices(codec, num_buffers, buffers, sizes);
++    for (unsigned i = 0; i < num_buffers; i++)
++        if (render_slice(codec, &slice_param, sizeof(slice_param), buffers[i], sizes[i]))
++            return -1;
++    return 0;
+ }
+ 
+ static void vp9_fill_picture_param(struct virgl_video_codec *codec,

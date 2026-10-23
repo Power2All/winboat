@@ -1,0 +1,104 @@
+viogpu3d: 32-bit (WOW64) user-mode drivers, and a safe capset copy
+
+Applies to max8rr8/kvm-guest-drivers-windows@viogpu3d (9ed3aab), together with Mesa patch 0002.
+
+- VIOGPU_CAPSET_REQ carried a raw pointer, so a 32-bit process sent a different layout. Make it a UINT64 on both
+  sides.
+- The capset escape copied into that user-supplied address without probing it, letting any process that can open
+  the adapter make the kernel write to kernel memory. ProbeForWrite it first.
+- Package and register 32-bit builds of the Mesa user-mode drivers (UserModeDriverNameWow, OpenGLDriverNameWow).
+  Without them 32-bit apps get no D3D10/11 at all (DXGI_ERROR_UNSUPPORTED) and only software OpenGL 1.1.
+- Drop z.dll from the package: Mesa now links zlib statically.
+
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+index 51810d3..d4756e9 100644
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -89,7 +89,7 @@ typedef struct _VIOGPU_CAPSET_REQ
+     ULONG CapsetId;
+     ULONG Version;
+     ULONG Size;
+-    UCHAR *Capset;
++    UINT64 Capset; // user-mode buffer address; 64 bits wide so 32-bit (WOW64) callers use the same layout
+ } VIOGPU_CAPSET_REQ;
+ #pragma pack()
+ 
+diff --git a/viogpu/viogpu3d/viogpu3d.inx b/viogpu/viogpu3d/viogpu3d.inx
+index 1862684..9e90103 100644
+--- a/viogpu/viogpu3d/viogpu3d.inx
++++ b/viogpu/viogpu3d/viogpu3d.inx
+@@ -28,7 +28,8 @@ VioGpu3D_Files.Usermode = 13 ; DriverStore
+ viogpu3d.sys = 1,,f
+ viogpu_d3d10.dll = 1,,
+ viogpu_wgl.dll = 1,,
+-z.dll = 1,,
++viogpu_d3d10_x86.dll = 1,,
++viogpu_wgl_x86.dll = 1,,
+ 
+ [Manufacturer]
+ %RHEL%=RHEL,NT$ARCH$
+@@ -42,7 +43,8 @@ viogpu3d.sys,,,2
+ [VioGpu3D_Files.Usermode]
+ viogpu_d3d10.dll,,,0
+ viogpu_wgl.dll,,,0
+-z.dll,,,0
++viogpu_d3d10_x86.dll,,,0
++viogpu_wgl_x86.dll,,,0
+ 
+ [VioGpu3D_Inst]
+ Include=msdv.inf
+@@ -79,6 +81,11 @@ HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\viogpu_d3d10.dll,%13%\vi
+ HKR,, OpenGLDriverName,            %REG_MULTI_SZ%, %13%\viogpu_wgl.dll
+ HKR,, OpenGLFlags,                 %REG_DWORD%, 3
+ HKR,, OpenGLVersion,               %REG_DWORD%, 4096
++; 32-bit (WOW64) apps
++HKR,, UserModeDriverNameWow,       %REG_MULTI_SZ%, %13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll
++HKR,, OpenGLDriverNameWow,         %REG_MULTI_SZ%, %13%\viogpu_wgl_x86.dll
++HKR,, OpenGLFlagsWow,              %REG_DWORD%, 3
++HKR,, OpenGLVersionWow,            %REG_DWORD%, 4096
+ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,%REG_DWORD%,0
+ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,1
+ 
+diff --git a/viogpu/viogpu3d/viogpu3d.vcxproj b/viogpu/viogpu3d/viogpu3d.vcxproj
+index 90293bb..a4c17e4 100644
+--- a/viogpu/viogpu3d/viogpu3d.vcxproj
++++ b/viogpu/viogpu3d/viogpu3d.vcxproj
+@@ -196,7 +196,11 @@
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
+-    <FilesToPackage Include="$(MESA_PREFIX)\bin\z.dll">
++    <FilesToPackage Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll">
++      <PackageRelativeDirectory>
++      </PackageRelativeDirectory>
++    </FilesToPackage>
++    <FilesToPackage Include="$(MESA_PREFIX32)\bin\viogpu_wgl_x86.dll">
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
+@@ -212,7 +216,8 @@
+     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.pdb" />
+     <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_d3d10.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_wgl.dll" />
+-    <PackOne_Files Include="$(MESA_PREFIX)\bin\z.dll" />
++    <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll" />
++    <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_wgl_x86.dll" />
+   </ItemGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <Import Condition="Exists('$(MESA_PREFIX)\bin\viogpu_d3d10.dll')" Project="$(MSBuildProjectDirectory)\..\..\build\Driver.Common.targets" />
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 8d3512a..4d4755b 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -665,7 +665,10 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                 ULONG to_copy = min(pVioGpuEscape->Capset.Size, pCapsetInfo->max_size);
+                 __try
+                 {
+-                    memcpy(pVioGpuEscape->Capset.Capset, buf, to_copy);
++                    // The address comes from the calling process: make sure it is a user-mode buffer it can write
++                    PVOID dest = (PVOID)(ULONG_PTR)pVioGpuEscape->Capset.Capset;
++                    ProbeForWrite(dest, to_copy, 1);
++                    memcpy(dest, buf, to_copy);
+                 }
+                 __except (EXCEPTION_EXECUTE_HANDLER)
+                 {

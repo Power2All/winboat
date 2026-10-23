@@ -1,0 +1,2925 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: video decoding and the video processor
+
+The Direct3D 11 video DDI (RetrieveSubObject's video function table), so
+programs get hardware decoding: players, browsers, ffmpeg's d3d11va, Media
+Foundation. DXVA picture parameters and bitstream buffers become gallium
+picture descriptions for virgl's video codec, which runs them on the host's
+VA-API driver. H.264, HEVC Main and Main 10, VP9 profiles 0 and 2, AV1 Main
+(8 and 10-bit) and MPEG-2 Main, as far as the host decodes them (the profiles
+are listed from its caps; others are not offered and programs decode on the
+CPU). Short slice formats only.
+
+- NV12/P010 textures: each array slice a gallium video buffer whose planes are
+  separate R8/R8G8 (R16/R16G16) textures: decoder output slices are the video
+  codec's buffers (the host keeps its surface with each as the reference for
+  later pictures), the others the texture's size. Views select a plane by
+  format; maps, uploads and copies see the D3D layout (chroma rows after luma).
+  Shader views of planes are kept on their plane (ShaderBindStage recreated
+  views on a resource's first texture).
+- Decoder buffers are system memory the program fills and SubmitBuffers reads.
+  AV1 tiles and MPEG-2 slices are taken from their DXVA slice control buffers.
+- The video processor: NV12/P010 or RGB to RGB with scaling, BT.601/709 and
+  both ranges, through gallium's video compositor, on a pipe context of its own
+  (flushed in order with the device's, waiting on each other's fences: Windows
+  schedules each context by itself), with 2D-array views of the planes, as
+  its shaders sample.
+- CreateResource's NV12 and decoder buffer path still ends the device's
+  allocation bookkeeping for the resource.
+- VIOGPU_VIDEO_LOG=<file> logs what the video entry points refuse.
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+index 59f5766..8a3cd3c 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -28,6 +28,7 @@
+ #include "Rasterizer.h"
+ #include "Shader.h"
+ #include "State.h"
++#include "Video.h"
+ 
+ #include "util/format/u_format.h"
+ #include "util/u_inlines.h"
+@@ -204,6 +205,10 @@ static void APIENTRY
+ CreateShaderResourceView11(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *pView,
+                            D3D10DDI_HSHADERRESOURCEVIEW hView, D3D10DDI_HRTSHADERRESOURCEVIEW hRTView)
+ {
++   /* NV12/P010: a view of one plane */
++   if (VideoCreateShaderResourceView(hDevice, pView, CastShaderResourceView(hView))) {
++      return;
++   }
+    bool bufferex = pView->ResourceDimension == D3D11DDIRESOURCE_BUFFEREX;
+    bool raw = bufferex && (pView->BufferEx.Flags & D3D11_DDI_BUFFEREX_SRV_FLAG_RAW);
+    bool structured = (bufferex || pView->ResourceDimension == D3D10DDIRESOURCE_BUFFER) &&
+@@ -572,7 +577,10 @@ HRESULT APIENTRY
+ RetrieveSubObject11_1(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T ParamSize, void *pParams,
+                       SIZE_T OutputParamSize, void *pOutputParamsBuffer)
+ {
+-   /* Video decoding and processing: none */
++   /* Video decoding and processing (Video.cpp) */
++   if (SubDeviceID == D3D11_1DDI_VIDEO_FUNCTIONS) {
++      return VideoRetrieveFunctions(hDevice, pParams, ParamSize);
++   }
+    return E_NOTIMPL;
+ }
+ 
+@@ -581,6 +589,9 @@ RetrieveSubObject11_1(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T Param
+ static void APIENTRY
+ CheckFormatSupport11_1(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps)
+ {
++   if (VideoFormatSupport(hDevice, Format, pFormatCaps)) {
++      return;
++   }
+    funcs10.pfnCheckFormatSupport(hDevice, Format, pFormatCaps);
+ 
+    struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
+@@ -601,6 +612,7 @@ CheckFormatSupport11_1(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pForm
+        screen->get_param(screen, PIPE_CAP_MAX_TEXTURE_GATHER_COMPONENTS)) {
+       *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_SHADER_GATHER;
+    }
++   VideoAddFormatSupport(hDevice, Format, pFormatCaps);
+ }
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index 3c94876..95b8e5e 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -41,6 +41,7 @@
+ #include "Resource.h"
+ #include "Shader.h"
+ #include "State.h"
++#include "Video.h"
+ #include "Format.h"
+ 
+ #include "Debug.h"
+@@ -401,6 +402,7 @@ DestroyDevice(D3D10DDI_HDEVICE hDevice)   // IN
+    pipe->set_sampler_views(pipe, PIPE_SHADER_GEOMETRY, 0,
+                            PIPE_MAX_SHADER_SAMPLER_VIEWS, 0, false, sampler_views);
+ 
++   VideoDestroyDevice(hDevice);
+    pipe->destroy(pipe);
+    pDevice->screen->destroy(pDevice->screen);
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index 61dd739..03b2579 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -32,6 +32,7 @@
+ 
+ 
+ #include "Resource.h"
++#include "Video.h"
+ #include "Format.h"
+ #include "State.h"
+ #include "Query.h"
+@@ -277,6 +278,11 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+    pResource->Format = pCreateResource->Format;
+    pResource->MipLevels = pCreateResource->MipLevels;
+ 
++   /* NV12/P010 textures and decoder buffers */
++   if (VideoCreateResource(hDevice, pCreateResource, pResource)) {
++      goto done;
++   }
++
+    struct pipe_resource templat;
+ 
+    memset(&templat, 0, sizeof templat);
+@@ -408,6 +414,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+       }
+    }
+ 
++done:
+    device->device.allocationVidPn = 0;
+    device->device.isPrimary = false;
+    device->device.hRTResource = NULL;
+@@ -539,6 +546,7 @@ DestroyResource(D3D10DDI_HDEVICE hDevice,       // IN
+       free(pResource->shadows);
+       pResource->shadows = NULL;
+    }
++   VideoDestroyResource(pResource);
+ 
+    pipe_resource_reference(&pResource->resource, NULL);
+ }
+@@ -568,6 +576,10 @@ ResourceMap(D3D10DDI_HDEVICE hDevice,                                // IN
+    Resource *pResource = CastResource(hResource);
+    struct pipe_resource *resource = pResource->resource;
+ 
++   if (VideoResourceMap(hDevice, pResource, SubResource, DDIMap, pMappedSubResource)) {
++      return;
++   }
++
+    unsigned usage;
+    switch (DDIMap) {
+    case D3D10_DDI_MAP_READ:
+@@ -692,6 +704,10 @@ ResourceUnmap(D3D10DDI_HDEVICE hDevice,      // IN
+ 
+    assert(SubResource < pResource->NumSubResources);
+ 
++   if (VideoResourceUnmap(hDevice, pResource, SubResource)) {
++      return;
++   }
++
+    if (pResource->shadows && pResource->shadows[SubResource].data) {
+       struct ResourceShadow *shadow = &pResource->shadows[SubResource];
+       if (shadow->usage & PIPE_MAP_WRITE) {
+@@ -802,6 +818,10 @@ ResourceCopy(D3D10DDI_HDEVICE hDevice,          // IN
+    struct pipe_resource *src_resource = pSrcResource->resource;
+    bool compatible;
+ 
++   if (VideoResourceCopy(hDevice, pDstResource, pSrcResource)) {
++      return;
++   }
++
+    assert(dst_resource->target == src_resource->target);
+    assert(dst_resource->width0 == src_resource->width0);
+    assert(dst_resource->height0 == src_resource->height0);
+@@ -875,6 +895,11 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
+    struct pipe_resource *dst_resource = pDstResource->resource;
+    struct pipe_resource *src_resource = pSrcResource->resource;
+ 
++   if (VideoResourceCopyRegion(hDevice, pDstResource, DstSubResource, DstX, DstY, pSrcResource, SrcSubResource,
++                               pSrcBox)) {
++      return;
++   }
++
+    unsigned dst_level = DstSubResource % (dst_resource->last_level + 1);
+    unsigned dst_layer = DstSubResource / (dst_resource->last_level + 1);
+    unsigned src_level = SrcSubResource % (src_resource->last_level + 1);
+@@ -1035,6 +1060,10 @@ ResourceUpdateSubResourceUP(D3D10DDI_HDEVICE hDevice,                // IN
+    Resource *pDstResource = CastResource(hDstResource);
+    struct pipe_resource *dst_resource = pDstResource->resource;
+ 
++   if (VideoUpdateSubresourceUP(hDevice, pDstResource, DstSubResource, pDstBox, pSysMemUP, RowPitch)) {
++      return;
++   }
++
+    unsigned level;
+    struct pipe_box box;
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+index 6fd6247..6d7a34a 100644
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -329,7 +329,8 @@ GetPipeShaderResourceView(D3D10DDI_HSHADERRESOURCEVIEW hRenderTargetView)
+    if (!currentSurface) {
+       return NULL;   /* raw and structured buffer views (ShaderBindStage) */
+    }
+-   if (currentSurface->texture != res->resource) {
++   /* (NV12/P010 views are of one plane, not of the resource's first luma plane) */
++   if (currentSurface->texture != res->resource && !res->video) {
+       struct pipe_context *pipe = currentSurface->context;
+       struct pipe_sampler_view *newView = pipe->create_sampler_view(pipe, res->resource, currentSurface);
+       pipe_sampler_view_reference(&pShaderResourceView->handle, newView);
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+index 6ad5393..7c40cdd 100644
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -128,6 +128,8 @@ struct Device
+    bool so_vs_bound;
+    Shader *bound_shader[PIPE_SHADER_TYPES];      /* whose bindings to bind (Shader_bindings) */
+    bool bindings_dirty[PIPE_SHADER_TYPES];
++   struct pipe_context *video_pipe;              /* decoding and the video processor (Video.cpp), created at first use */
++   struct VideoCompositor *compositor;
+    struct ShaderResourceView *srvs[PIPE_SHADER_TYPES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
+    struct UnorderedAccessView *uavs[PIPE_SHADER_TYPES][D3D11_1_UAV_SLOT_COUNT];
+    unsigned patch_vertices;                      /* control points per patch of a patch list topology */
+@@ -214,7 +216,10 @@ struct Resource
+    struct pipe_resource *resource;
+    struct pipe_transfer **transfers;
+    struct pipe_stream_output_target *so_target;
+-   struct ResourceShadow *shadows;   /* 3D read maps, slice by slice (ResourceMap) */
++   struct ResourceShadow *shadows;   /* 3D read maps, slice by slice (ResourceMap); NV12/P010 maps (Video.cpp) */
++   struct VideoSurface *video;       /* NV12/P010 textures: each array slice's planes (Video.cpp) */
++   void *sysmem;                     /* decoder buffers: the memory programs fill and the decoder reads */
++   UINT sysmem_size;
+ };
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+new file mode 100644
+index 0000000..871c1c6
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -0,0 +1,2625 @@
++/*
++ * Video.cpp --
++ *    The Direct3D 11 video DDI (RetrieveSubObject's video function table): decoding and the video processor, and
++ *    the NV12/P010 textures and decoder buffers they work on.
++ *
++ *    Decoding: programs (players, browsers, ffmpeg's d3d11va, Media Foundation) hand the decoder DXVA picture
++ *    parameters and bitstream buffers. They become gallium picture descriptions for virgl's video codec, which runs
++ *    them on the host's VA-API driver (NVDEC through nvidia-vaapi-driver, or Mesa's). H.264, HEVC Main and Main 10 and
++ *    VP9 profiles 0 and 2, as far as the host decodes them: only those are listed. Short slice formats only (no slice
++ *    headers to parse).
++ *
++ *    NV12 and P010 textures: each array slice is a gallium video buffer whose planes are separate R8 and R8G8 (R16,
++ *    R16G16) textures. The host copies each decoded picture into them and keeps the picture itself as the reference
++ *    for later ones, so a decoder output slice keeps its video buffer. Views select a plane by format (R8: luma, R8G8:
++ *    chroma); maps and uploads see the D3D layout (the chroma rows after the luma rows, at the same pitch).
++ *
++ *    The video processor converts NV12/P010 (or RGB) to RGB with scaling: gallium's video compositor.
++ *
++ *    Decoding and the video processor run on a pipe context of their own (the compositor binds its own state), on the
++ *    device's screen, so with the same resources: each is flushed before the other uses what it wrote.
++ */
++
++#include "Video.h"
++#include "Format.h"
++#include "State.h"
++
++#include "pipe/p_video_codec.h"
++#include "pipe/p_video_state.h"
++#include "util/format/u_format.h"
++#include "util/os_time.h"
++#include "util/u_inlines.h"
++#include "util/u_sampler.h"
++#include "util/u_surface.h"
++#include "util/vl_zscan_data.h"
++/* (C headers without C++ guards) */
++extern "C" {
++#include "vl/vl_compositor.h"
++#include "vl/vl_csc.h"
++#include "vl/vl_video_buffer.h"
++}
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <new>
++#include <type_traits>
++#include <vector>
++
++/* VIOGPU_VIDEO_LOG=<file>: what the video entry points refuse, and why */
++static void
++VideoLog(const char *format, ...)
++{
++   static FILE *log = getenv("VIOGPU_VIDEO_LOG") ? fopen(getenv("VIOGPU_VIDEO_LOG"), "a") : NULL;
++   if (log) {
++      va_list ap;
++      va_start(ap, format);
++      vfprintf(log, format, ap);
++      va_end(ap);
++      fflush(log);
++   }
++}
++
++
++/*
++ * DXVA's structures (DXVA spec, as in Mesa's d3d12 video driver)
++ */
++
++#pragma pack(push, 1)
++struct DXVA_PicEntry {
++   union {
++      struct {
++         uint8_t Index7Bits : 7;
++         uint8_t AssociatedFlag : 1;
++      };
++      uint8_t bPicEntry;
++   };
++};
++
++struct DXVA_PicParams_H264 {
++   uint16_t wFrameWidthInMbsMinus1;
++   uint16_t wFrameHeightInMbsMinus1;
++   DXVA_PicEntry CurrPic; /* flag: bottom field */
++   uint8_t num_ref_frames;
++   union {
++      struct {
++         uint16_t field_pic_flag : 1;
++         uint16_t MbaffFrameFlag : 1;
++         uint16_t residual_colour_transform_flag : 1;
++         uint16_t sp_for_switch_flag : 1;
++         uint16_t chroma_format_idc : 2;
++         uint16_t RefPicFlag : 1;
++         uint16_t constrained_intra_pred_flag : 1;
++         uint16_t weighted_pred_flag : 1;
++         uint16_t weighted_bipred_idc : 2;
++         uint16_t MbsConsecutiveFlag : 1;
++         uint16_t frame_mbs_only_flag : 1;
++         uint16_t transform_8x8_mode_flag : 1;
++         uint16_t MinLumaBipredSize8x8Flag : 1;
++         uint16_t IntraPicFlag : 1;
++      };
++      uint16_t wBitFields;
++   };
++   uint8_t bit_depth_luma_minus8;
++   uint8_t bit_depth_chroma_minus8;
++   uint16_t Reserved16Bits;
++   uint32_t StatusReportFeedbackNumber;
++   DXVA_PicEntry RefFrameList[16]; /* flag: long term */
++   int32_t CurrFieldOrderCnt[2];
++   int32_t FieldOrderCntList[16][2];
++   int8_t pic_init_qs_minus26;
++   int8_t chroma_qp_index_offset;
++   int8_t second_chroma_qp_index_offset;
++   uint8_t ContinuationFlag;
++   int8_t pic_init_qp_minus26;
++   uint8_t num_ref_idx_l0_active_minus1;
++   uint8_t num_ref_idx_l1_active_minus1;
++   uint8_t Reserved8BitsA;
++   uint16_t FrameNumList[16];
++   uint32_t UsedForReferenceFlags;
++   uint16_t NonExistingFrameFlags;
++   uint16_t frame_num;
++   uint8_t log2_max_frame_num_minus4;
++   uint8_t pic_order_cnt_type;
++   uint8_t log2_max_pic_order_cnt_lsb_minus4;
++   uint8_t delta_pic_order_always_zero_flag;
++   uint8_t direct_8x8_inference_flag;
++   uint8_t entropy_coding_mode_flag;
++   uint8_t pic_order_present_flag;
++   uint8_t num_slice_groups_minus1;
++   uint8_t slice_group_map_type;
++   uint8_t deblocking_filter_control_present_flag;
++   uint8_t redundant_pic_cnt_present_flag;
++   uint8_t Reserved8BitsB;
++   uint16_t slice_group_change_rate_minus1;
++   uint8_t SliceGroupMap[810];
++};
++
++struct DXVA_Qmatrix_H264 {
++   uint8_t bScalingLists4x4[6][16];
++   uint8_t bScalingLists8x8[2][64];
++};
++
++/* The short slice control of H.264, HEVC and VPx: where each slice's data is in the bitstream buffer */
++struct DXVA_Slice_Short {
++   uint32_t BSNALunitDataLocation;
++   uint32_t SliceBytesInBuffer;
++   uint16_t wBadSliceChopping;
++};
++
++struct DXVA_PicParams_HEVC {
++   uint16_t PicWidthInMinCbsY;
++   uint16_t PicHeightInMinCbsY;
++   union {
++      struct {
++         uint16_t chroma_format_idc : 2;
++         uint16_t separate_colour_plane_flag : 1;
++         uint16_t bit_depth_luma_minus8 : 3;
++         uint16_t bit_depth_chroma_minus8 : 3;
++         uint16_t log2_max_pic_order_cnt_lsb_minus4 : 4;
++         uint16_t NoPicReorderingFlag : 1;
++         uint16_t NoBiPredFlag : 1;
++         uint16_t ReservedBits1 : 1;
++      };
++      uint16_t wFormatAndSequenceInfoFlags;
++   };
++   DXVA_PicEntry CurrPic;
++   uint8_t sps_max_dec_pic_buffering_minus1;
++   uint8_t log2_min_luma_coding_block_size_minus3;
++   uint8_t log2_diff_max_min_luma_coding_block_size;
++   uint8_t log2_min_transform_block_size_minus2;
++   uint8_t log2_diff_max_min_transform_block_size;
++   uint8_t max_transform_hierarchy_depth_inter;
++   uint8_t max_transform_hierarchy_depth_intra;
++   uint8_t num_short_term_ref_pic_sets;
++   uint8_t num_long_term_ref_pics_sps;
++   uint8_t num_ref_idx_l0_default_active_minus1;
++   uint8_t num_ref_idx_l1_default_active_minus1;
++   int8_t init_qp_minus26;
++   uint8_t ucNumDeltaPocsOfRefRpsIdx;
++   uint16_t wNumBitsForShortTermRPSInSlice;
++   uint16_t ReservedBits2;
++   union {
++      struct {
++         uint32_t scaling_list_enabled_flag : 1;
++         uint32_t amp_enabled_flag : 1;
++         uint32_t sample_adaptive_offset_enabled_flag : 1;
++         uint32_t pcm_enabled_flag : 1;
++         uint32_t pcm_sample_bit_depth_luma_minus1 : 4;
++         uint32_t pcm_sample_bit_depth_chroma_minus1 : 4;
++         uint32_t log2_min_pcm_luma_coding_block_size_minus3 : 2;
++         uint32_t log2_diff_max_min_pcm_luma_coding_block_size : 2;
++         uint32_t pcm_loop_filter_disabled_flag : 1;
++         uint32_t long_term_ref_pics_present_flag : 1;
++         uint32_t sps_temporal_mvp_enabled_flag : 1;
++         uint32_t strong_intra_smoothing_enabled_flag : 1;
++         uint32_t dependent_slice_segments_enabled_flag : 1;
++         uint32_t output_flag_present_flag : 1;
++         uint32_t num_extra_slice_header_bits : 3;
++         uint32_t sign_data_hiding_enabled_flag : 1;
++         uint32_t cabac_init_present_flag : 1;
++         uint32_t ReservedBits3 : 5;
++      };
++      uint32_t dwCodingParamToolFlags;
++   };
++   union {
++      struct {
++         uint32_t constrained_intra_pred_flag : 1;
++         uint32_t transform_skip_enabled_flag : 1;
++         uint32_t cu_qp_delta_enabled_flag : 1;
++         uint32_t pps_slice_chroma_qp_offsets_present_flag : 1;
++         uint32_t weighted_pred_flag : 1;
++         uint32_t weighted_bipred_flag : 1;
++         uint32_t transquant_bypass_enabled_flag : 1;
++         uint32_t tiles_enabled_flag : 1;
++         uint32_t entropy_coding_sync_enabled_flag : 1;
++         uint32_t uniform_spacing_flag : 1;
++         uint32_t loop_filter_across_tiles_enabled_flag : 1;
++         uint32_t pps_loop_filter_across_slices_enabled_flag : 1;
++         uint32_t deblocking_filter_override_enabled_flag : 1;
++         uint32_t pps_deblocking_filter_disabled_flag : 1;
++         uint32_t lists_modification_present_flag : 1;
++         uint32_t slice_segment_header_extension_present_flag : 1;
++         uint32_t IrapPicFlag : 1;
++         uint32_t IdrPicFlag : 1;
++         uint32_t IntraPicFlag : 1;
++         uint32_t ReservedBits4 : 13;
++      };
++      uint32_t dwCodingSettingPicturePropertyFlags;
++   };
++   int8_t pps_cb_qp_offset;
++   int8_t pps_cr_qp_offset;
++   uint8_t num_tile_columns_minus1;
++   uint8_t num_tile_rows_minus1;
++   uint16_t column_width_minus1[19];
++   uint16_t row_height_minus1[21];
++   uint8_t diff_cu_qp_delta_depth;
++   int8_t pps_beta_offset_div2;
++   int8_t pps_tc_offset_div2;
++   uint8_t log2_parallel_merge_level_minus2;
++   int32_t CurrPicOrderCntVal;
++   DXVA_PicEntry RefPicList[15];
++   uint8_t ReservedBits5;
++   int32_t PicOrderCntValList[15];
++   uint8_t RefPicSetStCurrBefore[8];
++   uint8_t RefPicSetStCurrAfter[8];
++   uint8_t RefPicSetLtCurr[8];
++   uint16_t ReservedBits6;
++   uint16_t ReservedBits7;
++   uint32_t StatusReportFeedbackNumber;
++};
++
++struct DXVA_Qmatrix_HEVC {
++   uint8_t ucScalingLists0[6][16];
++   uint8_t ucScalingLists1[6][64];
++   uint8_t ucScalingLists2[6][64];
++   uint8_t ucScalingLists3[2][64];
++   uint8_t ucScalingListDCCoefSizeID2[6];
++   uint8_t ucScalingListDCCoefSizeID3[2];
++};
++
++struct DXVA_PicParams_VP9 {
++   DXVA_PicEntry CurrPic;
++   uint8_t profile;
++   union {
++      struct {
++         uint16_t frame_type : 1;
++         uint16_t show_frame : 1;
++         uint16_t error_resilient_mode : 1;
++         uint16_t subsampling_x : 1;
++         uint16_t subsampling_y : 1;
++         uint16_t extra_plane : 1;
++         uint16_t refresh_frame_context : 1;
++         uint16_t frame_parallel_decoding_mode : 1;
++         uint16_t intra_only : 1;
++         uint16_t frame_context_idx : 2;
++         uint16_t reset_frame_context : 2;
++         uint16_t allow_high_precision_mv : 1;
++         uint16_t ReservedFormatInfo2Bits : 2;
++      };
++      uint16_t wFormatAndPictureInfoFlags;
++   };
++   uint32_t width;
++   uint32_t height;
++   uint8_t BitDepthMinus8Luma;
++   uint8_t BitDepthMinus8Chroma;
++   uint8_t interp_filter;
++   uint8_t Reserved8Bits;
++   DXVA_PicEntry ref_frame_map[8];
++   uint32_t ref_frame_coded_width[8];
++   uint32_t ref_frame_coded_height[8];
++   DXVA_PicEntry frame_refs[3];
++   int8_t ref_frame_sign_bias[4];
++   int8_t filter_level;
++   int8_t sharpness_level;
++   union {
++      struct {
++         uint8_t mode_ref_delta_enabled : 1;
++         uint8_t mode_ref_delta_update : 1;
++         uint8_t use_prev_in_find_mv_refs : 1;
++         uint8_t ReservedControlInfo5Bits : 5;
++      };
++      uint8_t wControlInfoFlags;
++   };
++   int8_t ref_deltas[4];
++   int8_t mode_deltas[2];
++   int16_t base_qindex;
++   int8_t y_dc_delta_q;
++   int8_t uv_dc_delta_q;
++   int8_t uv_ac_delta_q;
++   struct {
++      union {
++         struct {
++            uint8_t enabled : 1;
++            uint8_t update_map : 1;
++            uint8_t temporal_update : 1;
++            uint8_t abs_delta : 1;
++            uint8_t ReservedSegmentFlags4Bits : 4;
++         };
++         uint8_t wSegmentInfoFlags;
++      };
++      uint8_t tree_probs[7];
++      uint8_t pred_probs[3];
++      int16_t feature_data[8][4];
++      uint8_t feature_mask[8];
++   } stVP9Segments;
++   uint8_t log2_tile_cols;
++   uint8_t log2_tile_rows;
++   uint16_t uncompressed_header_size_byte_aligned;
++   uint16_t first_partition_size;
++   uint16_t Reserved16Bits;
++   uint32_t Reserved32Bits;
++   uint32_t StatusReportFeedbackNumber;
++};
++struct DXVA_PicEntry_AV1 {
++   uint32_t width;
++   uint32_t height;
++   int32_t wmmat[6];
++   union {
++      struct {
++         uint8_t wminvalid : 1;
++         uint8_t wmtype : 2;
++         uint8_t Reserved : 5;
++      };
++      uint8_t GlobalMotionFlags;
++   };
++   uint8_t Index;
++   uint16_t Reserved16Bits;
++};
++
++struct DXVA_PicParams_AV1 {
++   uint32_t width;
++   uint32_t height;
++   uint32_t max_width;
++   uint32_t max_height;
++   uint8_t CurrPicTextureIndex;
++   uint8_t superres_denom;
++   uint8_t bitdepth;
++   uint8_t seq_profile;
++   struct {
++      uint8_t cols;
++      uint8_t rows;
++      uint16_t context_update_id;
++      uint16_t widths[64];
++      uint16_t heights[64];
++   } tiles;
++   union {
++      struct {
++         uint32_t use_128x128_superblock : 1;
++         uint32_t intra_edge_filter : 1;
++         uint32_t interintra_compound : 1;
++         uint32_t masked_compound : 1;
++         uint32_t warped_motion : 1;
++         uint32_t dual_filter : 1;
++         uint32_t jnt_comp : 1;
++         uint32_t screen_content_tools : 1;
++         uint32_t integer_mv : 1;
++         uint32_t cdef : 1;
++         uint32_t restoration : 1;
++         uint32_t film_grain : 1;
++         uint32_t intrabc : 1;
++         uint32_t high_precision_mv : 1;
++         uint32_t switchable_motion_mode : 1;
++         uint32_t filter_intra : 1;
++         uint32_t disable_frame_end_update_cdf : 1;
++         uint32_t disable_cdf_update : 1;
++         uint32_t reference_mode : 1;
++         uint32_t skip_mode : 1;
++         uint32_t reduced_tx_set : 1;
++         uint32_t superres : 1;
++         uint32_t tx_mode : 2;
++         uint32_t use_ref_frame_mvs : 1;
++         uint32_t enable_ref_frame_mvs : 1;
++         uint32_t reference_frame_update : 1;
++         uint32_t Reserved : 5;
++      };
++      uint32_t CodingParamToolFlags;
++   } coding;
++   union {
++      struct {
++         uint8_t frame_type : 2;
++         uint8_t show_frame : 1;
++         uint8_t showable_frame : 1;
++         uint8_t subsampling_x : 1;
++         uint8_t subsampling_y : 1;
++         uint8_t mono_chrome : 1;
++         uint8_t Reserved : 1;
++      };
++      uint8_t FormatAndPictureInfoFlags;
++   } format;
++   uint8_t primary_ref_frame;
++   uint8_t order_hint;
++   uint8_t order_hint_bits;
++   DXVA_PicEntry_AV1 frame_refs[7];
++   uint8_t RefFrameMapTextureIndex[8];
++   struct {
++      uint8_t filter_level[2];
++      uint8_t filter_level_u;
++      uint8_t filter_level_v;
++      uint8_t sharpness_level;
++      union {
++         struct {
++            uint8_t mode_ref_delta_enabled : 1;
++            uint8_t mode_ref_delta_update : 1;
++            uint8_t delta_lf_multi : 1;
++            uint8_t delta_lf_present : 1;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      int8_t ref_deltas[8];
++      int8_t mode_deltas[2];
++      uint8_t delta_lf_res;
++      uint8_t frame_restoration_type[3];
++      uint16_t log2_restoration_unit_size[3];
++      uint16_t Reserved16Bits;
++   } loop_filter;
++   struct {
++      union {
++         struct {
++            uint8_t delta_q_present : 1;
++            uint8_t delta_q_res : 2;
++            uint8_t Reserved : 5;
++         };
++         uint8_t ControlFlags;
++      };
++      uint8_t base_qindex;
++      int8_t y_dc_delta_q;
++      int8_t u_dc_delta_q;
++      int8_t v_dc_delta_q;
++      int8_t u_ac_delta_q;
++      int8_t v_ac_delta_q;
++      uint8_t qm_y;
++      uint8_t qm_u;
++      uint8_t qm_v;
++      uint16_t Reserved16Bits;
++   } quantization;
++   struct {
++      union {
++         struct {
++            uint8_t damping : 2;
++            uint8_t bits : 2;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      union {
++         struct {
++            uint8_t primary : 6;
++            uint8_t secondary : 2;
++         };
++         uint8_t combined;
++      } y_strengths[8], uv_strengths[8];
++   } cdef;
++   uint8_t interp_filter;
++   struct {
++      union {
++         struct {
++            uint8_t enabled : 1;
++            uint8_t update_map : 1;
++            uint8_t update_data : 1;
++            uint8_t temporal_update : 1;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      uint8_t Reserved24Bits[3];
++      uint8_t feature_mask[8];
++      int16_t feature_data[8][8];
++   } segmentation;
++   struct {
++      union {
++         struct {
++            uint16_t apply_grain : 1;
++            uint16_t scaling_shift_minus8 : 2;
++            uint16_t chroma_scaling_from_luma : 1;
++            uint16_t ar_coeff_lag : 2;
++            uint16_t ar_coeff_shift_minus6 : 2;
++            uint16_t grain_scale_shift : 2;
++            uint16_t overlap_flag : 1;
++            uint16_t clip_to_restricted_range : 1;
++            uint16_t matrix_coeff_is_identity : 1;
++            uint16_t Reserved : 3;
++         };
++         uint16_t ControlFlags;
++      };
++      uint16_t grain_seed;
++      uint8_t scaling_points_y[14][2];
++      uint8_t num_y_points;
++      uint8_t scaling_points_cb[10][2];
++      uint8_t num_cb_points;
++      uint8_t scaling_points_cr[10][2];
++      uint8_t num_cr_points;
++      uint8_t ar_coeffs_y[24];
++      uint8_t ar_coeffs_cb[25];
++      uint8_t ar_coeffs_cr[25];
++      uint8_t cb_mult;
++      uint8_t cb_luma_mult;
++      uint8_t cr_mult;
++      uint8_t cr_luma_mult;
++      uint8_t Reserved8Bits;
++      int16_t cb_offset;
++      int16_t cr_offset;
++   } film_grain;
++   uint32_t Reserved32Bits;
++   uint32_t StatusReportFeedbackNumber;
++};
++
++/* MPEG-2 (DXVA 1's structures) */
++struct DXVA_PictureParameters {
++   uint16_t wDecodedPictureIndex;
++   uint16_t wDeblockedPictureIndex;
++   uint16_t wForwardRefPictureIndex;
++   uint16_t wBackwardRefPictureIndex;
++   uint16_t wPicWidthInMBminus1;
++   uint16_t wPicHeightInMBminus1;
++   uint8_t bMacroblockWidthMinus1;
++   uint8_t bMacroblockHeightMinus1;
++   uint8_t bBlockWidthMinus1;
++   uint8_t bBlockHeightMinus1;
++   uint8_t bBPPminus1;
++   uint8_t bPicStructure;
++   uint8_t bSecondField;
++   uint8_t bPicIntra;
++   uint8_t bPicBackwardPrediction;
++   uint8_t bBidirectionalAveragingMode;
++   uint8_t bMVprecisionAndChromaRelation;
++   uint8_t bChromaFormat;
++   uint8_t bPicScanFixed;
++   uint8_t bPicScanMethod;
++   uint8_t bPicReadbackRequests;
++   uint8_t bRcontrol;
++   uint8_t bPicSpatialResid8;
++   uint8_t bPicOverflowBlocks;
++   uint8_t bPicExtrapolation;
++   uint8_t bPicDeblocked;
++   uint8_t bPicDeblockConfined;
++   uint8_t bPic4MVallowed;
++   uint8_t bPicOBMC;
++   uint8_t bPicBinPB;
++   uint8_t bMV_RPS;
++   uint8_t bReservedBits;
++   uint16_t wBitstreamFcodes;
++   uint16_t wBitstreamPCEelements;
++   uint8_t bBitstreamConcealmentNeed;
++   uint8_t bBitstreamConcealmentMethod;
++};
++
++struct DXVA_QmatrixData {
++   uint8_t bNewQmatrix[4];   /* intra, inter (luma), intra, inter (chroma) */
++   uint16_t Qmatrix[4][64];  /* in zig-zag order */
++};
++
++struct DXVA_SliceInfo {
++   uint16_t wHorizontalPosition;
++   uint16_t wVerticalPosition;
++   uint32_t dwSliceBitsInBuffer;
++   uint32_t dwSliceDataLocation;
++   uint8_t bStartCodeBitOffset;
++   uint8_t bReservedBits;
++   uint16_t wMBbitOffset;
++   uint16_t wNumberMBsInSlice;
++   uint16_t wQuantizerScaleCode;
++   uint16_t wBadSliceChopping;
++};
++
++/* AV1's slice control: the tiles */
++struct DXVA_Tile_AV1 {
++   uint32_t DataOffset;
++   uint32_t DataSize;
++   uint16_t row;
++   uint16_t column;
++   uint16_t Reserved16Bits;
++   uint8_t anchor_frame;
++   uint8_t Reserved8Bits;
++};
++#pragma pack(pop)
++
++static const uint8_t DXVA_INVALID_ENTRY = 0xff;
++
++
++/*
++ * The decoder profiles (D3D11_DECODER_PROFILE_*), as gallium's
++ */
++
++enum VideoCodec { CODEC_H264, CODEC_HEVC, CODEC_VP9, CODEC_AV1, CODEC_MPEG2 };
++
++struct VideoProfileInfo {
++   GUID guid;
++   enum pipe_video_profile profile;
++   DXGI_FORMAT format;
++   VideoCodec codec;
++   DXGI_FORMAT format2 = DXGI_FORMAT_UNKNOWN;   /* a profile for 8 and 10 bits (AV1's) */
++
++   bool Outputs(DXGI_FORMAT f) const { return f == format || (format2 != DXGI_FORMAT_UNKNOWN && f == format2); }
++};
++
++static const VideoProfileInfo PROFILES[] = {
++   {{0x1b81be68, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}}, /* H264_VLD_NOFGT */
++    PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH, DXGI_FORMAT_NV12, CODEC_H264},
++   {{0x5b11d51b, 0x2f4c, 0x4452, {0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0}}, /* HEVC_VLD_MAIN */
++    PIPE_VIDEO_PROFILE_HEVC_MAIN, DXGI_FORMAT_NV12, CODEC_HEVC},
++   {{0x107af0e0, 0xef1a, 0x4d19, {0xab, 0xa8, 0x67, 0xa1, 0x63, 0x07, 0x3d, 0x13}}, /* HEVC_VLD_MAIN10 */
++    PIPE_VIDEO_PROFILE_HEVC_MAIN_10, DXGI_FORMAT_P010, CODEC_HEVC},
++   {{0x463707f8, 0xa1d0, 0x4585, {0x87, 0x6d, 0x83, 0xaa, 0x6d, 0x60, 0xb8, 0x9e}}, /* VP9_VLD_PROFILE0 */
++    PIPE_VIDEO_PROFILE_VP9_PROFILE0, DXGI_FORMAT_NV12, CODEC_VP9},
++   {{0xa4c749ef, 0x6ecf, 0x48aa, {0x84, 0x48, 0x50, 0xa7, 0xa1, 0x16, 0x5f, 0xf7}}, /* VP9_VLD_10BIT_PROFILE2 */
++    PIPE_VIDEO_PROFILE_VP9_PROFILE2, DXGI_FORMAT_P010, CODEC_VP9},
++   {{0xb8be4ccb, 0xcf53, 0x46ba, {0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a}}, /* AV1_VLD_PROFILE0: 8 and 10 bits */
++    PIPE_VIDEO_PROFILE_AV1_MAIN, DXGI_FORMAT_NV12, CODEC_AV1, DXGI_FORMAT_P010},
++   {{0xee27417f, 0x5e28, 0x4e65, {0xbe, 0xea, 0x1d, 0x26, 0xb5, 0x08, 0xad, 0xc9}}, /* MPEG2_VLD */
++    PIPE_VIDEO_PROFILE_MPEG2_MAIN, DXGI_FORMAT_NV12, CODEC_MPEG2},
++};
++
++/* DXVA_NoEncrypt */
++static const GUID NO_ENCRYPT = {0x1b81bed0, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}};
++
++static bool
++ProfileSupported(struct pipe_screen *screen, const VideoProfileInfo &p)
++{
++   return screen->get_video_param &&
++          screen->get_video_param(screen, p.profile, PIPE_VIDEO_ENTRYPOINT_BITSTREAM, PIPE_VIDEO_CAP_SUPPORTED);
++}
++
++static const VideoProfileInfo *
++FindProfile(D3D10DDI_HDEVICE hDevice, const GUID *guid)
++{
++   struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
++   for (auto &p : PROFILES) {
++      if (IsEqualGUID(p.guid, *guid) && ProfileSupported(screen, p)) {
++         return &p;
++      }
++   }
++   return NULL;
++}
++
++
++/*
++ * The video context, and the order of its work and the device's
++ */
++
++static struct pipe_context *
++VideoPipe(Device *pDevice)
++{
++   if (!pDevice->video_pipe) {
++      pDevice->video_pipe = pDevice->screen->context_create(pDevice->screen, NULL, 0);
++   }
++   return pDevice->video_pipe;
++}
++
++/*
++ * The two contexts' work in order: flushed and done before the other uses what it wrote. Flushing alone isn't enough:
++ * Windows schedules each context's submissions on its own, and the host could run the device's copy of a decoded
++ * picture before the decoding (now and then a frame came out as the slice's previous picture).
++ */
++static void
++Finish(struct pipe_context *pipe)
++{
++   struct pipe_fence_handle *fence = NULL;
++   pipe->flush(pipe, &fence, 0);
++   if (fence) {
++      pipe->screen->fence_finish(pipe->screen, NULL, fence, OS_TIMEOUT_INFINITE);
++      pipe->screen->fence_reference(pipe->screen, &fence, NULL);
++   }
++}
++
++/* What the device did before the video context reads or writes it */
++static void
++FlushDevice(Device *pDevice)
++{
++   Finish(pDevice->pipe);
++}
++
++/* What the video context did before the device reads it */
++static void
++FlushVideo(Device *pDevice)
++{
++   Finish(pDevice->video_pipe);
++}
++
++
++/*
++ * NV12 and P010 textures
++ */
++
++struct VideoSurface {
++   enum pipe_format format;          /* PIPE_FORMAT_NV12 or P010 */
++   unsigned width, height;           /* the texture's (decoder output planes are macroblock-aligned: larger) */
++   unsigned slices;
++   unsigned bpp;                     /* bytes per luma sample */
++   struct pipe_video_buffer **buffers;
++};
++
++static struct pipe_resource *
++Plane(const VideoSurface *v, unsigned slice, unsigned plane)
++{
++   struct pipe_resource *resources[VL_NUM_COMPONENTS] = {};
++   v->buffers[slice]->get_resources(v->buffers[slice], resources);
++   return resources[plane];
++}
++
++static bool
++IsVideoFormat(DXGI_FORMAT Format)
++{
++   return Format == DXGI_FORMAT_NV12 || Format == DXGI_FORMAT_P010;
++}
++
++static enum pipe_resource_usage
++PipeUsage(D3D10_DDI_RESOURCE_USAGE usage)
++{
++   switch (usage) {
++   case D3D10_DDI_USAGE_DYNAMIC:
++      return PIPE_USAGE_DYNAMIC;
++   case D3D10_DDI_USAGE_STAGING:
++      return PIPE_USAGE_STAGING;
++   default:
++      return PIPE_USAGE_DEFAULT;
++   }
++}
++
++/* A slice for the video processor and copies: planes of the texture's size */
++static struct pipe_video_buffer *
++CreatePlaneBuffer(Device *pDevice, const struct pipe_video_buffer *tmpl, enum pipe_resource_usage usage)
++{
++   bool ten = tmpl->buffer_format == PIPE_FORMAT_P010;
++   const enum pipe_format formats[2] = {ten ? PIPE_FORMAT_R16_UNORM : PIPE_FORMAT_R8_UNORM,
++                                        ten ? PIPE_FORMAT_R16G16_UNORM : PIPE_FORMAT_R8G8_UNORM};
++   struct pipe_resource *resources[VL_NUM_COMPONENTS] = {};
++   for (unsigned p = 0; p < 2; p++) {
++      struct pipe_resource templat = {};
++      templat.target = PIPE_TEXTURE_2D;
++      templat.format = formats[p];
++      templat.width0 = p ? tmpl->width / 2 : tmpl->width;
++      templat.height0 = p ? tmpl->height / 2 : tmpl->height;
++      templat.depth0 = 1;
++      templat.array_size = 1;
++      templat.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
++      templat.usage = usage;
++      resources[p] = pDevice->screen->resource_create(pDevice->screen, &templat);
++      if (!resources[p]) {
++         pipe_resource_reference(&resources[0], NULL);
++         return NULL;
++      }
++   }
++   struct pipe_video_buffer *buffer = vl_video_buffer_create_ex2(VideoPipe(pDevice), tmpl, resources);
++   if (!buffer) {
++      pipe_resource_reference(&resources[0], NULL);
++      pipe_resource_reference(&resources[1], NULL);
++   }
++   return buffer;
++}
++
++static void WritePlanes(struct pipe_context *pipe, const VideoSurface *v, unsigned slice, unsigned x, unsigned y,
++                        unsigned w, unsigned h, const uint8_t *data, unsigned stride);
++
++bool
++VideoCreateResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_CREATERESOURCE *pCreateResource, Resource *pResource)
++{
++   Device *pDevice = CastDevice(hDevice);
++
++   /* Decoder buffers (picture parameters, bitstream, ...): memory the program fills and SubmitBuffers reads */
++   if (pCreateResource->BindFlags & D3D11_DDI_BIND_DECODER) {
++      VideoLog("CreateResource: decoder %s %ux%u format %u usage %u slices %u\n",
++               pCreateResource->ResourceDimension == D3D10DDIRESOURCE_BUFFER ? "buffer" : "texture",
++               pCreateResource->pMipInfoList[0].TexelWidth, pCreateResource->pMipInfoList[0].TexelHeight,
++               pCreateResource->Format, pCreateResource->Usage, pCreateResource->ArraySize);
++   }
++   if (pCreateResource->ResourceDimension == D3D10DDIRESOURCE_BUFFER &&
++       (pCreateResource->BindFlags & D3D11_DDI_BIND_DECODER)) {
++      pResource->buffer = true;
++      pResource->MipLevels = 1;
++      pResource->NumSubResources = 1;
++      pResource->sysmem_size = pCreateResource->pMipInfoList[0].TexelWidth;
++      pResource->sysmem = calloc(1, pCreateResource->pMipInfoList[0].TexelWidth);
++      pResource->transfers = (struct pipe_transfer **)calloc(1, sizeof *pResource->transfers);
++      if (!pResource->sysmem || !pResource->transfers) {
++         SetError(hDevice, E_OUTOFMEMORY);
++      }
++      return true;
++   }
++
++   if (!IsVideoFormat(pCreateResource->Format)) {
++      return false;
++   }
++   if (pCreateResource->ResourceDimension != D3D10DDIRESOURCE_TEXTURE2D || pCreateResource->MipLevels != 1 ||
++       pCreateResource->SampleDesc.Count > 1 || !VideoPipe(pDevice)) {
++      SetError(hDevice, E_INVALIDARG);
++      return true;
++   }
++
++   VideoSurface *v = (VideoSurface *)calloc(1, sizeof *v);
++   unsigned slices = pCreateResource->ArraySize;
++   if (v) {
++      v->buffers = (struct pipe_video_buffer **)calloc(slices, sizeof *v->buffers);
++   }
++   pResource->transfers = (struct pipe_transfer **)calloc(slices, sizeof *pResource->transfers);
++   if (!v || !v->buffers || !pResource->transfers) {
++      free(v ? v->buffers : NULL);
++      free(v);
++      SetError(hDevice, E_OUTOFMEMORY);
++      return true;
++   }
++   VideoLog("CreateResource: %s %ux%u, %u slices, bind 0x%x usage %u, initial data %p\n",
++            pCreateResource->Format == DXGI_FORMAT_P010 ? "P010" : "NV12", pCreateResource->pMipInfoList[0].TexelWidth,
++            pCreateResource->pMipInfoList[0].TexelHeight, pCreateResource->ArraySize, pCreateResource->BindFlags,
++            pCreateResource->Usage, pCreateResource->pInitialDataUP);
++   v->format = pCreateResource->Format == DXGI_FORMAT_P010 ? PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
++   v->bpp = v->format == PIPE_FORMAT_P010 ? 2 : 1;
++   v->width = pCreateResource->pMipInfoList[0].TexelWidth;
++   v->height = pCreateResource->pMipInfoList[0].TexelHeight;
++   v->slices = slices;
++   pResource->video = v;
++   pResource->Format = pCreateResource->Format;
++   pResource->MipLevels = 1;
++   pResource->NumSubResources = slices;
++
++   struct pipe_video_buffer tmpl = {};
++   tmpl.buffer_format = v->format;
++   tmpl.width = v->width;
++   tmpl.height = v->height;
++   tmpl.interlaced = false;
++   struct pipe_context *vpipe = VideoPipe(pDevice);
++   bool decoder = (pCreateResource->BindFlags & D3D11_DDI_BIND_DECODER) && vpipe->create_video_buffer;
++   for (unsigned s = 0; s < slices; s++) {
++      /* decoder output: the video codec's buffers (the host's surfaces with them); the others the texture's size */
++      v->buffers[s] = decoder ? vpipe->create_video_buffer(vpipe, &tmpl)
++                              : CreatePlaneBuffer(pDevice, &tmpl, PipeUsage((D3D10_DDI_RESOURCE_USAGE)pCreateResource->Usage));
++      if (!v->buffers[s]) {
++         SetError(hDevice, E_OUTOFMEMORY);
++         return true;
++      }
++   }
++   for (unsigned s = 0; pCreateResource->pInitialDataUP && s < slices; s++) {
++      WritePlanes(CastPipeContext(hDevice), v, s, 0, 0, v->width, v->height,
++                  (const uint8_t *)pCreateResource->pInitialDataUP[s].pSysMem, pCreateResource->pInitialDataUP[s].SysMemPitch);
++   }
++   /* the luma plane of the first slice for the rest of the driver, which never asks more of an NV12 texture */
++   pipe_resource_reference(&pResource->resource, Plane(v, 0, 0));
++   return true;
++}
++
++void
++VideoDestroyResource(Resource *pResource)
++{
++   free(pResource->sysmem);
++   pResource->sysmem = NULL;
++   VideoSurface *v = pResource->video;
++   if (!v) {
++      return;
++   }
++   for (unsigned s = 0; s < v->slices; s++) {
++      if (v->buffers[s]) {
++         v->buffers[s]->destroy(v->buffers[s]);
++      }
++   }
++   free(v->buffers);
++   free(v);
++   pResource->video = NULL;
++}
++
++/* A plane's box of a slice: the chroma plane at half the size */
++static struct pipe_box
++PlaneBox(const VideoSurface *v, unsigned plane, unsigned x, unsigned y, unsigned w, unsigned h)
++{
++   struct pipe_box box;
++   unsigned d = plane ? 2 : 1;
++   u_box_2d(x / d, y / d, w / d, h / d, &box);
++   (void)v;
++   return box;
++}
++
++bool
++VideoResourceMap(D3D10DDI_HDEVICE hDevice, Resource *pResource, UINT SubResource, D3D10_DDI_MAP DDIMap,
++                 D3D10DDI_MAPPED_SUBRESOURCE *pMapped)
++{
++   if (pResource->sysmem) {
++      pMapped->pData = pResource->sysmem;
++      pMapped->RowPitch = pMapped->DepthPitch = pResource->sysmem_size;
++      return true;
++   }
++   VideoSurface *v = pResource->video;
++   if (!v) {
++      return false;
++   }
++
++   /* the D3D layout in memory: the luma rows, then the chroma rows at the same pitch */
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   if (!pResource->shadows) {
++      pResource->shadows = (struct ResourceShadow *)calloc(pResource->NumSubResources, sizeof *pResource->shadows);
++   }
++   struct ResourceShadow *shadow = pResource->shadows ? &pResource->shadows[SubResource] : NULL;
++   unsigned row = v->width * v->bpp;
++   unsigned stride = align(row, 64);
++   if (shadow && !shadow->data) {
++      shadow->stride = stride;
++      shadow->layer_stride = stride * (v->height + v->height / 2);
++      shadow->data = malloc(shadow->layer_stride);
++   }
++   if (!shadow || !shadow->data) {
++      SetError(hDevice, E_OUTOFMEMORY);
++      return true;
++   }
++   shadow->usage = DDIMap == D3D10_DDI_MAP_READ ? PIPE_MAP_READ
++                 : DDIMap == D3D10_DDI_MAP_READWRITE ? PIPE_MAP_READ | PIPE_MAP_WRITE : PIPE_MAP_WRITE;
++   if (shadow->usage & PIPE_MAP_READ) {
++      for (unsigned p = 0; p < 2; p++) {
++         struct pipe_box box = PlaneBox(v, p, 0, 0, v->width, v->height);
++         struct pipe_transfer *transfer;
++         const uint8_t *map = (const uint8_t *)pipe->texture_map(pipe, Plane(v, SubResource, p), 0, PIPE_MAP_READ,
++                                                                 &box, &transfer);
++         if (!map) {
++            continue;
++         }
++         uint8_t *dst = (uint8_t *)shadow->data + (p ? stride * v->height : 0);
++         for (int y = 0; y < box.height; y++) {
++            memcpy(dst + y * stride, map + y * transfer->stride, row);
++         }
++         pipe_texture_unmap(pipe, transfer);
++      }
++   }
++   pMapped->pData = shadow->data;
++   pMapped->RowPitch = shadow->stride;
++   pMapped->DepthPitch = shadow->layer_stride;
++   return true;
++}
++
++static void
++WritePlanes(struct pipe_context *pipe, const VideoSurface *v, unsigned slice, unsigned x, unsigned y, unsigned w,
++            unsigned h, const uint8_t *data, unsigned stride)
++{
++   for (unsigned p = 0; p < 2; p++) {
++      struct pipe_box box = PlaneBox(v, p, x, y, w, h);
++      struct pipe_transfer *transfer;
++      uint8_t *map = (uint8_t *)pipe->texture_map(pipe, Plane(v, slice, p), 0, PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE,
++                                                  &box, &transfer);
++      if (!map) {
++         continue;
++      }
++      const uint8_t *src = data + (p ? stride * h : 0);
++      for (int row = 0; row < box.height; row++) {
++         memcpy(map + row * transfer->stride, src + row * stride, w * v->bpp);
++      }
++      pipe_texture_unmap(pipe, transfer);
++   }
++}
++
++bool
++VideoResourceUnmap(D3D10DDI_HDEVICE hDevice, Resource *pResource, UINT SubResource)
++{
++   if (pResource->sysmem) {
++      return true;
++   }
++   VideoSurface *v = pResource->video;
++   if (!v) {
++      return false;
++   }
++   struct ResourceShadow *shadow = pResource->shadows ? &pResource->shadows[SubResource] : NULL;
++   if (shadow && shadow->data) {
++      if (shadow->usage & PIPE_MAP_WRITE) {
++         WritePlanes(CastPipeContext(hDevice), v, SubResource, 0, 0, v->width, v->height, (const uint8_t *)shadow->data,
++                     shadow->stride);
++      }
++      free(shadow->data);
++      memset(shadow, 0, sizeof *shadow);
++   }
++   return true;
++}
++
++static void
++CopyPlanes(struct pipe_context *pipe, const VideoSurface *dst, unsigned dst_slice, unsigned dst_x, unsigned dst_y,
++           const VideoSurface *src, unsigned src_slice, unsigned x, unsigned y, unsigned w, unsigned h)
++{
++   for (unsigned p = 0; p < 2; p++) {
++      struct pipe_box box = PlaneBox(src, p, x, y, w, h);
++      unsigned d = p ? 2 : 1;
++      pipe->resource_copy_region(pipe, Plane(dst, dst_slice, p), 0, dst_x / d, dst_y / d, 0, Plane(src, src_slice, p),
++                                 0, &box);
++   }
++}
++
++bool
++VideoResourceCopy(D3D10DDI_HDEVICE hDevice, Resource *pDst, Resource *pSrc)
++{
++   if (!pDst->video && !pSrc->video) {
++      return false;
++   }
++   /* (NV12 to and from other formats: not offered) */
++   if (pDst->video && pSrc->video) {
++      for (unsigned s = 0; s < MIN2(pDst->video->slices, pSrc->video->slices); s++) {
++         CopyPlanes(CastPipeContext(hDevice), pDst->video, s, 0, 0, pSrc->video, s, 0, 0,
++                    MIN2(pDst->video->width, pSrc->video->width), MIN2(pDst->video->height, pSrc->video->height));
++      }
++   }
++   return true;
++}
++
++bool
++VideoResourceCopyRegion(D3D10DDI_HDEVICE hDevice, Resource *pDst, UINT DstSubResource, UINT DstX, UINT DstY,
++                        Resource *pSrc, UINT SrcSubResource, const D3D10_DDI_BOX *pSrcBox)
++{
++   if (!pDst->video && !pSrc->video) {
++      return false;
++   }
++   if (pDst->video && pSrc->video) {
++      const VideoSurface *src = pSrc->video;
++      unsigned x = pSrcBox ? pSrcBox->left : 0, y = pSrcBox ? pSrcBox->top : 0;
++      unsigned w = pSrcBox ? pSrcBox->right - pSrcBox->left : src->width;
++      unsigned h = pSrcBox ? pSrcBox->bottom - pSrcBox->top : src->height;
++      CopyPlanes(CastPipeContext(hDevice), pDst->video, DstSubResource, DstX, DstY, src, SrcSubResource, x, y, w, h);
++   }
++   return true;
++}
++
++bool
++VideoUpdateSubresourceUP(D3D10DDI_HDEVICE hDevice, Resource *pDst, UINT DstSubResource, const D3D10_DDI_BOX *pDstBox,
++                         const void *pSysMem, UINT RowPitch)
++{
++   VideoSurface *v = pDst->video;
++   if (!v) {
++      return false;
++   }
++   unsigned x = pDstBox ? pDstBox->left : 0, y = pDstBox ? pDstBox->top : 0;
++   unsigned w = pDstBox ? pDstBox->right - pDstBox->left : v->width;
++   unsigned h = pDstBox ? pDstBox->bottom - pDstBox->top : v->height;
++   VideoLog("UpdateSubresourceUP: slice %u %ux%u at %u,%u pitch %u\n", DstSubResource, w, h, x, y, RowPitch);
++   WritePlanes(CastPipeContext(hDevice), v, DstSubResource, x, y, w, h, (const uint8_t *)pSysMem, RowPitch);
++   return true;
++}
++
++bool
++VideoCreateShaderResourceView(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *pView,
++                              ShaderResourceView *pSRView)
++{
++   Resource *pResource = CastResource(pView->hDrvResource);
++   VideoSurface *v = pResource->video;
++   if (!v) {
++      return false;
++   }
++   /* the format picks the plane: R8/R16 luma, R8G8/R16G16 chroma */
++   unsigned plane = 0;
++   switch (pView->Format) {
++   case DXGI_FORMAT_R8G8_UNORM:
++   case DXGI_FORMAT_R8G8_UINT:
++   case DXGI_FORMAT_R16G16_UNORM:
++   case DXGI_FORMAT_R16G16_UINT:
++      plane = 1;
++      break;
++   default:
++      break;
++   }
++   unsigned slice = pView->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D ? pView->Tex2D.FirstArraySlice : 0;
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   struct pipe_resource *resource = Plane(v, MIN2(slice, v->slices - 1), plane);
++   struct pipe_sampler_view templat;
++   /* the plane's own format (its UINT variants as they are) */
++   enum pipe_format format = FormatTranslate(pView->Format, false);
++   if (util_format_is_pure_uint(format) != util_format_is_pure_uint(resource->format)) {
++      VideoLog("CreateShaderResourceView: format %s on a %s plane\n", util_format_name(format), util_format_name(resource->format));
++   } else {
++      format = resource->format;
++   }
++   u_sampler_view_default_template(&templat, resource, format);
++   memset(pSRView, 0, sizeof *pSRView);
++   pSRView->resource = pResource;
++   pSRView->handle = pipe->create_sampler_view(pipe, resource, &templat);
++   VideoLog("CreateShaderResourceView: format %u dimension %u plane %u slice %u: %p\n", pView->Format,
++            pView->ResourceDimension, plane, slice, pSRView->handle);
++   return true;
++}
++
++
++/*
++ * Format caps
++ */
++
++static bool
++ProcessorFormat(DXGI_FORMAT Format)
++{
++   switch (Format) {
++   case DXGI_FORMAT_B8G8R8A8_UNORM:
++   case DXGI_FORMAT_B8G8R8X8_UNORM:
++   case DXGI_FORMAT_R8G8B8A8_UNORM:
++   case DXGI_FORMAT_R10G10B10A2_UNORM:
++   case DXGI_FORMAT_R16G16B16A16_FLOAT:
++      return true;
++   default:
++      return false;
++   }
++}
++
++bool
++VideoFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps)
++{
++   if (!IsVideoFormat(Format)) {
++      return false;
++   }
++   /* shader views of the planes, the video processor's input, and decoder output for the profiles in this format */
++   *pFormatCaps = D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_1DDI_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT;
++   struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
++   for (auto &p : PROFILES) {
++      if (p.Outputs(Format) && ProfileSupported(screen, p)) {
++         *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_DECODER_OUTPUT;
++      }
++   }
++   return true;
++}
++
++void
++VideoAddFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps)
++{
++   if (!ProcessorFormat(Format)) {
++      return;
++   }
++   if (*pFormatCaps & D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE) {
++      *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT;
++   }
++   if (*pFormatCaps & D3D10_DDI_FORMAT_SUPPORT_RENDERTARGET) {
++      *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT;
++   }
++}
++
++
++/*
++ * The decoder
++ */
++
++struct VideoDecoder {
++   const VideoProfileInfo *profile;
++   struct pipe_video_codec *codec;
++   unsigned width, height;
++
++   /* the frame between BeginFrame and EndFrame */
++   Resource *target;
++   unsigned slice;
++   std::vector<uint8_t> pic_params, qmatrix;
++   std::vector<uint8_t> stream;     /* the slices' data, each H.264/HEVC slice after a start code */
++   unsigned slices;
++   std::vector<DXVA_Tile_AV1> tiles; /* AV1: where each tile is in stream */
++   uint8_t intra_matrix[64], non_intra_matrix[64];   /* MPEG-2's, for its picture description */
++
++   union {
++      struct pipe_h264_picture_desc h264;
++      struct pipe_h265_picture_desc h265;
++      struct pipe_vp9_picture_desc vp9;
++      struct pipe_av1_picture_desc av1;
++      struct pipe_mpeg12_picture_desc mpeg2;
++   } desc;
++   struct pipe_h264_pps h264_pps;
++   struct pipe_h264_sps h264_sps;
++   struct pipe_h265_pps h265_pps;
++   struct pipe_h265_sps h265_sps;
++};
++
++struct VideoDecoderOutputView {
++   Resource *resource;
++   unsigned slice;
++};
++
++static VideoDecoder *
++CastDecoder(D3D11_1DDI_HDECODE hDecoder)
++{
++   return static_cast<VideoDecoder *>(hDecoder.pDrvPrivate);
++}
++
++static void APIENTRY
++GetVideoDecoderProfileCount(D3D10DDI_HDEVICE hDevice, UINT *pCount)
++{
++   struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
++   *pCount = 0;
++   for (auto &p : PROFILES) {
++      *pCount += ProfileSupported(screen, p);
++   }
++}
++
++static void APIENTRY
++GetVideoDecoderProfile(D3D10DDI_HDEVICE hDevice, UINT Index, GUID *pGuid)
++{
++   struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
++   for (auto &p : PROFILES) {
++      if (ProfileSupported(screen, p) && Index-- == 0) {
++         *pGuid = p.guid;
++         return;
++      }
++   }
++}
++
++static void APIENTRY
++CheckVideoDecoderFormat(D3D10DDI_HDEVICE hDevice, const GUID *pGuid, DXGI_FORMAT Format, BOOL *pSupported)
++{
++   const VideoProfileInfo *p = FindProfile(hDevice, pGuid);
++   *pSupported = p && p->Outputs(Format);
++}
++
++static bool
++DecoderSizeSupported(D3D10DDI_HDEVICE hDevice, const D3D11_1DDI_VIDEO_DECODER_DESC *pDesc,
++                     const VideoProfileInfo **pProfile)
++{
++   const VideoProfileInfo *p = FindProfile(hDevice, &pDesc->Guid);
++   if (!p || !p->Outputs(pDesc->OutputFormat)) {
++      return false;
++   }
++   struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
++   unsigned max_width = screen->get_video_param(screen, p->profile, PIPE_VIDEO_ENTRYPOINT_BITSTREAM,
++                                                PIPE_VIDEO_CAP_MAX_WIDTH);
++   unsigned max_height = screen->get_video_param(screen, p->profile, PIPE_VIDEO_ENTRYPOINT_BITSTREAM,
++                                                 PIPE_VIDEO_CAP_MAX_HEIGHT);
++   if (pProfile) {
++      *pProfile = p;
++   }
++   return (!max_width || pDesc->SampleWidth <= max_width) && (!max_height || pDesc->SampleHeight <= max_height);
++}
++
++static void APIENTRY
++GetVideoDecoderConfigCount(D3D10DDI_HDEVICE hDevice, const D3D11_1DDI_VIDEO_DECODER_DESC *pDesc, UINT *pCount)
++{
++   *pCount = DecoderSizeSupported(hDevice, pDesc, NULL) ? 1 : 0;
++}
++
++static void APIENTRY
++GetVideoDecoderConfig(D3D10DDI_HDEVICE hDevice, const D3D11_1DDI_VIDEO_DECODER_DESC *pDesc, UINT Index,
++                      D3D11_1DDI_VIDEO_DECODER_CONFIG *pConfig)
++{
++   const VideoProfileInfo *p = FindProfile(hDevice, &pDesc->Guid);
++   memset(pConfig, 0, sizeof *pConfig);
++   pConfig->guidConfigBitstreamEncryption = NO_ENCRYPT;
++   pConfig->guidConfigMBcontrolEncryption = NO_ENCRYPT;
++   pConfig->guidConfigResidDiffEncryption = NO_ENCRYPT;
++   /* the short slice format: for H.264 that's 2 (1 is the long one, with slice headers parsed); HEVC and VP9 only
++    * have this one */
++   pConfig->ConfigBitstreamRaw = p && p->codec == CODEC_H264 ? 2 : 1;
++}
++
++static const D3D11_1DDI_VIDEO_DECODER_BUFFER_TYPE BUFFER_TYPES[] = {
++   D3D11_1DDI_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
++   D3D11_1DDI_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
++   D3D11_1DDI_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
++   D3D11_1DDI_VIDEO_DECODER_BUFFER_BITSTREAM,
++};
++
++static void APIENTRY
++GetVideoDecoderBufferTypeCount(D3D10DDI_HDEVICE hDevice, const D3D11_1DDI_VIDEO_DECODER_DESC *pDesc, UINT *pCount)
++{
++   *pCount = ARRAY_SIZE(BUFFER_TYPES);
++}
++
++static void APIENTRY
++GetVideoDecoderBufferInfo(D3D10DDI_HDEVICE hDevice, const D3D11_1DDI_VIDEO_DECODER_DESC *pDesc, UINT Index,
++                          D3D11_1DDI_VIDEO_DECODER_BUFFER_INFO *pInfo)
++{
++   unsigned pixels = pDesc->SampleWidth * pDesc->SampleHeight;
++   pInfo->Type = BUFFER_TYPES[MIN2(Index, ARRAY_SIZE(BUFFER_TYPES) - 1)];
++   switch (pInfo->Type) {
++   case D3D11_1DDI_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS:
++      pInfo->Size = MAX2(sizeof(DXVA_PicParams_H264), sizeof(DXVA_PicParams_AV1));
++      break;
++   case D3D11_1DDI_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX:
++      pInfo->Size = sizeof(DXVA_Qmatrix_HEVC);
++      break;
++   case D3D11_1DDI_VIDEO_DECODER_BUFFER_SLICE_CONTROL:
++      pInfo->Size = 4096 * sizeof(DXVA_Tile_AV1);
++      break;
++   default:
++      /* a compressed picture: at most about its raw size */
++      pInfo->Size = MAX2(pixels * 3 / 2, 1u << 20);
++      break;
++   }
++   pInfo->Usage = D3D10_DDI_USAGE_DYNAMIC;
++}
++
++static SIZE_T APIENTRY
++CalcPrivateVideoDecoderSize(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEODECODER *pCreate)
++{
++   return sizeof(VideoDecoder);
++}
++
++static HRESULT APIENTRY
++CreateVideoDecoder(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEODECODER *pCreate,
++                   D3D11_1DDI_HDECODE hDecoder, D3D11_1DDI_HRTDECODE hRTDecoder)
++{
++   Device *pDevice = CastDevice(hDevice);
++   const VideoProfileInfo *p = NULL;
++   if (!DecoderSizeSupported(hDevice, &pCreate->Desc, &p)) {
++      return E_INVALIDARG;
++   }
++   struct pipe_context *vpipe = VideoPipe(pDevice);
++   if (!vpipe || !vpipe->create_video_codec) {
++      return E_FAIL;
++   }
++
++   struct pipe_video_codec templat = {};
++   templat.profile = p->profile;
++   templat.entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
++   templat.chroma_format = PIPE_VIDEO_CHROMA_FORMAT_420;
++   templat.width = pCreate->Desc.SampleWidth;
++   templat.height = pCreate->Desc.SampleHeight;
++   templat.max_references = 16;
++   templat.expect_chunked_decode = true;
++   struct pipe_video_codec *codec = vpipe->create_video_codec(vpipe, &templat);
++   if (!codec) {
++      VideoLog("CreateVideoDecoder: no codec for profile %d %ux%u\n", p->profile, templat.width, templat.height);
++      return E_FAIL;
++   }
++
++   VideoDecoder *dec = new (hDecoder.pDrvPrivate) VideoDecoder();
++   dec->profile = p;
++   dec->codec = codec;
++   dec->width = pCreate->Desc.SampleWidth;
++   dec->height = pCreate->Desc.SampleHeight;
++   return S_OK;
++}
++
++static void APIENTRY
++DestroyVideoDecoder(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder)
++{
++   VideoDecoder *dec = CastDecoder(hDecoder);
++   dec->codec->destroy(dec->codec);
++   dec->~VideoDecoder();
++}
++
++static SIZE_T APIENTRY
++CalcPrivateVideoDecoderOutputViewSize(D3D10DDI_HDEVICE hDevice,
++                                      const D3D11_1DDIARG_CREATEVIDEODECODEROUTPUTVIEW *pCreate)
++{
++   return sizeof(VideoDecoderOutputView);
++}
++
++static HRESULT APIENTRY
++CreateVideoDecoderOutputView(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEODECODEROUTPUTVIEW *pCreate,
++                             D3D11_1DDI_HVIDEODECODEROUTPUTVIEW hView, D3D11_1DDI_HRTVIDEODECODEROUTPUTVIEW hRTView)
++{
++   Resource *pResource = CastResource(pCreate->hDrvResource);
++   if (!pResource->video || pCreate->FirstArraySlice >= pResource->video->slices) {
++      return E_INVALIDARG;
++   }
++   VideoDecoderOutputView *view = static_cast<VideoDecoderOutputView *>(hView.pDrvPrivate);
++   view->resource = pResource;
++   view->slice = pCreate->FirstArraySlice;
++   return S_OK;
++}
++
++static void APIENTRY
++DestroyVideoDecoderOutputView(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEODECODEROUTPUTVIEW hView)
++{
++}
++
++static HRESULT APIENTRY
++VideoDecoderBeginFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder,
++                       const D3D11_1DDIARG_VIDEODECODERBEGINFRAME *pBegin)
++{
++   VideoDecoder *dec = CastDecoder(hDecoder);
++   VideoDecoderOutputView *view = static_cast<VideoDecoderOutputView *>(pBegin->hOutputView.pDrvPrivate);
++   if (pBegin->pContentKey && pBegin->ContentKeySize) {
++      VideoLog("BeginFrame: a content key (%u bytes): no encryption here\n", pBegin->ContentKeySize);
++      return E_INVALIDARG;
++   }
++   dec->target = view->resource;
++   dec->slice = view->slice;
++   dec->pic_params.clear();
++   dec->qmatrix.clear();
++   dec->stream.clear();
++   dec->slices = 0;
++   dec->tiles.clear();
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++VideoDecoderSubmitBuffers(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder, UINT BufferCount,
++                          const D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC *pBufferDesc)
++{
++   VideoDecoder *dec = CastDecoder(hDecoder);
++   const uint8_t *slice_control = NULL, *bitstream = NULL;
++   unsigned slice_control_size = 0, bitstream_size = 0;
++
++   for (UINT i = 0; i < BufferCount; i++) {
++      const D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC &b = pBufferDesc[i];
++      Resource *pResource = CastResource(b.hResource);
++      if (!pResource->sysmem || b.DataOffset + b.DataSize > pResource->sysmem_size) {
++         VideoLog("SubmitBuffers: buffer %u (type %u, %u bytes at %u) isn't a decoder buffer of ours (%p, %u bytes)\n",
++                  i, b.BufferType, b.DataSize, b.DataOffset, pResource->sysmem, pResource->sysmem_size);
++         return E_INVALIDARG;
++      }
++      const uint8_t *data = (const uint8_t *)pResource->sysmem + b.DataOffset;
++      switch (b.BufferType) {
++      case D3D11_1DDI_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS:
++         dec->pic_params.assign(data, data + b.DataSize);
++         break;
++      case D3D11_1DDI_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX:
++         dec->qmatrix.assign(data, data + b.DataSize);
++         break;
++      case D3D11_1DDI_VIDEO_DECODER_BUFFER_SLICE_CONTROL:
++         slice_control = data;
++         slice_control_size = b.DataSize;
++         break;
++      case D3D11_1DDI_VIDEO_DECODER_BUFFER_BITSTREAM:
++         bitstream = data;
++         bitstream_size = b.DataSize;
++         break;
++      default:
++         break;
++      }
++   }
++
++   /* the slices of this call's bitstream buffer, where its slice control says they are: H.264 and HEVC slices each
++    * after a start code (the host's VA-API driver gets them one by one, split at the start codes) */
++   /* AV1: the bitstream buffer as it is, its tiles where the slice control says */
++   if (slice_control && bitstream && dec->profile->codec == CODEC_AV1) {
++      uint32_t base = (uint32_t)dec->stream.size();
++      for (unsigned i = 0; i < slice_control_size / sizeof(DXVA_Tile_AV1); i++) {
++         DXVA_Tile_AV1 t;
++         memcpy(&t, slice_control + i * sizeof t, sizeof t);
++         if (t.DataOffset > bitstream_size || t.DataSize > bitstream_size - t.DataOffset) {
++            VideoLog("SubmitBuffers: tile %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i, t.DataSize,
++                     t.DataOffset, bitstream_size);
++            return E_INVALIDARG;
++         }
++         t.DataOffset += base;
++         dec->tiles.push_back(t);
++      }
++      dec->stream.insert(dec->stream.end(), bitstream, bitstream + bitstream_size);
++      dec->slices = (unsigned)dec->tiles.size();
++   } else if (slice_control && bitstream && dec->profile->codec == CODEC_MPEG2) {
++      /* MPEG-2: the slices with their start codes, as they are */
++      for (unsigned i = 0; i < slice_control_size / sizeof(DXVA_SliceInfo); i++) {
++         DXVA_SliceInfo si;
++         memcpy(&si, slice_control + i * sizeof si, sizeof si);
++         uint32_t bytes = si.dwSliceBitsInBuffer / 8;
++         if (si.dwSliceDataLocation > bitstream_size || bytes > bitstream_size - si.dwSliceDataLocation) {
++            VideoLog("SubmitBuffers: slice %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i, bytes,
++                     si.dwSliceDataLocation, bitstream_size);
++            return E_INVALIDARG;
++         }
++         dec->stream.insert(dec->stream.end(), bitstream + si.dwSliceDataLocation,
++                            bitstream + si.dwSliceDataLocation + bytes);
++         dec->slices++;
++      }
++   } else if (slice_control && bitstream) {
++      static const uint8_t start_code[3] = {0, 0, 1};
++      bool annexb = dec->profile->codec != CODEC_VP9;
++      for (unsigned i = 0; i < slice_control_size / sizeof(DXVA_Slice_Short); i++) {
++         DXVA_Slice_Short s;
++         memcpy(&s, slice_control + i * sizeof s, sizeof s);
++         if (s.BSNALunitDataLocation > bitstream_size || s.SliceBytesInBuffer > bitstream_size - s.BSNALunitDataLocation) {
++            VideoLog("SubmitBuffers: slice %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i,
++                     s.SliceBytesInBuffer, s.BSNALunitDataLocation, bitstream_size);
++            return E_INVALIDARG;
++         }
++         const uint8_t *slice = bitstream + s.BSNALunitDataLocation;
++         if (annexb && (s.SliceBytesInBuffer < 3 || memcmp(slice, start_code, 3))) {
++            dec->stream.insert(dec->stream.end(), start_code, start_code + 3);
++         }
++         dec->stream.insert(dec->stream.end(), slice, slice + s.SliceBytesInBuffer);
++         dec->slices++;
++      }
++   }
++   return S_OK;
++}
++
++/* The picture a DXVA surface index names: in D3D11 the decoder output texture's array slice */
++static struct pipe_video_buffer *
++Surface(VideoDecoder *dec, unsigned index)
++{
++   VideoSurface *v = dec->target->video;
++   return index < v->slices ? v->buffers[index] : NULL;
++}
++
++static bool
++H264Picture(VideoDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DXVA_PicParams_H264)) {
++      return false;
++   }
++   const DXVA_PicParams_H264 *pp = (const DXVA_PicParams_H264 *)dec->pic_params.data();
++   struct pipe_h264_picture_desc *d = &dec->desc.h264;
++   struct pipe_h264_pps *pps = &dec->h264_pps;
++   struct pipe_h264_sps *sps = &dec->h264_sps;
++   memset(d, 0, sizeof *d);
++   memset(pps, 0, sizeof *pps);
++   memset(sps, 0, sizeof *sps);
++   d->pps = pps;
++   pps->sps = sps;
++
++   sps->chroma_format_idc = pp->chroma_format_idc;
++   sps->separate_colour_plane_flag = pp->residual_colour_transform_flag;
++   sps->bit_depth_luma_minus8 = pp->bit_depth_luma_minus8;
++   sps->bit_depth_chroma_minus8 = pp->bit_depth_chroma_minus8;
++   sps->log2_max_frame_num_minus4 = pp->log2_max_frame_num_minus4;
++   sps->pic_order_cnt_type = pp->pic_order_cnt_type;
++   sps->log2_max_pic_order_cnt_lsb_minus4 = pp->log2_max_pic_order_cnt_lsb_minus4;
++   sps->delta_pic_order_always_zero_flag = pp->delta_pic_order_always_zero_flag;
++   sps->max_num_ref_frames = pp->num_ref_frames;
++   sps->frame_mbs_only_flag = pp->frame_mbs_only_flag;
++   sps->mb_adaptive_frame_field_flag = pp->MbaffFrameFlag;
++   sps->direct_8x8_inference_flag = pp->direct_8x8_inference_flag;
++   sps->MinLumaBiPredSize8x8 = pp->MinLumaBipredSize8x8Flag;
++
++   pps->entropy_coding_mode_flag = pp->entropy_coding_mode_flag;
++   pps->bottom_field_pic_order_in_frame_present_flag = pp->pic_order_present_flag;
++   pps->num_slice_groups_minus1 = pp->num_slice_groups_minus1;
++   pps->slice_group_map_type = pp->slice_group_map_type;
++   pps->slice_group_change_rate_minus1 = pp->slice_group_change_rate_minus1;
++   pps->num_ref_idx_l0_default_active_minus1 = pp->num_ref_idx_l0_active_minus1;
++   pps->num_ref_idx_l1_default_active_minus1 = pp->num_ref_idx_l1_active_minus1;
++   pps->weighted_pred_flag = pp->weighted_pred_flag;
++   pps->weighted_bipred_idc = pp->weighted_bipred_idc;
++   pps->pic_init_qp_minus26 = pp->pic_init_qp_minus26;
++   pps->pic_init_qs_minus26 = pp->pic_init_qs_minus26;
++   pps->chroma_qp_index_offset = pp->chroma_qp_index_offset;
++   pps->second_chroma_qp_index_offset = pp->second_chroma_qp_index_offset;
++   pps->deblocking_filter_control_present_flag = pp->deblocking_filter_control_present_flag;
++   pps->constrained_intra_pred_flag = pp->constrained_intra_pred_flag;
++   pps->redundant_pic_cnt_present_flag = pp->redundant_pic_cnt_present_flag;
++   pps->transform_8x8_mode_flag = pp->transform_8x8_mode_flag;
++
++   /* the scaling lists: DXVA's in zig-zag order, gallium's (VA-API's) in raster order; flat without them */
++   memset(pps->ScalingList4x4, 16, sizeof pps->ScalingList4x4);
++   memset(pps->ScalingList8x8, 16, sizeof pps->ScalingList8x8);
++   if (dec->qmatrix.size() >= sizeof(DXVA_Qmatrix_H264)) {
++      const DXVA_Qmatrix_H264 *qm = (const DXVA_Qmatrix_H264 *)dec->qmatrix.data();
++      for (unsigned i = 0; i < 6; i++) {
++         for (unsigned j = 0; j < 16; j++) {
++            pps->ScalingList4x4[i][vl_zscan_normal_16[j]] = qm->bScalingLists4x4[i][j];
++         }
++      }
++      for (unsigned i = 0; i < 2; i++) {
++         for (unsigned j = 0; j < 64; j++) {
++            pps->ScalingList8x8[i][vl_zscan_normal[j]] = qm->bScalingLists8x8[i][j];
++         }
++      }
++   }
++
++   d->frame_num = pp->frame_num;
++   d->field_pic_flag = pp->field_pic_flag;
++   d->bottom_field_flag = pp->field_pic_flag && pp->CurrPic.AssociatedFlag;
++   d->num_ref_idx_l0_active_minus1 = pp->num_ref_idx_l0_active_minus1;
++   d->num_ref_idx_l1_active_minus1 = pp->num_ref_idx_l1_active_minus1;
++   d->slice_count = dec->slices;
++   d->field_order_cnt[0] = pp->CurrFieldOrderCnt[0];
++   d->field_order_cnt[1] = pp->CurrFieldOrderCnt[1];
++   d->is_reference = pp->RefPicFlag;
++   d->num_ref_frames = pp->num_ref_frames;
++
++   /* the references, packed from the first entry (virgl's host reads entries up to num_ref_frames) */
++   unsigned n = 0;
++   for (unsigned i = 0; i < 16; i++) {
++      DXVA_PicEntry e = pp->RefFrameList[i];
++      bool top = pp->UsedForReferenceFlags & (1u << (2 * i)), bottom = pp->UsedForReferenceFlags & (2u << (2 * i));
++      struct pipe_video_buffer *ref = e.bPicEntry == DXVA_INVALID_ENTRY ? NULL : Surface(dec, e.Index7Bits);
++      if (!ref || (!top && !bottom) || (pp->NonExistingFrameFlags & (1u << i))) {
++         continue;
++      }
++      d->ref[n] = ref;
++      d->is_long_term[n] = e.AssociatedFlag;
++      d->top_is_reference[n] = top;
++      d->bottom_is_reference[n] = bottom;
++      d->field_order_cnt_list[n][0] = pp->FieldOrderCntList[i][0];
++      d->field_order_cnt_list[n][1] = pp->FieldOrderCntList[i][1];
++      d->frame_num_list[n] = pp->FrameNumList[i];
++      n++;
++   }
++   return true;
++}
++
++static bool
++HEVCPicture(VideoDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DXVA_PicParams_HEVC)) {
++      return false;
++   }
++   const DXVA_PicParams_HEVC *pp = (const DXVA_PicParams_HEVC *)dec->pic_params.data();
++   struct pipe_h265_picture_desc *d = &dec->desc.h265;
++   struct pipe_h265_pps *pps = &dec->h265_pps;
++   struct pipe_h265_sps *sps = &dec->h265_sps;
++   memset(d, 0, sizeof *d);
++   memset(pps, 0, sizeof *pps);
++   memset(sps, 0, sizeof *sps);
++   d->pps = pps;
++   pps->sps = sps;
++
++   unsigned log2_min_cb = pp->log2_min_luma_coding_block_size_minus3 + 3;
++   sps->chroma_format_idc = pp->chroma_format_idc;
++   sps->separate_colour_plane_flag = pp->separate_colour_plane_flag;
++   sps->pic_width_in_luma_samples = pp->PicWidthInMinCbsY << log2_min_cb;
++   sps->pic_height_in_luma_samples = pp->PicHeightInMinCbsY << log2_min_cb;
++   sps->bit_depth_luma_minus8 = pp->bit_depth_luma_minus8;
++   sps->bit_depth_chroma_minus8 = pp->bit_depth_chroma_minus8;
++   sps->log2_max_pic_order_cnt_lsb_minus4 = pp->log2_max_pic_order_cnt_lsb_minus4;
++   sps->sps_max_dec_pic_buffering_minus1 = pp->sps_max_dec_pic_buffering_minus1;
++   sps->log2_min_luma_coding_block_size_minus3 = pp->log2_min_luma_coding_block_size_minus3;
++   sps->log2_diff_max_min_luma_coding_block_size = pp->log2_diff_max_min_luma_coding_block_size;
++   sps->log2_min_transform_block_size_minus2 = pp->log2_min_transform_block_size_minus2;
++   sps->log2_diff_max_min_transform_block_size = pp->log2_diff_max_min_transform_block_size;
++   sps->max_transform_hierarchy_depth_inter = pp->max_transform_hierarchy_depth_inter;
++   sps->max_transform_hierarchy_depth_intra = pp->max_transform_hierarchy_depth_intra;
++   sps->num_short_term_ref_pic_sets = pp->num_short_term_ref_pic_sets;
++   sps->num_long_term_ref_pics_sps = pp->num_long_term_ref_pics_sps;
++   sps->scaling_list_enabled_flag = pp->scaling_list_enabled_flag;
++   sps->amp_enabled_flag = pp->amp_enabled_flag;
++   sps->sample_adaptive_offset_enabled_flag = pp->sample_adaptive_offset_enabled_flag;
++   sps->pcm_enabled_flag = pp->pcm_enabled_flag;
++   sps->pcm_sample_bit_depth_luma_minus1 = pp->pcm_sample_bit_depth_luma_minus1;
++   sps->pcm_sample_bit_depth_chroma_minus1 = pp->pcm_sample_bit_depth_chroma_minus1;
++   sps->log2_min_pcm_luma_coding_block_size_minus3 = pp->log2_min_pcm_luma_coding_block_size_minus3;
++   sps->log2_diff_max_min_pcm_luma_coding_block_size = pp->log2_diff_max_min_pcm_luma_coding_block_size;
++   sps->pcm_loop_filter_disabled_flag = pp->pcm_loop_filter_disabled_flag;
++   sps->long_term_ref_pics_present_flag = pp->long_term_ref_pics_present_flag;
++   sps->sps_temporal_mvp_enabled_flag = pp->sps_temporal_mvp_enabled_flag;
++   sps->strong_intra_smoothing_enabled_flag = pp->strong_intra_smoothing_enabled_flag;
++
++   pps->dependent_slice_segments_enabled_flag = pp->dependent_slice_segments_enabled_flag;
++   pps->output_flag_present_flag = pp->output_flag_present_flag;
++   pps->num_extra_slice_header_bits = pp->num_extra_slice_header_bits;
++   pps->sign_data_hiding_enabled_flag = pp->sign_data_hiding_enabled_flag;
++   pps->cabac_init_present_flag = pp->cabac_init_present_flag;
++   pps->num_ref_idx_l0_default_active_minus1 = pp->num_ref_idx_l0_default_active_minus1;
++   pps->num_ref_idx_l1_default_active_minus1 = pp->num_ref_idx_l1_default_active_minus1;
++   pps->init_qp_minus26 = pp->init_qp_minus26;
++   pps->constrained_intra_pred_flag = pp->constrained_intra_pred_flag;
++   pps->transform_skip_enabled_flag = pp->transform_skip_enabled_flag;
++   pps->cu_qp_delta_enabled_flag = pp->cu_qp_delta_enabled_flag;
++   pps->diff_cu_qp_delta_depth = pp->diff_cu_qp_delta_depth;
++   pps->pps_cb_qp_offset = pp->pps_cb_qp_offset;
++   pps->pps_cr_qp_offset = pp->pps_cr_qp_offset;
++   pps->pps_slice_chroma_qp_offsets_present_flag = pp->pps_slice_chroma_qp_offsets_present_flag;
++   pps->weighted_pred_flag = pp->weighted_pred_flag;
++   pps->weighted_bipred_flag = pp->weighted_bipred_flag;
++   pps->transquant_bypass_enabled_flag = pp->transquant_bypass_enabled_flag;
++   pps->tiles_enabled_flag = pp->tiles_enabled_flag;
++   pps->entropy_coding_sync_enabled_flag = pp->entropy_coding_sync_enabled_flag;
++   pps->uniform_spacing_flag = pp->uniform_spacing_flag;
++   pps->loop_filter_across_tiles_enabled_flag = pp->loop_filter_across_tiles_enabled_flag;
++   pps->pps_loop_filter_across_slices_enabled_flag = pp->pps_loop_filter_across_slices_enabled_flag;
++   pps->deblocking_filter_override_enabled_flag = pp->deblocking_filter_override_enabled_flag;
++   pps->pps_deblocking_filter_disabled_flag = pp->pps_deblocking_filter_disabled_flag;
++   pps->lists_modification_present_flag = pp->lists_modification_present_flag;
++   pps->slice_segment_header_extension_present_flag = pp->slice_segment_header_extension_present_flag;
++   pps->pps_beta_offset_div2 = pp->pps_beta_offset_div2;
++   pps->pps_tc_offset_div2 = pp->pps_tc_offset_div2;
++   pps->log2_parallel_merge_level_minus2 = pp->log2_parallel_merge_level_minus2;
++   pps->st_rps_bits = pp->wNumBitsForShortTermRPSInSlice;
++   if (pp->tiles_enabled_flag) {
++      pps->num_tile_columns_minus1 = pp->num_tile_columns_minus1;
++      pps->num_tile_rows_minus1 = pp->num_tile_rows_minus1;
++      for (unsigned i = 0; i < MIN2(ARRAY_SIZE(pp->column_width_minus1), ARRAY_SIZE(pps->column_width_minus1)); i++) {
++         pps->column_width_minus1[i] = pp->column_width_minus1[i];
++      }
++      for (unsigned i = 0; i < MIN2(ARRAY_SIZE(pp->row_height_minus1), ARRAY_SIZE(pps->row_height_minus1)); i++) {
++         pps->row_height_minus1[i] = pp->row_height_minus1[i];
++      }
++   }
++
++   /* the scaling lists: DXVA's in up-right diagonal order, gallium's (VA-API's) in raster order; flat without them */
++   memset(sps->ScalingList4x4, 16, sizeof sps->ScalingList4x4);
++   memset(sps->ScalingList8x8, 16, sizeof sps->ScalingList8x8);
++   memset(sps->ScalingList16x16, 16, sizeof sps->ScalingList16x16);
++   memset(sps->ScalingList32x32, 16, sizeof sps->ScalingList32x32);
++   memset(sps->ScalingListDCCoeff16x16, 16, sizeof sps->ScalingListDCCoeff16x16);
++   memset(sps->ScalingListDCCoeff32x32, 16, sizeof sps->ScalingListDCCoeff32x32);
++   if (pp->scaling_list_enabled_flag && dec->qmatrix.size() >= sizeof(DXVA_Qmatrix_HEVC)) {
++      const DXVA_Qmatrix_HEVC *qm = (const DXVA_Qmatrix_HEVC *)dec->qmatrix.data();
++      for (unsigned i = 0; i < 6; i++) {
++         for (unsigned j = 0; j < 16; j++) {
++            sps->ScalingList4x4[i][vl_zscan_h265_up_right_diagonal_16[j]] = qm->ucScalingLists0[i][j];
++         }
++         for (unsigned j = 0; j < 64; j++) {
++            sps->ScalingList8x8[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists1[i][j];
++            sps->ScalingList16x16[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists2[i][j];
++            if (i < 2) {
++               sps->ScalingList32x32[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists3[i][j];
++            }
++         }
++      }
++      memcpy(sps->ScalingListDCCoeff16x16, qm->ucScalingListDCCoefSizeID2, sizeof qm->ucScalingListDCCoefSizeID2);
++      memcpy(sps->ScalingListDCCoeff32x32, qm->ucScalingListDCCoefSizeID3, sizeof qm->ucScalingListDCCoefSizeID3);
++   }
++
++   d->IDRPicFlag = pp->IdrPicFlag;
++   d->RAPPicFlag = pp->IrapPicFlag;
++   d->IntraPicFlag = pp->IntraPicFlag;
++   d->NumDeltaPocsOfRefRpsIdx = pp->ucNumDeltaPocsOfRefRpsIdx;
++   d->NumShortTermPictureSliceHeaderBits = pp->wNumBitsForShortTermRPSInSlice;
++   d->UseStRpsBits = true;
++   d->CurrPicOrderCntVal = pp->CurrPicOrderCntVal;
++   for (unsigned i = 0; i < 15; i++) {
++      DXVA_PicEntry e = pp->RefPicList[i];
++      d->ref[i] = e.bPicEntry == DXVA_INVALID_ENTRY ? NULL : Surface(dec, e.Index7Bits);
++      d->IsLongTerm[i] = e.AssociatedFlag;
++      d->PicOrderCntVal[i] = pp->PicOrderCntValList[i];
++   }
++   for (unsigned i = 0; i < 8; i++) {
++      if (pp->RefPicSetStCurrBefore[i] != DXVA_INVALID_ENTRY) {
++         d->RefPicSetStCurrBefore[d->NumPocStCurrBefore++] = pp->RefPicSetStCurrBefore[i];
++      }
++      if (pp->RefPicSetStCurrAfter[i] != DXVA_INVALID_ENTRY) {
++         d->RefPicSetStCurrAfter[d->NumPocStCurrAfter++] = pp->RefPicSetStCurrAfter[i];
++      }
++      if (pp->RefPicSetLtCurr[i] != DXVA_INVALID_ENTRY) {
++         d->RefPicSetLtCurr[d->NumPocLtCurr++] = pp->RefPicSetLtCurr[i];
++      }
++   }
++   d->NumPocTotalCurr = d->NumPocStCurrBefore + d->NumPocStCurrAfter + d->NumPocLtCurr;
++   /* ponytail: no per-slice reference lists (the short slice format has none): NVIDIA's VA-API driver builds them
++    * from the reference sets, Mesa's (AMD) read RefPicList - those need the slice headers parsed */
++   return true;
++}
++
++static bool
++VP9Picture(VideoDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DXVA_PicParams_VP9)) {
++      return false;
++   }
++   const DXVA_PicParams_VP9 *pp = (const DXVA_PicParams_VP9 *)dec->pic_params.data();
++   struct pipe_vp9_picture_desc *d = &dec->desc.vp9;
++   memset(d, 0, sizeof *d);
++
++   for (unsigned i = 0; i < 8; i++) {
++      DXVA_PicEntry e = pp->ref_frame_map[i];
++      d->ref[i] = e.bPicEntry == DXVA_INVALID_ENTRY || e.Index7Bits == 0x7f ? NULL : Surface(dec, e.Index7Bits);
++   }
++   /* DXVA's active references are surfaces, VA-API's (gallium's) slots of ref_frame_map: the slot of each */
++   unsigned slots[3] = {};
++   for (unsigned r = 0; r < 3; r++) {
++      for (unsigned i = 0; i < 8; i++) {
++         if (pp->ref_frame_map[i].bPicEntry != DXVA_INVALID_ENTRY &&
++             pp->ref_frame_map[i].Index7Bits == pp->frame_refs[r].Index7Bits) {
++            slots[r] = i;
++            break;
++         }
++      }
++   }
++
++   auto &pic = d->picture_parameter;
++   pic.frame_width = pp->width;
++   pic.frame_height = pp->height;
++   pic.pic_fields.subsampling_x = pp->subsampling_x;
++   pic.pic_fields.subsampling_y = pp->subsampling_y;
++   pic.pic_fields.frame_type = pp->frame_type;
++   pic.pic_fields.show_frame = pp->show_frame;
++   pic.pic_fields.error_resilient_mode = pp->error_resilient_mode;
++   pic.pic_fields.intra_only = pp->intra_only;
++   pic.pic_fields.allow_high_precision_mv = pp->allow_high_precision_mv;
++   /* DXVA's interpolation filters start with smooth, regular; VA-API's (the VP9 spec's) with regular, smooth */
++   pic.pic_fields.mcomp_filter_type = pp->interp_filter ^ (pp->interp_filter <= 1);
++   pic.pic_fields.frame_parallel_decoding_mode = pp->frame_parallel_decoding_mode;
++   pic.pic_fields.reset_frame_context = pp->reset_frame_context;
++   pic.pic_fields.refresh_frame_context = pp->refresh_frame_context;
++   pic.pic_fields.frame_context_idx = pp->frame_context_idx;
++   pic.pic_fields.segmentation_enabled = pp->stVP9Segments.enabled;
++   pic.pic_fields.segmentation_temporal_update = pp->stVP9Segments.temporal_update;
++   pic.pic_fields.segmentation_update_map = pp->stVP9Segments.update_map;
++   pic.pic_fields.last_ref_frame = slots[0];
++   pic.pic_fields.last_ref_frame_sign_bias = pp->ref_frame_sign_bias[1];
++   pic.pic_fields.golden_ref_frame = slots[1];
++   pic.pic_fields.golden_ref_frame_sign_bias = pp->ref_frame_sign_bias[2];
++   pic.pic_fields.alt_ref_frame = slots[2];
++   pic.pic_fields.alt_ref_frame_sign_bias = pp->ref_frame_sign_bias[3];
++   pic.pic_fields.lossless_flag = pp->base_qindex == 0 && pp->y_dc_delta_q == 0 && pp->uv_dc_delta_q == 0 &&
++                                  pp->uv_ac_delta_q == 0;
++   pic.filter_level = pp->filter_level;
++   pic.sharpness_level = pp->sharpness_level;
++   pic.log2_tile_rows = pp->log2_tile_rows;
++   pic.log2_tile_columns = pp->log2_tile_cols;
++   pic.frame_header_length_in_bytes = pp->uncompressed_header_size_byte_aligned;
++   pic.first_partition_size = pp->first_partition_size;
++   memcpy(pic.mb_segment_tree_probs, pp->stVP9Segments.tree_probs, sizeof pic.mb_segment_tree_probs);
++   memcpy(pic.segment_pred_probs, pp->stVP9Segments.pred_probs, sizeof pic.segment_pred_probs);
++   pic.profile = pp->profile;
++   pic.bit_depth = pp->BitDepthMinus8Luma + 8;
++   pic.mode_ref_delta_enabled = pp->mode_ref_delta_enabled;
++   pic.mode_ref_delta_update = pp->mode_ref_delta_update;
++   pic.base_qindex = pp->base_qindex;
++   pic.y_dc_delta_q = pp->y_dc_delta_q;
++   pic.uv_ac_delta_q = pp->uv_ac_delta_q;
++   pic.uv_dc_delta_q = pp->uv_dc_delta_q;
++   pic.abs_delta = pp->stVP9Segments.abs_delta;
++   for (unsigned i = 0; i < 4; i++) {
++      pic.ref_deltas[i] = pp->ref_deltas[i];
++   }
++   for (unsigned i = 0; i < 2; i++) {
++      pic.mode_deltas[i] = pp->mode_deltas[i];
++   }
++
++   auto &slice = d->slice_parameter;
++   slice.slice_count = 1;
++   slice.slice_data_size[0] = dec->stream.size();
++   slice.slice_data_offset[0] = 0;
++   slice.slice_data_flag[0] = PIPE_SLICE_BUFFER_PLACEMENT_TYPE_WHOLE;
++   for (unsigned i = 0; i < 8; i++) {
++      uint8_t mask = pp->stVP9Segments.feature_mask[i];
++      auto &seg = slice.seg_param[i];
++      seg.alt_quant_enabled = mask & 1;
++      seg.alt_quant = pp->stVP9Segments.feature_data[i][0];
++      seg.alt_lf_enabled = (mask >> 1) & 1;
++      seg.alt_lf = pp->stVP9Segments.feature_data[i][1];
++      seg.segment_flags.segment_reference_enabled = (mask >> 2) & 1;
++      seg.segment_flags.segment_reference = pp->stVP9Segments.feature_data[i][2];
++      seg.segment_flags.segment_reference_skipped = (mask >> 3) & 1;
++   }
++   /* ponytail: no per-segment quantizer scales and loop filter levels (VA-API wants them derived): NVIDIA's VA-API
++    * driver reads those from the frame header, Mesa's (AMD) need the derivation (VP9 spec 8.6.1, 8.8.1) */
++   return true;
++}
++
++static bool
++AV1Picture(VideoDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DXVA_PicParams_AV1) || dec->tiles.empty()) {
++      return false;
++   }
++   const DXVA_PicParams_AV1 *pp = (const DXVA_PicParams_AV1 *)dec->pic_params.data();
++   struct pipe_av1_picture_desc *d = &dec->desc.av1;
++   memset(d, 0, sizeof *d);
++   auto &pic = d->picture_parameter;
++
++   /* the 8 reference slots, and which of them the 7 references are (DXVA's frame_refs[].Index is the slot) */
++   for (unsigned i = 0; i < 8; i++) {
++      d->ref[i] = pp->RefFrameMapTextureIndex[i] == DXVA_INVALID_ENTRY ? NULL : Surface(dec, pp->RefFrameMapTextureIndex[i]);
++   }
++   for (unsigned i = 0; i < 7; i++) {
++      const DXVA_PicEntry_AV1 &e = pp->frame_refs[i];
++      pic.ref_frame_idx[i] = e.Index == DXVA_INVALID_ENTRY ? 0 : e.Index;
++      pic.wm[i].invalid = e.wminvalid;
++      pic.wm[i].wmtype = e.wmtype;
++      for (unsigned j = 0; j < 6; j++) {
++         pic.wm[i].wmmat[j] = e.wmmat[j];
++      }
++   }
++
++   pic.profile = pp->seq_profile;
++   pic.order_hint_bits_minus_1 = pp->order_hint_bits ? pp->order_hint_bits - 1 : 0;
++   pic.bit_depth_idx = pp->bitdepth == 12 ? 2 : pp->bitdepth == 10 ? 1 : 0;
++   pic.matrix_coefficients = pp->film_grain.matrix_coeff_is_identity ? 0 : 1;
++   pic.seq_info_fields.use_128x128_superblock = pp->coding.use_128x128_superblock;
++   pic.seq_info_fields.enable_filter_intra = pp->coding.filter_intra;
++   pic.seq_info_fields.enable_intra_edge_filter = pp->coding.intra_edge_filter;
++   pic.seq_info_fields.enable_interintra_compound = pp->coding.interintra_compound;
++   pic.seq_info_fields.enable_masked_compound = pp->coding.masked_compound;
++   pic.seq_info_fields.enable_dual_filter = pp->coding.dual_filter;
++   pic.seq_info_fields.enable_order_hint = pp->order_hint_bits != 0;
++   pic.seq_info_fields.enable_jnt_comp = pp->coding.jnt_comp;
++   pic.seq_info_fields.enable_cdef = pp->coding.cdef;
++   pic.seq_info_fields.mono_chrome = pp->format.mono_chrome;
++   pic.seq_info_fields.ref_frame_mvs = pp->coding.enable_ref_frame_mvs;
++   pic.seq_info_fields.film_grain_params_present = pp->coding.film_grain;
++
++   pic.frame_width = pp->width;
++   pic.frame_height = pp->height;
++   pic.max_width = pp->max_width;
++   pic.max_height = pp->max_height;
++   pic.primary_ref_frame = pp->primary_ref_frame;
++   pic.order_hint = pp->order_hint;
++   pic.superres_scale_denominator = pp->superres_denom;
++   pic.interp_filter = pp->interp_filter;
++
++   pic.pic_info_fields.frame_type = pp->format.frame_type;
++   pic.pic_info_fields.show_frame = pp->format.show_frame;
++   pic.pic_info_fields.showable_frame = pp->format.showable_frame;
++   pic.pic_info_fields.disable_cdf_update = pp->coding.disable_cdf_update;
++   pic.pic_info_fields.allow_screen_content_tools = pp->coding.screen_content_tools;
++   pic.pic_info_fields.force_integer_mv = pp->coding.integer_mv;
++   pic.pic_info_fields.allow_intrabc = pp->coding.intrabc;
++   pic.pic_info_fields.use_superres = pp->coding.superres;
++   pic.pic_info_fields.allow_high_precision_mv = pp->coding.high_precision_mv;
++   pic.pic_info_fields.is_motion_mode_switchable = pp->coding.switchable_motion_mode;
++   pic.pic_info_fields.use_ref_frame_mvs = pp->coding.use_ref_frame_mvs;
++   pic.pic_info_fields.disable_frame_end_update_cdf = pp->coding.disable_frame_end_update_cdf;
++   pic.pic_info_fields.allow_warped_motion = pp->coding.warped_motion;
++
++   /* the tiles: their sizes in superblocks (DXVA has them for uniform spacing too) */
++   pic.tile_cols = pp->tiles.cols;
++   pic.tile_rows = pp->tiles.rows;
++   pic.context_update_tile_id = pp->tiles.context_update_id;
++   for (unsigned i = 0, start = 0; i < MIN2(pp->tiles.cols, 64u); start += pp->tiles.widths[i], i++) {
++      pic.width_in_sbs[i] = pp->tiles.widths[i];
++      pic.tile_col_start_sb[i] = start;
++   }
++   for (unsigned i = 0, start = 0; i < MIN2(pp->tiles.rows, 64u); start += pp->tiles.heights[i], i++) {
++      pic.height_in_sbs[i] = pp->tiles.heights[i];
++      pic.tile_row_start_sb[i] = start;
++   }
++
++   pic.filter_level[0] = pp->loop_filter.filter_level[0];
++   pic.filter_level[1] = pp->loop_filter.filter_level[1];
++   pic.filter_level_u = pp->loop_filter.filter_level_u;
++   pic.filter_level_v = pp->loop_filter.filter_level_v;
++   pic.loop_filter_info_fields.sharpness_level = pp->loop_filter.sharpness_level;
++   pic.loop_filter_info_fields.mode_ref_delta_enabled = pp->loop_filter.mode_ref_delta_enabled;
++   pic.loop_filter_info_fields.mode_ref_delta_update = pp->loop_filter.mode_ref_delta_update;
++   for (unsigned i = 0; i < 8; i++) {
++      pic.ref_deltas[i] = pp->loop_filter.ref_deltas[i];
++   }
++   pic.mode_deltas[0] = pp->loop_filter.mode_deltas[0];
++   pic.mode_deltas[1] = pp->loop_filter.mode_deltas[1];
++   pic.mode_control_fields.delta_lf_present_flag = pp->loop_filter.delta_lf_present;
++   pic.mode_control_fields.log2_delta_lf_res = pp->loop_filter.delta_lf_res;
++   pic.mode_control_fields.delta_lf_multi = pp->loop_filter.delta_lf_multi;
++
++   /* loop restoration: DXVA has the unit sizes, VA-API (gallium) the shifts */
++   pic.loop_restoration_fields.yframe_restoration_type = pp->loop_filter.frame_restoration_type[0];
++   pic.loop_restoration_fields.cbframe_restoration_type = pp->loop_filter.frame_restoration_type[1];
++   pic.loop_restoration_fields.crframe_restoration_type = pp->loop_filter.frame_restoration_type[2];
++   if (pp->loop_filter.frame_restoration_type[0] || pp->loop_filter.frame_restoration_type[1] ||
++       pp->loop_filter.frame_restoration_type[2]) {
++      pic.loop_restoration_fields.lr_unit_shift = pp->loop_filter.log2_restoration_unit_size[0] - 6;
++      pic.loop_restoration_fields.lr_uv_shift = pp->loop_filter.log2_restoration_unit_size[0] -
++                                                pp->loop_filter.log2_restoration_unit_size[1];
++   }
++
++   pic.base_qindex = pp->quantization.base_qindex;
++   pic.y_dc_delta_q = pp->quantization.y_dc_delta_q;
++   pic.u_dc_delta_q = pp->quantization.u_dc_delta_q;
++   pic.u_ac_delta_q = pp->quantization.u_ac_delta_q;
++   pic.v_dc_delta_q = pp->quantization.v_dc_delta_q;
++   pic.v_ac_delta_q = pp->quantization.v_ac_delta_q;
++   pic.qmatrix_fields.using_qmatrix = pp->quantization.qm_y != 0xff;
++   if (pic.qmatrix_fields.using_qmatrix) {
++      pic.qmatrix_fields.qm_y = pp->quantization.qm_y;
++      pic.qmatrix_fields.qm_u = pp->quantization.qm_u;
++      pic.qmatrix_fields.qm_v = pp->quantization.qm_v;
++   }
++   pic.mode_control_fields.delta_q_present_flag = pp->quantization.delta_q_present;
++   pic.mode_control_fields.log2_delta_q_res = pp->quantization.delta_q_res;
++   pic.mode_control_fields.tx_mode = pp->coding.tx_mode;
++   pic.mode_control_fields.reference_select = pp->coding.reference_mode;
++   pic.mode_control_fields.reduced_tx_set_used = pp->coding.reduced_tx_set;
++   pic.mode_control_fields.skip_mode_present = pp->coding.skip_mode;
++
++   /* CDEF strengths: DXVA's split, VA-API's (gallium's) primary << 2 | secondary */
++   pic.cdef_damping_minus_3 = pp->cdef.damping;
++   pic.cdef_bits = pp->cdef.bits;
++   for (unsigned i = 0; i < 8; i++) {
++      pic.cdef_y_strengths[i] = pp->cdef.y_strengths[i].primary << 2 | pp->cdef.y_strengths[i].secondary;
++      pic.cdef_uv_strengths[i] = pp->cdef.uv_strengths[i].primary << 2 | pp->cdef.uv_strengths[i].secondary;
++   }
++
++   pic.seg_info.segment_info_fields.enabled = pp->segmentation.enabled;
++   pic.seg_info.segment_info_fields.update_map = pp->segmentation.update_map;
++   pic.seg_info.segment_info_fields.update_data = pp->segmentation.update_data;
++   pic.seg_info.segment_info_fields.temporal_update = pp->segmentation.temporal_update;
++   for (unsigned i = 0; i < 8; i++) {
++      pic.seg_info.feature_mask[i] = pp->segmentation.feature_mask[i];
++      for (unsigned j = 0; j < 8; j++) {
++         pic.seg_info.feature_data[i][j] = pp->segmentation.feature_data[i][j];
++      }
++   }
++
++   /* film grain (applied on the target: no separate film grain picture) */
++   auto &fg = pic.film_grain_info;
++   auto &dfg = pp->film_grain;
++   fg.film_grain_info_fields.apply_grain = dfg.apply_grain;
++   if (dfg.apply_grain) {
++      fg.film_grain_info_fields.chroma_scaling_from_luma = dfg.chroma_scaling_from_luma;
++      fg.film_grain_info_fields.grain_scaling_minus_8 = dfg.scaling_shift_minus8;
++      fg.film_grain_info_fields.ar_coeff_lag = dfg.ar_coeff_lag;
++      fg.film_grain_info_fields.ar_coeff_shift_minus_6 = dfg.ar_coeff_shift_minus6;
++      fg.film_grain_info_fields.grain_scale_shift = dfg.grain_scale_shift;
++      fg.film_grain_info_fields.overlap_flag = dfg.overlap_flag;
++      fg.film_grain_info_fields.clip_to_restricted_range = dfg.clip_to_restricted_range;
++      fg.grain_seed = dfg.grain_seed;
++      fg.num_y_points = dfg.num_y_points;
++      for (unsigned i = 0; i < MIN2(dfg.num_y_points, 14u); i++) {
++         fg.point_y_value[i] = dfg.scaling_points_y[i][0];
++         fg.point_y_scaling[i] = dfg.scaling_points_y[i][1];
++      }
++      fg.num_cb_points = dfg.num_cb_points;
++      for (unsigned i = 0; i < MIN2(dfg.num_cb_points, 10u); i++) {
++         fg.point_cb_value[i] = dfg.scaling_points_cb[i][0];
++         fg.point_cb_scaling[i] = dfg.scaling_points_cb[i][1];
++      }
++      fg.num_cr_points = dfg.num_cr_points;
++      for (unsigned i = 0; i < MIN2(dfg.num_cr_points, 10u); i++) {
++         fg.point_cr_value[i] = dfg.scaling_points_cr[i][0];
++         fg.point_cr_scaling[i] = dfg.scaling_points_cr[i][1];
++      }
++      for (unsigned i = 0; i < 24; i++) {
++         fg.ar_coeffs_y[i] = (int8_t)dfg.ar_coeffs_y[i];
++      }
++      for (unsigned i = 0; i < 25; i++) {
++         fg.ar_coeffs_cb[i] = (int8_t)dfg.ar_coeffs_cb[i];
++         fg.ar_coeffs_cr[i] = (int8_t)dfg.ar_coeffs_cr[i];
++      }
++      fg.cb_mult = dfg.cb_mult;
++      fg.cb_luma_mult = dfg.cb_luma_mult;
++      fg.cb_offset = dfg.cb_offset;
++      fg.cr_mult = dfg.cr_mult;
++      fg.cr_luma_mult = dfg.cr_luma_mult;
++      fg.cr_offset = dfg.cr_offset;
++   }
++
++   auto &slice = d->slice_parameter;
++   slice.slice_count = MIN2((unsigned)dec->tiles.size(), (unsigned)ARRAY_SIZE(slice.slice_data_size));
++   for (unsigned i = 0; i < slice.slice_count; i++) {
++      slice.slice_data_size[i] = dec->tiles[i].DataSize;
++      slice.slice_data_offset[i] = dec->tiles[i].DataOffset;
++      slice.slice_data_row[i] = dec->tiles[i].row;
++      slice.slice_data_col[i] = dec->tiles[i].column;
++      slice.slice_data_anchor_frame_idx[i] = dec->tiles[i].anchor_frame;
++   }
++   return true;
++}
++
++/* MPEG-2's default intra quantizer matrix (zig-zag order), for programs that send none */
++static const uint8_t MPEG2_DEFAULT_INTRA[64] = {
++   8,  16, 16, 19, 16, 19, 22, 22, 22, 22, 22, 22, 26, 24, 26, 27, 27, 27, 26, 26, 26, 26, 27, 27, 27, 29, 29, 29, 34, 34, 34, 29,
++   29, 29, 27, 27, 29, 29, 32, 32, 34, 34, 37, 38, 37, 35, 35, 34, 35, 38, 38, 40, 40, 40, 48, 48, 46, 46, 56, 56, 58, 69, 69, 83,
++};
++
++static bool
++MPEG2Picture(VideoDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DXVA_PictureParameters)) {
++      return false;
++   }
++   const DXVA_PictureParameters *pp = (const DXVA_PictureParameters *)dec->pic_params.data();
++   struct pipe_mpeg12_picture_desc *d = &dec->desc.mpeg2;
++   memset(d, 0, sizeof *d);
++
++   d->picture_coding_type = pp->bPicIntra ? 1 : pp->bPicBackwardPrediction ? 3 : 2;   /* I, B, P */
++   /* f_codes: DXVA's as coded, gallium's (VA-API's) minus one */
++   d->f_code[0][0] = ((pp->wBitstreamFcodes >> 12) & 0xf) - 1;
++   d->f_code[0][1] = ((pp->wBitstreamFcodes >> 8) & 0xf) - 1;
++   d->f_code[1][0] = ((pp->wBitstreamFcodes >> 4) & 0xf) - 1;
++   d->f_code[1][1] = (pp->wBitstreamFcodes & 0xf) - 1;
++   uint16_t pce = pp->wBitstreamPCEelements;
++   d->intra_dc_precision = (pce >> 14) & 3;
++   d->picture_structure = (pce >> 12) & 3;
++   d->top_field_first = (pce >> 11) & 1;
++   d->frame_pred_frame_dct = (pce >> 10) & 1;
++   d->concealment_motion_vectors = (pce >> 9) & 1;
++   d->q_scale_type = (pce >> 8) & 1;
++   d->intra_vlc_format = (pce >> 7) & 1;
++   d->alternate_scan = (pce >> 6) & 1;
++   d->num_slices = dec->slices;
++
++   memcpy(dec->intra_matrix, MPEG2_DEFAULT_INTRA, 64);
++   memset(dec->non_intra_matrix, 16, 64);
++   if (dec->qmatrix.size() >= sizeof(DXVA_QmatrixData)) {
++      const DXVA_QmatrixData *qm = (const DXVA_QmatrixData *)dec->qmatrix.data();
++      for (unsigned i = 0; i < 64; i++) {
++         if (qm->bNewQmatrix[0]) {
++            dec->intra_matrix[i] = (uint8_t)qm->Qmatrix[0][i];
++         }
++         if (qm->bNewQmatrix[1]) {
++            dec->non_intra_matrix[i] = (uint8_t)qm->Qmatrix[1][i];
++         }
++      }
++   }
++   d->intra_matrix = dec->intra_matrix;
++   d->non_intra_matrix = dec->non_intra_matrix;
++
++   d->ref[0] = pp->wForwardRefPictureIndex == 0xffff ? NULL : Surface(dec, pp->wForwardRefPictureIndex);
++   d->ref[1] = pp->wBackwardRefPictureIndex == 0xffff ? NULL : Surface(dec, pp->wBackwardRefPictureIndex);
++   return true;
++}
++
++static void APIENTRY
++VideoDecoderEndFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder)
++{
++   Device *pDevice = CastDevice(hDevice);
++   VideoDecoder *dec = CastDecoder(hDecoder);
++   if (!dec->target || dec->stream.empty()) {
++      return;
++   }
++   bool ok = dec->profile->codec == CODEC_H264 ? H264Picture(dec)
++           : dec->profile->codec == CODEC_HEVC ? HEVCPicture(dec)
++           : dec->profile->codec == CODEC_VP9  ? VP9Picture(dec)
++           : dec->profile->codec == CODEC_AV1  ? AV1Picture(dec)
++                                               : MPEG2Picture(dec);
++   struct pipe_video_buffer *target = Surface(dec, dec->slice);
++   if (!ok || !target) {
++      VideoLog("EndFrame: %s (picture parameters %zu bytes)\n", ok ? "no target" : "no picture parameters",
++               dec->pic_params.size());
++      return;
++   }
++   struct pipe_picture_desc *picture = &dec->desc.h264.base;
++   picture->profile = dec->profile->profile;
++   picture->entry_point = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
++
++   FlushDevice(pDevice);
++   const void *buffers[1] = {dec->stream.data()};
++   unsigned sizes[1] = {(unsigned)dec->stream.size()};
++   dec->codec->begin_frame(dec->codec, target, picture);
++   dec->codec->decode_bitstream(dec->codec, target, picture, 1, buffers, sizes);
++   dec->codec->end_frame(dec->codec, target, picture);
++   FlushVideo(pDevice);
++   dec->target = NULL;
++}
++
++
++/*
++ * The video processor
++ */
++
++struct VideoCompositor {
++   struct vl_compositor compositor;
++   struct vl_compositor_state state;
++};
++
++struct VideoProcessorEnum {
++   D3D11_1DDI_VIDEO_PROCESSOR_CONTENT_DESC desc;
++};
++
++struct VideoProcessor {
++   BOOL target_rect_enabled;
++   RECT target_rect;
++   BOOL background_ycbcr;
++   D3D11_1DDI_VIDEO_COLOR background;
++   struct {
++      D3D11_1DDI_VIDEO_PROCESSOR_COLOR_SPACE color_space;
++      BOOL src_enabled, dst_enabled;
++      RECT src, dst;
++   } stream;
++};
++
++struct VideoProcessorInputView {
++   Resource *resource;
++   unsigned slice;
++   struct pipe_sampler_view *rgb;   /* RGB input (on the video context) */
++};
++
++struct VideoProcessorOutputView {
++   Resource *resource;
++   unsigned level, slice;
++};
++
++static VideoProcessor *
++CastProcessor(D3D11_1DDI_HVIDEOPROCESSOR hProcessor)
++{
++   return static_cast<VideoProcessor *>(hProcessor.pDrvPrivate);
++}
++
++static SIZE_T APIENTRY
++CalcPrivateVideoProcessorEnumSize(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSORENUM *pCreate)
++{
++   return sizeof(VideoProcessorEnum);
++}
++
++static HRESULT APIENTRY
++CreateVideoProcessorEnum(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSORENUM *pCreate,
++                         D3D11_1DDI_HVIDEOPROCESSORENUM hEnum, D3D11_1DDI_HRTVIDEOPROCESSORENUM hRTEnum)
++{
++   static_cast<VideoProcessorEnum *>(hEnum.pDrvPrivate)->desc = pCreate->Desc;
++   return S_OK;
++}
++
++static void APIENTRY
++DestroyVideoProcessorEnum(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum)
++{
++}
++
++static void APIENTRY
++CheckVideoProcessorFormat(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum, DXGI_FORMAT Format,
++                          UINT *pSupport)
++{
++   *pSupport = IsVideoFormat(Format) ? D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT
++             : ProcessorFormat(Format) ? D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT |
++                                             D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT
++                                       : 0;
++}
++
++static void APIENTRY
++GetVideoProcessorCaps(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
++                      D3D11_1DDI_VIDEO_PROCESSOR_CAPS *pCaps)
++{
++   /* one stream, color conversion (BT.601/709, both ranges) and scaling: no filters, deinterlacing or rate
++    * conversion */
++   memset(pCaps, 0, sizeof *pCaps);
++   pCaps->DeviceCaps = D3D11_1DDI_VIDEO_PROCESSOR_DEVICE_CAPS_YCbCr_MATRIX_CONVERSION |
++                       D3D11_1DDI_VIDEO_PROCESSOR_DEVICE_CAPS_NOMINAL_RANGE;
++   pCaps->RateConversionCapsCount = 1;
++   pCaps->MaxInputStreams = 1;
++   pCaps->MaxStreamStates = 1;
++}
++
++static void APIENTRY
++GetVideoProcessorRateConversionCaps(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum, UINT Index,
++                                    D3D11_1DDI_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS *pCaps)
++{
++   memset(pCaps, 0, sizeof *pCaps);
++}
++
++static void APIENTRY
++GetVideoProcessorCustomRate(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum, UINT RateIndex,
++                            UINT CustomRateIndex, D3D11_1DDI_VIDEO_PROCESSOR_CUSTOM_RATE *pRate)
++{
++   memset(pRate, 0, sizeof *pRate);
++}
++
++static void APIENTRY
++GetVideoProcessorFilterRange(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
++                             D3D11_1DDI_VIDEO_PROCESSOR_FILTER Filter, D3D11_1DDI_VIDEO_PROCESSOR_FILTER_RANGE *pRange)
++{
++   memset(pRange, 0, sizeof *pRange);
++}
++
++static SIZE_T APIENTRY
++CalcPrivateVideoProcessorSize(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSOR *pCreate)
++{
++   return sizeof(VideoProcessor);
++}
++
++static HRESULT APIENTRY
++CreateVideoProcessor(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSOR *pCreate,
++                     D3D11_1DDI_HVIDEOPROCESSOR hProcessor, D3D11_1DDI_HRTVIDEOPROCESSOR hRTProcessor)
++{
++   VideoProcessor *vp = CastProcessor(hProcessor);
++   memset(vp, 0, sizeof *vp);
++   /* defaults: BT.709 limited range in, full range RGB out */
++   vp->stream.color_space.YCbCr_Matrix = 1;
++   return S_OK;
++}
++
++static void APIENTRY
++DestroyVideoProcessor(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor)
++{
++}
++
++static void APIENTRY
++VideoProcessorSetOutputTargetRect(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, BOOL Enable,
++                                  const RECT *pRect)
++{
++   VideoProcessor *vp = CastProcessor(hProcessor);
++   vp->target_rect_enabled = Enable && pRect;
++   if (vp->target_rect_enabled) {
++      vp->target_rect = *pRect;
++   }
++}
++
++static void APIENTRY
++VideoProcessorSetOutputBackgroundColor(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, BOOL YCbCr,
++                                       const D3D11_1DDI_VIDEO_COLOR *pColor)
++{
++   VideoProcessor *vp = CastProcessor(hProcessor);
++   vp->background_ycbcr = YCbCr;
++   vp->background = *pColor;
++}
++
++static void APIENTRY
++VideoProcessorSetStreamColorSpace(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, UINT Stream,
++                                  const D3D11_1DDI_VIDEO_PROCESSOR_COLOR_SPACE *pColorSpace)
++{
++   if (Stream == 0) {
++      CastProcessor(hProcessor)->stream.color_space = *pColorSpace;
++   }
++}
++
++static void APIENTRY
++VideoProcessorSetStreamSourceRect(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, UINT Stream,
++                                  BOOL Enable, const RECT *pRect)
++{
++   VideoProcessor *vp = CastProcessor(hProcessor);
++   if (Stream == 0) {
++      vp->stream.src_enabled = Enable && pRect;
++      if (vp->stream.src_enabled) {
++         vp->stream.src = *pRect;
++      }
++   }
++}
++
++static void APIENTRY
++VideoProcessorSetStreamDestRect(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, UINT Stream,
++                                BOOL Enable, const RECT *pRect)
++{
++   VideoProcessor *vp = CastProcessor(hProcessor);
++   if (Stream == 0) {
++      vp->stream.dst_enabled = Enable && pRect;
++      if (vp->stream.dst_enabled) {
++         vp->stream.dst = *pRect;
++      }
++   }
++}
++
++static SIZE_T APIENTRY
++CalcPrivateVideoProcessorInputViewSize(D3D10DDI_HDEVICE hDevice,
++                                       const D3D11_1DDIARG_CREATEVIDEOPROCESSORINPUTVIEW *pCreate)
++{
++   return sizeof(VideoProcessorInputView);
++}
++
++static HRESULT APIENTRY
++CreateVideoProcessorInputView(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPROCESSORINPUTVIEW *pCreate,
++                              D3D11_1DDI_HVIDEOPROCESSORINPUTVIEW hView,
++                              D3D11_1DDI_HRTVIDEOPROCESSORINPUTVIEW hRTView)
++{
++   Device *pDevice = CastDevice(hDevice);
++   Resource *pResource = CastResource(pCreate->hDrvResource);
++   VideoProcessorInputView *view = static_cast<VideoProcessorInputView *>(hView.pDrvPrivate);
++   VideoLog("CreateVideoProcessorInputView: format %u slice %u\n", pResource->Format, pCreate->FirstArraySlice);
++   memset(view, 0, sizeof *view);
++   view->resource = pResource;
++   view->slice = pCreate->FirstArraySlice;
++   if (pResource->video) {
++      return view->slice < pResource->video->slices ? S_OK : E_INVALIDARG;
++   }
++   struct pipe_context *vpipe = VideoPipe(pDevice);
++   if (!vpipe || !ProcessorFormat(pResource->Format) || !pResource->resource) {
++      VideoLog("CreateVideoProcessorInputView: format %u isn't one of ours\n", pResource->Format);
++      return E_INVALIDARG;
++   }
++   struct pipe_sampler_view templat;
++   u_sampler_view_default_template(&templat, pResource->resource, pResource->resource->format);
++   templat.u.tex.first_level = templat.u.tex.last_level = pCreate->MipSlice;
++   templat.u.tex.first_layer = templat.u.tex.last_layer = pCreate->FirstArraySlice;
++   templat.target = PIPE_TEXTURE_2D;
++   view->rgb = vpipe->create_sampler_view(vpipe, pResource->resource, &templat);
++   return view->rgb ? S_OK : E_OUTOFMEMORY;
++}
++
++static void APIENTRY
++DestroyVideoProcessorInputView(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORINPUTVIEW hView)
++{
++   VideoProcessorInputView *view = static_cast<VideoProcessorInputView *>(hView.pDrvPrivate);
++   pipe_sampler_view_reference(&view->rgb, NULL);
++}
++
++static SIZE_T APIENTRY
++CalcPrivateVideoProcessorOutputViewSize(D3D10DDI_HDEVICE hDevice,
++                                        const D3D11_1DDIARG_CREATEVIDEOPROCESSOROUTPUTVIEW *pCreate)
++{
++   return sizeof(VideoProcessorOutputView);
++}
++
++static HRESULT APIENTRY
++CreateVideoProcessorOutputView(D3D10DDI_HDEVICE hDevice,
++                               const D3D11_1DDIARG_CREATEVIDEOPROCESSOROUTPUTVIEW *pCreate,
++                               D3D11_1DDI_HVIDEOPROCESSOROUTPUTVIEW hView,
++                               D3D11_1DDI_HRTVIDEOPROCESSOROUTPUTVIEW hRTView)
++{
++   Resource *pResource = CastResource(pCreate->hDrvResource);
++   if (pResource->video || !pResource->resource || !ProcessorFormat(pResource->Format)) {
++      VideoLog("CreateVideoProcessorOutputView: format %u isn't one of ours\n", pResource->Format);
++      return E_INVALIDARG;
++   }
++   VideoProcessorOutputView *view = static_cast<VideoProcessorOutputView *>(hView.pDrvPrivate);
++   view->resource = pResource;
++   view->level = pCreate->MipSlice;
++   view->slice = pCreate->FirstArraySlice;
++   return S_OK;
++}
++
++static void APIENTRY
++DestroyVideoProcessorOutputView(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOROUTPUTVIEW hView)
++{
++}
++
++static struct u_rect
++Rect(const RECT &r)
++{
++   struct u_rect u = {(int)r.left, (int)r.right, (int)r.top, (int)r.bottom};
++   return u;
++}
++
++/*
++ * The compositor's views of a slice's Y, Cb and Cr: as 2D arrays, which its shader samples (vl's video buffers can be
++ * interlaced arrays), where vl's own views of these 2D planes are 2D - a GL host samples a 2D texture through an array
++ * sampler as zeros. Each a view of its own (a texture view on the host), so Cb and Cr keep their swizzles.
++ */
++static void
++ComponentViews(struct pipe_context *vpipe, struct pipe_video_buffer *buffer)
++{
++   struct vl_video_buffer *buf = (struct vl_video_buffer *)buffer;
++   const unsigned planes[3] = {0, 1, 1};
++   for (unsigned c = 0; c < 3; c++) {
++      if (buf->sampler_view_components[c]) {
++         continue;
++      }
++      struct pipe_resource *res = buf->resources[planes[c]];
++      struct pipe_sampler_view templat;
++      u_sampler_view_default_template(&templat, res, res->format);
++      templat.target = PIPE_TEXTURE_2D_ARRAY;
++      templat.swizzle_r = templat.swizzle_g = templat.swizzle_b = c == 2 ? PIPE_SWIZZLE_Y : PIPE_SWIZZLE_X;
++      templat.swizzle_a = PIPE_SWIZZLE_1;
++      buf->sampler_view_components[c] = vpipe->create_sampler_view(vpipe, res, &templat);
++   }
++}
++
++static VideoCompositor *
++Compositor(Device *pDevice)
++{
++   if (!pDevice->compositor) {
++      VideoCompositor *c = new VideoCompositor();
++      if (!vl_compositor_init(&c->compositor, VideoPipe(pDevice))) {
++         delete c;
++         return NULL;
++      }
++      if (!vl_compositor_init_state(&c->state, VideoPipe(pDevice))) {
++         vl_compositor_cleanup(&c->compositor);
++         delete c;
++         return NULL;
++      }
++      pDevice->compositor = c;
++   }
++   return pDevice->compositor;
++}
++
++static HRESULT APIENTRY
++VideoProcessorBlt(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
++                  D3D11_1DDI_HVIDEOPROCESSOROUTPUTVIEW hOutputView, UINT OutputFrame, UINT StreamCount,
++                  const D3D11_1DDI_VIDEO_PROCESSOR_STREAM *pStreams)
++{
++   Device *pDevice = CastDevice(hDevice);
++   VideoProcessor *vp = CastProcessor(hProcessor);
++   VideoProcessorOutputView *out = static_cast<VideoProcessorOutputView *>(hOutputView.pDrvPrivate);
++   VideoCompositor *c = Compositor(pDevice);
++   if (!c) {
++      return E_OUTOFMEMORY;
++   }
++   struct pipe_context *vpipe = pDevice->video_pipe;
++   struct pipe_resource *dst = out->resource->resource;
++   struct pipe_surface templat;
++   u_surface_default_template(&templat, dst);
++   templat.u.tex.level = out->level;
++   templat.u.tex.first_layer = templat.u.tex.last_layer = out->slice;
++   struct pipe_surface *surface = vpipe->create_surface(vpipe, dst, &templat);
++   if (!surface) {
++      return E_OUTOFMEMORY;
++   }
++   struct u_rect target = {0, (int)u_minify(dst->width0, out->level), 0, (int)u_minify(dst->height0, out->level)};
++   if (vp->target_rect_enabled) {
++      target = Rect(vp->target_rect);
++   }
++
++   FlushDevice(pDevice);
++   vl_compositor_clear_layers(&c->state);
++   unsigned layers = 0;
++   for (UINT i = 0; i < MIN2(StreamCount, 1u); i++) {
++      if (!pStreams[i].Enable || !pStreams[i].hInputSurface.pDrvPrivate) {
++         continue;
++      }
++      VideoProcessorInputView *in = static_cast<VideoProcessorInputView *>(pStreams[i].hInputSurface.pDrvPrivate);
++      VideoSurface *v = in->resource->video;
++      struct u_rect src = {0, (int)(v ? v->width : in->resource->resource->width0), 0,
++                           (int)(v ? v->height : in->resource->resource->height0)};
++      if (vp->stream.src_enabled) {
++         src = Rect(vp->stream.src);
++      }
++      struct u_rect dst_area = vp->stream.dst_enabled ? Rect(vp->stream.dst) : target;
++      if (v) {
++         /* YCbCr_Matrix: 0 BT.601, 1 BT.709; Nominal_Range 2: full range (0-255) input */
++         vl_csc_matrix csc;
++         enum VL_CSC_COLOR_STANDARD standard = vp->stream.color_space.YCbCr_Matrix ? VL_CSC_COLOR_STANDARD_BT_709
++                                                                                  : VL_CSC_COLOR_STANDARD_BT_601;
++         vl_csc_get_matrix(standard, NULL, vp->stream.color_space.Nominal_Range != 2, &csc);
++         vl_compositor_set_csc_matrix(&c->state, (const vl_csc_matrix *)&csc, 1.0f, 0.0f);
++         ComponentViews(vpipe, v->buffers[in->slice]);
++         vl_compositor_set_buffer_layer(&c->state, &c->compositor, layers, v->buffers[in->slice], &src, NULL,
++                                        VL_COMPOSITOR_NONE);
++      } else {
++         vl_compositor_set_rgba_layer(&c->state, &c->compositor, layers, in->rgb, &src, NULL, NULL);
++      }
++      vl_compositor_set_layer_dst_area(&c->state, layers, &dst_area);
++      /* the background around the picture */
++      if (dst_area.x0 > target.x0 || dst_area.y0 > target.y0 || dst_area.x1 < target.x1 || dst_area.y1 < target.y1) {
++         union pipe_color_union color = {};
++         if (!vp->background_ycbcr) {
++            color.f[0] = vp->background.RGBA.R;
++            color.f[1] = vp->background.RGBA.G;
++            color.f[2] = vp->background.RGBA.B;
++            color.f[3] = vp->background.RGBA.A;
++         }
++         vpipe->clear_render_target(vpipe, surface, &color, target.x0, target.y0, target.x1 - target.x0,
++                                    target.y1 - target.y0, false);
++      }
++      layers++;
++   }
++   if (layers) {
++      vl_compositor_render(&c->state, &c->compositor, surface, NULL, false);
++   }
++   FlushVideo(pDevice);
++   pipe_surface_reference(&surface, NULL);
++   return S_OK;
++}
++
++
++/*
++ * The function table
++ */
++
++/* Entry points of features not offered: nothing to do, or E_NOTIMPL (sizes: of a minimal private object) */
++template <typename F> struct VideoStub;
++template <typename R, typename... A> struct VideoStub<R(APIENTRY *)(A...)> {
++   static R APIENTRY Call(A...)
++   {
++      if constexpr (std::is_void_v<R>) {
++         return;
++      } else if constexpr (std::is_same_v<R, HRESULT>) {
++         return E_NOTIMPL;
++      } else {
++         return R(16);
++      }
++   }
++};
++
++HRESULT
++VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize)
++{
++   if (!pParams || ParamSize < sizeof(D3D11_1DDI_VIDEO_INPUT)) {
++      return E_INVALIDARG;
++   }
++   D3D11_1DDI_VIDEODEVICEFUNCS *f = static_cast<D3D11_1DDI_VIDEO_INPUT *>(pParams)->p11VideoDeviceFuncs;
++   if (!f) {
++      return E_INVALIDARG;
++   }
++
++#define STUB_ALL(member) f->member = VideoStub<decltype(f->member)>::Call;
++   STUB_ALL(pfnVideoDecoderExtension)
++   STUB_ALL(pfnVideoProcessorSetOutputColorSpace)
++   STUB_ALL(pfnVideoProcessorSetOutputAlphaFillMode)
++   STUB_ALL(pfnVideoProcessorSetOutputConstriction)
++   STUB_ALL(pfnVideoProcessorSetOutputStereoMode)
++   STUB_ALL(pfnVideoProcessorSetOutputExtension)
++   STUB_ALL(pfnVideoProcessorGetOutputExtension)
++   STUB_ALL(pfnVideoProcessorSetStreamFrameFormat)
++   STUB_ALL(pfnVideoProcessorSetStreamOutputRate)
++   STUB_ALL(pfnVideoProcessorSetStreamAlpha)
++   STUB_ALL(pfnVideoProcessorSetStreamPalette)
++   STUB_ALL(pfnVideoProcessorSetStreamPixelAspectRatio)
++   STUB_ALL(pfnVideoProcessorSetStreamLumaKey)
++   STUB_ALL(pfnVideoProcessorSetStreamStereoFormat)
++   STUB_ALL(pfnVideoProcessorSetStreamAutoProcessingMode)
++   STUB_ALL(pfnVideoProcessorSetStreamFilter)
++   STUB_ALL(pfnVideoProcessorSetStreamExtension)
++   STUB_ALL(pfnVideoProcessorGetStreamExtension)
++   STUB_ALL(pfnVideoProcessorInputViewReadAfterWriteHazard)
++   /* content protection: none */
++   STUB_ALL(pfnGetContentProtectionCaps)
++   STUB_ALL(pfnGetCryptoKeyExchangeType)
++   STUB_ALL(pfnCalcPrivateCryptoSessionSize)
++   STUB_ALL(pfnCreateCryptoSession)
++   STUB_ALL(pfnDestroyCryptoSession)
++   STUB_ALL(pfnGetCertificateSize)
++   STUB_ALL(pfnGetCertificate)
++   STUB_ALL(pfnNegotiateCryptoSessionKeyExchange)
++   STUB_ALL(pfnEncryptionBlt)
++   STUB_ALL(pfnDecryptionBlt)
++   STUB_ALL(pfnStartSessionKeyRefresh)
++   STUB_ALL(pfnFinishSessionKeyRefresh)
++   STUB_ALL(pfnGetEncryptionBltKey)
++   STUB_ALL(pfnCalcPrivateAuthenticatedChannelSize)
++   STUB_ALL(pfnCreateAuthenticatedChannel)
++   STUB_ALL(pfnDestroyAuthenticatedChannel)
++   STUB_ALL(pfnNegotiateAuthenticatedChannelKeyExchange)
++   STUB_ALL(pfnQueryAuthenticatedChannel)
++   STUB_ALL(pfnConfigureAuthenticatedChannel)
++   STUB_ALL(pfnVideoDecoderGetHandle)
++   STUB_ALL(pfnCryptoSessionGetHandle)
++   STUB_ALL(pfnGetCaptureHandle)
++#undef STUB_ALL
++
++   f->pfnGetVideoDecoderProfileCount = GetVideoDecoderProfileCount;
++   f->pfnGetVideoDecoderProfile = GetVideoDecoderProfile;
++   f->pfnCheckVideoDecoderFormat = CheckVideoDecoderFormat;
++   f->pfnGetVideoDecoderConfigCount = GetVideoDecoderConfigCount;
++   f->pfnGetVideoDecoderConfig = GetVideoDecoderConfig;
++   f->pfnGetVideoDecoderBufferTypeCount = GetVideoDecoderBufferTypeCount;
++   f->pfnGetVideoDecoderBufferInfo = GetVideoDecoderBufferInfo;
++   f->pfnCalcPrivateVideoDecoderSize = CalcPrivateVideoDecoderSize;
++   f->pfnCreateVideoDecoder = CreateVideoDecoder;
++   f->pfnDestroyVideoDecoder = DestroyVideoDecoder;
++   f->pfnVideoDecoderBeginFrame = VideoDecoderBeginFrame;
++   f->pfnVideoDecoderEndFrame = VideoDecoderEndFrame;
++   f->pfnVideoDecoderSubmitBuffers = VideoDecoderSubmitBuffers;
++   f->pfnCalcPrivateVideoDecoderOutputViewSize = CalcPrivateVideoDecoderOutputViewSize;
++   f->pfnCreateVideoDecoderOutputView = CreateVideoDecoderOutputView;
++   f->pfnDestroyVideoDecoderOutputView = DestroyVideoDecoderOutputView;
++
++   f->pfnCalcPrivateVideoProcessorEnumSize = CalcPrivateVideoProcessorEnumSize;
++   f->pfnCreateVideoProcessorEnum = CreateVideoProcessorEnum;
++   f->pfnDestroyVideoProcessorEnum = DestroyVideoProcessorEnum;
++   f->pfnCheckVideoProcessorFormat = CheckVideoProcessorFormat;
++   f->pfnGetVideoProcessorCaps = GetVideoProcessorCaps;
++   f->pfnGetVideoProcessorRateConversionCaps = GetVideoProcessorRateConversionCaps;
++   f->pfnGetVideoProcessorCustomRate = GetVideoProcessorCustomRate;
++   f->pfnGetVideoProcessorFilterRange = GetVideoProcessorFilterRange;
++   f->pfnCalcPrivateVideoProcessorSize = CalcPrivateVideoProcessorSize;
++   f->pfnCreateVideoProcessor = CreateVideoProcessor;
++   f->pfnDestroyVideoProcessor = DestroyVideoProcessor;
++   f->pfnVideoProcessorSetOutputTargetRect = VideoProcessorSetOutputTargetRect;
++   f->pfnVideoProcessorSetOutputBackgroundColor = VideoProcessorSetOutputBackgroundColor;
++   f->pfnVideoProcessorSetStreamColorSpace = VideoProcessorSetStreamColorSpace;
++   f->pfnVideoProcessorSetStreamSourceRect = VideoProcessorSetStreamSourceRect;
++   f->pfnVideoProcessorSetStreamDestRect = VideoProcessorSetStreamDestRect;
++   f->pfnVideoProcessorBlt = VideoProcessorBlt;
++   f->pfnCalcPrivateVideoProcessorInputViewSize = CalcPrivateVideoProcessorInputViewSize;
++   f->pfnCreateVideoProcessorInputView = CreateVideoProcessorInputView;
++   f->pfnDestroyVideoProcessorInputView = DestroyVideoProcessorInputView;
++   f->pfnCalcPrivateVideoProcessorOutputViewSize = CalcPrivateVideoProcessorOutputViewSize;
++   f->pfnCreateVideoProcessorOutputView = CreateVideoProcessorOutputView;
++   f->pfnDestroyVideoProcessorOutputView = DestroyVideoProcessorOutputView;
++   return S_OK;
++}
++
++void
++VideoDestroyDevice(D3D10DDI_HDEVICE hDevice)
++{
++   Device *pDevice = CastDevice(hDevice);
++   if (pDevice->compositor) {
++      vl_compositor_cleanup_state(&pDevice->compositor->state);
++      vl_compositor_cleanup(&pDevice->compositor->compositor);
++      delete pDevice->compositor;
++      pDevice->compositor = NULL;
++   }
++   if (pDevice->video_pipe) {
++      pDevice->video_pipe->destroy(pDevice->video_pipe);
++      pDevice->video_pipe = NULL;
++   }
++}
+diff --git a/src/gallium/frontends/d3d10umd/Video.h b/src/gallium/frontends/d3d10umd/Video.h
+new file mode 100644
+index 0000000..15ac28a
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/Video.h
+@@ -0,0 +1,38 @@
++/*
++ * Video.h --
++ *    Video decoding (DXVA through gallium's video codecs: VA-API on the host) and the video processor (color
++ *    conversion and scaling), with the NV12/P010 textures and decoder buffers they work on. See Video.cpp.
++ */
++
++#pragma once
++
++#include "DriverIncludes.h"
++
++struct Resource;
++struct ShaderResourceView;
++
++/* NV12/P010 textures and decoder buffers: true when it's one of them (created, or the error set) */
++bool VideoCreateResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_CREATERESOURCE *pCreateResource,
++                         Resource *pResource);
++void VideoDestroyResource(Resource *pResource);
++
++/* The rest: true when the resource is one of them and it was handled */
++bool VideoResourceMap(D3D10DDI_HDEVICE hDevice, Resource *pResource, UINT SubResource, D3D10_DDI_MAP DDIMap,
++                      D3D10DDI_MAPPED_SUBRESOURCE *pMapped);
++bool VideoResourceUnmap(D3D10DDI_HDEVICE hDevice, Resource *pResource, UINT SubResource);
++bool VideoResourceCopy(D3D10DDI_HDEVICE hDevice, Resource *pDst, Resource *pSrc);
++bool VideoResourceCopyRegion(D3D10DDI_HDEVICE hDevice, Resource *pDst, UINT DstSubResource, UINT DstX, UINT DstY,
++                             Resource *pSrc, UINT SrcSubResource, const D3D10_DDI_BOX *pSrcBox);
++bool VideoUpdateSubresourceUP(D3D10DDI_HDEVICE hDevice, Resource *pDst, UINT DstSubResource,
++                              const D3D10_DDI_BOX *pDstBox, const void *pSysMem, UINT RowPitch);
++bool VideoCreateShaderResourceView(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *pView,
++                                   ShaderResourceView *pSRView);
++
++/* Format caps: NV12/P010 (true: all of them set), and the video processor's for the others */
++bool VideoFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps);
++void VideoAddFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps);
++
++/* RetrieveSubObject's video function table (D3D11_1DDI_VIDEO_INPUT) */
++HRESULT VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize);
++
++void VideoDestroyDevice(D3D10DDI_HDEVICE hDevice);
+diff --git a/src/gallium/frontends/d3d10umd/meson.build b/src/gallium/frontends/d3d10umd/meson.build
+index 261fd69..4c59f26 100644
+--- a/src/gallium/frontends/d3d10umd/meson.build
++++ b/src/gallium/frontends/d3d10umd/meson.build
+@@ -22,6 +22,7 @@ libd3d10umd = static_library(
+     'Rasterizer.cpp',
+     'Resource.cpp',
+     'Shader.cpp',
++    'Video.cpp',
+     'ShaderDump.cpp',
+     'ShaderParse.c',
+     'ShaderTGSI.c',

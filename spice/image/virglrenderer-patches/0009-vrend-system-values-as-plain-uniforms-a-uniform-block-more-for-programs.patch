@@ -1,0 +1,203 @@
+From: WinBoat
+Subject: [PATCH] vrend: system values as plain uniforms, a uniform block more for programs
+
+The system values vrend adds to shaders (winsys_adjust_y in nearly every
+vertex shader, clip planes, the polygon stipple, the alpha reference,
+the draw ID base) were a uniform block, VirglBlock, so the caps held one
+of the host's uniform blocks per stage back for it: an NVIDIA host's 14
+became 13 for programs, one short of OpenGL 4.3's minimum, and guests
+with every 4.3 extension stayed at OpenGL 4.2 (Windows' virgl: 4.2,
+though compute shaders, SSBOs and all were there).
+
+They are plain uniforms now (the same names, so the shaders' code is
+unchanged), set with glUniform* when the values or the program change;
+the caps give programs the host's whole count.
+---
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 167c722..5cec04e 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -420,6 +420,9 @@ struct sysval_uniform_block {
+ 
+ static struct global_renderer_state vrend_state;
+ 
++static const char *const sysval_uniform_names[6] = {"clipp", "stipple_pattern", "winsys_adjust_y",
++                                                    "alpha_ref_val", "clip_plane_enabled", "drawid_base"};
++
+ static inline bool has_feature(enum features_id feature_id)
+ {
+    int slot = feature_id / 64;
+@@ -479,6 +482,9 @@ struct vrend_linked_shader_program {
+    GLuint virgl_block_bind;
+    uint32_t sysvalue_data_cookie;
+    GLuint ubo_sysval_buffer_id;
++   /* the system value uniforms' locations (enum sysval_uniform), per stage; has_sysvals: any of them used */
++   GLint sysval_locs[PIPE_SHADER_TYPES][6];
++   bool has_sysvals;
+ 
+    uint32_t images_used_mask[PIPE_SHADER_TYPES];
+    GLint *img_locs[PIPE_SHADER_TYPES];
+@@ -1756,41 +1762,14 @@ static unsigned bind_ubo_locs(struct vrend_linked_shader_program *sprog,
+    return next_ubo_id;
+ }
+ 
+-static void bind_virgl_block_loc(struct vrend_linked_shader_program *sprog,
+-                                 enum pipe_shader_type shader_type,
+-                                 GLuint virgl_block_ubo_id)
++/* The system value uniforms' locations in a stage's program (plain uniforms: vrend_shader.c) */
++static void bind_sysval_locs(struct vrend_linked_shader_program *sprog, enum pipe_shader_type shader_type)
+ {
+-   sprog->separate_virgl_block_id[shader_type] =
+-      vrend_get_uniform_block_index(sprog, "VirglBlock", shader_type);
+-
+-   if (sprog->separate_virgl_block_id[shader_type] != GL_INVALID_INDEX) {
+-      bool created_virgl_block_buffer = false;
+-
+-      if (sprog->virgl_block_bind == GL_INVALID_INDEX) {
+-         sprog->virgl_block_bind = virgl_block_ubo_id;
+-         if (sprog->ubo_sysval_buffer_id == GL_INVALID_INDEX) {
+-             glGenBuffers(1, &sprog->ubo_sysval_buffer_id);
+-             created_virgl_block_buffer = true;
+-         }
+-      }
+-
+-      vrend_set_active_pipeline_stage(sprog, shader_type);
+-      vrend_uniform_block_binding(sprog, shader_type,
+-                                  sprog->separate_virgl_block_id[shader_type],
+-                                  sprog->virgl_block_bind);
+-
+-      GLint virgl_block_size;
+-      int prog_id = sprog->is_pipeline ? sprog->ss[shader_type]->program_id :
+-                                         sprog->id.program;
+-      glGetActiveUniformBlockiv(prog_id, sprog->separate_virgl_block_id[shader_type],
+-                                GL_UNIFORM_BLOCK_DATA_SIZE, &virgl_block_size);
+-      assert((size_t) virgl_block_size >= sizeof(struct sysval_uniform_block));
+-
+-      if (created_virgl_block_buffer) {
+-         glBindBuffer(GL_UNIFORM_BUFFER, sprog->ubo_sysval_buffer_id);
+-         glBufferData(GL_UNIFORM_BUFFER, virgl_block_size, NULL, GL_DYNAMIC_DRAW);
+-         glBindBuffer(GL_UNIFORM_BUFFER, 0);
+-      }
++   int prog_id = sprog->is_pipeline ? sprog->ss[shader_type]->program_id : sprog->id.program;
++   for (unsigned i = 0; i < ARRAY_SIZE(sysval_uniform_names); i++) {
++      sprog->sysval_locs[shader_type][i] = glGetUniformLocation(prog_id, sysval_uniform_names[i]);
++      if (sprog->sysval_locs[shader_type][i] != -1)
++         sprog->has_sysvals = true;
+    }
+ }
+ 
+@@ -1813,15 +1792,17 @@ static void rebind_ubo_and_sampler_locs(struct vrend_linked_shader_program *spro
+          sprog->ss[shader_type]->last_pipeline_id = sprog->id.pipeline;
+    }
+ 
+-   /* Now `next_ubo_id` is the last ubo id, which is used for the VirglBlock. */
+    sprog->virgl_block_bind = GL_INVALID_INDEX;
++   sprog->has_sysvals = false;
++   /* a (re)linked program's uniforms are zero: set them at its next draw */
++   sprog->sysvalue_data_cookie = UINT32_MAX;
+    for (enum pipe_shader_type shader_type = PIPE_SHADER_VERTEX;
+         shader_type <= last_shader;
+         shader_type++) {
+       if (!sprog->ss[shader_type])
+          continue;
+ 
+-      bind_virgl_block_loc(sprog, shader_type, next_ubo_id);
++      bind_sysval_locs(sprog, shader_type);
+    }
+ }
+ 
+@@ -5562,16 +5543,34 @@ static void vrend_draw_bind_images_shader(struct vrend_sub_context *sub_ctx, int
+ static void
+ vrend_fill_sysval_uniform_block (struct vrend_sub_context *sub_ctx)
+ {
+-   if (sub_ctx->prog->virgl_block_bind == GL_INVALID_INDEX)
++   struct vrend_linked_shader_program *prog = sub_ctx->prog;
++   if (!prog->has_sysvals || sub_ctx->sysvalue_data_cookie == prog->sysvalue_data_cookie)
+       return;
+ 
+-   if (sub_ctx->sysvalue_data_cookie != sub_ctx->prog->sysvalue_data_cookie) {
+-      glBindBuffer(GL_UNIFORM_BUFFER, sub_ctx->prog->ubo_sysval_buffer_id);
+-      glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(struct sysval_uniform_block),
+-                      &sub_ctx->sysvalue_data);
+-      glBindBuffer(GL_UNIFORM_BUFFER, 0);
+-      sub_ctx->prog->sysvalue_data_cookie = sub_ctx->sysvalue_data_cookie;
+-   }
++   const struct sysval_uniform_block *d = &sub_ctx->sysvalue_data;
++   GLuint stipple[VREND_POLYGON_STIPPLE_SIZE];
++   for (unsigned i = 0; i < VREND_POLYGON_STIPPLE_SIZE; i++)
++      stipple[i] = d->stipple_pattern[i][0];
++   for (int shader_type = PIPE_SHADER_VERTEX; shader_type <= sub_ctx->last_shader_idx; shader_type++) {
++      const GLint *loc = prog->sysval_locs[shader_type];
++      if (!prog->ss[shader_type])
++         continue;
++      vrend_set_active_pipeline_stage(prog, shader_type);
++      if (loc[0] != -1)
++         glUniform4fv(loc[0], VIRGL_NUM_CLIP_PLANES, &d->clipp[0][0]);
++      if (loc[1] != -1)
++         glUniform1uiv(loc[1], VREND_POLYGON_STIPPLE_SIZE, stipple);
++      if (loc[2] != -1)
++         glUniform1f(loc[2], d->winsys_adjust_y);
++      if (loc[3] != -1)
++         glUniform1f(loc[3], d->alpha_ref_val);
++      if (loc[4] != -1)
++         glUniform1i(loc[4], d->clip_plane_enabled != 0.0f);
++      if (loc[5] != -1)
++         glUniform1i(loc[5], d->drawid_base);
++   }
++   vrend_set_active_pipeline_stage(prog, PIPE_SHADER_FRAGMENT);
++   prog->sysvalue_data_cookie = sub_ctx->sysvalue_data_cookie;
+ }
+ 
+ static void vrend_draw_bind_objects(struct vrend_sub_context *sub_ctx, bool new_program)
+@@ -5597,11 +5596,6 @@ static void vrend_draw_bind_objects(struct vrend_sub_context *sub_ctx, bool new_
+       }
+    }
+ 
+-   if (sub_ctx->prog->virgl_block_bind != GL_INVALID_INDEX)
+-      glBindBufferRange(GL_UNIFORM_BUFFER, sub_ctx->prog->virgl_block_bind,
+-                        sub_ctx->prog->ubo_sysval_buffer_id,
+-                        0, sizeof(struct sysval_uniform_block));
+-
+    vrend_draw_bind_abo_shader(sub_ctx);
+ 
+    vrend_set_active_pipeline_stage(sub_ctx->prog, PIPE_SHADER_FRAGMENT);
+@@ -12333,9 +12327,9 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
+ 
+    if (has_feature(feat_ubo)) {
+       glGetIntegerv(GL_MAX_VERTEX_UNIFORM_BLOCKS, &max);
+-      /* GL_MAX_VERTEX_UNIFORM_BLOCKS is omitting the ordinary uniform block, add it
+-       * also reduce by 1 as we might generate a VirglBlock helper uniform block */
+-      caps->v1.max_uniform_blocks = max + 1 - 1;
++      /* GL_MAX_VERTEX_UNIFORM_BLOCKS is omitting the ordinary uniform block, add it (the system values are
++       * plain uniforms, no block of their own) */
++      caps->v1.max_uniform_blocks = max + 1;
+    }
+ 
+    if (has_feature(feat_depth_clamp))
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index 6a26fdf..6730fac 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -7962,14 +7962,14 @@ static void emit_required_sysval_uniforms(struct vrend_strbuf *block, uint32_t m
+    if (!mask)
+       return;
+ 
+-   strbuf_append(block, "layout (std140) uniform VirglBlock {\n");
+-   strbuf_append(block, "\tvec4 clipp[8];\n");
+-   strbuf_appendf(block, "\tuint stipple_pattern[%d];\n", VREND_POLYGON_STIPPLE_SIZE);
+-   strbuf_append(block, "\tfloat winsys_adjust_y;\n");
+-   strbuf_append(block, "\tfloat alpha_ref_val;\n");
+-   strbuf_append(block, "\tbool clip_plane_enabled;\n");
+-   strbuf_append(block, "\tint drawid_base;\n");
+-   strbuf_append(block, "};\n");
++   /* Plain uniforms, not a uniform block: a block took one of the stage's uniform blocks (nearly every vertex
++    * shader has winsys_adjust_y), so programs got one less than the host has, and guests one too few for GL 4.3 */
++   strbuf_append(block, "uniform vec4 clipp[8];\n");
++   strbuf_appendf(block, "uniform uint stipple_pattern[%d];\n", VREND_POLYGON_STIPPLE_SIZE);
++   strbuf_append(block, "uniform float winsys_adjust_y;\n");
++   strbuf_append(block, "uniform float alpha_ref_val;\n");
++   strbuf_append(block, "uniform bool clip_plane_enabled;\n");
++   strbuf_append(block, "uniform int drawid_base;\n");
+ 
+ }
+ 

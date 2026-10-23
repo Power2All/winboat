@@ -1,0 +1,61 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: grow the frame buffer segment for large modes
+
+The frame buffer segment is sized at start (16 MB, or the BAR), but CreateFrameBufferObj needs width * height * 4
+for every mode: a maximized SPICE window on a 5120x2160 display asked for 5106x2051 (42 MB). VioGpuObj::Init then
+refused the object, and its error message dereferenced m_pSegment before it was set; CreateFrameBufferObj had already
+created the 2D resource and left it without backing, and QEMU crashed on it. Grow the segment when a mode needs more
+(nothing else uses it then), destroy the resource if the object still can't be set up, and print the segment that
+was passed in.
+---
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index ce52a2a..2372d78 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -1329,8 +1329,9 @@ BOOLEAN VioGpuObj::Init(_In_ UINT size, VioGpuMemSegment *pSegment)
+     size = pages * PAGE_SIZE;
+     if (size > pSegment->GetSize())
+     {
++        // pSegment: m_pSegment isn't set yet
+         DbgPrint(TRACE_LEVEL_FATAL,
+-                 ("<--- %s segment size too small = %Iu (%u)\n", __FUNCTION__, m_pSegment->GetSize(), size));
++                 ("<--- %s segment size too small = %Iu (%u)\n", __FUNCTION__, pSegment->GetSize(), size));
+         return FALSE;
+     }
+     m_pSegment = pSegment;
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index 903d8a9..0957bdd 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -675,12 +675,31 @@ void VioGpuVidPN::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURREN
+     format = ColorFormat(pCurrentMode->DispInfo.ColorFormat);
+     DbgPrint(TRACE_LEVEL_INFORMATION,
+              ("---> %s - (%d -> %d)\n", __FUNCTION__, pCurrentMode->DispInfo.ColorFormat, format));
++    // The segment is sized at start (16 MB, or the BAR): a larger mode (a maximized SPICE window on a wide
++    // display) needs a larger one. Nothing else uses it now, the previous frame buffer object is gone.
++    if ((SIZE_T)BYTES_TO_PAGES(size) * PAGE_SIZE > m_pAdapter->frameSegment.GetSize())
++    {
++        DbgPrint(TRACE_LEVEL_WARNING,
++                 ("%s growing the frame buffer segment from %Iu to %u bytes\n",
++                  __FUNCTION__,
++                  m_pAdapter->frameSegment.GetSize(),
++                  size));
++        m_pAdapter->frameSegment.Close();
++        if (!m_pAdapter->frameSegment.Init(size, NULL))
++        {
++            DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to grow the frame buffer segment\n", __FUNCTION__));
++            return;
++        }
++    }
+     resid = m_pAdapter->resourceIdr.GetId();
+     m_pAdapter->ctrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
+     obj = new (NonPagedPoolNx) VioGpuObj();
+     if (!obj->Init(size, &m_pAdapter->frameSegment))
+     {
+         DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to init obj size = %d\n", __FUNCTION__, size));
++        // A resource without backing must not stay behind (scanouts of it crashed QEMU)
++        m_pAdapter->ctrlQueue.DestroyResource(resid);
++        m_pAdapter->resourceIdr.PutId(resid);
+         delete obj;
+         return;
+     }

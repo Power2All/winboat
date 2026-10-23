@@ -1,0 +1,952 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: DirectX 12 Ultimate (feature level 12_2), MSAA
+
+The D3D12 DDI's DirectX 12 Ultimate features, passed on to vkd3d-proton:
+
+- Variable rate shading: RSSetShadingRate and RSSetShadingRateImage (tier 2
+  caps from vkd3d-proton).
+- Mesh and amplification shaders: CreateMeshShader/CreateAmplificationShader
+  (containers with the mesh shader's vertex and primitive output signatures,
+  OSG1/PSG1), mesh pipelines as pipeline state streams, DispatchMesh.
+- Ray tracing (umd_raytracing.cpp): state objects (collections, ray tracing
+  pipelines, AddToStateObject), whose subobjects are the API's but for the
+  associations: the runtime resolves those into an export summary, passed on
+  as an explicit association per export and associated subobject; DXIL
+  libraries get a container. Shader identifiers and stack sizes,
+  acceleration structure prebuild info, builds, copies and postbuild info,
+  SetPipelineState1, DispatchRays. Tier from vkd3d-proton (1.1).
+- Sampler feedback: feedback maps (DESC1 with their mip region, through
+  ID3D12Device8), CreateSamplerFeedbackUnorderedAccessView, the tier (0.9).
+- Feature level 12_2 when vkd3d-proton has it.
+
+Found on the way:
+- MSAA: CheckMultisampleQualityLevels answered 0 for every sample count above
+  1, so no multisampled render target could be made at all. It now has
+  vkd3d-proton's levels, and format support its multisample render target
+  and load bits: the runtime refuses the device unless every typed format's
+  levels agree with its multisample render target bit, so formats that only
+  view multisampled ones (R32_FLOAT_X8X24_TYPELESS...) get none; typeless
+  formats keep their family's.
+- WriteBufferImmediate was there but reported unsupported: its queue flags
+  are vkd3d-proton's now (12_2 wants them).
+
+12_2 also needs 40 bits of GPU virtual address a process: the viogpu3d kernel
+driver's page tables (kvm-guest-drivers-windows 0021).
+---
+diff --git a/libs/viogpu_umd/meson.build b/libs/viogpu_umd/meson.build
+index b6e8a2d9..26ce1f11 100644
+--- a/libs/viogpu_umd/meson.build
++++ b/libs/viogpu_umd/meson.build
+@@ -8,7 +8,7 @@ viogpu_umd_bridge = static_library('viogpu_umd_bridge', ['umd_bridge.c'] + vkd3d
+   dependencies        : [ vkd3d_dep ],
+   include_directories : vkd3d_private_includes)
+ 
+-viogpu_umd_lib = shared_library(get_option('viogpu_umd_name'), ['umd_ddi.cpp', 'umd_state.cpp', 'umd_resource.cpp', 'umd_command.cpp', 'umd_video.cpp',
++viogpu_umd_lib = shared_library(get_option('viogpu_umd_name'), ['umd_ddi.cpp', 'umd_state.cpp', 'umd_resource.cpp', 'umd_command.cpp', 'umd_raytracing.cpp', 'umd_video.cpp',
+     'umd_video_decode.cpp'],
+   name_prefix         : '',
+   link_with           : [ viogpu_umd_bridge ],
+diff --git a/libs/viogpu_umd/umd_command.cpp b/libs/viogpu_umd/umd_command.cpp
+index 9a7758e7..022e3276 100644
+--- a/libs/viogpu_umd/umd_command.cpp
++++ b/libs/viogpu_umd/umd_command.cpp
+@@ -177,6 +177,8 @@ create_command_list(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_COMMAND_L
+    list->list->QueryInterface(IID_PPV_ARGS(&list->list1));
+    list->list->QueryInterface(IID_PPV_ARGS(&list->list2));
+    list->list->QueryInterface(IID_PPV_ARGS(&list->list4));
++   list->list->QueryInterface(IID_PPV_ARGS(&list->list5));
++   list->list->QueryInterface(IID_PPV_ARGS(&list->list6));
+ 
+    bool compute = list->type == D3D12_COMMAND_LIST_TYPE_COMPUTE || list->type == D3D12_COMMAND_LIST_TYPE_COPY;
+    device->umCallbacks->pfnSetCommandListDDITableCb(
+@@ -194,6 +196,10 @@ destroy_command_list(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDLIST h)
+       viogpu_video_list_destroy(list->video);
+    if (list->list4)
+       list->list4->Release();
++   if (list->list5)
++      list->list5->Release();
++   if (list->list6)
++      list->list6->Release();
+    if (list->list2)
+       list->list2->Release();
+    if (list->list1)
+@@ -244,6 +250,29 @@ dispatch(D3D12DDI_HCOMMANDLIST h, UINT x, UINT y, UINT z)
+    L(h)->Dispatch(x, y, z);
+ }
+ 
++static VOID APIENTRY
++dispatch_mesh(D3D12DDI_HCOMMANDLIST h, UINT x, UINT y, UINT z)
++{
++   if (list_from(h)->list6)
++      list_from(h)->list6->DispatchMesh(x, y, z);
++}
++
++/* Variable rate shading (the DDI's shading rates and combiners have the API's values) */
++static VOID APIENTRY
++rs_set_shading_rate(D3D12DDI_HCOMMANDLIST h, D3D12DDI_SHADING_RATE_0062 rate,
++                    const D3D12DDI_SHADING_RATE_COMBINER_0062 *combiners)
++{
++   if (list_from(h)->list5)
++      list_from(h)->list5->RSSetShadingRate((D3D12_SHADING_RATE)rate, (const D3D12_SHADING_RATE_COMBINER *)combiners);
++}
++
++static VOID APIENTRY
++rs_set_shading_rate_image(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HRESOURCE image)
++{
++   if (list_from(h)->list5)
++      list_from(h)->list5->RSSetShadingRateImage(resource_of(image));
++}
++
+ static D3D12_GPU_DESCRIPTOR_HANDLE
+ gpu_handle(D3D12DDI_GPU_DESCRIPTOR_HANDLE h)
+ {
+@@ -858,6 +887,14 @@ viogpu_fill_command_list_table(void *table, SIZE_T size, UINT number, D3D12DDI_H
+    f->pfnDrawInstanced = draw_instanced;
+    f->pfnDrawIndexedInstanced = draw_indexed_instanced;
+    f->pfnDispatch = dispatch;
++   if (size >= offsetof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0062, pfnRSSetShadingRateImage) + sizeof(void *)) {
++      f->pfnRSSetShadingRate = rs_set_shading_rate;
++      f->pfnRSSetShadingRateImage = rs_set_shading_rate_image;
++   }
++   if (size >= offsetof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0074, pfnDispatchMesh) + sizeof(void *))
++      f->pfnDispatchMesh = dispatch_mesh;
++   if (size >= offsetof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0054, pfnDispatchRays) + sizeof(void *))
++      viogpu_fill_raytracing_list_funcs(f);
+    f->pfnClearUnorderedAccessViewUint = clear_uav_uint;
+    f->pfnClearUnorderedAccessViewFloat = clear_uav_float;
+    f->pfnClearRenderTargetView = clear_rtv;
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+index c5a740e3..181a4f94 100644
+--- a/libs/viogpu_umd/umd_ddi.cpp
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -157,18 +157,48 @@ device_check_format_support(D3D12DDI_HDEVICE hDevice, DXGI_FORMAT format, UINT *
+       break;
+    case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
+       *support = D3D12DDI_FORMAT_SUPPORT_NOT_SUPPORTED;
+-      break;
++      return;
+    default:
+       *support = 0;
+       break;
+    }
++   /* multisampling, as vkd3d-proton has it (the runtime holds it against CheckMultisampleQualityLevels' answers) */
++   D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
++   fs.Format = format;
++   if (SUCCEEDED(device_from(hDevice)->vkd3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs)))) {
++      if (fs.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET)
++         *support |= D3D12DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
++      if (fs.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD)
++         *support |= D3D12DDI_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
++   }
+ }
+ 
++/* vkd3d-proton's answer (the flags have the API's values). The runtime holds every typed format's levels against its
++ * support's multisample render target bit (and refuses the device otherwise): vkd3d-proton also has levels for formats
++ * that only view multisampled ones (R32_FLOAT_X8X24_TYPELESS and the like), so those get none. A typeless format keeps
++ * its family's */
+ static void APIENTRY
+-device_check_multisample_quality_levels(D3D12DDI_HDEVICE, DXGI_FORMAT, UINT sampleCount,
+-                                        D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS, UINT *levels)
++device_check_multisample_quality_levels(D3D12DDI_HDEVICE hDevice, DXGI_FORMAT format, UINT sampleCount,
++                                        D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS flags, UINT *levels)
+ {
+-   *levels = sampleCount == 1 ? 1 : 0;
++   ID3D12Device *vkd3d = device_from(hDevice)->vkd3d;
++   D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS data = {};
++   data.Format = format;
++   data.SampleCount = sampleCount;
++   data.Flags = (D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS)flags;
++   if (FAILED(vkd3d->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &data, sizeof(data))))
++      data.NumQualityLevels = sampleCount == 1 ? 1 : 0;
++   if (sampleCount > 1 && data.NumQualityLevels) {
++      D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
++      fs.Format = format;
++      /* a typeless format (no loads, no targets) has its family's levels */
++      const UINT typed = D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
++                         D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL;
++      if (FAILED(vkd3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
++          ((fs.Support1 & typed) && !(fs.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET)))
++         data.NumQualityLevels = 0;
++   }
++   *levels = data.NumQualityLevels;
+ }
+ 
+ static UINT APIENTRY
+@@ -299,9 +329,8 @@ caps_from_vkd3d(ID3D12Device *device, viogpu_caps *caps)
+    fl.pFeatureLevelsRequested = levels;
+    device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl));
+    switch (fl.MaxSupportedFeatureLevel) {
+-   /* ponytail: 12_2 (DirectX 12 Ultimate) needs ray tracing, mesh shaders, VRS and sampler feedback through the
+-    * DDI (state objects, DispatchRays/DispatchMesh, shading rate entries), none of them passed on yet: 12_1 */
+-   case D3D_FEATURE_LEVEL_12_2:
++   /* 12_2 (DirectX 12 Ultimate): ray tracing, mesh shaders, VRS and sampler feedback, all passed on */
++   case D3D_FEATURE_LEVEL_12_2: caps->level = D3D12DDI_3DPIPELINELEVEL_12_2; break;
+    case D3D_FEATURE_LEVEL_12_1: caps->level = D3D12DDI_3DPIPELINELEVEL_12_1; break;
+    case D3D_FEATURE_LEVEL_12_0: caps->level = D3D12DDI_3DPIPELINELEVEL_12_0; break;
+    case D3D_FEATURE_LEVEL_11_1: caps->level = D3D12DDI_3DPIPELINELEVEL_11_1; break;
+@@ -355,12 +384,33 @@ caps_from_vkd3d(ID3D12Device *device, viogpu_caps *caps)
+    options.ProgrammableSamplePositionsTier =
+       (D3D12DDI_PROGRAMMABLE_SAMPLE_POSITIONS_TIER)o2.ProgrammableSamplePositionsTier;
+    options.CopyQueueTimestampQueriesSupported = o3.CopyQueueTimestampQueriesSupported;
+-   /* WriteBufferImmediate isn't implemented yet */
++   /* WriteBufferImmediate (vkd3d-proton's): the API's list types as the DDI's queue flags */
+    options.WriteBufferImmediateQueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_NONE;
++   if (o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT)
++      options.WriteBufferImmediateQueueFlags |= D3D12DDI_COMMAND_QUEUE_FLAG_3D;
++   if (o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE)
++      options.WriteBufferImmediateQueueFlags |= D3D12DDI_COMMAND_QUEUE_FLAG_COMPUTE;
++   if (o3.WriteBufferImmediateSupportFlags & D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY)
++      options.WriteBufferImmediateQueueFlags |= D3D12DDI_COMMAND_QUEUE_FLAG_COPY;
+    options.ViewInstancingTier = (D3D12DDI_VIEW_INSTANCING_TIER)o3.ViewInstancingTier;
+    options.BarycentricsSupported = o3.BarycentricsSupported;
+    options.ReservedBufferPlacementSupported = o4.MSAA64KBAlignedTextureSupported;
+    options.SRVOnlyTiledResourceTier3 = o5.SRVOnlyTiledResourceTier3;
++   /* variable rate shading (RSSetShadingRate[Image]: umd_command.cpp) */
++   D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6 = {};
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6));
++   options.VariableShadingRateTier = (D3D12DDI_VARIABLE_SHADING_RATE_TIER)o6.VariableShadingRateTier;
++   options.AdditionalShadingRatesSupported = o6.AdditionalShadingRatesSupported;
++   options.PerPrimitiveShadingRateSupportedWithViewportIndexing = o6.PerPrimitiveShadingRateSupportedWithViewportIndexing;
++   options.ShadingRateImageTileSize = o6.ShadingRateImageTileSize;
++   /* mesh and amplification shaders (umd_state.cpp's mesh pipelines, DispatchMesh) */
++   D3D12_FEATURE_DATA_D3D12_OPTIONS7 o7 = {};
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
++   options.MeshShaderTier = (D3D12DDI_MESH_SHADER_TIER)o7.MeshShaderTier;
++   /* sampler feedback (feedback maps and their UAVs: umd_resource.cpp) */
++   options.SamplerFeedbackTier = (D3D12DDI_SAMPLER_FEEDBACK_TIER)o7.SamplerFeedbackTier;
++   /* ray tracing (umd_raytracing.cpp; tier 1.1's AddToStateObject too) */
++   options.RaytracingTier = (D3D12DDI_RAYTRACING_TIER)o5.RaytracingTier;
+ 
+    /* the heaps the runtime makes out of DEFAULT/UPLOAD/READBACK follow this, vkd3d-proton's custom heaps too */
+    D3D12_FEATURE_DATA_ARCHITECTURE arch = {};
+@@ -588,6 +638,10 @@ adapter_fill_ddi_table(D3D12DDI_HADAPTER, D3D12DDI_TABLE_TYPE type, VOID *table,
+       funcs->pfnGetImplicitPhysicalAdapterMask = device_get_implicit_physical_adapter_mask;
+       funcs->pfnQueryNodeMap = device_query_node_map;
+       viogpu_fill_state_funcs(funcs);
++      if (size >= offsetof(D3D12DDI_DEVICE_FUNCS_CORE_0074, pfnCalcPrivateMeshShaderSize) + sizeof(void *))
++         viogpu_fill_mesh_shader_funcs(funcs);
++      if (size >= offsetof(D3D12DDI_DEVICE_FUNCS_CORE_0072, pfnAddToStateObject) + sizeof(void *))
++         viogpu_fill_raytracing_funcs(funcs);
+       viogpu_fill_resource_funcs(funcs);
+       viogpu_fill_command_funcs(funcs);
+       return S_OK;
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+index 5e7217d9..92339a03 100644
+--- a/libs/viogpu_umd/umd_private.h
++++ b/libs/viogpu_umd/umd_private.h
+@@ -85,6 +85,8 @@ struct viogpu_resource {
+    D3DKMT_HANDLE kmAllocation;
+    UINT kmPitch;
+    ID3D12Resource *readback;
++   /* a sampler feedback map's (zero otherwise) */
++   D3D12_MIP_REGION mipRegion;
+ };
+ 
+ struct viogpu_descriptor_heap {
+@@ -113,9 +115,14 @@ heap_of(D3D12DDI_HHEAP h)
+ 
+ /* umd_state.cpp: shaders, input layouts, blend/depth-stencil/rasterizer states, root signatures, pipeline states */
+ void viogpu_fill_state_funcs(viogpu_device_funcs *funcs);
++void viogpu_fill_mesh_shader_funcs(viogpu_device_funcs *funcs);
+ ID3D12RootSignature *viogpu_root_signature_of(D3D12DDI_HROOTSIGNATURE h);
+ ID3D12PipelineState *viogpu_pipeline_state_of(D3D12DDI_HPIPELINESTATE h);
+ 
++/* umd_raytracing.cpp: state objects, acceleration structures, DispatchRays */
++void viogpu_fill_raytracing_funcs(viogpu_device_funcs *funcs);
++void viogpu_fill_raytracing_list_funcs(viogpu_command_list_funcs *funcs);
++
+ /* umd_resource.cpp: heaps, resources, descriptor heaps and views, query heaps, command signatures, residency */
+ void viogpu_fill_resource_funcs(viogpu_device_funcs *funcs);
+ 
+@@ -129,6 +136,8 @@ struct viogpu_command_list {
+    ID3D12GraphicsCommandList1 *list1;
+    ID3D12GraphicsCommandList2 *list2;
+    ID3D12GraphicsCommandList4 *list4;
++   ID3D12GraphicsCommandList5 *list5; /* variable rate shading */
++   ID3D12GraphicsCommandList6 *list6; /* mesh shaders */
+    struct viogpu_video_list *video;
+ };
+ 
+diff --git a/libs/viogpu_umd/umd_raytracing.cpp b/libs/viogpu_umd/umd_raytracing.cpp
+new file mode 100644
+index 00000000..7d3a7661
+--- /dev/null
++++ b/libs/viogpu_umd/umd_raytracing.cpp
+@@ -0,0 +1,377 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* Ray tracing: state objects (collections, ray tracing pipelines) and acceleration structures.
++ *
++ * The DDI's subobjects are the API's (same types, same layouts) except that the runtime resolves the associations
++ * itself: no SUBOBJECT_TO_EXPORTS_ASSOCIATION, but a summary of every export's associated subobjects instead. The
++ * state object passed on to vkd3d-proton gets an explicit association per export and associated subobject. DXIL
++ * libraries come as the bare program (like shaders: umd_state.cpp) and get a container. The acceleration structure
++ * arguments are the API's as they are. */
++
++#include "umd_private.h"
++#include <deque>
++
++struct viogpu_state_object {
++   ID3D12StateObject *so;
++   ID3D12StateObjectProperties *props;
++   D3D12DDI_HRTSTATEOBJECT_0054 hRT;
++};
++
++static ID3D12StateObject *
++state_object_of(D3D12DDI_HSTATEOBJECT_0054 h)
++{
++   return h.pDrvPrivate ? ((viogpu_state_object *)h.pDrvPrivate)->so : NULL;
++}
++
++static_assert(sizeof(D3D12DDI_EXPORT_DESC_0054) == sizeof(D3D12_EXPORT_DESC), "export desc");
++static_assert(offsetof(D3D12DDI_HIT_GROUP_DESC_0054, IntersectionShaderImport) ==
++              offsetof(D3D12_HIT_GROUP_DESC, IntersectionShaderImport), "hit group desc");
++static_assert(sizeof(D3D12DDI_RAYTRACING_SHADER_CONFIG_0054) == sizeof(D3D12_RAYTRACING_SHADER_CONFIG),
++              "shader config");
++static_assert(sizeof(D3D12DDI_RAYTRACING_PIPELINE_CONFIG_0075) == sizeof(D3D12_RAYTRACING_PIPELINE_CONFIG1),
++              "pipeline config");
++
++/* A DXIL library in a container (as is when it is one already) */
++static std::vector<BYTE>
++library_container(const UINT *code)
++{
++   const BYTE *bytes = (const BYTE *)code;
++   if (code[0] == ('D' | 'X' << 8 | 'B' << 16 | (UINT)'C' << 24))
++      return std::vector<BYTE>(bytes, bytes + code[6]);
++   UINT program = code[1] * 4;
++   UINT header[] = {('D' | 'X' << 8 | 'B' << 16 | (UINT)'C' << 24), 0, 0, 0, 0, 1, 0, 1, 36,
++                    ('D' | 'X' << 8 | 'I' << 16 | (UINT)'L' << 24), program};
++   header[6] = sizeof(header) + program;
++   std::vector<BYTE> c((const BYTE *)header, (const BYTE *)header + sizeof(header));
++   c.insert(c.end(), bytes, bytes + program);
++   return c;
++}
++
++/* The API's description of a DDI one, and what it points to */
++struct state_object_desc {
++   D3D12_STATE_OBJECT_DESC desc;
++   std::vector<D3D12_STATE_SUBOBJECT> subobjects;
++   std::deque<std::vector<BYTE>> containers;
++   std::deque<D3D12_DXIL_LIBRARY_DESC> libraries;
++   std::deque<D3D12_EXISTING_COLLECTION_DESC> collections;
++   std::deque<D3D12_GLOBAL_ROOT_SIGNATURE> globals;
++   std::deque<D3D12_LOCAL_ROOT_SIGNATURE> locals;
++   std::deque<D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION> associations;
++};
++
++static void
++translate(D3D12DDI_STATE_OBJECT_TYPE type, UINT count, const D3D12DDI_STATE_SUBOBJECT_0054 *in,
++          state_object_desc &out)
++{
++   /* every pointer into subobjects must stay put: room for the associations up front */
++   size_t associations = 0;
++   for (UINT i = 0; i < count; i++)
++      if (in[i].Type == D3D12DDI_STATE_SUBOBJECT_TYPE_SHADER_EXPORT_SUMMARY) {
++         const D3D12DDI_FUNCTION_SUMMARY_0054 *summary = (const D3D12DDI_FUNCTION_SUMMARY_0054 *)in[i].pDesc;
++         for (UINT j = 0; j < summary->NumExportedFunctions; j++)
++            associations += summary->pSummaries[j].NumAssociatedSubobjects;
++      }
++   out.subobjects.reserve(count + associations);
++   /* where each DDI subobject went (the summary refers to them) */
++   std::vector<const D3D12DDI_STATE_SUBOBJECT_0054 *> from;
++
++   for (UINT i = 0; i < count; i++) {
++      D3D12_STATE_SUBOBJECT s = {(D3D12_STATE_SUBOBJECT_TYPE)in[i].Type, in[i].pDesc};
++      switch (in[i].Type) {
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY: {
++         const D3D12DDI_DXIL_LIBRARY_DESC_0054 *lib = (const D3D12DDI_DXIL_LIBRARY_DESC_0054 *)in[i].pDesc;
++         out.containers.push_back(library_container(lib->pDXILLibrary));
++         D3D12_DXIL_LIBRARY_DESC d = {};
++         d.DXILLibrary.pShaderBytecode = out.containers.back().data();
++         d.DXILLibrary.BytecodeLength = out.containers.back().size();
++         d.NumExports = lib->NumExports;
++         d.pExports = (D3D12_EXPORT_DESC *)lib->pExports;
++         out.libraries.push_back(d);
++         s.pDesc = &out.libraries.back();
++         break;
++      }
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION: {
++         const D3D12DDI_EXISTING_COLLECTION_DESC_0054 *c = (const D3D12DDI_EXISTING_COLLECTION_DESC_0054 *)in[i].pDesc;
++         out.collections.push_back({state_object_of(c->hExistingCollection), c->NumExports,
++                                    (D3D12_EXPORT_DESC *)c->pExports});
++         s.pDesc = &out.collections.back();
++         break;
++      }
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE:
++         out.globals.push_back({viogpu_root_signature_of(
++            ((const D3D12DDI_GLOBAL_ROOT_SIGNATURE_0054 *)in[i].pDesc)->hGlobalRootSignature)});
++         s.pDesc = &out.globals.back();
++         break;
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE:
++         out.locals.push_back({viogpu_root_signature_of(
++            ((const D3D12DDI_LOCAL_ROOT_SIGNATURE_0054 *)in[i].pDesc)->hLocalRootSignature)});
++         s.pDesc = &out.locals.back();
++         break;
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG:
++         /* DDI 0075 on: with the flags (the API's PIPELINE_CONFIG1) */
++         s.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1;
++         break;
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG:
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_NODE_MASK:
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG:
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_HIT_GROUP:
++         break;
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_SHADER_EXPORT_SUMMARY:
++         continue;
++      default:
++         viogpu_log("CreateStateObject: subobject type %u passed on as is", (UINT)in[i].Type);
++         break;
++      }
++      out.subobjects.push_back(s);
++      from.push_back(&in[i]);
++   }
++
++   for (UINT i = 0; i < count; i++) {
++      if (in[i].Type != D3D12DDI_STATE_SUBOBJECT_TYPE_SHADER_EXPORT_SUMMARY)
++         continue;
++      const D3D12DDI_FUNCTION_SUMMARY_0054 *summary = (const D3D12DDI_FUNCTION_SUMMARY_0054 *)in[i].pDesc;
++      for (UINT j = 0; j < summary->NumExportedFunctions; j++) {
++         const D3D12DDI_FUNCTION_SUMMARY_NODE_0054 &node = summary->pSummaries[j];
++         for (UINT k = 0; k < node.NumAssociatedSubobjects; k++) {
++            size_t at = 0;
++            while (at < from.size() && from[at] != node.ppAssociatedSubobjects[k])
++               at++;
++            if (at == from.size())
++               continue; /* a collection's: it has it already */
++            switch (out.subobjects[at].Type) {
++            case D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE:
++            case D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE:
++            case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG:
++            case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1:
++               break;
++            default:
++               continue;
++            }
++            out.associations.push_back({&out.subobjects[at], 1, (LPCWSTR *)&node.ExportNameUnmangled});
++            out.subobjects.push_back({D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION,
++                                      &out.associations.back()});
++         }
++      }
++   }
++
++   out.desc.Type = (D3D12_STATE_OBJECT_TYPE)type;
++   out.desc.NumSubobjects = (UINT)out.subobjects.size();
++   out.desc.pSubobjects = out.subobjects.data();
++}
++
++static void
++state_object_finish(viogpu_state_object *so)
++{
++   if (so->so)
++      so->so->QueryInterface(IID_PPV_ARGS(&so->props));
++}
++
++static SIZE_T APIENTRY
++calc_state_object_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_STATE_OBJECT_0054 *)
++{
++   return sizeof(viogpu_state_object);
++}
++
++static HRESULT APIENTRY
++create_state_object(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_STATE_OBJECT_0054 *args,
++                    D3D12DDI_HSTATEOBJECT_0054 h, D3D12DDI_HRTSTATEOBJECT_0054 hRT)
++{
++   viogpu_state_object *so = new (h.pDrvPrivate) viogpu_state_object();
++   so->hRT = hRT;
++   ID3D12Device5 *device5 = NULL;
++   HRESULT hr = device_from(hDevice)->vkd3d->QueryInterface(IID_PPV_ARGS(&device5));
++   if (SUCCEEDED(hr)) {
++      state_object_desc desc;
++      translate(args->Type, args->NumSubobjects, args->pSubobjects, desc);
++      hr = device5->CreateStateObject(&desc.desc, IID_PPV_ARGS(&so->so));
++      device5->Release();
++   }
++   if (FAILED(hr))
++      viogpu_log("CreateStateObject (type %u, %u subobjects): 0x%08lx", (UINT)args->Type, args->NumSubobjects,
++                 (unsigned long)hr);
++   state_object_finish(so);
++   return hr;
++}
++
++static SIZE_T APIENTRY
++calc_add_to_state_object_size(D3D12DDI_HDEVICE, const D3D12DDIARG_ADD_TO_STATE_OBJECT_0072 *)
++{
++   return sizeof(viogpu_state_object);
++}
++
++static HRESULT APIENTRY
++add_to_state_object(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_ADD_TO_STATE_OBJECT_0072 *args,
++                    D3D12DDI_HSTATEOBJECT_0054 h, D3D12DDI_HRTSTATEOBJECT_0054 hRT)
++{
++   viogpu_state_object *so = new (h.pDrvPrivate) viogpu_state_object();
++   so->hRT = hRT;
++   ID3D12Device7 *device7 = NULL;
++   HRESULT hr = device_from(hDevice)->vkd3d->QueryInterface(IID_PPV_ARGS(&device7));
++   if (SUCCEEDED(hr)) {
++      state_object_desc desc;
++      translate(args->Type, args->NumSubobjects, args->pSubobjects, desc);
++      hr = device7->AddToStateObject(&desc.desc, state_object_of(args->StateObjectToGrowFrom),
++                                     IID_PPV_ARGS(&so->so));
++      device7->Release();
++   }
++   if (FAILED(hr))
++      viogpu_log("AddToStateObject (%u subobjects): 0x%08lx", args->NumSubobjects, (unsigned long)hr);
++   state_object_finish(so);
++   return hr;
++}
++
++static VOID APIENTRY
++destroy_state_object(D3D12DDI_HDEVICE, D3D12DDI_HSTATEOBJECT_0054 h)
++{
++   viogpu_state_object *so = (viogpu_state_object *)h.pDrvPrivate;
++   if (so->props)
++      so->props->Release();
++   if (so->so)
++      so->so->Release();
++   so->~viogpu_state_object();
++}
++
++static void *APIENTRY
++get_shader_identifier(D3D12DDI_HSTATEOBJECT_0054 h, LPCWSTR name)
++{
++   viogpu_state_object *so = (viogpu_state_object *)h.pDrvPrivate;
++   return so->props ? so->props->GetShaderIdentifier(name) : NULL;
++}
++
++static UINT APIENTRY
++get_shader_stack_size(D3D12DDI_HSTATEOBJECT_0054 h, LPCWSTR name)
++{
++   viogpu_state_object *so = (viogpu_state_object *)h.pDrvPrivate;
++   return so->props ? (UINT)so->props->GetShaderStackSize(name) : 0;
++}
++
++static UINT APIENTRY
++get_pipeline_stack_size(D3D12DDI_HSTATEOBJECT_0054 h)
++{
++   viogpu_state_object *so = (viogpu_state_object *)h.pDrvPrivate;
++   return so->props ? (UINT)so->props->GetPipelineStackSize() : 0;
++}
++
++static VOID APIENTRY
++set_pipeline_stack_size(D3D12DDI_HSTATEOBJECT_0054 h, UINT size)
++{
++   viogpu_state_object *so = (viogpu_state_object *)h.pDrvPrivate;
++   if (so->props)
++      so->props->SetPipelineStackSize(size);
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Acceleration structures */
++
++static_assert(sizeof(D3D12DDI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0054) ==
++              sizeof(D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS), "build inputs");
++static_assert(sizeof(D3D12DDI_RAYTRACING_GEOMETRY_DESC_0054) == sizeof(D3D12_RAYTRACING_GEOMETRY_DESC), "geometry");
++static_assert(offsetof(D3D12DDIARG_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_0054, NumPostbuildInfoDescs) ==
++              sizeof(D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC), "build desc");
++static_assert(sizeof(D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054) ==
++              sizeof(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO), "prebuild info");
++static_assert(sizeof(D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC_0054) ==
++              sizeof(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC), "postbuild info");
++static_assert(sizeof(D3D12DDIARG_DISPATCH_RAYS_0054) == sizeof(D3D12_DISPATCH_RAYS_DESC), "dispatch rays");
++static_assert(sizeof(D3D12DDI_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER_0054) ==
++              sizeof(D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER), "driver matching identifier");
++
++static VOID APIENTRY
++get_prebuild_info(D3D12DDI_HDEVICE hDevice, const D3D12DDI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0054 *inputs,
++                  D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054 *info)
++{
++   memset(info, 0, sizeof(*info));
++   ID3D12Device5 *device5 = NULL;
++   if (FAILED(device_from(hDevice)->vkd3d->QueryInterface(IID_PPV_ARGS(&device5))))
++      return;
++   device5->GetRaytracingAccelerationStructurePrebuildInfo(
++      (const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *)inputs,
++      (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *)info);
++   device5->Release();
++}
++
++static D3D12DDI_DRIVER_MATCHING_IDENTIFIER_STATUS APIENTRY
++check_driver_matching_identifier(D3D12DDI_HDEVICE hDevice, D3D12DDI_SERIALIZED_DATA_TYPE type,
++                                 const D3D12DDI_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER_0054 *id)
++{
++   ID3D12Device5 *device5 = NULL;
++   if (FAILED(device_from(hDevice)->vkd3d->QueryInterface(IID_PPV_ARGS(&device5))))
++      return D3D12DDI_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
++   D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS status = device5->CheckDriverMatchingIdentifier(
++      (D3D12_SERIALIZED_DATA_TYPE)type, (const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *)id);
++   device5->Release();
++   return (D3D12DDI_DRIVER_MATCHING_IDENTIFIER_STATUS)status;
++}
++
++static VOID APIENTRY
++build_acceleration_structure(D3D12DDI_HCOMMANDLIST h, const D3D12DDIARG_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_0054 *a)
++{
++   if (list_from(h)->list4)
++      list_from(h)->list4->BuildRaytracingAccelerationStructure(
++         (const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *)a, a->NumPostbuildInfoDescs,
++         (const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *)a->pPostbuildInfoDescs);
++}
++
++static VOID APIENTRY
++emit_postbuild_info(D3D12DDI_HCOMMANDLIST h,
++                    const D3D12DDIARG_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_0054 *a)
++{
++   if (list_from(h)->list4)
++      list_from(h)->list4->EmitRaytracingAccelerationStructurePostbuildInfo(
++         (const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *)&a->Desc,
++         a->NumSourceAccelerationStructures, a->pSourceAccelerationStructureData);
++}
++
++static VOID APIENTRY
++copy_acceleration_structure(D3D12DDI_HCOMMANDLIST h, const D3D12DDIARG_COPY_RAYTRACING_ACCELERATION_STRUCTURE_0054 *a)
++{
++   if (list_from(h)->list4)
++      list_from(h)->list4->CopyRaytracingAccelerationStructure(
++         a->DestAccelerationStructureData, a->SourceAccelerationStructureData,
++         (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE)a->Mode);
++}
++
++static VOID APIENTRY
++set_pipeline_state1(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HSTATEOBJECT_0054 so)
++{
++   if (list_from(h)->list4)
++      list_from(h)->list4->SetPipelineState1(state_object_of(so));
++}
++
++static VOID APIENTRY
++dispatch_rays(D3D12DDI_HCOMMANDLIST h, const D3D12DDIARG_DISPATCH_RAYS_0054 *a)
++{
++   if (list_from(h)->list4)
++      list_from(h)->list4->DispatchRays((const D3D12_DISPATCH_RAYS_DESC *)a);
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++
++void
++viogpu_fill_raytracing_funcs(viogpu_device_funcs *f)
++{
++   f->pfnCalcPrivateStateObjectSize = calc_state_object_size;
++   f->pfnCreateStateObject = create_state_object;
++   f->pfnDestroyStateObject = destroy_state_object;
++   f->pfnGetRaytracingAccelerationStructurePrebuildInfo = get_prebuild_info;
++   f->pfnCheckDriverMatchingIdentifier = check_driver_matching_identifier;
++   f->pfnGetShaderIdentifier = get_shader_identifier;
++   f->pfnGetShaderStackSize = get_shader_stack_size;
++   f->pfnGetPipelineStackSize = get_pipeline_stack_size;
++   f->pfnSetPipelineStackSize = set_pipeline_stack_size;
++   f->pfnCalcPrivateAddToStateObjectSize = calc_add_to_state_object_size;
++   f->pfnAddToStateObject = add_to_state_object;
++}
++
++void
++viogpu_fill_raytracing_list_funcs(viogpu_command_list_funcs *f)
++{
++   f->pfnBuildRaytracingAccelerationStructure = build_acceleration_structure;
++   f->pfnEmitRaytracingAccelerationStructurePostbuildInfo = emit_postbuild_info;
++   f->pfnCopyRaytracingAccelerationStructure = copy_acceleration_structure;
++   f->pfnSetPipelineState1 = set_pipeline_state1;
++   f->pfnDispatchRays = dispatch_rays;
++}
+diff --git a/libs/viogpu_umd/umd_resource.cpp b/libs/viogpu_umd/umd_resource.cpp
+index f9527cff..1e96174a 100644
+--- a/libs/viogpu_umd/umd_resource.cpp
++++ b/libs/viogpu_umd/umd_resource.cpp
+@@ -83,6 +83,23 @@ resource_desc(const D3D12DDIARG_CREATERESOURCE_0075 *r)
+    return d;
+ }
+ 
++/* Sampler feedback maps also have a mip region: the API's DESC1, through ID3D12Device8 */
++static bool
++feedback_map(DXGI_FORMAT format)
++{
++   return format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE ||
++          format == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE;
++}
++
++static D3D12_RESOURCE_DESC1
++desc1(const D3D12_RESOURCE_DESC &desc, const D3D12_MIP_REGION &region)
++{
++   D3D12_RESOURCE_DESC1 d = {};
++   memcpy(&d, &desc, sizeof(desc));
++   d.SamplerFeedbackMipRegion = region;
++   return d;
++}
++
+ /* A swap chain buffer's kernel allocation: a virgl texture of its size and format, which DWM's driver opens (as it
+  * would one of the D3D10/11 driver's) and the kernel driver uploads before each use (a "GDI surface") */
+ static ULONG
+@@ -182,16 +199,26 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+       res->hRT = hRTResource;
+       desc = resource_desc(resDesc);
+       state = (D3D12_RESOURCE_STATES)resDesc->InitialResourceState;
++      memcpy(&res->mipRegion, &resDesc->SamplerFeedbackMipRegion, sizeof(res->mipRegion));
+       /* clear values only for render targets and depth-stencil buffers */
+       if (!(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+          clearValue = NULL;
+    }
++   ID3D12Device8 *device8 = NULL;
++   if (res && feedback_map(desc.Format))
++      device->vkd3d->QueryInterface(IID_PPV_ARGS(&device8));
+ 
+    if (heapDesc && resDesc) {
+       viogpu_heap *heap = new (hHeap.pDrvPrivate) viogpu_heap();
+       D3D12_HEAP_PROPERTIES props = heap_properties(heapDesc);
+-      hr = device->vkd3d->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, clearValue,
+-                                                   IID_PPV_ARGS(&res->resource));
++      if (device8) {
++         D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
++         hr = device8->CreateCommittedResource2(&props, D3D12_HEAP_FLAG_NONE, &d, state, clearValue, NULL,
++                                                IID_PPV_ARGS(&res->resource));
++      } else {
++         hr = device->vkd3d->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, clearValue,
++                                                      IID_PPV_ARGS(&res->resource));
++      }
+       heap->committed = res->resource;
+       heap->committedResource = res;
+       if (SUCCEEDED(hr) && (heapDesc->Flags & D3D12DDI_HEAP_FLAG_PRIMARY)) {
+@@ -223,12 +250,20 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+       }
+    } else if (resDesc && hHeap.pDrvPrivate) {
+       viogpu_heap *heap = (viogpu_heap *)hHeap.pDrvPrivate;
+-      hr = device->vkd3d->CreatePlacedResource(heap->heap, resDesc->ReuseBufferGPUVA.BaseAddress.UMD.Offset, &desc,
+-                                               state, clearValue, IID_PPV_ARGS(&res->resource));
++      UINT64 offset = resDesc->ReuseBufferGPUVA.BaseAddress.UMD.Offset;
++      if (device8) {
++         D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
++         hr = device8->CreatePlacedResource1(heap->heap, offset, &d, state, clearValue, IID_PPV_ARGS(&res->resource));
++      } else {
++         hr = device->vkd3d->CreatePlacedResource(heap->heap, offset, &desc, state, clearValue,
++                                                  IID_PPV_ARGS(&res->resource));
++      }
+    } else if (resDesc) {
+       hr = device->vkd3d->CreateReservedResource(&desc, state, clearValue, IID_PPV_ARGS(&res->resource));
+    }
+ 
++   if (device8)
++      device8->Release();
+    if (res && res->resource)
+       res->desc = res->resource->GetDesc();
+    if (FAILED(hr))
+@@ -239,6 +274,18 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+    return hr;
+ }
+ 
++static VOID APIENTRY
++create_sampler_feedback_uav(D3D12DDI_HDEVICE hDevice, D3D12DDI_HRESOURCE targeted, D3D12DDI_HRESOURCE feedback,
++                            D3D12DDI_CPU_DESCRIPTOR_HANDLE dest)
++{
++   ID3D12Device8 *device8 = NULL;
++   if (FAILED(device_from(hDevice)->vkd3d->QueryInterface(IID_PPV_ARGS(&device8))))
++      return;
++   device8->CreateSamplerFeedbackUnorderedAccessView(resource_of(targeted), resource_of(feedback),
++                                                      D3D12_CPU_DESCRIPTOR_HANDLE{(SIZE_T)dest.ptr});
++   device8->Release();
++}
++
+ static VOID APIENTRY
+ destroy_heap_and_resource(D3D12DDI_HDEVICE hDevice, D3D12DDI_HHEAP hHeap, D3D12DDI_HRESOURCE hResource)
+ {
+@@ -303,9 +350,17 @@ check_resource_virtual_address(D3D12DDI_HDEVICE, D3D12DDI_HRESOURCE hResource)
+ 
+ static void
+ allocation_info(viogpu_device *device, const D3D12_RESOURCE_DESC &desc, UINT visibleNodeMask,
+-                D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
++                D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info, const D3D12_MIP_REGION *region = NULL)
+ {
+-   D3D12_RESOURCE_ALLOCATION_INFO a = device->vkd3d->GetResourceAllocationInfo(visibleNodeMask, 1, &desc);
++   D3D12_RESOURCE_ALLOCATION_INFO a;
++   ID3D12Device8 *device8 = NULL;
++   if (feedback_map(desc.Format) && region && SUCCEEDED(device->vkd3d->QueryInterface(IID_PPV_ARGS(&device8)))) {
++      D3D12_RESOURCE_DESC1 d = desc1(desc, *region);
++      a = device8->GetResourceAllocationInfo2(visibleNodeMask, 1, &d, NULL);
++      device8->Release();
++   } else {
++      a = device->vkd3d->GetResourceAllocationInfo(visibleNodeMask, 1, &desc);
++   }
+    memset(info, 0, sizeof(*info));
+    info->ResourceDataSize = a.SizeInBytes;
+    info->ResourceDataAlignment = (UINT32)a.Alignment;
+@@ -322,7 +377,8 @@ check_resource_allocation_info(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREAT
+ {
+    D3D12_RESOURCE_DESC desc = resource_desc(resDesc);
+    desc.Alignment = alignmentRestriction;
+-   allocation_info(device_from(hDevice), desc, visibleNodeMask, info);
++   allocation_info(device_from(hDevice), desc, visibleNodeMask, info,
++                   (const D3D12_MIP_REGION *)&resDesc->SamplerFeedbackMipRegion);
+ }
+ 
+ static VOID APIENTRY
+@@ -330,7 +386,7 @@ check_existing_resource_allocation_info(D3D12DDI_HDEVICE hDevice, D3D12DDI_HRESO
+                                         D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
+ {
+    viogpu_resource *res = (viogpu_resource *)hResource.pDrvPrivate;
+-   allocation_info(device_from(hDevice), res->desc, 0, info);
++   allocation_info(device_from(hDevice), res->desc, 0, info, &res->mipRegion);
+ }
+ 
+ /* Where a subresource is in the mapped heap memory (Map, WriteToSubresource): a buffer is its own bytes, a texture
+@@ -978,6 +1034,7 @@ viogpu_fill_resource_funcs(viogpu_device_funcs *f)
+    f->pfnGetCPUDescriptorHandleForHeapStart = get_cpu_heap_start;
+    f->pfnGetGPUDescriptorHandleForHeapStart = get_gpu_heap_start;
+    f->pfnCreateShaderResourceView = create_srv;
++   f->pfnCreateSamplerFeedbackUnorderedAccessView = create_sampler_feedback_uav;
+    f->pfnCreateConstantBufferView = create_cbv;
+    f->pfnCreateSampler = create_sampler;
+    f->pfnCreateUnorderedAccessView = create_uav;
+diff --git a/libs/viogpu_umd/umd_state.cpp b/libs/viogpu_umd/umd_state.cpp
+index 9026e6cb..26f2a2d2 100644
+--- a/libs/viogpu_umd/umd_state.cpp
++++ b/libs/viogpu_umd/umd_state.cpp
+@@ -17,7 +17,7 @@
+ /* ---------------------------------------------------------------------------------------------------------------- */
+ /* DXBC containers */
+ 
+-enum viogpu_stage { STAGE_VS, STAGE_PS, STAGE_GS, STAGE_HS, STAGE_DS, STAGE_CS };
++enum viogpu_stage { STAGE_VS, STAGE_PS, STAGE_GS, STAGE_HS, STAGE_DS, STAGE_CS, STAGE_MS, STAGE_AS };
+ 
+ struct viogpu_sig_entry {
+    D3D12DDIARG_SIGNATURE_ENTRY_0012 e;
+@@ -135,9 +135,9 @@ entry_semantic(const D3D12DDIARG_SIGNATURE_ENTRY_0012 &e, viogpu_stage stage, bo
+  * the minimum precision at the end) */
+ static std::vector<BYTE>
+ signature_chunk(const D3D12DDIARG_SIGNATURE_ENTRY_0012 *entries, UINT count, viogpu_stage stage, bool input,
+-                bool patchConstant, const char **tag)
++                bool patchConstant, const char **tag, bool v1 = false)
+ {
+-   bool minPrecision = false, streams = false;
++   bool minPrecision = v1, streams = false;
+    for (UINT i = 0; i < count; i++) {
+       minPrecision |= entries[i].MinPrecision != D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT;
+       streams |= entries[i].Stream != 0;
+@@ -241,6 +241,20 @@ shader_build(viogpu_shader *shader, viogpu_stage stage, const D3D12DDIARG_CREATE
+                                                    stage == STAGE_DS, true, &tag);
+          chunks.push_back({tag, patch});
+       }
++   } else if (stage == STAGE_MS) {
++      /* a mesh shader's outputs: the vertices' (OSG1) and the primitives' (PSG1) */
++      const D3D12DDIARG_MESH_IO_SIGNATURES *sig = args->IOSignatures.Mesh;
++      if (sig) {
++         std::vector<BYTE> out = signature_chunk(sig->pVertexOutputSignature, sig->NumVertexOutputSignatureEntries,
++                                                 stage, false, false, &tag, true);
++         chunks.push_back({tag, out});
++         std::vector<BYTE> prim = signature_chunk(sig->pPrimitiveOutputSignature,
++                                                  sig->NumPrimitiveOutputSignatureEntries, stage, false, true, &tag,
++                                                  true);
++         chunks.push_back({tag, prim});
++      }
++   } else if (stage == STAGE_AS) {
++      /* an amplification shader has no signatures (its payload is the mesh shader's business) */
+    } else {
+       const D3D12DDIARG_STAGE_IO_SIGNATURES *sig = args->IOSignatures.Standard;
+       if (sig) {
+@@ -289,6 +303,8 @@ CREATE_SHADER(create_geometry_shader, STAGE_GS)
+ CREATE_SHADER(create_compute_shader, STAGE_CS)
+ CREATE_SHADER(create_hull_shader, STAGE_HS)
+ CREATE_SHADER(create_domain_shader, STAGE_DS)
++CREATE_SHADER(create_mesh_shader, STAGE_MS)
++CREATE_SHADER(create_amplification_shader, STAGE_AS)
+ 
+ /* Stream output: entries name output registers; the same names as the output signature's */
+ static VOID APIENTRY
+@@ -525,6 +541,63 @@ bytecode(D3D12DDI_HSHADER h)
+    return b;
+ }
+ 
++/* A pipeline state stream subobject, aligned as the runtime's are */
++template <typename T>
++static void
++stream_add(std::vector<BYTE> &stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const T &value)
++{
++   struct alignas(void *) subobject {
++      D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
++      T value;
++   } s = {type, value};
++   size_t at = (stream.size() + alignof(void *) - 1) & ~(alignof(void *) - 1);
++   stream.resize(at + sizeof(s));
++   memcpy(&stream[at], &s, sizeof(s));
++}
++
++static HRESULT
++create_mesh_pipeline_state(viogpu_device *device, const D3D12DDIARG_CREATE_PIPELINE_STATE_0075 *args,
++                           ID3D12PipelineState **out)
++{
++   std::vector<BYTE> s;
++   s.reserve(1024);
++   stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, viogpu_root_signature_of(args->hRootSignature));
++   if (args->hAmplificationShader.pDrvPrivate)
++      stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, bytecode(args->hAmplificationShader));
++   stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, bytecode(args->hMeshShader));
++   if (args->hPixelShader.pDrvPrivate)
++      stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, bytecode(args->hPixelShader));
++   D3D12_BLEND_DESC blend = {};
++   if (args->hBlendState.pDrvPrivate)
++      blend = *(const D3D12_BLEND_DESC *)args->hBlendState.pDrvPrivate;
++   stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend);
++   stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, args->SampleMask);
++   if (args->hRasterizerState.pDrvPrivate)
++      stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
++                 *(const D3D12_RASTERIZER_DESC *)args->hRasterizerState.pDrvPrivate);
++   if (args->hDepthStencilState.pDrvPrivate) {
++      D3D12_DEPTH_STENCIL_DESC ds;
++      memcpy(&ds, args->hDepthStencilState.pDrvPrivate, sizeof(ds));
++      stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, ds);
++   }
++   D3D12_RT_FORMAT_ARRAY rtv = {};
++   rtv.NumRenderTargets = args->NumRenderTargets;
++   memcpy(rtv.RTFormats, args->RTVFormats, sizeof(rtv.RTFormats));
++   stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, rtv);
++   stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, args->DSVFormat);
++   stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, args->SampleDesc);
++   stream_add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, args->NodeMask);
++
++   ID3D12Device2 *device2 = NULL;
++   HRESULT hr = device->vkd3d->QueryInterface(IID_PPV_ARGS(&device2));
++   if (FAILED(hr))
++      return hr;
++   D3D12_PIPELINE_STATE_STREAM_DESC desc = {s.size(), s.data()};
++   hr = device2->CreatePipelineState(&desc, IID_PPV_ARGS(out));
++   device2->Release();
++   return hr;
++}
++
+ static SIZE_T APIENTRY
+ calc_pipeline_state_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_PIPELINE_STATE_0075 *)
+ {
+@@ -546,6 +619,8 @@ create_pipeline_state(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_PIPELIN
+       desc.CS = bytecode(args->hComputeShader);
+       desc.NodeMask = args->NodeMask;
+       hr = device->vkd3d->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso->pso));
++   } else if (args->hMeshShader.pDrvPrivate) {
++      hr = create_mesh_pipeline_state(device, args, &pso->pso);
+    } else {
+       D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+       desc.pRootSignature = viogpu_root_signature_of(args->hRootSignature);
+@@ -587,7 +662,8 @@ create_pipeline_state(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_PIPELIN
+       hr = device->vkd3d->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso->pso));
+    }
+    if (FAILED(hr))
+-      viogpu_log("CreatePipelineState (%s): 0x%08lx", args->hComputeShader.pDrvPrivate ? "compute" : "graphics",
++      viogpu_log("CreatePipelineState (%s): 0x%08lx",
++                 args->hComputeShader.pDrvPrivate ? "compute" : args->hMeshShader.pDrvPrivate ? "mesh" : "graphics",
+                  (unsigned long)hr);
+    return hr;
+ }
+@@ -603,6 +679,15 @@ destroy_pipeline_state(D3D12DDI_HDEVICE, D3D12DDI_HPIPELINESTATE h)
+ 
+ /* ---------------------------------------------------------------------------------------------------------------- */
+ 
++/* the mesh and amplification shader entries (DDI 0074 on: the caller checks the table has them) */
++void
++viogpu_fill_mesh_shader_funcs(viogpu_device_funcs *f)
++{
++   f->pfnCreateMeshShader = create_mesh_shader;
++   f->pfnCreateAmplificationShader = create_amplification_shader;
++   f->pfnCalcPrivateMeshShaderSize = calc_shader_size;
++}
++
+ void
+ viogpu_fill_state_funcs(viogpu_device_funcs *f)
+ {

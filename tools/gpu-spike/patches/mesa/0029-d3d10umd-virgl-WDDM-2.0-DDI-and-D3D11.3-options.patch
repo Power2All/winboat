@@ -1,0 +1,625 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd, virgl: the WDDM 2.0 DDI and Direct3D 11.3's options
+
+The D3D11 runtime reads the 11.3 options only from drivers on the WDDM 2.0 DDI, so the driver offers it last
+(WINBOAT_D3D_WDDM2=0 leaves it out):
+- the 2.0 table is the WDDM 1.3 one with longer arguments in seven places, each the old one with fields after it
+  (views' plane slices: the plane still follows from the format; conservative rasterization: tier 0; a query's
+  context type), Flush with a context type, and SetHardwareProtection(State), GetResourceLayout and
+  RetrieveShaderComment; DXGI 1.4's table (TrimResidencySet, overlay color spaces: none); the 2.0 video table
+  (SubmitDecoderBuffers1, StreamColorSpace1 as the 11.1 color space, format conversion checks, no downsampling,
+  no content protection)
+- caps: GPUVA_CAPS 40 bits (the runtime refuses 0: DXGI_ERROR_DRIVER_INTERNAL_ERROR for every device)
+- typed UAV loads of more formats (D3DWDDM2_0DDI_FORMAT_SUPPORT_UAV_READS where UAV writes are: the shader
+  variants already declare the bound view's format)
+- SV_RenderTargetArrayIndex/SV_ViewportArrayIndex from vertex and domain shaders (OPTIONS3), with the host's
+  VS_VERTEX_LAYER, VS_VIEWPORT_INDEX and WinBoat's TES_LAYER_VIEWPORT (virglrenderer 0016)
+- oStencilRef (SV_StencilRef) when the host GL has ARB_shader_stencil_export (NVIDIA's has not: off there),
+  written through a temporary and a MOV (virglrenderer converts integer instructions' results for integer
+  outputs as floats)
+- Map on default textures, which the runtime offers on this DDI: GetResourceLayout reports the texture row-major
+  at the offsets and pitches of the virgl guest storage (virgl_resource_get_param STRIDE/OFFSET/LAYER_STRIDE) and
+  its allocation; WriteToSubresource/ReadFromSubresource then go through the ordinary Map
+diff --git a/src/gallium/drivers/virgl/virgl_resource.c b/src/gallium/drivers/virgl/virgl_resource.c
+index c691c5a..8e211cb 100644
+--- a/src/gallium/drivers/virgl/virgl_resource.c
++++ b/src/gallium/drivers/virgl/virgl_resource.c
+@@ -838,6 +838,17 @@ virgl_resource_get_param(struct pipe_screen *screen,
+    case PIPE_RESOURCE_PARAM_MODIFIER:
+       *value = res->metadata.modifier;
+       return true;
++   /* the guest storage's layout (WDDM 2.0's resource layouts: D3D11 maps on default textures) */
++   case PIPE_RESOURCE_PARAM_STRIDE:
++      *value = res->metadata.stride[level];
++      return true;
++   case PIPE_RESOURCE_PARAM_OFFSET:
++      *value = res->metadata.plane_offset + res->metadata.level_offset[level] +
++               (uint64_t)layer * res->metadata.layer_stride[level];
++      return true;
++   case PIPE_RESOURCE_PARAM_LAYER_STRIDE:
++      *value = res->metadata.layer_stride[level];
++      return true;
+    default:
+       return false;
+    }
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index ad83e14..8adc008 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -157,6 +157,8 @@ SupportedDDIInterfaceVersions[] = {
+    D3D11_1_DDI_SUPPORTED,
+    /* And the WDDM 1.3 DDI: composition buffers in more formats (A8 masks) */
+    D3DWDDM1_3_DDI_SUPPORTED,
++   /* And WDDM 2.0's: the runtime reads the 11.3 options from no earlier one. Last: WINBOAT_D3D_WDDM2=0 leaves it out */
++   D3DWDDM2_0_DDI_SUPPORTED,
+ };
+ 
+ 
+@@ -178,17 +180,20 @@ GetSupportedVersions(D3D10DDI_HADAPTER hAdapter,
+ {
+    LOG_ENTRYPOINT();
+ 
+-   if (pSupportedDDIInterfaceVersions &&
+-       *puEntries < ARRAYSIZE(SupportedDDIInterfaceVersions)) {
++   char env[4] = "";
++   UINT count = ARRAYSIZE(SupportedDDIInterfaceVersions);
++   if (GetEnvironmentVariableA("WINBOAT_D3D_WDDM2", env, sizeof env) && env[0] == '0') {
++      count--;
++   }
++
++   if (pSupportedDDIInterfaceVersions && *puEntries < count) {
+       return E_OUTOFMEMORY;
+    }
+ 
+-   *puEntries = ARRAYSIZE(SupportedDDIInterfaceVersions);
++   *puEntries = count;
+ 
+    if (pSupportedDDIInterfaceVersions) {
+-      memcpy(pSupportedDDIInterfaceVersions,
+-             SupportedDDIInterfaceVersions,
+-             sizeof SupportedDDIInterfaceVersions);
++      memcpy(pSupportedDDIInterfaceVersions, SupportedDDIInterfaceVersions, count * sizeof SupportedDDIInterfaceVersions[0]);
+    }
+ 
+    return S_OK;
+@@ -358,7 +363,11 @@ GetCaps(D3D10DDI_HADAPTER hAdapter,
+       if (pData->DataSize >= sizeof(D3D11DDI_SHADER_CAPS) && HostSupportsFL11()) {
+          static_cast<D3D11DDI_SHADER_CAPS *>(pData->pData)->Caps =
+             D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X |
+-            (HostSupportsDoubles() ? D3D11DDICAPS_SHADER_DOUBLES : 0);
++            (HostSupportsDoubles() ? D3D11DDICAPS_SHADER_DOUBLES : 0) |
++            /* 11.3: oStencilRef (GL_ARB_shader_stencil_export); typed UAV loads beyond R32 (GLSL image loads take
++             * any image format: shader variants declare the bound view's) */
++            (host_caps.v1.bset.shader_stencil_export ? D3D11DDICAPS_SHADER_SPECIFIED_STENCIL_REF : 0) |
++            D3D11DDICAPS_SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS;
+       }
+       break;
+    case D3D11DDICAPS_3DPIPELINESUPPORT:
+@@ -378,6 +387,24 @@ GetCaps(D3D10DDI_HADAPTER hAdapter,
+          static_cast<D3D11_1DDI_D3D11_OPTIONS_DATA *>(pData->pData)->OutputMergerLogicOp = TRUE;
+       }
+       break;
++   case D3DWDDM2_0DDICAPS_GPUVA_CAPS:
++      /* WDDM 2.0's runtime refuses 0 (D3D11_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT reports it); D3D12 on vkd3d-proton
++       * reports 40 */
++      if (pData->DataSize >= sizeof(D3DWDDM2_0DDI_GPUVA_CAPS_DATA)) {
++         static_cast<D3DWDDM2_0DDI_GPUVA_CAPS_DATA *>(pData->pData)->MaxGPUVirtualAddressBitsPerResource = 40;
++      }
++      break;
++   case D3DWDDM2_0DDICAPS_D3D11_OPTIONS3: {
++      /* 11.3: SV_RenderTargetArrayIndex/SV_ViewportArrayIndex from vertex and domain shaders too (GL_AMD_vertex_shader_layer
++       * and _viewport_index; the domain shader's through WinBoat's virglrenderer patch, GL_ARB_shader_viewport_layer_array) */
++      const unsigned layer_bits = VIRGL_CAP_V2_VS_VERTEX_LAYER | VIRGL_CAP_V2_VS_VIEWPORT_INDEX |
++                                  VIRGL_CAP_V2_TES_LAYER_VIEWPORT;
++      if (pData->DataSize >= sizeof(D3DWDDM2_0DDI_D3D11_OPTIONS3_DATA) && HostSupportsFL11() &&
++          (host_caps.v2.capability_bits_v2 & layer_bits) == layer_bits) {
++         static_cast<D3DWDDM2_0DDI_D3D11_OPTIONS3_DATA *>(pData->pData)->VPAndRTArrayIndexFromAnyShaderFeedingRasterizer = TRUE;
++      }
++      break;
++   }
+    default:
+       /* No threading caps (the runtime emulates deferred contexts), no debug binaries */
+       break;
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+index 8a3cd3c..50e757b 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -28,6 +28,7 @@
+ #include "Rasterizer.h"
+ #include "Shader.h"
+ #include "State.h"
++#include "frontend/winsys_handle.h"
+ #include "Video.h"
+ 
+ #include "util/format/u_format.h"
+@@ -578,8 +579,8 @@ RetrieveSubObject11_1(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T Param
+                       SIZE_T OutputParamSize, void *pOutputParamsBuffer)
+ {
+    /* Video decoding and processing (Video.cpp) */
+-   if (SubDeviceID == D3D11_1DDI_VIDEO_FUNCTIONS) {
+-      return VideoRetrieveFunctions(hDevice, pParams, ParamSize);
++   if (SubDeviceID == D3D11_1DDI_VIDEO_FUNCTIONS || SubDeviceID == D3DWDDM2_0DDI_VIDEO_FUNCTIONS) {
++      return VideoRetrieveFunctions(hDevice, pParams, ParamSize, SubDeviceID == D3DWDDM2_0DDI_VIDEO_FUNCTIONS);
+    }
+    return E_NOTIMPL;
+ }
+@@ -606,7 +607,8 @@ CheckFormatSupport11_1(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pForm
+       *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_BUFFER;
+    }
+    if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_SHADER_IMAGE)) {
+-      *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_UAV_WRITES;
++      /* typed loads too: shader variants declare the bound view's format */
++      *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_UAV_WRITES | D3DWDDM2_0DDI_FORMAT_SUPPORT_UAV_READS;
+    }
+    if ((*pFormatCaps & D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE) &&
+        screen->get_param(screen, PIPE_CAP_MAX_TEXTURE_GATHER_COMPONENTS)) {
+@@ -823,6 +825,149 @@ FillDeviceFuncsWDDM1_3(D3DWDDM1_3DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEF
+ }
+ 
+ 
++/*
++ * WDDM 2.0, the DDI the 11.3 options come with (the runtime reads them from no earlier one): its table is the WDDM 1.3
++ * one with longer arguments in seven places, each the 1.3 argument with fields after it (plane slices of views,
++ * conservative rasterization, a query's context type), and four more entries
++ */
++static BOOL APIENTRY
++FlushWDDM2_0(D3D10DDI_HDEVICE hDevice, UINT ContextType, UINT FlushFlags)
++{
++   return Flush1(hDevice, FlushFlags);
++}
++
++static void APIENTRY
++RelocateDeviceFuncsWDDM2_0(D3D10DDI_HDEVICE hDevice, struct D3DWDDM2_0DDI_DEVICEFUNCS *pDeviceFunctions)
++{
++}
++
++/* Views: the plane slice of a 2D view follows from its format (the video formats' planes: Video.cpp), as before */
++static SIZE_T APIENTRY
++CalcPrivateShaderResourceViewSizeWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIARG_CREATESHADERRESOURCEVIEW *pView)
++{
++   return CalcPrivateShaderResourceViewSize11(hDevice, reinterpret_cast<const D3D11DDIARG_CREATESHADERRESOURCEVIEW *>(pView));
++}
++
++static void APIENTRY
++CreateShaderResourceViewWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIARG_CREATESHADERRESOURCEVIEW *pView,
++                                D3D10DDI_HSHADERRESOURCEVIEW hView, D3D10DDI_HRTSHADERRESOURCEVIEW hRTView)
++{
++   CreateShaderResourceView11(hDevice, reinterpret_cast<const D3D11DDIARG_CREATESHADERRESOURCEVIEW *>(pView), hView,
++                              hRTView);
++}
++
++static SIZE_T APIENTRY
++CalcPrivateRenderTargetViewSizeWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIARG_CREATERENDERTARGETVIEW *pView)
++{
++   return funcs10.pfnCalcPrivateRenderTargetViewSize(hDevice, reinterpret_cast<const D3D10DDIARG_CREATERENDERTARGETVIEW *>(pView));
++}
++
++static void APIENTRY
++CreateRenderTargetViewWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIARG_CREATERENDERTARGETVIEW *pView,
++                              D3D10DDI_HRENDERTARGETVIEW hView, D3D10DDI_HRTRENDERTARGETVIEW hRTView)
++{
++   funcs10.pfnCreateRenderTargetView(hDevice, reinterpret_cast<const D3D10DDIARG_CREATERENDERTARGETVIEW *>(pView), hView,
++                                     hRTView);
++}
++
++static SIZE_T APIENTRY
++CalcPrivateUnorderedAccessViewSizeWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIARG_CREATEUNORDEREDACCESSVIEW *pView)
++{
++   return CalcPrivateUnorderedAccessViewSize(hDevice, reinterpret_cast<const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *>(pView));
++}
++
++static void APIENTRY
++CreateUnorderedAccessViewWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIARG_CREATEUNORDEREDACCESSVIEW *pView,
++                                 D3D11DDI_HUNORDEREDACCESSVIEW hView, D3D11DDI_HRTUNORDEREDACCESSVIEW hRTView)
++{
++   CreateUnorderedAccessView(hDevice, reinterpret_cast<const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *>(pView), hView,
++                             hRTView);
++}
++
++/* Rasterizer states: no conservative rasterization (tier 0) */
++static SIZE_T APIENTRY
++CalcPrivateRasterizerStateSizeWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDI_RASTERIZER_DESC *pDesc)
++{
++   return CalcPrivateRasterizerStateSize11_1(hDevice, reinterpret_cast<const D3D11_1_DDI_RASTERIZER_DESC *>(pDesc));
++}
++
++static void APIENTRY
++CreateRasterizerStateWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDI_RASTERIZER_DESC *pDesc,
++                             D3D10DDI_HRASTERIZERSTATE hState, D3D10DDI_HRTRASTERIZERSTATE hRTState)
++{
++   CreateRasterizerState11_1(hDevice, reinterpret_cast<const D3D11_1_DDI_RASTERIZER_DESC *>(pDesc), hState, hRTState);
++}
++
++/* Queries: the context type (3D, compute, copy, video) changes nothing here */
++static SIZE_T APIENTRY
++CalcPrivateQuerySizeWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIARG_CREATEQUERY *pCreateQuery)
++{
++   return funcs10.pfnCalcPrivateQuerySize(hDevice, reinterpret_cast<const D3D10DDIARG_CREATEQUERY *>(pCreateQuery));
++}
++
++static void APIENTRY
++CreateQueryWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIARG_CREATEQUERY *pCreateQuery, D3D10DDI_HQUERY hQuery,
++                   D3D10DDI_HRTQUERY hRTQuery)
++{
++   funcs10.pfnCreateQuery(hDevice, reinterpret_cast<const D3D10DDIARG_CREATEQUERY *>(pCreateQuery), hQuery, hRTQuery);
++}
++
++/* Map on default textures (11.3: the runtime offers it on this DDI): the runtime writes and reads the texture's
++ * allocation itself (WriteToSubresource, ReadFromSubresource), at the offsets and pitches of the guest storage
++ * virgl transfers to and from the host, row by row */
++static void APIENTRY
++GetResourceLayoutWDDM2_0(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource, UINT SubresourceCount,
++                         D3DKMT_HANDLE *phAllocation, D3DWDDM2_0DDI_TEXTURE_LAYOUT *pLayout,
++                         UINT *pMipLevelSwizzleTransition, D3DWDDM2_0DDI_SUBRESOURCE_LAYOUT *pSubresourceLayouts)
++{
++   struct pipe_screen *screen = CastDevice(hDevice)->screen;
++   struct pipe_resource *res = CastResource(hResource)->resource;
++   struct winsys_handle handle = {};
++   handle.type = WINSYS_HANDLE_TYPE_D3DKMT_ALLOC;
++   *phAllocation = screen->resource_get_handle(screen, NULL, res, &handle, 0) ? (D3DKMT_HANDLE)(uintptr_t)handle.handle : 0;
++   *pLayout = D3DWDDM2_0DDI_TL_ROW_MAJOR;
++   *pMipLevelSwizzleTransition = 0;
++   unsigned mips = res->last_level + 1;
++   for (UINT i = 0; pSubresourceLayouts && i < SubresourceCount; i++) {
++      D3DWDDM2_0DDI_SUBRESOURCE_LAYOUT &l = pSubresourceLayouts[i];
++      uint64_t offset = 0, stride = 0, layer_stride = 0;
++      screen->resource_get_param(screen, NULL, res, 0, i / mips, i % mips, PIPE_RESOURCE_PARAM_OFFSET, 0, &offset);
++      screen->resource_get_param(screen, NULL, res, 0, i / mips, i % mips, PIPE_RESOURCE_PARAM_STRIDE, 0, &stride);
++      screen->resource_get_param(screen, NULL, res, 0, i / mips, i % mips, PIPE_RESOURCE_PARAM_LAYER_STRIDE, 0,
++                                 &layer_stride);
++      memset(&l, 0, sizeof l);
++      l.BaseOffset = offset;
++      l.RowPitch = stride;
++      l.DepthPitch = layer_stride;
++   }
++}
++
++void
++FillDeviceFuncsWDDM2_0(D3DWDDM2_0DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10)
++{
++   static_assert(offsetof(D3DWDDM2_0DDI_DEVICEFUNCS, pfnSetHardwareProtection) == sizeof(D3DWDDM1_3DDI_DEVICEFUNCS),
++                 "the WDDM 2.0 table begins with the 1.3 one");
++   FillDeviceFuncsWDDM1_3(reinterpret_cast<D3DWDDM1_3DDI_DEVICEFUNCS *>(pFuncs), pFuncs10);
++   pFuncs->pfnFlush = FlushWDDM2_0;
++   pFuncs->pfnRelocateDeviceFuncs = RelocateDeviceFuncsWDDM2_0;
++   pFuncs->pfnCalcPrivateShaderResourceViewSize = CalcPrivateShaderResourceViewSizeWDDM2_0;
++   pFuncs->pfnCreateShaderResourceView = CreateShaderResourceViewWDDM2_0;
++   pFuncs->pfnCalcPrivateRenderTargetViewSize = CalcPrivateRenderTargetViewSizeWDDM2_0;
++   pFuncs->pfnCreateRenderTargetView = CreateRenderTargetViewWDDM2_0;
++   pFuncs->pfnCalcPrivateRasterizerStateSize = CalcPrivateRasterizerStateSizeWDDM2_0;
++   pFuncs->pfnCreateRasterizerState = CreateRasterizerStateWDDM2_0;
++   pFuncs->pfnCalcPrivateQuerySize = CalcPrivateQuerySizeWDDM2_0;
++   pFuncs->pfnCreateQuery = CreateQueryWDDM2_0;
++   pFuncs->pfnCalcPrivateUnorderedAccessViewSize = CalcPrivateUnorderedAccessViewSizeWDDM2_0;
++   pFuncs->pfnCreateUnorderedAccessView = CreateUnorderedAccessViewWDDM2_0;
++   /* no hardware content protection, standard swizzle or shader comments */
++   STUB(pfnSetHardwareProtection);
++   pFuncs->pfnGetResourceLayout = GetResourceLayoutWDDM2_0;
++   STUB(pfnRetrieveShaderComment);
++   STUB(pfnSetHardwareProtectionState);
++}
++
++
+ /* DXGI 1.2: blits with rectangles (DxgiFns.cpp), offering memory back (nothing to give) */
+ static HRESULT APIENTRY
+ OfferResources(DXGI_DDI_ARG_OFFERRESOURCES *pOffer)
+@@ -909,3 +1054,25 @@ FillDXGIFuncs1_3(DXGI1_3_DDI_BASE_FUNCTIONS *pFuncs)
+    pFuncs->pfnPresent1 = Present1;
+    pFuncs->pfnCheckPresentDurationSupport = CheckPresentDurationSupport;
+ }
++
++/* DXGI 1.4 (with WDDM 2.0): residency trimming (these drivers keep what they made resident), no overlay planes */
++static HRESULT APIENTRY
++TrimResidencySet(DXGI_DDI_ARG_TRIMRESIDENCYSET *pTrim)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++CheckMultiplaneOverlayColorSpaceSupport(DXGI_DDI_ARG_CHECKMULTIPLANEOVERLAYCOLORSPACESUPPORT *pCheck)
++{
++   pCheck->Supported = FALSE;
++   return S_OK;
++}
++
++void
++FillDXGIFuncs1_4(DXGI1_4_DDI_BASE_FUNCTIONS *pFuncs)
++{
++   FillDXGIFuncs1_3(reinterpret_cast<DXGI1_3_DDI_BASE_FUNCTIONS *>(pFuncs));
++   pFuncs->pfnTrimResidencySet = TrimResidencySet;
++   pFuncs->pfnCheckMultiplaneOverlayColorSpaceSupport = CheckMultiplaneOverlayColorSpaceSupport;
++}
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.h b/src/gallium/frontends/d3d10umd/D3D11_1.h
+index ed3fafd..8914889 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.h
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.h
+@@ -16,6 +16,8 @@ void FillDeviceFuncsWDDM1_3(D3DWDDM1_3DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DE
+ /* The DXGI 1.2 and 1.3 entry points the 1.0 table doesn't have */
+ void FillDXGIFuncs1_2(DXGI1_2_DDI_BASE_FUNCTIONS *pFuncs);
+ void FillDXGIFuncs1_3(DXGI1_3_DDI_BASE_FUNCTIONS *pFuncs);
++void FillDeviceFuncsWDDM2_0(D3DWDDM2_0DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
++void FillDXGIFuncs1_4(DXGI1_4_DDI_BASE_FUNCTIONS *pFuncs);
+ 
+ HRESULT APIENTRY RetrieveSubObject11_1(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T ParamSize,
+                                        void *pParams, SIZE_T OutputParamSize, void *pOutputParamsBuffer);
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index 95b8e5e..a60a285 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -128,6 +128,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+ #endif
+    case D3D11_1_DDI_INTERFACE_VERSION:
+    case D3DWDDM1_3_DDI_INTERFACE_VERSION:
++   case D3DWDDM2_0_DDI_INTERFACE_VERSION:
+       break;
+    default:
+       DebugPrintf("%s: unsupported interface version 0x%08x\n",
+@@ -185,8 +186,9 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    /*
+     * Fill in the D3D10 DDI functions (for the 11.1 DDI a copy, which D3D11_1.cpp builds its table from)
+     */
++   const bool isWDDM2_0 = pCreateData->Interface == D3DWDDM2_0_DDI_INTERFACE_VERSION;
+    const bool isWDDM1_3 = pCreateData->Interface == D3DWDDM1_3_DDI_INTERFACE_VERSION;
+-   const bool is11_1 = pCreateData->Interface == D3D11_1_DDI_INTERFACE_VERSION || isWDDM1_3;
++   const bool is11_1 = pCreateData->Interface == D3D11_1_DDI_INTERFACE_VERSION || isWDDM1_3 || isWDDM2_0;
+    D3D10DDI_DEVICEFUNCS funcs10 = {};
+    D3D10DDI_DEVICEFUNCS *pDeviceFuncs = is11_1 ? &funcs10 : pCreateData->pDeviceFuncs;
+    pDeviceFuncs->pfnDefaultConstantBufferUpdateSubresourceUP = ResourceUpdateSubResourceUP;
+@@ -302,7 +304,9 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+       p10_1DeviceFuncs->pfnResourceConvert = ResourceCopy;
+       p10_1DeviceFuncs->pfnResourceConvertRegion = ResourceCopyRegion;
+    }
+-   if (isWDDM1_3) {
++   if (isWDDM2_0) {
++      FillDeviceFuncsWDDM2_0(pCreateData->pWDDM2_0DeviceFuncs, &funcs10);
++   } else if (isWDDM1_3) {
+       FillDeviceFuncsWDDM1_3(pCreateData->pWDDM1_3DeviceFuncs, &funcs10);
+    } else if (is11_1) {
+       FillDeviceFuncs11_1(pCreateData->p11_1DeviceFuncs, &funcs10);
+@@ -330,7 +334,9 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+       _RotateResourceIdentities;
+    pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions->pfnBlt =
+       _Blt;
+-   if (isWDDM1_3) {
++   if (isWDDM2_0) {
++      FillDXGIFuncs1_4(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions5);
++   } else if (isWDDM1_3) {
+       /* The WDDM 1.3 DDI comes with DXGI 1.3's table, the 11.1 one with DXGI 1.2's (the 1.0 entries above are
+        * their first ones) */
+       FillDXGIFuncs1_3(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions4);
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.h b/src/gallium/frontends/d3d10umd/ShaderParse.h
+index 123f09f..36639d7 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.h
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.h
+@@ -36,6 +36,9 @@
+ #include "DriverIncludes.h"
+ #include "util/format/u_formats.h"
+ 
++/* 11.3's oStencilRef, newer than the WDK's d3d11TokenizedProgramFormat.hpp (DirectX-Headers name it) */
++#define D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF ((D3D10_SB_OPERAND_TYPE)41)
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index 40f1611..cbf1e06 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -396,6 +396,7 @@ struct Shader_xlate {
+    struct ureg_src gs_instance_id;     /* vGSInstanceID */
+    struct ureg_src coverage;           /* vCoverage */
+    struct ureg_dst output_mask;        /* oMask */
++   struct ureg_dst output_stencil;     /* oStencilRef (11.3) */
+ 
+    uint addr_cur;
+    bool dst_addr;                          /* the next relative operand indexes a temporary destination */
+@@ -1045,6 +1046,10 @@ translate_operand(struct Shader_xlate *sx,
+       reg = ureg_writemask(sx->output_mask, TGSI_WRITEMASK_X);
+       break;
+ 
++   case D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF:
++      reg = sx->output_stencil;
++      break;
++
+    case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT:
+       reg = pc_operand(sx, &operand->index[0]);
+       break;
+@@ -1143,8 +1148,9 @@ translate_dst_operand(struct Shader_xlate *sx,
+       sx->dst_addr = false;
+    }
+ 
+-   /* oDepth and oMask (scalars) often have an empty writemask */
++   /* oDepth, oMask and oStencilRef (scalars) often have an empty writemask */
+    if (operand->base.type != D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH &&
++       operand->base.type != D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF &&
+        operand->base.type != D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL &&
+        operand->base.type != D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL &&
+        operand->base.type != D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK) {
+@@ -4527,6 +4533,10 @@ Shader_tgsi_translate_ex(const unsigned *code,
+                }
+             } else if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK) {
+                sx->output_mask = ureg_DECL_output(ureg, TGSI_SEMANTIC_SAMPLEMASK, 0);
++            } else if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF) {
++               /* TGSI's stencil output is the Y channel (gl_FragStencilRefARB, an integer) */
++               sx->output_stencil = ureg_DECL_output_masked(ureg, TGSI_SEMANTIC_STENCIL, 0, TGSI_WRITEMASK_Y, 0, 1);
++               sx->output_stencil = ureg_writemask(sx->output_stencil, TGSI_WRITEMASK_Y);
+             } else {
+                /* Color outputs. */
+                assert(opcode.dst[0].base.index_dim == 1);
+@@ -4817,12 +4827,25 @@ Shader_tgsi_translate_ex(const unsigned *code,
+                src[0] = ureg_scalar(src[0], TGSI_SWIZZLE_X);
+             }
+ 
++            /* oStencilRef through a temporary and a MOV: virglrenderer converts an integer instruction's result
++             * for the integer output as if it were a float (int(uintBitsToFloat(..))), a MOV's right */
++            struct ureg_dst stencil = ureg_dst_undef();
++            if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF) {
++               stencil = ureg_DECL_temporary(ureg);
++               dst[0] = ureg_writemask(stencil, TGSI_WRITEMASK_X);
++            }
++
+             ureg_insn(ureg,
+                       ox->tgsi_opcode,
+                       dst,
+                       opcode.num_dst,
+                       src,
+                       opcode.num_src, 0);
++
++            if (!ureg_dst_is_undef(stencil)) {
++               ureg_MOV(ureg, sx->output_stencil, ureg_scalar(ureg_src(stencil), TGSI_SWIZZLE_X));
++               ureg_release_temporary(ureg, stencil);
++            }
+          }
+       }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index f35ea15..9279e13 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -1616,12 +1616,91 @@ template <typename R, typename... A> struct VideoStub<R(APIENTRY *)(A...)> {
+    }
+ };
+ 
++/* WDDM 2.0 (the DDI the 11.3 features come with): SubmitDecoderBuffers1 (no encryption: the same buffers) */
++static HRESULT APIENTRY
++VideoDecoderSubmitBuffers1(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder, UINT BufferCount,
++                           const D3DWDDM2_0DDI_VIDEO_DECODER_BUFFER_DESC1 *pBufferDesc)
++{
++   std::vector<D3D11_1DDI_VIDEO_DECODER_BUFFER_DESC> desc(BufferCount);
++   for (UINT i = 0; i < BufferCount; i++) {
++      desc[i].hResource = pBufferDesc[i].hResource;
++      desc[i].BufferType = pBufferDesc[i].BufferType;
++      desc[i].DataOffset = pBufferDesc[i].DataOffset;
++      desc[i].DataSize = pBufferDesc[i].DataSize;
++   }
++   return VideoDecoderSubmitBuffers(hDevice, hDecoder, BufferCount, desc.data());
++}
++
++/* No decoder downsampling */
++static void APIENTRY
++QueryVideoCapabilities(D3D10DDI_HDEVICE hDevice, D3DWDDM2_0DDI_VIDEO_CAPABILITY_QUERY QueryType, UINT DataSize,
++                       void *pData)
++{
++   if (QueryType == D3DWDDM2_0DDI_VIDEO_CAPABILITY_QUERY_DECODER_DOWNSAMPLING &&
++       DataSize >= sizeof(D3DWDDM2_0DDI_VIDEO_CAPABILITY_DECODER_DOWNSAMPLING)) {
++      static_cast<D3DWDDM2_0DDI_VIDEO_CAPABILITY_DECODER_DOWNSAMPLING *>(pData)->Supported = FALSE;
++   } else if (QueryType == D3DWDDM2_0DDI_VIDEO_CAPABILITY_QUERY_DECODER_DOWNSAMPLE_OUTPUT_FORMAT &&
++              DataSize >= sizeof(D3DWDDM2_0DDI_VIDEO_CAPABILITY_DECODER_DOWNSAMPLE_OUTPUT_FORMAT)) {
++      static_cast<D3DWDDM2_0DDI_VIDEO_CAPABILITY_DECODER_DOWNSAMPLE_OUTPUT_FORMAT *>(pData)->Supported = FALSE;
++   }
++}
++
++/* DXGI color spaces (DXGI_COLOR_SPACE_TYPE): HDR ones (PQ, HLG) aren't converted */
++static bool
++HdrColorSpace(D3DDDI_COLOR_SPACE_TYPE c)
++{
++   return c == D3DDDI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || c == D3DDDI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020 ||
++          c == D3DDDI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020 || c == D3DDDI_COLOR_SPACE_YCBCR_STUDIO_G2084_TOPLEFT_P2020 ||
++          c == D3DDDI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020 || c == D3DDDI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020;
++}
++
++static void APIENTRY
++CheckVideoProcessorFormatConversion(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
++                                    D3DWDDM2_0DDI_CHECK_VIDEO_PROCESSOR_FORMAT_CONVERSION *pConversion)
++{
++   UINT in = 0, out = 0;
++   CheckVideoProcessorFormat(hDevice, hEnum, pConversion->InputFormat, &in);
++   CheckVideoProcessorFormat(hDevice, hEnum, pConversion->OutputFormat, &out);
++   pConversion->Supported = (in & D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) &&
++                            (out & D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) &&
++                            !HdrColorSpace(pConversion->InputColorSpace) && !HdrColorSpace(pConversion->OutputColorSpace);
++}
++
++/* SetStreamColorSpace1: the DXGI color space as the 11.1 one (matrix and range); BT.2020 is converted as BT.709
++ * (ponytail: the compositor has no BT.2020 matrix; HDR isn't offered) */
++static void APIENTRY
++VideoProcessorSetStreamColorSpace1(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, UINT Stream,
++                                   D3DDDI_COLOR_SPACE_TYPE ColorSpace)
++{
++   D3D11_1DDI_VIDEO_PROCESSOR_COLOR_SPACE cs = {};
++   cs.YCbCr_Matrix = !(ColorSpace == D3DDDI_COLOR_SPACE_YCBCR_FULL_G22_NONE_P709_X601 ||
++                       ColorSpace == D3DDDI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601 ||
++                       ColorSpace == D3DDDI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601);
++   bool full = ColorSpace == D3DDDI_COLOR_SPACE_YCBCR_FULL_G22_NONE_P709_X601 ||
++               ColorSpace == D3DDDI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601 ||
++               ColorSpace == D3DDDI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 ||
++               ColorSpace == D3DDDI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020 ||
++               ColorSpace == D3DDDI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020;
++   cs.Nominal_Range = full ? 2 : 1;
++   VideoProcessorSetStreamColorSpace(hDevice, hProcessor, Stream, &cs);
++}
++
++static HRESULT APIENTRY
++VideoProcessorGetBehaviorHints(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, UINT OutputWidth,
++                               UINT OutputHeight, DXGI_FORMAT OutputFormat, UINT StreamCount,
++                               const D3DWDDM2_0DDI_VIDEO_PROCESSOR_STREAM_BEHAVIOR_HINT *pStreams, UINT *pBehaviorHints)
++{
++   *pBehaviorHints = 0;
++   return S_OK;
++}
++
+ HRESULT
+-VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize)
++VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize, bool wddm2_0)
+ {
+    if (!pParams || ParamSize < sizeof(D3D11_1DDI_VIDEO_INPUT)) {
+       return E_INVALIDARG;
+    }
++   /* the 2.0 table begins with the 11.1 one */
+    D3D11_1DDI_VIDEODEVICEFUNCS *f = static_cast<D3D11_1DDI_VIDEO_INPUT *>(pParams)->p11VideoDeviceFuncs;
+    if (!f) {
+       return E_INVALIDARG;
+@@ -1712,6 +1791,27 @@ VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize
+    f->pfnCalcPrivateVideoProcessorOutputViewSize = CalcPrivateVideoProcessorOutputViewSize;
+    f->pfnCreateVideoProcessorOutputView = CreateVideoProcessorOutputView;
+    f->pfnDestroyVideoProcessorOutputView = DestroyVideoProcessorOutputView;
++
++   if (wddm2_0) {
++      D3DWDDM2_0DDI_VIDEODEVICEFUNCS *f2 = reinterpret_cast<D3DWDDM2_0DDI_VIDEODEVICEFUNCS *>(f);
++#define STUB_2_0(member) f2->member = VideoStub<decltype(f2->member)>::Call;
++      /* content protection, decoder downsampling, mirroring (not in the processor caps), output color spaces (as
++       * SetOutputColorSpace) and shader usage: none */
++      STUB_2_0(pfnGetDataForNewHardwareKey)
++      STUB_2_0(pfnCheckCryptoSessionStatus)
++      STUB_2_0(pfnGetCryptoSessionPrivateDataSize)
++      STUB_2_0(pfnVideoDecoderEnableDownsampling)
++      STUB_2_0(pfnVideoDecoderUpdateDownsampling)
++      STUB_2_0(pfnVideoProcessorSetStreamMirror)
++      STUB_2_0(pfnVideoProcessorSetOutputColorSpace1)
++      STUB_2_0(pfnVideoProcessorSetOutputShaderUsage)
++#undef STUB_2_0
++      f2->pfnVideoDecoderSubmitBuffers1 = VideoDecoderSubmitBuffers1;
++      f2->pfnQueryVideoCapabilities = QueryVideoCapabilities;
++      f2->pfnCheckVideoProcessorFormatConversion = CheckVideoProcessorFormatConversion;
++      f2->pfnVideoProcessorSetStreamColorSpace1 = VideoProcessorSetStreamColorSpace1;
++      f2->pfnVideoProcessorGetBehaviorHints = VideoProcessorGetBehaviorHints;
++   }
+    return S_OK;
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Video.h b/src/gallium/frontends/d3d10umd/Video.h
+index 15ac28a..5fb4c3c 100644
+--- a/src/gallium/frontends/d3d10umd/Video.h
++++ b/src/gallium/frontends/d3d10umd/Video.h
+@@ -33,6 +33,6 @@ bool VideoFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFor
+ void VideoAddFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps);
+ 
+ /* RetrieveSubObject's video function table (D3D11_1DDI_VIDEO_INPUT) */
+-HRESULT VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize);
++HRESULT VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize, bool wddm2_0);
+ 
+ void VideoDestroyDevice(D3D10DDI_HDEVICE hDevice);
+diff --git a/src/virtio/virtio-gpu/virgl_hw.h b/src/virtio/virtio-gpu/virgl_hw.h
+index 5b27501..e747d71 100644
+--- a/src/virtio/virtio-gpu/virgl_hw.h
++++ b/src/virtio/virtio-gpu/virgl_hw.h
+@@ -590,6 +590,9 @@ enum virgl_formats {
+ #define VIRGL_CAP_V2_RESOURCE_LAYOUT      (1 << 18)
+ /* WinBoat's virglrenderer patches (from the top down, away from upstream's bits) */
+ #define VIRGL_CAP_V2_RASTER_SAMPLES       (1u << 31)
++/* WinBoat: gl_Layer and gl_ViewportIndex written by tessellation evaluation shaders too
++ * (GL_ARB_shader_viewport_layer_array) */
++#define VIRGL_CAP_V2_TES_LAYER_VIEWPORT   (1u << 30)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.

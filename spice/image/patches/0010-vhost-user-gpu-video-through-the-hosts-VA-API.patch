@@ -1,0 +1,40 @@
+vhost-user-gpu: video decoding and encoding through the host's VA-API
+
+virglrenderer decodes (and encodes) video for the guest through VA-API when it
+is built with video support and initialized with VIRGL_RENDERER_USE_VIDEO;
+the guest's virgl driver then finds video capabilities in the capset. Pass
+the flag. Without video in virglrenderer, or without a VA-API driver on the
+host, the guest sees no video capabilities, as before.
+---
+diff --git a/contrib/vhost-user-gpu/virgl.c b/contrib/vhost-user-gpu/virgl.c
+index cd585278e..05b4e4bd0 100644
+--- a/contrib/vhost-user-gpu/virgl.c
++++ b/contrib/vhost-user-gpu/virgl.c
+@@ -901,6 +901,9 @@ vg_virgl_poll(VuDev *dev, int condition, void *data)
+     virgl_renderer_poll();
+ }
+ 
++/* virglrenderer.h has the flag among its unstable APIs */
++#define VG_VIRGL_USE_VIDEO (1 << 11)
++
+ bool
+ vg_virgl_init(VuGpu *g)
+ {
+@@ -914,10 +917,16 @@ vg_virgl_init(VuGpu *g)
+     g->ctx_sources = g_hash_table_new_full(NULL, NULL, NULL,
+                                            (GDestroyNotify)vug_source_destroy);
+ 
+-    /* Venus runs in virglrenderer's render server, a process of its own */
++    /*
++     * Venus runs in virglrenderer's render server, a process of its own.
++     * Video decoding and encoding go through the host's VA-API (virglrenderer
++     * built with -Dvideo=true; without it, or without a VA-API driver, the
++     * guest sees no video capabilities).
++     */
+     ret = virgl_renderer_init(g,
+                               VIRGL_RENDERER_USE_EGL |
+                               VIRGL_RENDERER_THREAD_SYNC |
++                              VG_VIRGL_USE_VIDEO |
+                               (g->venus ? VIRGL_RENDERER_VENUS |
+                                           VIRGL_RENDERER_RENDER_SERVER : 0),
+                               &virgl_cbs);

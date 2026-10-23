@@ -1,0 +1,118 @@
+vc1: the advanced profile's start codes, the picture flags; field pairs (WinBoat)
+
+VC-1 through VA-API decoded the advanced profile wrong on every frame
+(ffmpeg's nvdec, NVDEC directly, bit-exact):
+- VA-API's slices start after their start code, NVDEC wants it (as ffmpeg's
+  nvdec gives it): a frame's (0x0D), a second field's (0x0C) or a slice's
+  (0x0B), put back unless the data starts with one; by the picture's profile
+  (one context decodes every VC-1 profile)
+- the picture's intra/reference flags go into CUVIDVC1PICPARAMS too, and the
+  entry point's pan-scan flag
+Field pairs (any codec): a field pair's second field began while the first
+one's resolve could still be pending; finishing after that, it marked the
+surface resolved and a sync returned the half-decoded frame. BeginPicture now
+waits for a pending resolve (at most a second: a picture begun and never ended
+leaves the surface resolving), and resolves wake every waiter.
+The FATE suite's VC-1 clips (simple/main, advanced progressive and
+interlaced, field pairs) are bit-exact against libavcodec with ffmpeg's VA-API
+decoder (SMM0005's last frames are a damaged packet, NVDEC differs there too);
+the H.264 field/MBAFF conformance clips stay bit-exact.
+postprocflag stays post_processing != 0 (Mesa's VA frontend takes
+post_processing as the sequence's flag; ffmpeg sends the picture's POSTPROC).
+---
+diff --git a/src/direct/direct-export-buf.c b/src/direct/direct-export-buf.c
+index 54ebfd4..44e5cfa 100644
+--- a/src/direct/direct-export-buf.c
++++ b/src/direct/direct-export-buf.c
+@@ -319,7 +319,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
+     //notify anyone waiting for us to be resolved
+     pthread_mutex_lock(&surface->mutex);
+     surface->resolving = 0;
+-    pthread_cond_signal(&surface->cond);
++    pthread_cond_broadcast(&surface->cond);
+     pthread_mutex_unlock(&surface->mutex);
+ 
+     return true;
+diff --git a/src/export-buf.c b/src/export-buf.c
+index c20f060..7bcb32b 100644
+--- a/src/export-buf.c
++++ b/src/export-buf.c
+@@ -506,7 +506,7 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
+     //notify anyone waiting for us to be resolved
+     pthread_mutex_lock(&surface->mutex);
+     surface->resolving = 0;
+-    pthread_cond_signal(&surface->cond);
++    pthread_cond_broadcast(&surface->cond);
+     pthread_mutex_unlock(&surface->mutex);
+ 
+     return true;
+diff --git a/src/vabackend.c b/src/vabackend.c
+index 52a4803..23df469 100644
+--- a/src/vabackend.c
++++ b/src/vabackend.c
+@@ -433,7 +433,7 @@ static void* resolveSurfaces(void *param) {
+         if (surface->decodeFailed || CHECK_CUDA_RESULT(cv->cuvidMapVideoFrame(ctx->decoder, surface->pictureIdx, &deviceMemory, &pitch, &procParams))) {
+             pthread_mutex_lock(&surface->mutex);
+             surface->resolving = 0;
+-            pthread_cond_signal(&surface->cond);
++            pthread_cond_broadcast(&surface->cond);
+             pthread_mutex_unlock(&surface->mutex);
+             continue;
+         }
+@@ -1340,6 +1340,14 @@ static VAStatus nvBeginPicture(
+     //I don't know if we actually need to lock here, nothing should be waiting
+     //until after this function returns...
+     pthread_mutex_lock(&surface->mutex);
++    /* A field pair's second field: the first one's resolve may still be pending, and finishing after this picture
++     * began it marked the surface resolved, so a sync returned the half-decoded frame. Bounded: a picture begun and
++     * never ended leaves the surface resolving (WinBoat) */
++    struct timespec deadline;
++    clock_gettime(CLOCK_REALTIME, &deadline);
++    deadline.tv_sec += 1;
++    while (surface->resolving && pthread_cond_timedwait(&surface->cond, &surface->mutex, &deadline) == 0) {
++    }
+     surface->resolving = 1;
+     pthread_mutex_unlock(&surface->mutex);
+ 
+@@ -1423,6 +1431,7 @@ static VAStatus nvEndPicture(
+     surface->secondField = picParams->second_field;
+     surface->decodeFailed = status != VA_STATUS_SUCCESS;
+ 
++
+     //TODO check we're not overflowing the queue
+     pthread_mutex_lock(&nvCtx->resolveMutex);
+     nvCtx->surfaceQueue[nvCtx->surfaceQueueWriteIdx++] = nvCtx->renderTarget;
+diff --git a/src/vc1.c b/src/vc1.c
+index ddbf76e..90e674f 100644
+--- a/src/vc1.c
++++ b/src/vc1.c
+@@ -39,6 +39,11 @@ static void copyVC1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
+     pps->progressive_fcm = buf->picture_fields.bits.frame_coding_mode == 0;
+     pps->profile = buf->sequence_fields.bits.profile;
+     pps->postprocflag = buf->post_processing != 0;
++    /* the entry point's pan-scan flag and the picture's intra/reference flags in the codec's own structure too, as
++     * ffmpeg's nvdec sets them (WinBoat) */
++    pps->panscan_flag = buf->entrypoint_fields.bits.panscan_flag;
++    pps->intra_pic_flag = picParams->intra_pic_flag;
++    pps->ref_pic_flag = picParams->ref_pic_flag;
+     pps->pulldown = buf->sequence_fields.bits.pulldown;
+     pps->interlace = buf->sequence_fields.bits.interlace;
+     pps->tfcntrflag = buf->sequence_fields.bits.tfcntrflag;
+@@ -79,6 +84,17 @@ static void copyVC1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picP
+         VASliceParameterBufferVC1 *sliceParams = &((VASliceParameterBufferVC1*) ctx->lastSliceParams)[i];
+         uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
+         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
++        /* VA-API's advanced profile slices start after their start code, NVDEC wants it (as ffmpeg's nvdec gives it):
++         * a frame's, a second field's or a slice's. The picture's profile (3: advanced), one context decodes them
++         * all (WinBoat) */
++        const uint8_t *data = PTROFF(buf->ptr, sliceParams->slice_data_offset);
++        if (picParams->CodecSpecific.vc1.profile == 3 &&
++            (sliceParams->slice_data_size < 3 || data[0] || data[1] || data[2] != 1)) {
++            const uint8_t start_code[4] = {0, 0, 1, sliceParams->slice_vertical_position ? 0x0b :
++                                                    picParams->second_field ? 0x0c : 0x0d};
++            appendBuffer(&ctx->bitstreamBuffer, start_code, sizeof(start_code));
++            picParams->nBitstreamDataLen += sizeof(start_code);
++        }
+         appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
+         picParams->nBitstreamDataLen += sliceParams->slice_data_size;
+     }

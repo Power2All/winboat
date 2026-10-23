@@ -1,0 +1,1336 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: tessellation, hull and domain shaders (feature level 11_0, stage 3)
+
+- Hull shaders are TGSI tessellation control shaders: the control point phase runs per invocation (in a run-once
+  loop, ret leaving it), then a barrier and the fork/join phases once, by invocation 0, each in a loop over its
+  instance count. Patch constants (o# in fork/join phases, vpc# in join phases) live in a temporary array and are
+  written at the end: tess factors to GL's outer/inner levels (D3D's names mapped per domain, isolines: density
+  is outer[0], detail outer[1]), the rest as per-patch outputs. Hull shaders without a control point phase pass
+  the control points through (registers from the output signature the runtime passes).
+- Domain shaders are TGSI tessellation evaluation shaders. GL declares the partitioning, winding and point mode
+  there, D3D in the hull shader: domain shaders are translated for the bound hull shader's (a variant per
+  combination). D3D's winding is defined with the domain origin top left, GL's bottom left: cw is ccw.
+- CreateHullShader/CreateDomainShader, Hs/Ds Set*, patch list topologies (set_patch_vertices).
+- Fixes found on the way, also for D3D10 shaders:
+  - virglrenderer ignores relative addressing of immediates (it reads the base one): an immediate constant
+    buffer read with a run-time index (lookup tables) is bound as constant slot 0 (D3D's are 1..14) and read
+    from there. The translator also dropped the immediate offset of such reads.
+  - virglrenderer indexes temporary destinations with ADDR[0] whichever address register is named: indexable
+    temp and patch constant writes use ADDR[0], other operands the other address registers.
+  - a domain shader's ret is a plain return in virglrenderer's GLSL, skipping its epilogue (the y flip for
+    render targets, clip distances): the domain shader runs in a run-once loop, ret and retc leave it.
+---
+diff --git a/src/gallium/frontends/d3d10umd/InputAssembly.cpp b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
+--- a/src/gallium/frontends/d3d10umd/InputAssembly.cpp
++++ b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
+@@ -93,6 +93,14 @@
+       primitive = MESA_PRIM_TRIANGLE_STRIP_ADJACENCY;
+       break;
+    default:
++      if (PrimitiveTopology >= D3D11_DDI_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST &&
++          PrimitiveTopology <= D3D11_DDI_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST) {
++         /* tessellation */
++         primitive = MESA_PRIM_PATCHES;
++         pDevice->patch_vertices = PrimitiveTopology - D3D11_DDI_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + 1;
++         pDevice->pipe->set_patch_vertices(pDevice->pipe, pDevice->patch_vertices);
++         break;
++      }
+       assert(0);
+       primitive = MESA_PRIM_COUNT;
+       break;
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -40,6 +40,7 @@
+ #include "Format.h"
+ 
+ #include "tgsi/tgsi_ureg.h"
++#include "util/u_memory.h"
+ 
+ extern "C" bool use_old_tex_ops;
+ 
+@@ -63,14 +64,42 @@
+  * ----------------------------------------------------------------------
+  */
+ 
+-/* Shaders with typed UAVs keep their bytecode for translations with other image formats */
++static void
++ShaderDeleteState(struct pipe_context *pipe, enum pipe_shader_type type, void *handle)
++{
++   switch (type) {
++   case PIPE_SHADER_FRAGMENT:
++      pipe->delete_fs_state(pipe, handle);
++      break;
++   case PIPE_SHADER_VERTEX:
++      pipe->delete_vs_state(pipe, handle);
++      break;
++   case PIPE_SHADER_GEOMETRY:
++      pipe->delete_gs_state(pipe, handle);
++      break;
++   case PIPE_SHADER_TESS_CTRL:
++      pipe->delete_tcs_state(pipe, handle);
++      break;
++   case PIPE_SHADER_TESS_EVAL:
++      pipe->delete_tes_state(pipe, handle);
++      break;
++   case PIPE_SHADER_COMPUTE:
++      pipe->delete_compute_state(pipe, handle);
++      break;
++   default:
++      assert(0);
++   }
++}
++
++/* Shaders with typed UAVs, and domain shaders, keep their bytecode for other translations (ShaderSelectVariant) */
+ static void
+ ShaderKeepCode(Shader *pShader, const UINT *pCode)
+ {
+    pShader->code = NULL;
+    pShader->num_variants = 0;
++   pShader->bound_tess_key = 0;
+    memset(pShader->bound_formats, 0, sizeof pShader->bound_formats);
+-   if (pShader->bindings.num_images && pCode) {
++   if ((pShader->bindings.num_images || pShader->type == PIPE_SHADER_TESS_EVAL) && pCode) {
+       pShader->code = (UINT *)malloc(pCode[1] * sizeof(UINT));
+       if (pShader->code) {
+          memcpy(pShader->code, pCode, pCode[1] * sizeof(UINT));
+@@ -80,14 +109,18 @@
+ 
+ 
+ /*
+- * Typed UAVs are images with a format in GLSL (virglrenderer declares format-less ones rgba32f), so the shader is
+- * translated again for the formats of the bound views where they differ (a few variants per shader are kept).
++ * Translations for what the shader is bound with, made when it differs from the bound translation's (a few
++ * variants per shader are kept):
++ * - typed UAVs are images with a format in GLSL (virglrenderer declares format-less ones rgba32f): the bound
++ *   views' formats;
++ * - domain shaders: GL declares the partitioning and output primitive there, D3D in the hull shader.
+  */
+ static void
+-ShaderSelectImageVariant(Device *pDevice, enum pipe_shader_type type, Shader *shader)
++ShaderSelectVariant(Device *pDevice, enum pipe_shader_type type, Shader *shader)
+ {
+    struct pipe_context *pipe = pDevice->pipe;
+    enum pipe_format want[SHADER_MAX_IMAGE_SLOTS];
++   unsigned tess_key = 0;
+    unsigned v;
+ 
+    memset(want, 0, sizeof want);
+@@ -95,22 +128,35 @@
+       const UnorderedAccessView *uav = pDevice->uavs[type][shader->bindings.image_uav[k]];
+       want[k] = uav && uav->typed ? uav->image.format : PIPE_FORMAT_NONE;
+    }
+-   if (!memcmp(want, shader->bound_formats, sizeof want)) {
++   if (type == PIPE_SHADER_TESS_EVAL && pDevice->bound_shader[PIPE_SHADER_TESS_CTRL]) {
++      const Shader *hs = pDevice->bound_shader[PIPE_SHADER_TESS_CTRL];
++      tess_key = 1 + hs->bindings.tess_partitioning * 8 + hs->bindings.tess_output_primitive;
++   }
++   if (!memcmp(want, shader->bound_formats, sizeof want) && tess_key == shader->bound_tess_key) {
+       return;
+    }
+    for (v = 0; v < shader->num_variants; v++) {
+-      if (!memcmp(want, shader->variants[v].formats, sizeof want)) {
++      if (!memcmp(want, shader->variants[v].formats, sizeof want) && tess_key == shader->variants[v].tess_key) {
+          break;
+       }
+    }
+    if (v == shader->num_variants) {
+       struct Shader_bindings bindings;
++      struct Shader_translate_options options;
+       unsigned mapping[PIPE_MAX_SHADER_OUTPUTS];
+       const struct tgsi_token *tokens;
+       void *handle = NULL;
+ 
+       memset(&bindings, 0, sizeof bindings);
+-      tokens = Shader_tgsi_translate_images(shader->code, mapping, &bindings, want);
++      memset(&options, 0, sizeof options);
++      options.image_formats = want;
++      if (tess_key) {
++         options.have_tess = true;
++         options.tess_partitioning = (tess_key - 1) / 8;
++         options.tess_output_primitive = (tess_key - 1) % 8;
++      }
++      tokens = Shader_tgsi_translate_ex(shader->code, mapping, &bindings, &options);
++      FREE(bindings.icb);   /* the same as shader->bindings' */
+       if (!tokens) {
+          return;
+       }
+@@ -126,7 +172,8 @@
+          memset(&state, 0, sizeof state);
+          state.type = PIPE_SHADER_IR_TGSI;
+          state.tokens = tokens;
+-         handle = pipe->create_fs_state(pipe, &state);
++         handle = type == PIPE_SHADER_TESS_EVAL ? pipe->create_tes_state(pipe, &state) :
++                                                  pipe->create_fs_state(pipe, &state);
+       }
+       if (!handle) {
+          ureg_free_tokens(tokens);
+@@ -135,25 +182,29 @@
+       if (shader->num_variants == ARRAY_SIZE(shader->variants)) {
+          /* replace the last one */
+          v = shader->num_variants - 1;
+-         if (type == PIPE_SHADER_COMPUTE) {
+-            pipe->delete_compute_state(pipe, shader->variants[v].handle);
+-         } else {
+-            pipe->delete_fs_state(pipe, shader->variants[v].handle);
+-         }
++         ShaderDeleteState(pipe, type, shader->variants[v].handle);
+          ureg_free_tokens(shader->variants[v].tokens);
+       } else {
+          shader->num_variants++;
+       }
+       memcpy(shader->variants[v].formats, want, sizeof want);
++      shader->variants[v].tess_key = tess_key;
+       shader->variants[v].handle = handle;
+       shader->variants[v].tokens = tokens;
+    }
+-   if (type == PIPE_SHADER_COMPUTE) {
++   switch (type) {
++   case PIPE_SHADER_COMPUTE:
+       pipe->bind_compute_state(pipe, shader->variants[v].handle);
+-   } else {
++      break;
++   case PIPE_SHADER_TESS_EVAL:
++      pipe->bind_tes_state(pipe, shader->variants[v].handle);
++      break;
++   default:
+       pipe->bind_fs_state(pipe, shader->variants[v].handle);
++      break;
+    }
+    memcpy(shader->bound_formats, want, sizeof want);
++   shader->bound_tess_key = tess_key;
+ }
+ 
+ 
+@@ -186,9 +237,23 @@
+       pipe->bind_sampler_states(pipe, type, 0, PIPE_MAX_SAMPLERS, samplers);
+    }
+ 
++   /* indexed immediate constant buffers (Shader_bindings.icb): constant slot 0, D3D's are 1..14 */
++   if ((b && b->icb) || pDevice->icb_bound[type]) {
++      struct pipe_constant_buffer cb;
++      memset(&cb, 0, sizeof cb);
++      if (b && b->icb) {
++         cb.user_buffer = b->icb;
++         cb.buffer_size = b->icb_size * 16;
++      }
++      pipe->set_constant_buffer(pipe, type, 0, false, &cb);
++      pDevice->icb_bound[type] = b && b->icb;
++   }
++
+    unsigned num_images = b ? b->num_images : 0, num_buffers = b ? b->num_buffers : 0;
+-   if (num_images && shader->code && (type == PIPE_SHADER_COMPUTE || type == PIPE_SHADER_FRAGMENT)) {
+-      ShaderSelectImageVariant(pDevice, type, shader);
++   if (shader && shader->code &&
++       ((num_images && (type == PIPE_SHADER_COMPUTE || type == PIPE_SHADER_FRAGMENT)) ||
++        type == PIPE_SHADER_TESS_EVAL)) {
++      ShaderSelectVariant(pDevice, type, shader);
+    }
+    if (num_images || pDevice->bound_images[type]) {
+       struct pipe_image_view images[SHADER_MAX_IMAGE_SLOTS];
+@@ -241,6 +306,8 @@
+ ShaderBindTexSlots(Device *pDevice)
+ {
+    ShaderBindStage(pDevice, PIPE_SHADER_VERTEX);
++   ShaderBindStage(pDevice, PIPE_SHADER_TESS_CTRL);
++   ShaderBindStage(pDevice, PIPE_SHADER_TESS_EVAL);
+    ShaderBindStage(pDevice, PIPE_SHADER_GEOMETRY);
+    ShaderBindStage(pDevice, PIPE_SHADER_FRAGMENT);
+ }
+@@ -549,6 +616,12 @@
+       case PIPE_SHADER_COMPUTE:
+          pipe->delete_compute_state(pipe, pShader->handle);
+          break;
++      case PIPE_SHADER_TESS_CTRL:
++         pipe->delete_tcs_state(pipe, pShader->handle);
++         break;
++      case PIPE_SHADER_TESS_EVAL:
++         pipe->delete_tes_state(pipe, pShader->handle);
++         break;
+       default:
+          assert(0);
+       }
+@@ -558,15 +631,12 @@
+       ureg_free_tokens(pShader->state.tokens);
+    }
+    for (unsigned v = 0; v < pShader->num_variants; v++) {
+-      if (pShader->type == PIPE_SHADER_COMPUTE) {
+-         pipe->delete_compute_state(pipe, pShader->variants[v].handle);
+-      } else {
+-         pipe->delete_fs_state(pipe, pShader->variants[v].handle);
+-      }
++      ShaderDeleteState(pipe, (enum pipe_shader_type)pShader->type, pShader->variants[v].handle);
+       ureg_free_tokens(pShader->variants[v].tokens);
+    }
+    pShader->num_variants = 0;
+    free(pShader->code);
++   FREE(pShader->bindings.icb);
+    pShader->code = NULL;
+ }
+ 
+@@ -1754,3 +1824,122 @@
+ {
+    SetSamplers(PIPE_SHADER_COMPUTE, hDevice, Offset, NumSamplers, phSamplers);
+ }
++
++
++/*
++ * ----------------------------------------------------------------------
++ *
++ * Hull and domain shaders (feature level 11) --
++ *
++ * ----------------------------------------------------------------------
++ */
++
++SIZE_T APIENTRY
++CalcPrivateTessellationShaderSize(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode,
++                                  const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures)
++{
++   return sizeof(Shader);
++}
++
++static void
++CreateTessellationShader(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                         const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures, enum pipe_shader_type type)
++{
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   Shader *pShader = CastShader(hShader);
++   struct Shader_translate_options options;
++
++   pShader->type = type;
++   pShader->output_resolved = true;
++   memset(&pShader->state, 0, sizeof pShader->state);
++   memset(&pShader->bindings, 0, sizeof pShader->bindings);
++   memset(&options, 0, sizeof options);
++   if (type == PIPE_SHADER_TESS_CTRL && pSignatures && pSignatures->pOutputSignatureDeprecated) {
++      /* hull shaders without a control point phase pass the control points through: these registers */
++      for (UINT i = 0; i < pSignatures->NumOutputSignatureEntries &&
++                       options.num_passthrough < ARRAY_SIZE(options.passthrough); i++) {
++         const D3D11_1DDIARG_SIGNATURE_ENTRY *e = &pSignatures->pOutputSignatureDeprecated[i];
++         options.passthrough[options.num_passthrough].reg = e->Register;
++         options.passthrough[options.num_passthrough].mask = e->Mask;
++         options.passthrough[options.num_passthrough].position = e->SystemValue == D3D10_SB_NAME_POSITION;
++         options.num_passthrough++;
++      }
++   }
++   pShader->state.tokens = Shader_tgsi_translate_ex(pShaderCode, pShader->output_mapping, &pShader->bindings,
++                                                    &options);
++   pShader->handle = !pShader->state.tokens ? NULL :
++                     type == PIPE_SHADER_TESS_CTRL ? pipe->create_tcs_state(pipe, &pShader->state) :
++                                                     pipe->create_tes_state(pipe, &pShader->state);
++   ShaderKeepCode(pShader, pShaderCode);
++}
++
++void APIENTRY
++CreateHullShader(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                 D3D10DDI_HRTSHADER hRTShader, const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures)
++{
++   LOG_ENTRYPOINT();
++   CreateTessellationShader(hDevice, pShaderCode, hShader, pSignatures, PIPE_SHADER_TESS_CTRL);
++}
++
++void APIENTRY
++CreateDomainShader(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                   D3D10DDI_HRTSHADER hRTShader, const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures)
++{
++   LOG_ENTRYPOINT();
++   CreateTessellationShader(hDevice, pShaderCode, hShader, pSignatures, PIPE_SHADER_TESS_EVAL);
++}
++
++void APIENTRY
++HsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
++{
++   LOG_ENTRYPOINT();
++
++   Device *pDevice = CastDevice(hDevice);
++   pDevice->bound_shader[PIPE_SHADER_TESS_CTRL] = CastShader(hShader);
++   pDevice->bindings_dirty[PIPE_SHADER_TESS_CTRL] = true;
++   /* the domain shader's translation may depend on it */
++   pDevice->bindings_dirty[PIPE_SHADER_TESS_EVAL] = true;
++   pDevice->pipe->bind_tcs_state(pDevice->pipe, CastPipeShader(hShader));
++}
++
++void APIENTRY
++DsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
++{
++   LOG_ENTRYPOINT();
++
++   Device *pDevice = CastDevice(hDevice);
++   Shader *pShader = CastShader(hShader);
++   pDevice->bound_shader[PIPE_SHADER_TESS_EVAL] = pShader;
++   pDevice->bindings_dirty[PIPE_SHADER_TESS_EVAL] = true;
++   if (pShader) {
++      memset(pShader->bound_formats, 0, sizeof pShader->bound_formats);
++      pShader->bound_tess_key = 0;
++   }
++   pDevice->pipe->bind_tes_state(pDevice->pipe, CastPipeShader(hShader));
++}
++
++void APIENTRY
++HsSetShaderResources(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
++                     const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews)
++{
++   SetShaderResources(PIPE_SHADER_TESS_CTRL, hDevice, Offset, NumViews, phShaderResourceViews);
++}
++
++void APIENTRY
++DsSetShaderResources(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
++                     const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews)
++{
++   SetShaderResources(PIPE_SHADER_TESS_EVAL, hDevice, Offset, NumViews, phShaderResourceViews);
++}
++
++void APIENTRY
++HsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers, const D3D10DDI_HSAMPLER *phSamplers)
++{
++   SetSamplers(PIPE_SHADER_TESS_CTRL, hDevice, Offset, NumSamplers, phSamplers);
++}
++
++void APIENTRY
++DsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers, const D3D10DDI_HSAMPLER *phSamplers)
++{
++   SetSamplers(PIPE_SHADER_TESS_EVAL, hDevice, Offset, NumSamplers, phSamplers);
++}
+diff --git a/src/gallium/frontends/d3d10umd/Shader.h b/src/gallium/frontends/d3d10umd/Shader.h
+--- a/src/gallium/frontends/d3d10umd/Shader.h
++++ b/src/gallium/frontends/d3d10umd/Shader.h
+@@ -70,6 +70,29 @@
+ CsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers, const D3D10DDI_HSAMPLER *phSamplers);
+ 
+ SIZE_T APIENTRY
++CalcPrivateTessellationShaderSize(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode,
++                                  const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures);
++
++void APIENTRY
++CreateHullShader(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                 D3D10DDI_HRTSHADER hRTShader, const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures);
++
++void APIENTRY
++CreateDomainShader(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                   D3D10DDI_HRTSHADER hRTShader, const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures);
++
++void APIENTRY HsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader);
++void APIENTRY DsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader);
++void APIENTRY HsSetShaderResources(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
++                                   const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews);
++void APIENTRY DsSetShaderResources(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
++                                   const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews);
++void APIENTRY HsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers,
++                            const D3D10DDI_HSAMPLER *phSamplers);
++void APIENTRY DsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers,
++                            const D3D10DDI_HSAMPLER *phSamplers);
++
++SIZE_T APIENTRY
+ CalcPrivateShaderSize(D3D10DDI_HDEVICE hDevice,
+                       __in_ecount (pShaderCode[1]) const UINT *pShaderCode,
+                       __in const D3D10DDIARG_STAGE_IO_SIGNATURES *pSignatures);
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.h b/src/gallium/frontends/d3d10umd/ShaderParse.h
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.h
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.h
+@@ -232,6 +232,26 @@
+    struct Shader_buffer_slot buffer[SHADER_MAX_BUFFER_SLOTS];
+    unsigned shared_mem;
+    unsigned block[3];
++   unsigned tess_partitioning;        /* hull shaders: D3D11_SB_TESSELLATOR_PARTITIONING */
++   unsigned tess_output_primitive;    /* D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE */
++   /* an immediate constant buffer read with a relative index (MALLOC'd, the caller frees it): bound as constant
++    * slot 0, as virglrenderer ignores indirect immediates */
++   unsigned *icb;
++   unsigned icb_size;                 /* vec4s */
++};
++
++/* Translation for the state a shader is bound with */
++struct Shader_translate_options {
++   const enum pipe_format *image_formats;   /* typed UAV images per slot (PIPE_FORMAT_NONE: as declared) */
++   /* hull shaders without a control point phase: the output control point registers (their signature) */
++   unsigned num_passthrough;
++   struct {
++      unsigned char reg, mask, position;
++   } passthrough[32];
++   /* domain shaders: the hull shader's partitioning and output primitive (GL declares them in this stage) */
++   bool have_tess;
++   unsigned tess_partitioning;
++   unsigned tess_output_primitive;
+ };
+ 
+ const struct tgsi_token *
+@@ -239,12 +259,11 @@
+                       unsigned *output_mapping,
+                       struct Shader_bindings *bindings);
+ 
+-/* The same, typed UAV images declared with these formats (per image slot; PIPE_FORMAT_NONE: as declared) */
+ const struct tgsi_token *
+-Shader_tgsi_translate_images(const unsigned *code,
+-                             unsigned *output_mapping,
+-                             struct Shader_bindings *bindings,
+-                             const enum pipe_format *image_formats);
++Shader_tgsi_translate_ex(const unsigned *code,
++                         unsigned *output_mapping,
++                         struct Shader_bindings *bindings,
++                         const struct Shader_translate_options *options);
+ 
+ 
+ #ifdef __cplusplus
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -390,6 +390,7 @@
+    struct ureg_dst output_mask;        /* oMask */
+ 
+    uint addr_cur;
++   bool dst_addr;                          /* the next relative operand indexes a temporary destination */
+    uint temp_offset;
+    uint indexable_temp_offsets[SHADER_MAX_INDEXABLE_TEMPS];
+ 
+@@ -425,6 +426,30 @@
+    bool uav_read[SHADER_MAX_UAVS];          /* typed UAVs loaded or used atomically (Shader_scan_control_flow) */
+    bool uav_sync;                           /* a sync with a UAV memory barrier (Shader_scan_control_flow) */
+    const enum pipe_format *image_formats;   /* the bound views' formats per image slot, or NULL */
++   const struct Shader_translate_options *options;
++
++   /* hull shaders: phases (D3D's control point phase per invocation, then fork and join phases once per patch,
++    * by invocation 0 after a barrier, each phase in a loop that runs once so ret leaves it) and patch constants
++    * (in a temporary array for indexed writes, copied out at the end); domain shaders read patch constants from
++    * the same kind of array */
++   enum { HS_NONE, HS_DECLS, HS_CONTROL_POINT, HS_FORK, HS_JOIN } hs_phase;
++   bool hs_had_control_point_phase;
++   bool hs_patch_started;
++   unsigned hs_phase_index;                /* fork and join phases, in order */
++   unsigned hs_instance_counts[64];        /* their instance counts (Shader_scan_control_flow) */
++   unsigned hs_num_counted;
++   struct ureg_dst hs_counter;             /* .x the phase instance, .y ret in a loop */
++   bool ds_body;                           /* the domain shader's main code, in a run-once loop */
++   unsigned *icb_data;                     /* the immediate constant buffer, for bindings.icb */
++   unsigned icb_dwords;
++   struct ureg_src invocation_id;
++   bool pc_declared;
++   struct ureg_dst pc;                     /* patch constants o#/vpc# */
++   struct {
++      unsigned generic_mask;               /* components that are per-patch outputs/inputs */
++      signed char tess[4];                 /* per component: tess level, 1..4 outer, 5..6 inner (+1 index), 0 none */
++   } pc_regs[32];
++   struct ureg_src tess_coord;
+    struct {
+       bool declared;
+       unsigned stride;                      /* structured: bytes per element; raw: 0 */
+@@ -932,22 +957,37 @@
+ 
+    reg = ureg_scalar(reg, operand->comp);
+    
+-   struct ureg_dst addr_reg = sx->addrs[sx->addr_cur];
++   /* virglrenderer indexes temporary destinations with ADDR[0] whichever is named: those have it, the rest
++    * rotate through the others */
++   struct ureg_dst addr_reg;
++   if (sx->dst_addr) {
++      addr_reg = sx->addrs[0];
++      sx->dst_addr = false;
++   } else {
++      addr_reg = sx->addrs[sx->addr_cur];
++      sx->addr_cur++;
++      if (sx->addr_cur >= SHADER_MAX_ADDRS) sx->addr_cur = 1;
++   }
+    ureg_UARL(sx->ureg, addr_reg, reg);
+-      
+-   sx->addr_cur++;
+-   if(sx->addr_cur >= SHADER_MAX_ADDRS) sx->addr_cur = 0;
+ 
+    return ureg_src(addr_reg);
+ }
+ 
+ static struct ureg_dst
++pc_operand(struct Shader_xlate *sx, const struct Shader_index *index);
++
++static struct ureg_dst
+ translate_operand(struct Shader_xlate *sx,
+                   const struct Shader_operand *operand,
+                   unsigned writemask)
+ {
+    struct ureg_dst reg;
+ 
++   if (operand->type == D3D10_SB_OPERAND_TYPE_OUTPUT && (sx->hs_phase == HS_FORK || sx->hs_phase == HS_JOIN)) {
++      /* patch constants */
++      return pc_operand(sx, &operand->index[0]);
++   }
++
+    switch (operand->type) {
+    case D3D10_SB_OPERAND_TYPE_TEMP:
+       assert(operand->index_dim == 1);
+@@ -994,6 +1034,10 @@
+       reg = ureg_writemask(sx->output_mask, TGSI_WRITEMASK_X);
+       break;
+ 
++   case D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT:
++      reg = pc_operand(sx, &operand->index[0]);
++      break;
++
+    case D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID:
+       assert(operand->index_dim == 0);
+ 
+@@ -1077,11 +1121,15 @@
+       assert(operand->base.index[0].index_rep == D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+       assert(operand->base.index[0].imm < SHADER_MAX_INDEXABLE_TEMPS);
+ 
++      sx->dst_addr = true;
+       reg = ureg_dst(translate_indexable_temp(sx, &operand->base));
++      sx->dst_addr = false;
+       break;
+ 
+    default:
++      sx->dst_addr = true;
+       reg = translate_operand(sx, &operand->base, writemask);
++      sx->dst_addr = false;
+    }
+ 
+    /* oDepth and oMask (scalars) often have an empty writemask */
+@@ -1108,6 +1156,7 @@
+ 
+    switch (operand->base.type) {
+    case D3D10_SB_OPERAND_TYPE_INPUT:
++   case D3D11_SB_OPERAND_TYPE_INPUT_CONTROL_POINT:
+       if (operand->base.index_dim == 1) {
+          switch (operand->base.index[0].index_rep) {
+          case D3D10_SB_OPERAND_INDEX_IMMEDIATE32:
+@@ -1274,11 +1323,16 @@
+          break;
+       case D3D10_SB_OPERAND_INDEX_RELATIVE:
+       case D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE:
+-         reg = sx->imms;
+-         reg.Index += operand->base.index[0].imm;
+-         reg = ureg_src_indirect(
+-            sx->imms,
+-            translate_relative_operand(sx, &operand->base.index[0].rel));
++         /* virglrenderer ignores indirect immediates (reads the base one): constant slot 0 (bindings.icb) */
++         if (!sx->bindings.icb && sx->icb_dwords >= 4) {
++            sx->bindings.icb = sx->icb_data;
++            sx->bindings.icb_size = sx->icb_dwords / 4;
++            sx->icb_data = NULL;
++            ureg_DECL_constant2D(sx->ureg, 0, sx->bindings.icb_size - 1, 0);
++         }
++         reg = ureg_src_register(TGSI_FILE_CONSTANT, operand->base.index[0].imm);
++         reg = ureg_src_indirect(reg, translate_relative_operand(sx, &operand->base.index[0].rel));
++         reg = ureg_src_dimension(reg, 0);
+          break;
+       default:
+          /* XXX: Other index representations.
+@@ -1295,6 +1349,32 @@
+       reg = sx->gs_instance_id;
+       break;
+ 
++   case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID:
++      reg = ureg_scalar(sx->invocation_id, TGSI_SWIZZLE_X);
++      break;
++
++   case D3D11_SB_OPERAND_TYPE_INPUT_FORK_INSTANCE_ID:
++   case D3D11_SB_OPERAND_TYPE_INPUT_JOIN_INSTANCE_ID:
++      reg = ureg_scalar(ureg_src(sx->hs_counter), TGSI_SWIZZLE_X);
++      break;
++
++   case D3D11_SB_OPERAND_TYPE_INPUT_DOMAIN_POINT:
++      reg = sx->tess_coord;
++      break;
++
++   case D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT: {
++      /* the hull shader's output control points: its outputs, of a vertex */
++      unsigned r = operand->base.index[1].imm;
++      reg = ureg_src(sx->outputs[r < SHADER_MAX_OUTPUTS ? r : 0].reg[0]);
++      if (operand->base.index[0].index_rep == D3D10_SB_OPERAND_INDEX_IMMEDIATE32) {
++         reg = ureg_src_dimension(reg, operand->base.index[0].imm);
++      } else {
++         reg = ureg_src_dimension_indirect(reg, translate_relative_operand(sx, &operand->base.index[0].rel),
++                                           operand->base.index[0].imm);
++      }
++      break;
++   }
++
+    case D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK:
+       reg = sx->coverage;
+       break;
+@@ -2730,6 +2810,303 @@
+    }
+ }
+ 
++/*
++ * Tessellation: hull shaders (TGSI tessellation control) and domain shaders (TGSI tessellation evaluation).
++ */
++static struct ureg_dst
++pc_element(struct Shader_xlate *sx, unsigned index)
++{
++   if (!sx->pc_declared) {
++      sx->pc = ureg_DECL_array_temporary(sx->ureg, ARRAY_SIZE(sx->pc_regs), true);
++      sx->pc_declared = true;
++   }
++   return ureg_dst_array_offset(sx->pc, MIN2(index, ARRAY_SIZE(sx->pc_regs) - 1));
++}
++
++/* A patch constant register operand (o# in fork/join phases, vpc#), with relative addressing */
++static struct ureg_dst
++pc_operand(struct Shader_xlate *sx, const struct Shader_index *index)
++{
++   struct ureg_dst reg = pc_element(sx, index->imm);
++   if (index->index_rep != D3D10_SB_OPERAND_INDEX_IMMEDIATE32) {
++      reg = ureg_dst_indirect(reg, translate_relative_operand(sx, &index->rel));
++   }
++   return reg;
++}
++
++/* D3D's tess factor names: GL's outer (1..4) or inner (5..6) level, plus one; 0 for other names */
++static signed char
++tess_level(D3D10_SB_NAME name)
++{
++   switch (name) {
++   case D3D11_SB_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR: return 1;
++   case D3D11_SB_NAME_FINAL_QUAD_V_EQ_0_EDGE_TESSFACTOR: return 2;
++   case D3D11_SB_NAME_FINAL_QUAD_U_EQ_1_EDGE_TESSFACTOR: return 3;
++   case D3D11_SB_NAME_FINAL_QUAD_V_EQ_1_EDGE_TESSFACTOR: return 4;
++   case D3D11_SB_NAME_FINAL_QUAD_U_INSIDE_TESSFACTOR: return 5;
++   case D3D11_SB_NAME_FINAL_QUAD_V_INSIDE_TESSFACTOR: return 6;
++   case D3D11_SB_NAME_FINAL_TRI_U_EQ_0_EDGE_TESSFACTOR: return 1;
++   case D3D11_SB_NAME_FINAL_TRI_V_EQ_0_EDGE_TESSFACTOR: return 2;
++   case D3D11_SB_NAME_FINAL_TRI_W_EQ_0_EDGE_TESSFACTOR: return 3;
++   case D3D11_SB_NAME_FINAL_TRI_INSIDE_TESSFACTOR: return 5;
++   /* isolines: GL's outer[0] is the number of lines, outer[1] the segments per line */
++   case D3D11_SB_NAME_FINAL_LINE_DETAIL_TESSFACTOR: return 2;
++   case D3D11_SB_NAME_FINAL_LINE_DENSITY_TESSFACTOR: return 1;
++   default: return 0;
++   }
++}
++
++/* dcl_output (fork/join phases) or dcl_input (domain shaders) of a patch constant register */
++static void
++dcl_patch_constant(struct Shader_xlate *sx, const struct Shader_dst_operand *dst, D3D10_SB_NAME name)
++{
++   unsigned r = dst->base.index[dst->base.index_dim ? dst->base.index_dim - 1 : 0].imm;
++   unsigned mask = dst->mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT;
++   signed char level = tess_level(name);
++
++   if (r >= ARRAY_SIZE(sx->pc_regs)) {
++      LOG_UNSUPPORTED(true);
++      return;
++   }
++   pc_element(sx, r);
++   for (unsigned c = 0; c < 4; c++) {
++      if (!(mask & (1 << c))) {
++         continue;
++      }
++      if (level) {
++         sx->pc_regs[r].tess[c] = level;
++      } else {
++         sx->pc_regs[r].generic_mask |= 1 << c;
++      }
++   }
++   if (sx->hs_phase == HS_NONE) {
++      /* domain shader: fill the array from the patch inputs and tess levels */
++      struct ureg_program *ureg = sx->ureg;
++      if (level) {
++         struct ureg_src sv = ureg_DECL_system_value(ureg, level >= 5 ? TGSI_SEMANTIC_TESSINNER :
++                                                     TGSI_SEMANTIC_TESSOUTER, 0);
++         for (unsigned c = 0; c < 4; c++) {
++            if (mask & (1 << c)) {
++               ureg_MOV(ureg, ureg_writemask(pc_element(sx, r), 1 << c),
++                        ureg_scalar(sv, level >= 5 ? level - 5 : level - 1));
++            }
++         }
++      } else {
++         ureg_MOV(ureg, ureg_writemask(pc_element(sx, r), mask),
++                  ureg_DECL_input(ureg, TGSI_SEMANTIC_PATCH, r, 0, 1));
++      }
++   }
++}
++
++/* Hull shader end: invocation 0 writes the tess levels and per-patch outputs */
++static void
++hs_write_patch_constants(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct ureg_dst outer = ureg_dst_undef(), inner = ureg_dst_undef();
++
++   for (unsigned r = 0; r < ARRAY_SIZE(sx->pc_regs); r++) {
++      if (sx->pc_regs[r].generic_mask) {
++         ureg_MOV(ureg, ureg_writemask(ureg_DECL_output(ureg, TGSI_SEMANTIC_PATCH, r), sx->pc_regs[r].generic_mask),
++                  ureg_src(pc_element(sx, r)));
++      }
++      for (unsigned c = 0; c < 4; c++) {
++         signed char level = sx->pc_regs[r].tess[c];
++         if (!level) {
++            continue;
++         }
++         if (level >= 5 && ureg_dst_is_undef(inner)) {
++            inner = ureg_DECL_output(ureg, TGSI_SEMANTIC_TESSINNER, 0);
++         } else if (level < 5 && ureg_dst_is_undef(outer)) {
++            outer = ureg_DECL_output(ureg, TGSI_SEMANTIC_TESSOUTER, 0);
++         }
++         ureg_MOV(ureg, ureg_writemask(level >= 5 ? inner : outer, 1 << (level >= 5 ? level - 5 : level - 1)),
++                  ureg_scalar(ureg_src(pc_element(sx, r)), c));
++      }
++   }
++}
++
++/* Code in a run-once loop, where ret leaves the loop: hull shader phases, and the domain shader (virglrenderer
++ * turns RET into a plain return there, skipping its epilogue: the y flip, clip distances) */
++static bool
++ret_is_break(const struct Shader_xlate *sx)
++{
++   return sx->hs_phase == HS_CONTROL_POINT || sx->hs_phase == HS_FORK || sx->hs_phase == HS_JOIN || sx->ds_body;
++}
++
++/* ret: out of the run-once loop, through D3D loops inside it */
++static void
++emit_ret(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++
++   if (!ret_is_break(sx)) {
++      ureg_RET(ureg);
++      return;
++   }
++   if (sx->cf_depth) {
++      ureg_MOV(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, ~0u));
++      for (unsigned i = 0; i < sx->cf_depth; i++) {
++         if (!sx->cf[i].is_switch && sx->cf[i].lowered) {
++            ureg_MOV(ureg, ureg_writemask(sx->cf[i].flags, TGSI_WRITEMASK_X), ureg_imm1u(ureg, ~0u));
++         }
++      }
++   }
++   ureg_BRK(ureg);
++}
++
++/* The end of the domain shader's run-once loop */
++static void
++ds_close_body(struct Shader_xlate *sx)
++{
++   unsigned label;
++
++   if (sx->ds_body) {
++      ureg_BRK(sx->ureg);
++      ureg_ENDLOOP(sx->ureg, &label);
++      sx->ds_body = false;
++   }
++}
++
++static void
++hs_close_phase(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   unsigned label;
++
++   if (sx->hs_phase == HS_CONTROL_POINT || sx->hs_phase == HS_FORK || sx->hs_phase == HS_JOIN) {
++      ureg_BRK(ureg);
++      ureg_ENDLOOP(ureg, &label);
++   }
++   if (sx->hs_phase == HS_FORK || sx->hs_phase == HS_JOIN) {
++      ureg_UADD(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_X),
++                ureg_scalar(ureg_src(sx->hs_counter), TGSI_SWIZZLE_X), ureg_imm1u(ureg, 1));
++      ureg_ENDLOOP(ureg, &label);
++   }
++}
++
++/* A control point phase that isn't there: each output control point is the input one (registers from the
++ * signature the driver gets) */
++static void
++hs_pass_through(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   const struct Shader_translate_options *o = sx->options;
++   /* virglrenderer indexes arrays with address registers only */
++   struct ureg_dst addr = sx->addrs[1];
++
++   if (o && o->num_passthrough) {
++      ureg_UARL(ureg, ureg_writemask(addr, TGSI_WRITEMASK_X), ureg_scalar(sx->invocation_id, TGSI_SWIZZLE_X));
++   }
++   for (unsigned i = 0; o && i < o->num_passthrough; i++) {
++      unsigned r = o->passthrough[i].reg, mask = o->passthrough[i].mask;
++      unsigned semantic = o->passthrough[i].position ? TGSI_SEMANTIC_POSITION : TGSI_SEMANTIC_GENERIC;
++      struct ureg_src in = ureg_DECL_input(ureg, semantic, o->passthrough[i].position ? 0 : r, 0, 1);
++      struct ureg_dst out = ureg_DECL_output(ureg, semantic, o->passthrough[i].position ? 0 : r);
++      ureg_MOV(ureg, ureg_writemask(out, mask),
++               ureg_src_dimension_indirect(in, ureg_scalar(ureg_src(addr), TGSI_SWIZZLE_X), 0));
++   }
++}
++
++/* Hull shader phase markers; false: not one */
++static bool
++translate_hs_phase(struct Shader_xlate *sx, const struct Shader_opcode *opcode)
++{
++   struct ureg_program *ureg = sx->ureg;
++   unsigned label;
++
++   switch (opcode->type) {
++   case D3D11_SB_OPCODE_HS_DECLS:
++      sx->hs_phase = HS_DECLS;
++      return true;
++   case D3D11_SB_OPCODE_HS_CONTROL_POINT_PHASE:
++      hs_close_phase(sx);
++      sx->hs_phase = HS_CONTROL_POINT;
++      sx->hs_had_control_point_phase = true;
++      ureg_MOV(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, 0));
++      ureg_BGNLOOP(ureg, &label);
++      return true;
++   case D3D11_SB_OPCODE_HS_FORK_PHASE:
++   case D3D11_SB_OPCODE_HS_JOIN_PHASE: {
++      unsigned count = sx->hs_phase_index < sx->hs_num_counted ? sx->hs_instance_counts[sx->hs_phase_index] : 1;
++      struct ureg_dst t;
++      sx->hs_phase_index++;
++      hs_close_phase(sx);
++      if (!sx->hs_patch_started) {
++         if (!sx->hs_had_control_point_phase) {
++            hs_pass_through(sx);
++         }
++         /* the output control points are written: the patch constant phases once, by invocation 0 */
++         ureg_BARRIER(ureg);
++         t = ureg_DECL_temporary(ureg);
++         ureg_USEQ(ureg, ureg_writemask(t, TGSI_WRITEMASK_X), ureg_scalar(sx->invocation_id, TGSI_SWIZZLE_X),
++                   ureg_imm1u(ureg, 0));
++         ureg_UIF(ureg, ureg_scalar(ureg_src(t), TGSI_SWIZZLE_X), &label);
++         ureg_release_temporary(ureg, t);
++         sx->hs_patch_started = true;
++      }
++      sx->hs_phase = opcode->type == D3D11_SB_OPCODE_HS_FORK_PHASE ? HS_FORK : HS_JOIN;
++      /* for (instance = 0; instance < count; instance++) { do { phase } while (0); } */
++      ureg_MOV(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_X), ureg_imm1u(ureg, 0));
++      ureg_BGNLOOP(ureg, &label);
++      t = ureg_DECL_temporary(ureg);
++      ureg_USGE(ureg, ureg_writemask(t, TGSI_WRITEMASK_X), ureg_scalar(ureg_src(sx->hs_counter), TGSI_SWIZZLE_X),
++                ureg_imm1u(ureg, count));
++      ureg_UIF(ureg, ureg_scalar(ureg_src(t), TGSI_SWIZZLE_X), &label);
++      ureg_BRK(ureg);
++      ureg_ENDIF(ureg);
++      ureg_release_temporary(ureg, t);
++      ureg_MOV(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, 0));
++      ureg_BGNLOOP(ureg, &label);
++      return true;
++   }
++   case D3D10_SB_OPCODE_RET:
++      if (!ret_is_break(sx)) {
++         return false;
++      }
++      emit_ret(sx);
++      return true;
++   case D3D11_SB_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT:
++   case D3D11_SB_OPCODE_DCL_HS_MAX_TESSFACTOR:
++   case D3D11_SB_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT:
++   case D3D11_SB_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT:
++      return true;
++   case D3D11_SB_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT:
++      ureg_property(ureg, TGSI_PROPERTY_TCS_VERTICES_OUT, opcode->specific.dcl_control_point_count);
++      return true;
++   case D3D11_SB_OPCODE_DCL_TESS_DOMAIN:
++      if (sx->hs_phase == HS_NONE) {
++         /* domain shader */
++         const struct Shader_translate_options *o = sx->options;
++         unsigned domain = opcode->specific.dcl_tess_domain;
++         ureg_property(ureg, TGSI_PROPERTY_TES_PRIM_MODE,
++                       domain == D3D11_SB_TESSELLATOR_DOMAIN_QUAD ? MESA_PRIM_QUADS :
++                       domain == D3D11_SB_TESSELLATOR_DOMAIN_ISOLINE ? MESA_PRIM_LINES : MESA_PRIM_TRIANGLES);
++         if (o && o->have_tess) {
++            /* the bound hull shader's partitioning and output primitive (GL has them here) */
++            unsigned p = o->tess_partitioning, prim = o->tess_output_primitive;
++            ureg_property(ureg, TGSI_PROPERTY_TES_SPACING,
++                          p == D3D11_SB_TESSELLATOR_PARTITIONING_FRACTIONAL_ODD ? PIPE_TESS_SPACING_FRACTIONAL_ODD :
++                          p == D3D11_SB_TESSELLATOR_PARTITIONING_FRACTIONAL_EVEN ? PIPE_TESS_SPACING_FRACTIONAL_EVEN :
++                          PIPE_TESS_SPACING_EQUAL);
++            /* D3D's winding is in a domain with the origin top left, GL's bottom left: the other way round */
++            ureg_property(ureg, TGSI_PROPERTY_TES_VERTEX_ORDER_CW,
++                          prim == D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW);
++            ureg_property(ureg, TGSI_PROPERTY_TES_POINT_MODE, prim == D3D11_SB_TESSELLATOR_OUTPUT_POINT);
++         }
++      }
++      return true;
++   case D3D11_SB_OPCODE_DCL_TESS_PARTITIONING:
++      sx->bindings.tess_partitioning = opcode->specific.dcl_tess_partitioning;
++      return true;
++   case D3D11_SB_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE:
++      sx->bindings.tess_output_primitive = opcode->specific.dcl_tess_output_primitive;
++      return true;
++   default:
++      return false;
++   }
++}
++
+ /* Finds the loops that have a continue and each switch's case values, ahead of the translation. */
+ static void
+ Shader_scan_control_flow(struct Shader_xlate *sx, const unsigned *code)
+@@ -2782,6 +3159,18 @@
+             }
+          }
+          break;
++      case D3D11_SB_OPCODE_HS_FORK_PHASE:
++      case D3D11_SB_OPCODE_HS_JOIN_PHASE:
++         if (sx->hs_num_counted < ARRAY_SIZE(sx->hs_instance_counts)) {
++            sx->hs_instance_counts[sx->hs_num_counted++] = 1;
++         }
++         break;
++      case D3D11_SB_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT:
++      case D3D11_SB_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT:
++         if (sx->hs_num_counted) {
++            sx->hs_instance_counts[sx->hs_num_counted - 1] = MAX2(opcode.specific.dcl_phase_instance_count, 1);
++         }
++         break;
+       case D3D11_SB_OPCODE_SYNC:
+          if (opcode.specific.sync_flags & (D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GROUP |
+                                            D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL)) {
+@@ -2840,6 +3229,20 @@
+    }
+ }
+ 
++/* After a loop or switch in a run-once loop (ret_is_break): a ret inside it leaves that loop too */
++static void
++cf_hs_ret_check(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   unsigned label;
++
++   if (ret_is_break(sx)) {
++      ureg_UIF(ureg, ureg_scalar(ureg_src(sx->hs_counter), TGSI_SWIZZLE_Y), &label);
++      ureg_BRK(ureg);
++      ureg_ENDIF(ureg);
++   }
++}
++
+ static struct Shader_cf *
+ cf_innermost_loop(struct Shader_xlate *sx)
+ {
+@@ -2895,6 +3298,7 @@
+    if (cf->lowered) {
+       ureg_release_temporary(ureg, cf->flags);
+    }
++   cf_hs_ret_check(sx);
+ }
+ 
+ static void
+@@ -3003,6 +3407,8 @@
+    ureg_ENDLOOP(ureg, &label);
+    ureg_release_temporary(ureg, cf->flags);
+ 
++   cf_hs_ret_check(sx);
++
+    /* a continue inside the switch */
+    loop = cf_innermost_loop(sx);
+    if (loop && loop->lowered) {
+@@ -3017,14 +3423,14 @@
+                       unsigned *output_mapping,
+                       struct Shader_bindings *bindings)
+ {
+-   return Shader_tgsi_translate_images(code, output_mapping, bindings, NULL);
++   return Shader_tgsi_translate_ex(code, output_mapping, bindings, NULL);
+ }
+ 
+ const struct tgsi_token *
+-Shader_tgsi_translate_images(const unsigned *code,
+-                             unsigned *output_mapping,
+-                             struct Shader_bindings *bindings,
+-                             const enum pipe_format *image_formats)
++Shader_tgsi_translate_ex(const unsigned *code,
++                         unsigned *output_mapping,
++                         struct Shader_bindings *bindings,
++                         const struct Shader_translate_options *options)
+ {
+    /* Large (4096 temporaries): on the heap, a stack frame this size overflowed DWM's shader-creating thread */
+    struct Shader_xlate *sx;
+@@ -3049,7 +3455,8 @@
+       shader_dumped = true;
+    }
+ 
+-   sx->image_formats = image_formats;
++   sx->options = options;
++   sx->image_formats = options ? options->image_formats : NULL;
+    sx->max_calls = 64;
+    sx->calls = (struct Shader_call *)MALLOC(sx->max_calls *
+                                            sizeof(struct Shader_call));
+@@ -3076,10 +3483,28 @@
+    case D3D11_SB_COMPUTE_SHADER:
+       ureg = ureg_create(PIPE_SHADER_COMPUTE);
+       break;
++   case D3D11_SB_HULL_SHADER:
++      ureg = ureg_create(PIPE_SHADER_TESS_CTRL);
++      break;
++   case D3D11_SB_DOMAIN_SHADER:
++      ureg = ureg_create(PIPE_SHADER_TESS_EVAL);
++      break;
+    }
+ 
+    assert(ureg);
+    sx->ureg = ureg;
++   if (parser.header.type == D3D11_SB_HULL_SHADER) {
++      sx->hs_counter = ureg_DECL_temporary(ureg);
++      sx->invocation_id = ureg_DECL_system_value(ureg, TGSI_SEMANTIC_INVOCATIONID, 0);
++   }
++   if (parser.header.type == D3D11_SB_DOMAIN_SHADER) {
++      unsigned label;
++      sx->tess_coord = ureg_DECL_system_value(ureg, TGSI_SEMANTIC_TESSCOORD, 0);
++      sx->hs_counter = ureg_DECL_temporary(ureg);
++      ureg_MOV(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, 0));
++      ureg_BGNLOOP(ureg, &label);
++      sx->ds_body = true;
++   }
+ 
+    for(uint i = 0; i < SHADER_MAX_ADDRS; i++) {
+       sx->addrs[i] = ureg_DECL_address(sx->ureg);
+@@ -3087,7 +3512,7 @@
+    for (uint i = 0; i < SHADER_MAX_SRC_OPERANDS; i++) {
+       sx->neg_temps[i] = ureg_dst_undef();
+    }
+-   sx->addr_cur = 0;
++   sx->addr_cur = 1;
+ 
+    while (Shader_parse_opcode(&parser, &opcode)) {
+       const struct dx10_opcode_xlate *ox;
+@@ -3098,7 +3523,8 @@
+       sx->integer_op = ox->format != OF_FLOAT && opcode.type != D3D10_SB_OPCODE_MOV &&
+                        opcode.type != D3D10_SB_OPCODE_MOVC && opcode.type != D3D11_SB_OPCODE_SWAPC;
+ 
+-      if (translate_sm5_memory(sx, &opcode) || (virgl_tex_ops() && translate_texture_virgl(sx, &opcode)) ||
++      if (translate_hs_phase(sx, &opcode) || translate_sm5_memory(sx, &opcode) ||
++          (virgl_tex_ops() && translate_texture_virgl(sx, &opcode)) ||
+           translate_sm5_alu(sx, &opcode)) {
+          Shader_opcode_free(&opcode);
+          continue;
+@@ -3236,6 +3662,14 @@
+                ureg_DECL_immediate_block_uint(ureg,
+                                               opcode.customdata.u.constbuf.data,
+                                               opcode.customdata.u.constbuf.count);
++            FREE(sx->icb_data);
++            sx->icb_dwords = opcode.customdata.u.constbuf.count & ~3u;
++            sx->icb_data = MALLOC(MAX2(sx->icb_dwords, 4) * sizeof(unsigned));
++            if (sx->icb_data) {
++               memcpy(sx->icb_data, opcode.customdata.u.constbuf.data, sx->icb_dwords * sizeof(unsigned));
++            } else {
++               sx->icb_dwords = 0;
++            }
+          } else {
+             assert(0);
+          }
+@@ -3767,6 +4201,16 @@
+              opcode.dst[0].base.type <= D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED) {
+             sx->cs_input_wanted[opcode.dst[0].base.type - D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID] = true;
+             cs_inputs(sx);
++         } else if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT ||
++                    opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT_ID ||
++                    opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_FORK_INSTANCE_ID ||
++                    opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_JOIN_INSTANCE_ID ||
++                    opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_DOMAIN_POINT) {
++            /* the hull shader's outputs, IDs and instance counters, the domain point: nothing to declare */
++         } else if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
++            if (sx->hs_phase == HS_NONE) {
++               dcl_patch_constant(sx, &opcode.dst[0], D3D10_SB_NAME_UNDEFINED);
++            }
+          } else if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK) {
+             sx->coverage = ureg_scalar(ureg_DECL_system_value(ureg, TGSI_SEMANTIC_SAMPLEMASK, 0), TGSI_SWIZZLE_X);
+          } else if (parser.header.type == D3D10_SB_PIXEL_SHADER) {
+@@ -3775,7 +4219,9 @@
+          } else if (parser.header.type == D3D10_SB_VERTEX_SHADER) {
+             dcl_vs_input(sx, ureg, &opcode.dst[0]);
+          } else {
+-            assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
++            /* geometry, hull and domain shaders: 2D inputs (vertex, register) */
++            assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER || parser.header.type == D3D11_SB_HULL_SHADER ||
++                   parser.header.type == D3D11_SB_DOMAIN_SHADER);
+             dcl_gs_input(sx, ureg, &opcode.dst[0]);
+          }
+          break;
+@@ -3786,7 +4232,13 @@
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT_SIV:
+-         assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
++         if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_PATCH_CONSTANT) {
++            /* domain shaders reading tess factors (in join phases, the patch constant array already has them) */
++            if (sx->hs_phase == HS_NONE) {
++               dcl_patch_constant(sx, &opcode.dst[0], opcode.dcl_siv_name);
++            }
++            break;
++         }
+          dcl_siv_input(sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
+          break;
+ 
+@@ -3810,6 +4262,10 @@
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_OUTPUT:
++         if (sx->hs_phase == HS_FORK || sx->hs_phase == HS_JOIN) {
++            dcl_patch_constant(sx, &opcode.dst[0], D3D10_SB_NAME_UNDEFINED);
++            break;
++         }
+          if (parser.header.type == D3D10_SB_PIXEL_SHADER) {
+             /* Pixel shader outputs. */
+             if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH ||
+@@ -3857,6 +4313,10 @@
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_OUTPUT_SIV:
++         if (sx->hs_phase == HS_FORK || sx->hs_phase == HS_JOIN) {
++            dcl_patch_constant(sx, &opcode.dst[0], opcode.dcl_siv_name);
++            break;
++         }
+          assert(opcode.dst[0].base.index_dim == 1);
+          assert(opcode.dst[0].base.index[0].imm < SHADER_MAX_OUTPUTS);
+ 
+@@ -4000,7 +4460,7 @@
+          }
+          switch (opcode.type) {
+          case D3D10_SB_OPCODE_RETC:
+-            ureg_RET(ureg);
++            emit_ret(sx);
+             break;
+          case D3D10_SB_OPCODE_CONTINUEC:
+             cf_continue(sx);
+@@ -4031,6 +4491,7 @@
+          if (inside_sub) {
+             ureg_ENDSUB(ureg);
+          }
++         ds_close_body(sx);
+          tgsi_inst_no = ureg_get_instruction_number(ureg);
+          ureg_BGNSUB(ureg);
+          inside_sub = true;
+@@ -4136,6 +4597,24 @@
+    if (inside_sub) {
+       ureg_ENDSUB(ureg);
+    }
++   ds_close_body(sx);
++
++   if (parser.header.type == D3D11_SB_HULL_SHADER) {
++      unsigned label;
++      if (!sx->hs_patch_started) {
++         /* no patch constant phase (not valid D3D, but no hang either) */
++         hs_close_phase(sx);
++         sx->hs_phase = HS_NONE;
++         if (!sx->hs_had_control_point_phase) {
++            hs_pass_through(sx);
++         }
++      } else {
++         hs_close_phase(sx);
++         sx->hs_phase = HS_NONE;
++         hs_write_patch_constants(sx);
++         ureg_ENDIF(ureg);
++      }
++   }
+ 
+    ureg_END(ureg);
+ 
+@@ -4158,8 +4637,11 @@
+    FREE(sx->switches);
+    FREE(sx->loop_has_continue);
+ 
++   FREE(sx->icb_data);
+    if (bindings) {
+       *bindings = sx->bindings;
++   } else {
++      FREE(sx->bindings.icb);
+    }
+ 
+    FREE(sx);
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -77,11 +77,13 @@
+    UINT *code;
+    struct {
+       enum pipe_format formats[SHADER_MAX_IMAGE_SLOTS];
++      unsigned tess_key;
+       void *handle;
+       const struct tgsi_token *tokens;
+    } variants[8];
+    unsigned num_variants;
+    enum pipe_format bound_formats[SHADER_MAX_IMAGE_SLOTS];   /* the bound translation's: all NONE for the first */
++   unsigned bound_tess_key;   /* domain shaders: the hull shader tessellation the bound translation has (0: none) */
+ };
+ 
+ struct Query;
+@@ -119,8 +121,10 @@
+    bool bindings_dirty[PIPE_SHADER_TYPES];
+    struct ShaderResourceView *srvs[PIPE_SHADER_TYPES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
+    struct UnorderedAccessView *uavs[PIPE_SHADER_TYPES][D3D11_1_UAV_SLOT_COUNT];
++   unsigned patch_vertices;                      /* control points per patch of a patch list topology */
+    unsigned bound_images[PIPE_SHADER_TYPES];     /* how many were bound last, to unbind */
+    unsigned bound_buffers[PIPE_SHADER_TYPES];
++   bool icb_bound[PIPE_SHADER_TYPES];            /* constant slot 0: a shader's indexed immediate constant buffer */
+ 
+    unsigned max_dual_source_render_targets;
+    
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -94,6 +94,22 @@
+ }
+ 
+ static void APIENTRY
++HsSetConstantBuffers1(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers,
++                      const UINT *pFirstConstant, const UINT *pNumConstants)
++{
++   SetConstantBuffers1(PIPE_SHADER_TESS_CTRL, hDevice, StartSlot, NumBuffers, phBuffers, pFirstConstant,
++                       pNumConstants);
++}
++
++static void APIENTRY
++DsSetConstantBuffers1(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers,
++                      const UINT *pFirstConstant, const UINT *pNumConstants)
++{
++   SetConstantBuffers1(PIPE_SHADER_TESS_EVAL, hDevice, StartSlot, NumBuffers, phBuffers, pFirstConstant,
++                       pNumConstants);
++}
++
++static void APIENTRY
+ CsSetConstantBuffers1(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers,
+                       const UINT *pFirstConstant, const UINT *pNumConstants)
+ {
+@@ -392,6 +408,20 @@
+ }
+ 
+ static void APIENTRY
++HsSetShaderWithIfaces(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader, UINT NumClassInstances,
++                      const UINT *pPointerData, const D3D11DDIARG_POINTERDATA *pIfaces)
++{
++   HsSetShader(hDevice, hShader);
++}
++
++static void APIENTRY
++DsSetShaderWithIfaces(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader, UINT NumClassInstances,
++                      const UINT *pPointerData, const D3D11DDIARG_POINTERDATA *pIfaces)
++{
++   DsSetShader(hDevice, hShader);
++}
++
++static void APIENTRY
+ CsSetShaderWithIfaces(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader, UINT NumClassInstances,
+                       const UINT *pPointerData, const D3D11DDIARG_POINTERDATA *pIfaces)
+ {
+@@ -591,16 +621,20 @@
+    STUB(pfnDrawIndexedInstancedIndirect);
+    STUB(pfnDrawInstancedIndirect);
+    STUB(pfnCommandListExecute);
+-   STUB(pfnHsSetShaderResources);
+-   STUB(pfnHsSetShader);
+-   STUB(pfnHsSetSamplers);
+-   STUB(pfnHsSetConstantBuffers);
+-   STUB(pfnDsSetShaderResources);
+-   STUB(pfnDsSetShader);
+-   STUB(pfnDsSetSamplers);
+-   STUB(pfnDsSetConstantBuffers);
+-   STUB(pfnCreateHullShader);
+-   STUB(pfnCreateDomainShader);
++   /* Tessellation (Shader.cpp) */
++   pFuncs->pfnHsSetShaderResources = HsSetShaderResources;
++   pFuncs->pfnHsSetShader = HsSetShader;
++   pFuncs->pfnHsSetSamplers = HsSetSamplers;
++   pFuncs->pfnHsSetConstantBuffers = HsSetConstantBuffers1;
++   pFuncs->pfnDsSetShaderResources = DsSetShaderResources;
++   pFuncs->pfnDsSetShader = DsSetShader;
++   pFuncs->pfnDsSetSamplers = DsSetSamplers;
++   pFuncs->pfnDsSetConstantBuffers = DsSetConstantBuffers1;
++   pFuncs->pfnCreateHullShader = CreateHullShader;
++   pFuncs->pfnCreateDomainShader = CreateDomainShader;
++   pFuncs->pfnCalcPrivateTessellationShaderSize = CalcPrivateTessellationShaderSize;
++   pFuncs->pfnHsSetShaderWithIfaces = HsSetShaderWithIfaces;
++   pFuncs->pfnDsSetShaderWithIfaces = DsSetShaderWithIfaces;
+    STUB(pfnCalcDeferredContextHandleSize);
+    STUB(pfnCalcPrivateDeferredContextSize);
+    STUB(pfnCreateDeferredContext);
+@@ -608,9 +642,6 @@
+    STUB(pfnCalcPrivateCommandListSize);
+    STUB(pfnCreateCommandList);
+    STUB(pfnDestroyCommandList);
+-   STUB(pfnCalcPrivateTessellationShaderSize);
+-   STUB(pfnHsSetShaderWithIfaces);
+-   STUB(pfnDsSetShaderWithIfaces);
+    /* Compute and UAVs (Compute.cpp) */
+    pFuncs->pfnCsSetShaderWithIfaces = CsSetShaderWithIfaces;
+    pFuncs->pfnCreateComputeShader = CreateComputeShader;

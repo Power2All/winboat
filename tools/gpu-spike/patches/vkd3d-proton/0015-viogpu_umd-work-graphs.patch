@@ -1,0 +1,293 @@
+diff --git a/libs/viogpu_umd/umd_command.cpp b/libs/viogpu_umd/umd_command.cpp
+index 3cd4b636..c2184cb7 100644
+--- a/libs/viogpu_umd/umd_command.cpp
++++ b/libs/viogpu_umd/umd_command.cpp
+@@ -181,6 +181,7 @@ create_command_list(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_COMMAND_L
+    list->list->QueryInterface(IID_PPV_ARGS(&list->list5));
+    list->list->QueryInterface(IID_PPV_ARGS(&list->list6));
+    list->list->QueryInterface(IID_PPV_ARGS(&list->list9));
++   list->list->QueryInterface(IID_PPV_ARGS(&list->list10));
+ 
+    bool compute = list->type == D3D12_COMMAND_LIST_TYPE_COMPUTE || list->type == D3D12_COMMAND_LIST_TYPE_COPY;
+    device->umCallbacks->pfnSetCommandListDDITableCb(
+@@ -204,6 +205,8 @@ destroy_command_list(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDLIST h)
+       list->list6->Release();
+    if (list->list9)
+       list->list9->Release();
++   if (list->list10)
++      list->list10->Release();
+    if (list->list2)
+       list->list2->Release();
+    if (list->list1)
+@@ -1052,6 +1055,8 @@ viogpu_fill_command_list_table(void *table, SIZE_T size, UINT number, D3D12DDI_H
+       f->pfnDispatchMesh = dispatch_mesh;
+    if (size >= offsetof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0054, pfnDispatchRays) + sizeof(void *))
+       viogpu_fill_raytracing_list_funcs(f);
++   if (size >= offsetof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0108, pfnDispatchGraph) + sizeof(void *))
++      viogpu_fill_work_graph_list_funcs(f);
+    if (size >= offsetof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0095, pfnOmSetFrontAndBackStencilRef) + sizeof(void *))
+       f->pfnOmSetFrontAndBackStencilRef = om_set_front_and_back_stencil_ref;
+    if (size >= offsetof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0099, pfnIASetIndexBufferStripCutValue) + sizeof(void *)) {
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+index 1b6980ba..65f0c83f 100644
+--- a/libs/viogpu_umd/umd_ddi.cpp
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -13,7 +13,7 @@
+  * on x86 it pops the caller's arguments (__stdcall).
+  *
+  * DDI versions: D3D12DDI_SUPPORTED_0110 (interface R8, build 110: 0102's Vulkan-on-12 caps and line rasterization
+- * modes, 0110's ExecuteIndirect tier and shader model 6.8 caps; work graphs, 0108, not implemented), 0100 (shader
++ * modes, 0110's ExecuteIndirect tier and shader model 6.8 caps; 0108's work graphs in umd_raytracing.cpp), 0100 (shader
+  * models 6.7 and 6.8) and, for older runtimes, 0082 (shader model 6.6). The tables are 0110's; an older runtime's are a
+  * prefix of them, and the arguments that changed meaning on the way go by the build the runtime chose (device_ddi,
+  * umd_private.h). 0110 only where the device has the sampler heaps of 4096 descriptors and the UAV-only rendering at
+@@ -330,6 +330,7 @@ struct viogpu_caps {
+    D3D12DDI_OPTIONS_DATA_0091 options0091;
+    D3D12DDI_OPTIONS_DATA_0093 options0093;
+    D3D12DDI_OPTIONS_DATA_0102 options0102;
++   D3D12DDI_OPTIONS_DATA_0103 options0103;
+    D3D12DDI_OPTIONS_DATA_0110 options0110;
+    D3D12DDI_SHADER_MODEL_6_8_OPTIONS_0110 sm68;
+    UINT gpuvaBits;
+@@ -470,14 +471,14 @@ caps_from_vkd3d(ID3D12Device *device, viogpu_caps *caps)
+    caps->options0102.MaxSamplerDescriptorHeapSizeWithStaticSamplers = o19.MaxSamplerDescriptorHeapSizeWithStaticSamplers;
+    caps->options0102.MaxViewDescriptorHeapSize = o19.MaxViewDescriptorHeapSize;
+    /* 0110: ExecuteIndirect's incrementing constants (tier 1.1, device-generated commands), shader model 6.8's
+-    * SampleCmpGrad/SampleCmpBias; the tiers have the API's values. Work graphs (0103/0108) stay off: their DDIs aren't
+-    * implemented */
++    * SampleCmpGrad/SampleCmpBias; 0103: work graphs (0108's DDIs). The tiers have the API's values */
+    D3D12_FEATURE_DATA_D3D12_OPTIONS21 o21 = {};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS21, &o21, sizeof(o21))))
+       o21.ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
+    caps->options0110.ExecuteIndirectTier = (D3D12DDI_EXECUTE_INDIRECT_TIER)o21.ExecuteIndirectTier;
+    caps->sm68.SampleCmpGradientAndBiasSupported = o21.SampleCmpGradientAndBiasSupported;
+    caps->sm68.ExtendedCommandInfoSupported = o21.ExtendedCommandInfoSupported;
++   caps->options0103.WorkGraphsTier = (D3D12DDI_WORK_GRAPHS_TIER)o21.WorkGraphsTier;
+ 
+    /* the heaps the runtime makes out of DEFAULT/UPLOAD/READBACK follow this, vkd3d-proton's custom heaps too */
+    D3D12_FEATURE_DATA_ARCHITECTURE arch = {};
+@@ -595,6 +596,8 @@ adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps
+       return answer(caps, dev->options0102);
+    case D3D12DDICAPS_TYPE_OPTIONS_0110:
+       return answer(caps, dev->options0110);
++   case D3D12DDICAPS_TYPE_OPTIONS1_0103:
++      return answer(caps, dev->options0103);
+    case D3D12DDICAPS_TYPE_SHADER_MODEL_6_8_OPTIONS_0110:
+       return answer(caps, dev->sm68);
+ 
+@@ -702,10 +705,9 @@ adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps
+    case D3D12DDICAPS_TYPE_0073_SUPPORT_BATCHED_MARKERS:
+    case D3D12DDICAPS_TYPE_OPTIONS_0098:
+    case D3D12DDICAPS_TYPE_OPTIONS_0101:
+-   case D3D12DDICAPS_TYPE_OPTIONS1_0103:
+    case D3D12DDICAPS_TYPE_OPTIONS_0109:
+       /* none of it: queue flags 0, not compute-only, no hardware scheduling, FALSE; no fully CPU-accessible L1 memory,
+-       * compute-only custom heaps, work graphs or resources recreated at a virtual address */
++       * compute-only custom heaps or resources recreated at a virtual address */
+       if (!caps->pData)
+          return E_INVALIDARG;
+       memset(caps->pData, 0, caps->DataSize);
+@@ -791,6 +793,8 @@ adapter_fill_ddi_table(D3D12DDI_HADAPTER, D3D12DDI_TABLE_TYPE type, VOID *table,
+          viogpu_fill_mesh_shader_funcs(funcs);
+       if (size >= offsetof(D3D12DDI_DEVICE_FUNCS_CORE_0072, pfnAddToStateObject) + sizeof(void *))
+          viogpu_fill_raytracing_funcs(funcs);
++      if (size >= offsetof(D3D12DDI_DEVICE_FUNCS_CORE_0108, pfnGetWorkGraphMemoryRequirements) + sizeof(void *))
++         viogpu_fill_work_graph_funcs(funcs);
+       viogpu_fill_resource_funcs(funcs);
+       viogpu_fill_command_funcs(funcs);
+       return S_OK;
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+index c98c5c6e..688162c3 100644
+--- a/libs/viogpu_umd/umd_private.h
++++ b/libs/viogpu_umd/umd_private.h
+@@ -162,6 +162,8 @@ ID3D12PipelineState *viogpu_pipeline_state_of(D3D12DDI_HPIPELINESTATE h);
+ /* umd_raytracing.cpp: state objects, acceleration structures, DispatchRays */
+ void viogpu_fill_raytracing_funcs(viogpu_device_funcs *funcs);
+ void viogpu_fill_raytracing_list_funcs(viogpu_command_list_funcs *funcs);
++void viogpu_fill_work_graph_funcs(viogpu_device_funcs *funcs);
++void viogpu_fill_work_graph_list_funcs(viogpu_command_list_funcs *funcs);
+ 
+ /* umd_resource.cpp: heaps, resources, descriptor heaps and views, query heaps, command signatures, residency */
+ void viogpu_fill_resource_funcs(viogpu_device_funcs *funcs);
+@@ -179,6 +181,7 @@ struct viogpu_command_list {
+    ID3D12GraphicsCommandList5 *list5; /* variable rate shading */
+    ID3D12GraphicsCommandList6 *list6; /* mesh shaders */
+    ID3D12GraphicsCommandList9 *list9; /* per-face stencil references, dynamic depth bias and strip cut value */
++   ID3D12GraphicsCommandList10 *list10; /* work graphs */
+    struct viogpu_video_list *video;
+ };
+ 
+diff --git a/libs/viogpu_umd/umd_raytracing.cpp b/libs/viogpu_umd/umd_raytracing.cpp
+index 7d3a7661..40112cc3 100644
+--- a/libs/viogpu_umd/umd_raytracing.cpp
++++ b/libs/viogpu_umd/umd_raytracing.cpp
+@@ -3,15 +3,23 @@
+  * SPDX-License-Identifier: LGPL-2.1-or-later
+  */
+ 
+-/* Ray tracing: state objects (collections, ray tracing pipelines) and acceleration structures.
++/* Ray tracing and work graphs: state objects (collections, ray tracing pipelines, work graphs) and acceleration
++ * structures.
+  *
+  * The DDI's subobjects are the API's (same types, same layouts) except that the runtime resolves the associations
+  * itself: no SUBOBJECT_TO_EXPORTS_ASSOCIATION, but a summary of every export's associated subobjects instead. The
+  * state object passed on to vkd3d-proton gets an explicit association per export and associated subobject. DXIL
+  * libraries come as the bare program (like shaders: umd_state.cpp) and get a container. The acceleration structure
+- * arguments are the API's as they are. */
++ * arguments are the API's as they are.
++ *
++ * A work graph comes resolved (every node with its final properties); vkd3d-proton takes the API's form and resolves
++ * it again from the libraries, so it gets all their nodes and the entry points in the runtime's order (the runtime
++ * answers the app's entry point indices itself). ponytail: node overrides (renames, shared inputs, local root
++ * argument indices, dispatch grids set outside the shader) and per-export root signatures are lost - vkd3d-proton
++ * doesn't take them either. */
+ 
+ #include "umd_private.h"
++#include <algorithm>
+ #include <deque>
+ 
+ struct viogpu_state_object {
+@@ -60,8 +68,17 @@ struct state_object_desc {
+    std::deque<D3D12_GLOBAL_ROOT_SIGNATURE> globals;
+    std::deque<D3D12_LOCAL_ROOT_SIGNATURE> locals;
+    std::deque<D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION> associations;
++   std::deque<D3D12_WORK_GRAPH_DESC> graphs;
++   std::deque<std::vector<D3D12_NODE_ID>> entrypoints;
+ };
+ 
++static_assert(sizeof(D3D12DDI_NODE_ID_0108) == sizeof(D3D12_NODE_ID), "node id");
++static_assert(sizeof(D3D12DDI_PROGRAM_IDENTIFIER_0108) == sizeof(D3D12_PROGRAM_IDENTIFIER), "program identifier");
++static_assert(sizeof(D3D12DDI_WORK_GRAPH_MEMORY_REQUIREMENTS_0108) == sizeof(D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS),
++              "work graph memory requirements");
++static_assert(sizeof(D3D12DDI_SET_PROGRAM_DESC_0108) == sizeof(D3D12_SET_PROGRAM_DESC), "set program");
++static_assert(sizeof(D3D12DDI_DISPATCH_GRAPH_DESC_0108) == sizeof(D3D12_DISPATCH_GRAPH_DESC), "dispatch graph");
++
+ static void
+ translate(D3D12DDI_STATE_OBJECT_TYPE type, UINT count, const D3D12DDI_STATE_SUBOBJECT_0054 *in,
+           state_object_desc &out)
+@@ -119,6 +136,22 @@ translate(D3D12DDI_STATE_OBJECT_TYPE type, UINT count, const D3D12DDI_STATE_SUBO
+       case D3D12DDI_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG:
+       case D3D12DDI_STATE_SUBOBJECT_TYPE_HIT_GROUP:
+          break;
++      case D3D12DDI_STATE_SUBOBJECT_TYPE_WORK_GRAPH: {
++         const D3D12DDI_WORK_GRAPH_DESC_0108 *wg = (const D3D12DDI_WORK_GRAPH_DESC_0108 *)in[i].pDesc;
++         out.entrypoints.emplace_back();
++         /* every node kind's properties begin with its final name */
++         for (const D3D12DDI_NODE_LIST_ENTRY_0108 *e = wg->pEntrypoints; e; e = e->pNext)
++            out.entrypoints.back().push_back(
++               *(const D3D12_NODE_ID *)&e->pNode->Shader.pBroadcastingLaunchNodeProperties->FinalName);
++         D3D12_WORK_GRAPH_DESC d = {};
++         d.ProgramName = wg->ProgramName;
++         d.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
++         d.NumEntrypoints = (UINT)out.entrypoints.back().size();
++         d.pEntrypoints = out.entrypoints.back().data();
++         out.graphs.push_back(d);
++         s.pDesc = &out.graphs.back();
++         break;
++      }
+       case D3D12DDI_STATE_SUBOBJECT_TYPE_SHADER_EXPORT_SUMMARY:
+          continue;
+       default:
+@@ -157,6 +190,17 @@ translate(D3D12DDI_STATE_OBJECT_TYPE type, UINT count, const D3D12DDI_STATE_SUBO
+       }
+    }
+ 
++   /* vkd3d-proton's work graphs take nothing else (its root signatures are the defaults) */
++   if (!out.graphs.empty())
++      out.subobjects.erase(std::remove_if(out.subobjects.begin(), out.subobjects.end(),
++                                          [](const D3D12_STATE_SUBOBJECT &s) {
++                                             return s.Type != D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH &&
++                                                    s.Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY &&
++                                                    s.Type != D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE &&
++                                                    s.Type != D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE;
++                                          }),
++                           out.subobjects.end());
++
+    out.desc.Type = (D3D12_STATE_OBJECT_TYPE)type;
+    out.desc.NumSubobjects = (UINT)out.subobjects.size();
+    out.desc.pSubobjects = out.subobjects.data();
+@@ -263,6 +307,47 @@ set_pipeline_stack_size(D3D12DDI_HSTATEOBJECT_0054 h, UINT size)
+       so->props->SetPipelineStackSize(size);
+ }
+ 
++static D3D12DDI_PROGRAM_IDENTIFIER_0108 APIENTRY
++get_program_identifier(D3D12DDI_HSTATEOBJECT_0054 h, LPCWSTR name)
++{
++   viogpu_state_object *so = (viogpu_state_object *)h.pDrvPrivate;
++   D3D12DDI_PROGRAM_IDENTIFIER_0108 id = {};
++   ID3D12StateObjectProperties1 *props1 = NULL;
++   if (so->props && SUCCEEDED(so->props->QueryInterface(IID_PPV_ARGS(&props1)))) {
++      D3D12_PROGRAM_IDENTIFIER pid = props1->GetProgramIdentifier(name);
++      memcpy(&id, &pid, sizeof(id));
++      props1->Release();
++   }
++   return id;
++}
++
++static VOID APIENTRY
++get_work_graph_memory_requirements(D3D12DDI_HSTATEOBJECT_0054 h, LPCWSTR name,
++                                   D3D12DDI_WORK_GRAPH_MEMORY_REQUIREMENTS_0108 *req)
++{
++   viogpu_state_object *so = (viogpu_state_object *)h.pDrvPrivate;
++   memset(req, 0, sizeof(*req));
++   ID3D12WorkGraphProperties *wg = NULL;
++   if (so->so && SUCCEEDED(so->so->QueryInterface(IID_PPV_ARGS(&wg)))) {
++      wg->GetWorkGraphMemoryRequirements(wg->GetWorkGraphIndex(name), (D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS *)req);
++      wg->Release();
++   }
++}
++
++static VOID APIENTRY
++set_program(D3D12DDI_HCOMMANDLIST h, const D3D12DDI_SET_PROGRAM_DESC_0108 *desc)
++{
++   if (list_from(h)->list10)
++      list_from(h)->list10->SetProgram((const D3D12_SET_PROGRAM_DESC *)desc);
++}
++
++static VOID APIENTRY
++dispatch_graph(D3D12DDI_HCOMMANDLIST h, const D3D12DDI_DISPATCH_GRAPH_DESC_0108 *desc)
++{
++   if (list_from(h)->list10)
++      list_from(h)->list10->DispatchGraph((const D3D12_DISPATCH_GRAPH_DESC *)desc);
++}
++
+ /* ---------------------------------------------------------------------------------------------------------------- */
+ /* Acceleration structures */
+ 
+@@ -366,6 +451,20 @@ viogpu_fill_raytracing_funcs(viogpu_device_funcs *f)
+    f->pfnAddToStateObject = add_to_state_object;
+ }
+ 
++void
++viogpu_fill_work_graph_funcs(viogpu_device_funcs *f)
++{
++   f->pfnGetProgramIdentifier = get_program_identifier;
++   f->pfnGetWorkGraphMemoryRequirements = get_work_graph_memory_requirements;
++}
++
++void
++viogpu_fill_work_graph_list_funcs(viogpu_command_list_funcs *f)
++{
++   f->pfnSetProgram = set_program;
++   f->pfnDispatchGraph = dispatch_graph;
++}
++
+ void
+ viogpu_fill_raytracing_list_funcs(viogpu_command_list_funcs *f)
+ {
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index c3224f80..6b4527ec 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9743,9 +9743,8 @@ bool d3d12_device_supports_workgraphs(const struct d3d12_device *device)
+ {
+     /* Thread nodes currently need wave32 to function correctly since the API limits for thread nodes
+      * match wave32 expectations (8 nodes per thread * 32 threads = 256 max nodes). */
+-    return ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES) ||
+-            vkd3d_debug_control_is_test_suite()) &&
+-            device->device_info.shader_maximal_reconvergence_features.shaderMaximalReconvergence &&
++    /* viogpu: offered without enable_experimental_features (the D3D12 driver's work graphs) */
++    return device->device_info.shader_maximal_reconvergence_features.shaderMaximalReconvergence &&
+             device->device_info.vulkan_1_2_features.vulkanMemoryModel &&
+             device->device_info.vulkan_1_3_features.subgroupSizeControl &&
+             (device->device_info.vulkan_1_3_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) &&

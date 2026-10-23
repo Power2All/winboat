@@ -57,6 +57,11 @@
             "from": "./data",
             "to": "data",
             "filter": ["**/*"]
+        },
+        {
+            "from": "./spice",
+            "to": "spice",
+            "filter": ["image/**/*", "viewer/**/*"]
         }
     ]
 }

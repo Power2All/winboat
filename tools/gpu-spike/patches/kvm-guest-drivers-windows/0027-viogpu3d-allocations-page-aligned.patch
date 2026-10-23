@@ -1,0 +1,26 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: allocations page-aligned
+
+Allocations reported an alignment of 0. Windows 10's video memory manager suballocates process-private backing
+stores from 32 MB blocks reserved in the process (VIDMM_RECYCLE_HEAP) and looks for a free range with the
+alignment rounded up: (start + alignment - 1) & ~(alignment - 1), which is 0 for an alignment of 0 and below every
+range. No range ever fit, every allocation (a 4 KB one too) reserved a 32 MB block of its own, and 32-bit programs ran
+out of address space after ~60 resources (E_OUTOFMEMORY; dx-test's 32-bit groups: 15 failures). 64-bit programs
+only wasted address space; Windows 11 shares the blocks either way. Page alignment: 1500 textures in one block.
+---
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index edd53eb..389076d 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -349,7 +349,10 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+         pCreateAllocation->hResource = resource;
+     }
+ 
+-    allocationInfo->Alignment = 0;
++    // A page, not 0: Windows 10's video memory manager aligns backing stores to it, and an alignment of 0 never fits
++    // a free range (VidMmFindAlignedRange), so every allocation took a 32 MB block of the process's address space of
++    // its own and 32-bit programs ran out after ~60 resources
++    allocationInfo->Alignment = PAGE_SIZE;
+     allocationInfo->Size = (SIZE_T)resourceExchange->Size;
+     allocationInfo->PitchAlignedSize = 0;
+     allocationInfo->HintedBank.Value = 0;

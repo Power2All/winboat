@@ -1,0 +1,430 @@
+From: WinBoat
+Subject: [PATCH] gdikmt, d3d9umd, d3d10umd: residency for WDDM 2.0 kernel drivers
+
+With a WDDM 2.0 kernel driver Windows no longer makes allocations resident
+for the user-mode driver: a command buffer naming one that wasn't made
+resident is dropped ("Allocation is not requested to be resident"), and
+from D3DKMT the whole device is put in error.
+
+- gdikmt_wddm2_make_resident (D3D9 and D3D10/11 drivers): a paging queue
+  made on first use, MakeResident after every allocation created or opened,
+  then a wait for the paging fence. The runtimes' pfnMakeResidentCb reports
+  pending paging work as E_PENDING (not STATUS_PENDING), so the wait happens
+  whenever a paging fence value comes back; a command buffer sent before
+  the paging work is done is dropped ("allocation has not been fully
+  committed").
+- The OpenGL D3DKMT path does the same after D3DKMTCreateAllocation and
+  D3DKMTOpenResource (the window's back buffer is a resource shared from
+  another device, resident only for that one).
+- d3d9umd declares the WDDM 2.0 interface when the kernel driver is WDDM 2.0
+  (VIOGPU_ADAPTERINFO::Flags.Wddm2), so the runtime hands it the residency
+  callbacks; WDDM 1.x kernel drivers have no paging queue and nothing
+  changes.
+---
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt.h b/src/gallium/auxiliary/gdikmt/gdikmt.h
+--- a/src/gallium/auxiliary/gdikmt/gdikmt.h
++++ b/src/gallium/auxiliary/gdikmt/gdikmt.h
+@@ -4,6 +4,7 @@
+ #ifndef gdikmt_h
+ #define gdikmt_h
+ 
++#include <stdbool.h>
+ #include <windows.h>
+ #include <winternl.h>
+ #include <d3dkmthk.h>
+@@ -100,6 +101,17 @@
+ extern "C" {
+ #endif
+ 
++/* WDDM 2.0 residency for the D3D user-mode drivers (gdikmt_wddm2.c): their paging queue, made on first use */
++struct gdikmt_wddm2_residency {
++   D3DKMT_HANDLE hPagingQueue;
++   D3DKMT_HANDLE hPagingFence;
++   bool tried;
++};
++struct _D3DDDI_DEVICECALLBACKS;
++void
++gdikmt_wddm2_make_resident(struct gdikmt_wddm2_residency *residency, const struct _D3DDDI_DEVICECALLBACKS *cb,
++                           HANDLE hRTDevice, const D3DKMT_HANDLE *handles, UINT count);
++
+ struct gdikmt_device *gdikmt_create_from_hdc(HDC hDC);
+ /* Opens the adapter with this LUID through the D3DKMT* functions */
+ struct gdikmt_device *gdikmt_create_from_luid(LUID luid);
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+--- a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
++++ b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+@@ -26,6 +26,11 @@
+    PFND3DKMT_OPENADAPTERFROMHDC openAdapterFromHdc;
+    PFND3DKMT_OPENADAPTERFROMLUID openAdapterFromLuid;
+    PFND3DKMT_CLOSEADAPTER closeAdapter;
++   /* WDDM 2.0 residency */
++   PFND3DKMT_CREATEPAGINGQUEUE createPagingQueue;
++   PFND3DKMT_DESTROYPAGINGQUEUE destroyPagingQueue;
++   PFND3DKMT_MAKERESIDENT makeResident;
++   PFND3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU waitForSynchronizationObjectFromCpu;
+ };
+ 
+ void
+@@ -61,6 +66,15 @@
+       gdi32lib, "D3DKMTOpenAdapterFromLuid");
+    cb->closeAdapter =
+       (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32lib, "D3DKMTCloseAdapter");
++   cb->createPagingQueue = (PFND3DKMT_CREATEPAGINGQUEUE)GetProcAddress(
++      gdi32lib, "D3DKMTCreatePagingQueue");
++   cb->destroyPagingQueue = (PFND3DKMT_DESTROYPAGINGQUEUE)GetProcAddress(
++      gdi32lib, "D3DKMTDestroyPagingQueue");
++   cb->makeResident =
++      (PFND3DKMT_MAKERESIDENT)GetProcAddress(gdi32lib, "D3DKMTMakeResident");
++   cb->waitForSynchronizationObjectFromCpu =
++      (PFND3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU)GetProcAddress(
++         gdi32lib, "D3DKMTWaitForSynchronizationObjectFromCpu");
+ }
+ 
+ struct gdikmt_context_d3dkmt {
+@@ -81,6 +95,11 @@
+    D3DKMT_HANDLE hAdapter;
+    D3DKMT_HANDLE hDevice;
+ 
++   /* WDDM 2.0 kernel drivers (GPU virtual addresses) leave residency to the user-mode driver: allocations are made
++    * resident through this paging queue when they are created. 0 on WDDM 1.x, where the allocation lists do it */
++   D3DKMT_HANDLE hPagingQueue;
++   D3DKMT_HANDLE hPagingFence;
++
+    HINSTANCE gdi32lib;
+    struct d3dkmt_callbacks cb;
+ };
+@@ -225,6 +244,35 @@
+    return Status;
+ }
+ 
++/* WDDM 2.0: resident from now on, before any command uses them (a command buffer naming an allocation that isn't
++ * puts the whole device in error). Nothing to do on WDDM 1.x, which has no paging queue */
++static void
++d3dkmt_make_resident(struct gdikmt_device_d3dkmt *device, const D3DKMT_HANDLE *handles, UINT count)
++{
++   if (!device->hPagingQueue || !count)
++      return;
++
++   D3DDDI_MAKERESIDENT resident;
++   memset(&resident, 0, sizeof(resident));
++   resident.hPagingQueue = device->hPagingQueue;
++   resident.NumAllocations = count;
++   resident.AllocationList = handles;
++   resident.Flags.MustSucceed = 1;
++   NTSTATUS residentStatus = device->cb.makeResident(&resident);
++   /* pending paging work signals the paging fence with this value; a value already reached returns at once */
++   if ((residentStatus == STATUS_PENDING || NT_SUCCESS(residentStatus)) && resident.PagingFenceValue) {
++      D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait;
++      memset(&wait, 0, sizeof(wait));
++      wait.hDevice = device->hDevice;
++      wait.ObjectCount = 1;
++      wait.ObjectHandleArray = &device->hPagingFence;
++      wait.FenceValueArray = &resident.PagingFenceValue;
++      residentStatus = device->cb.waitForSynchronizationObjectFromCpu(&wait);
++   }
++   if (!NT_SUCCESS(residentStatus))
++      _debug_printf("Failed to make allocations resident: %lx\n", residentStatus);
++}
++
+ NTSTATUS
+ gdikmt_d3dkmt_createallocation(struct gdikmt_device *_device,
+                                struct gdikmt_createallocation *options)
+@@ -245,6 +293,14 @@
+ 
+    options->hResource = (HANDLE)createAllocation.hResource;
+ 
++   if (NT_SUCCESS(Status)) {
++      D3DKMT_HANDLE handles[16];
++      UINT count = MIN2(options->NumAllocations, ARRAY_SIZE(handles));
++      for (UINT i = 0; i < count; i++)
++         handles[i] = options->pAllocationInfo[i].hAllocation;
++      d3dkmt_make_resident(device, handles, count);
++   }
++
+    return Status;
+ }
+ 
+@@ -339,6 +395,15 @@
+ 
+    free(privateRuntimeData);
+ 
++   /* a shared resource (another device's, such as the window's back buffer) is resident for that device only */
++   if (NT_SUCCESS(Status)) {
++      D3DKMT_HANDLE handles[16];
++      UINT count = MIN2(openAllocation->NumAllocations, ARRAY_SIZE(handles));
++      for (UINT i = 0; i < count; i++)
++         handles[i] = openAllocation->pOpenAllocation[i].hAllocation;
++      d3dkmt_make_resident(device, handles, count);
++   }
++
+    return Status;
+ }
+ 
+@@ -400,6 +465,19 @@
+    }
+    device->hDevice = createDevice.hDevice;
+ 
++   /* a paging queue only exists with WDDM 2.0 kernel drivers */
++   if (device->cb.createPagingQueue && device->cb.makeResident &&
++       device->cb.waitForSynchronizationObjectFromCpu) {
++      D3DKMT_CREATEPAGINGQUEUE pagingQueue;
++      memset(&pagingQueue, 0, sizeof(pagingQueue));
++      pagingQueue.hDevice = device->hDevice;
++      pagingQueue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
++      if (NT_SUCCESS(device->cb.createPagingQueue(&pagingQueue))) {
++         device->hPagingQueue = pagingQueue.hPagingQueue;
++         device->hPagingFence = pagingQueue.hSyncObject;
++      }
++   }
++
+    device->base.destroy = gdikmt_d3dkmt_destroy;
+    device->base.queryAdapterInfo = gdikmt_d3dkmt_queryadapterinfo;
+    device->base.escape = gdikmt_d3dkmt_escape;
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt_wddm2.c b/src/gallium/auxiliary/gdikmt/gdikmt_wddm2.c
+new file mode 100644
+--- /dev/null
++++ b/src/gallium/auxiliary/gdikmt/gdikmt_wddm2.c
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Residency with WDDM 2.0 kernel drivers (GPU virtual addresses). Windows makes nothing resident for the user-mode
++ * driver any more: an allocation a command buffer names must have been made resident (MakeResident), else the
++ * kernel drops the command buffer ("Allocation is not requested to be resident"). The D3D runtimes hand our
++ * drivers the WDDM 2.0 callbacks for it even on their WDDM 1.x interfaces; on WDDM 1.x kernel drivers there is no
++ * paging queue and this does nothing.
++ */
++
++#include <string.h>
++#include "gdikmt/gdikmt.h"
++
++/* d3dumddi.h needs the D3D9 types first */
++#include <d3d9types.h>
++#include <d3dumddi.h>
++
++#include "util/macros.h"
++#include "util/u_debug.h"
++
++void
++gdikmt_wddm2_make_resident(struct gdikmt_wddm2_residency *residency, const D3DDDI_DEVICECALLBACKS *cb,
++                           HANDLE hRTDevice, const D3DKMT_HANDLE *handles, UINT count)
++{
++   if (!residency->tried) {
++      residency->tried = true;
++      if (cb->pfnCreatePagingQueueCb && cb->pfnMakeResidentCb && cb->pfnWaitForSynchronizationObjectFromCpuCb) {
++         D3DDDICB_CREATEPAGINGQUEUE queue;
++         memset(&queue, 0, sizeof(queue));
++         queue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
++         if (SUCCEEDED(cb->pfnCreatePagingQueueCb(hRTDevice, &queue))) {
++            residency->hPagingQueue = queue.hPagingQueue;
++            residency->hPagingFence = queue.hSyncObject;
++         }
++      }
++   }
++   if (!residency->hPagingQueue || !count)
++      return;
++
++   /* resident for good: these drivers never evict (the memory manager still may, under pressure) */
++   D3DDDI_MAKERESIDENT resident;
++   memset(&resident, 0, sizeof(resident));
++   resident.hPagingQueue = residency->hPagingQueue;
++   resident.NumAllocations = count;
++   resident.AllocationList = handles;
++   resident.Flags.MustSucceed = 1;
++   HRESULT hr = cb->pfnMakeResidentCb(hRTDevice, &resident);
++   /* pending paging work: the runtimes report it as E_PENDING (the kernel's STATUS_PENDING), with the paging fence
++    * value it signals. A command buffer naming the allocations before that is dropped ("allocation has not been
++    * fully committed"), so wait for it; a value already reached returns at once */
++   if ((SUCCEEDED(hr) || hr == E_PENDING || hr == (HRESULT)STATUS_PENDING) && resident.PagingFenceValue) {
++      D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait;
++      memset(&wait, 0, sizeof(wait));
++      wait.ObjectCount = 1;
++      wait.ObjectHandleArray = &residency->hPagingFence;
++      wait.FenceValueArray = &resident.PagingFenceValue;
++      hr = cb->pfnWaitForSynchronizationObjectFromCpuCb(hRTDevice, &wait);
++   }
++   if (FAILED(hr))
++      debug_printf("gdikmt: MakeResident failed: 0x%lx\n", (unsigned long)hr);
++}
+diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
+--- a/src/gallium/auxiliary/meson.build
++++ b/src/gallium/auxiliary/meson.build
+@@ -294,6 +294,7 @@
+   files_libgallium += files(
+     'gdikmt/gdikmt.h',
+     'gdikmt/gdikmt_d3dkmt.c',
++    'gdikmt/gdikmt_wddm2.c',
+   )
+ endif
+ 
+diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
+--- a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
++++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
+@@ -152,6 +152,13 @@
+    return Status;
+ }
+ 
++/* WDDM 2.0 kernel drivers: allocations must be made resident (gdikmt_wddm2_make_resident) */
++static void
++gdikmt_d3dddi_makeresident(struct gdikmt_device_d3dddi *device, const D3DKMT_HANDLE *handles, UINT count)
++{
++   gdikmt_wddm2_make_resident(&device->residency, &device->KTCallbacks, device->hRTDevice, handles, count);
++}
++
+ NTSTATUS
+ gdikmt_d3dddi_createallocation(struct gdikmt_device *_device,
+                                struct gdikmt_createallocation *options)
+@@ -187,6 +194,14 @@
+ 
+    options->hResource = (HANDLE)createAllocation.hKMResource;
+ 
++   if (NT_SUCCESS(Status)) {
++      D3DKMT_HANDLE handles[16];
++      UINT count = MIN2(options->NumAllocations, ARRAY_SIZE(handles));
++      for (UINT i = 0; i < count; i++)
++         handles[i] = options->pAllocationInfo[i].hAllocation;
++      gdikmt_d3dddi_makeresident(device, handles, count);
++   }
++
+    return Status;
+ }
+ 
+@@ -251,6 +266,13 @@
+       options->pOpenAllocation[i] =
+          device->pOpenResource->pOpenAllocationInfo[i];
+    }
++   {
++      D3DKMT_HANDLE handles[16];
++      UINT count = MIN2(options->NumAllocations, ARRAY_SIZE(handles));
++      for (UINT i = 0; i < count; i++)
++         handles[i] = options->pOpenAllocation[i].hAllocation;
++      gdikmt_d3dddi_makeresident(device, handles, count);
++   }
+ 
+    memcpy(options->pPrivateDriverData,
+           device->pOpenResource->pPrivateDriverData,
+diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h
+--- a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h
++++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h
+@@ -11,6 +11,9 @@
+    D3DDDI_ADAPTERCALLBACKS *pAdapterCallbacks;
+    DXGI_DDI_BASE_CALLBACKS *pDXGIBaseCallbacks;
+ 
++   /* WDDM 2.0 kernel drivers leave residency to the user-mode driver */
++   struct gdikmt_wddm2_residency residency;
++
+    UINT allocationVidPn;
+    boolean isPrimary;
+    HANDLE hRTResource;
+diff --git a/src/gallium/frontends/d3d9umd/adapter.cpp b/src/gallium/frontends/d3d9umd/adapter.cpp
+--- a/src/gallium/frontends/d3d9umd/adapter.cpp
++++ b/src/gallium/frontends/d3d9umd/adapter.cpp
+@@ -22,7 +22,7 @@
+  * callbacks can't create one, so open the virtio-gpu adapter through D3DKMT ourselves: find it by asking every
+  * adapter for its driver's private data (in an RDP session the desktop belongs to a different, remote adapter). */
+ static bool
+-FindVioGpuAdapter(LUID *luid)
++FindVioGpuAdapter(LUID *luid, bool *wddm2)
+ {
+    HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
+    auto enumAdapters2 = (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gdi32, "D3DKMTEnumAdapters2");
+@@ -52,6 +52,7 @@
+       query.PrivateDriverDataSize = sizeof(info);
+       if (!found && NT_SUCCESS(queryAdapterInfo(&query)) && info.IamVioGPU == VIOGPU_IAM) {
+          *luid = adapters[i].AdapterLuid;
++         *wddm2 = info.Flags.Wddm2;
+          found = true;
+       }
+       D3DKMT_CLOSEADAPTER close;
+@@ -176,7 +177,7 @@
+ ProbeAdapter(D3D9UmdAdapter *adapter)
+ {
+    LUID luid;
+-   if (!FindVioGpuAdapter(&luid)) {
++   if (!FindVioGpuAdapter(&luid, &adapter->wddm2)) {
+       D3D9UmdLog("no virtio-gpu adapter found");
+       return false;
+    }
+@@ -283,7 +284,8 @@
+    pOpenData->pAdapterFuncs->pfnGetCaps = D3D9UmdGetCaps;
+    pOpenData->pAdapterFuncs->pfnCreateDevice = CreateDevice;
+    pOpenData->pAdapterFuncs->pfnCloseAdapter = CloseAdapter;
+-   /* Windows 8.1's interface (WDDM 1.3, the kernel driver's) */
+-   pOpenData->DriverVersion = D3D_UMD_INTERFACE_VERSION_WDDM1_3;
++   /* The kernel driver's interface: WDDM 2.0 (the runtime then hands over the residency callbacks, which a WDDM 2.0
++    * kernel driver needs: gdikmt_wddm2_make_resident), else Windows 8.1's WDDM 1.3 */
++   pOpenData->DriverVersion = adapter->wddm2 ? D3D_UMD_INTERFACE_VERSION_WDDM2_0 : D3D_UMD_INTERFACE_VERSION_WDDM1_3;
+    return S_OK;
+ }
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd.h b/src/gallium/frontends/d3d9umd/d3d9umd.h
+--- a/src/gallium/frontends/d3d9umd/d3d9umd.h
++++ b/src/gallium/frontends/d3d9umd/d3d9umd.h
+@@ -26,6 +26,8 @@
+ struct D3D9UmdAdapter {
+    HANDLE hRTAdapter;
+    D3DDDI_ADAPTERCALLBACKS callbacks;
++   /* the kernel driver is WDDM 2.0 (VIOGPU_ADAPTERINFO::Flags.Wddm2) */
++   bool wddm2;
+ 
+    /* What the GPU supports, from a gallium screen on a D3DKMT device of our own (the runtime asks before any
+     * device exists) */
+diff --git a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
+--- a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
++++ b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
+@@ -150,6 +150,14 @@
+    device->hRTResource = NULL;
+    NTSTATUS status = device->callbacks.pfnAllocateCb(device->hRTDevice, &allocate);
+    options->hResource = (HANDLE)(uintptr_t)allocate.hKMResource;
++   if (NT_SUCCESS(status)) {
++      /* WDDM 2.0 kernel drivers: resident before any command names them */
++      D3DKMT_HANDLE handles[16];
++      UINT count = MIN2(options->NumAllocations, ARRAY_SIZE(handles));
++      for (UINT i = 0; i < count; i++)
++         handles[i] = options->pAllocationInfo[i].hAllocation;
++      gdikmt_wddm2_make_resident(&device->residency, &device->callbacks, device->hRTDevice, handles, count);
++   }
+    D3D9UMD_TRACE("  AllocateCb: %u allocation(s) for runtime resource %p -> 0x%lx, kernel resource 0x%x",
+                  allocate.NumAllocations, allocate.hResource, status, allocate.hKMResource);
+    return status;
+@@ -201,6 +209,14 @@
+       return STATUS_NOT_SUPPORTED;
+    for (UINT i = 0; i < options->NumAllocations; i++)
+       options->pOpenAllocation[i] = open->pOpenAllocationInfo[i];
++   {
++      D3DKMT_HANDLE handles[16];
++      UINT count = MIN2(options->NumAllocations, ARRAY_SIZE(handles));
++      for (UINT i = 0; i < count; i++)
++         handles[i] = options->pOpenAllocation[i].hAllocation;
++      gdikmt_wddm2_make_resident(&device_d3d9(_device)->residency, &device_d3d9(_device)->callbacks,
++                                 device_d3d9(_device)->hRTDevice, handles, count);
++   }
+    memcpy(options->pPrivateDriverData, open->pPrivateDriverData, open->PrivateDriverDataSize);
+    options->PrivateDriverDataSize = open->PrivateDriverDataSize;
+    return STATUS_SUCCESS;
+diff --git a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h
+--- a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h
++++ b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.h
+@@ -25,6 +25,8 @@
+    HANDLE hRTResource;
+    /* Set while the driver opens a shared resource: its allocations and private data */
+    const D3DDDIARG_OPENRESOURCE *pOpenResource;
++   /* WDDM 2.0 kernel drivers leave residency to the user-mode driver */
++   struct gdikmt_wddm2_residency residency;
+ };
+ 
+ /* What flush_frontbuffer passes as its drawable handle when presenting */
+diff --git a/src/virtio/wddm/viogpu_wddm_driver.h b/src/virtio/wddm/viogpu_wddm_driver.h
+--- a/src/virtio/wddm/viogpu_wddm_driver.h
++++ b/src/virtio/wddm/viogpu_wddm_driver.h
+@@ -51,7 +51,8 @@
+     struct {
+         UINT Supports3d : 1;
+         UINT SupportsBlob : 1; // Venus: blob resources with a host-visible memory window (VIOGPU_BLOB_*)
+-        UINT Reserved : 30;
++        UINT Wddm2 : 1;        // a WDDM 2.0 kernel driver: user-mode drivers make their allocations resident
++        UINT Reserved : 29;
+     } Flags;
+     ULONGLONG SupportedCapsetIDs;
+ } VIOGPU_ADAPTERINFO;

@@ -1,0 +1,89 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: Media Foundation hardware encoders in the package
+
+WinBoat's winboat_mft64.dll (tools/mf-encoder: asynchronous hardware H.264
+and HEVC encoder MFTs on the AMF runtime's Vulkan Video encoder) goes to
+System32, with the COM classes and Media Foundation entries its
+DllRegisterServer would write as AddReg (InfVerif refuses RegisterDlls;
+the server path as %SystemRoot%, expandable). Windows' capture and recording
+and ffmpeg's h264_mf/hevc_mf find a hardware encoder on the host GPU.
+---
+diff --git a/viogpu/viogpu3d/viogpu3d.inx b/viogpu/viogpu3d/viogpu3d.inx
+index d65ff89..5560da9 100644
+--- a/viogpu/viogpu3d/viogpu3d.inx
++++ b/viogpu/viogpu3d/viogpu3d.inx
+@@ -21,6 +21,7 @@ VioGpu3D_Files.Usermode = 13 ; DriverStore
+ VioGpu3D_Files.VulkanLoader = 11      ; System32: the Khronos Vulkan loader (Windows has none of its own)
+ VioGpu3D_Files.VulkanLoaderWow = 10,SysWOW64
+ VioGpu3D_Files.Amf = 11            ; System32: the AMF runtime (WinBoat's, on Vulkan Video: AMF encoders reach the host GPU)
++VioGpu3D_Files.Mft = 11            ; System32: Media Foundation's hardware H.264/HEVC encoders (WinBoat's, on Vulkan Video)
+ 
+ 
+ 
+@@ -47,6 +48,7 @@ vulkan-1_x86.dll = 1,,
+ vulkan-1-license.txt = 1,,
+ amfrt64.dll = 1,,
+ amfrt64-license.txt = 1,,
++winboat_mft64.dll = 1,,
+ 
+ [Manufacturer]
+ %RHEL%=RHEL,NT$ARCH$
+@@ -85,11 +87,34 @@ vulkan-1.dll,vulkan-1_x86.dll,,0x20
+ [VioGpu3D_Files.Amf]
+ amfrt64.dll,,,0x20
+ 
++[VioGpu3D_Files.Mft]
++winboat_mft64.dll,,,0
++
++; the encoders' COM classes and Media Foundation entries: what their DllRegisterServer writes (MFTRegister;
++; InfVerif refuses RegisterDlls). MFTFlags 6: hardware, asynchronous; Attributes: vendor VEN_1AF4, asynchronous
++[VioGpu3D_MftReg]
++HKLM,"SOFTWARE\Classes\CLSID\{6C0F8E3A-5B1D-4F7E-9C2A-1D8B3E4F5A60}\InprocServer32",,0x20000,"%%SystemRoot%%\System32\winboat_mft64.dll"
++HKLM,"SOFTWARE\Classes\CLSID\{6C0F8E3A-5B1D-4F7E-9C2A-1D8B3E4F5A60}\InprocServer32",ThreadingModel,,"Both"
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a60",,,"WinBoat H.264 Encoder"
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a60",InputTypes,0x1,76,69,64,73,00,00,10,00,80,00,00,aa,00,38,9b,71,4e,56,31,32,00,00,10,00,80,00,00,aa,00,38,9b,71,76,69,64,73,00,00,10,00,80,00,00,aa,00,38,9b,71,49,59,55,56,00,00,10,00,80,00,00,aa,00,38,9b,71
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a60",OutputTypes,0x1,76,69,64,73,00,00,10,00,80,00,00,aa,00,38,9b,71,48,32,36,34,00,00,10,00,80,00,00,aa,00,38,9b,71
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a60",Attributes,0x1,41,46,4d,49,02,00,00,00,cc,b0,ec,3a,5b,03,cc,4b,81,85,2b,8d,55,1e,f3,af,1f,00,00,00,00,00,00,00,12,00,00,00,48,00,00,00,9a,69,1a,f8,9a,64,7d,49,8c,73,29,f8,fe,d6,ad,7a,13,00,00,00,00,00,00,00,01,00,00,00,00,00,00,00,56,00,45,00,4e,00,5f,00,31,00,41,00,46,00,34,00,00,00
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a60",MFTFlags,0x10001,6
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\Categories\f79eac7d-e545-4387-bdee-d647d7bde42a\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a60",,0x10
++HKLM,"SOFTWARE\Classes\CLSID\{6C0F8E3A-5B1D-4F7E-9C2A-1D8B3E4F5A61}\InprocServer32",,0x20000,"%%SystemRoot%%\System32\winboat_mft64.dll"
++HKLM,"SOFTWARE\Classes\CLSID\{6C0F8E3A-5B1D-4F7E-9C2A-1D8B3E4F5A61}\InprocServer32",ThreadingModel,,"Both"
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a61",,,"WinBoat HEVC Encoder"
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a61",InputTypes,0x1,76,69,64,73,00,00,10,00,80,00,00,aa,00,38,9b,71,4e,56,31,32,00,00,10,00,80,00,00,aa,00,38,9b,71,76,69,64,73,00,00,10,00,80,00,00,aa,00,38,9b,71,49,59,55,56,00,00,10,00,80,00,00,aa,00,38,9b,71
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a61",OutputTypes,0x1,76,69,64,73,00,00,10,00,80,00,00,aa,00,38,9b,71,48,45,56,43,00,00,10,00,80,00,00,aa,00,38,9b,71
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a61",Attributes,0x1,41,46,4d,49,02,00,00,00,cc,b0,ec,3a,5b,03,cc,4b,81,85,2b,8d,55,1e,f3,af,1f,00,00,00,00,00,00,00,12,00,00,00,48,00,00,00,9a,69,1a,f8,9a,64,7d,49,8c,73,29,f8,fe,d6,ad,7a,13,00,00,00,00,00,00,00,01,00,00,00,00,00,00,00,56,00,45,00,4e,00,5f,00,31,00,41,00,46,00,34,00,00,00
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a61",MFTFlags,0x10001,6
++HKLM,"SOFTWARE\Classes\MediaFoundation\Transforms\Categories\f79eac7d-e545-4387-bdee-d647d7bde42a\6c0f8e3a-5b1d-4f7e-9c2a-1d8b3e4f5a61",,0x10
++
+ [VioGpu3D_Inst]
+ Include=msdv.inf
+ FeatureScore=F9
+-CopyFiles=VioGpu3D_Files.Driver, VioGpu3D_Files.Usermode, VioGpu3D_Files.VulkanLoader, VioGpu3D_Files.VulkanLoaderWow, VioGpu3D_Files.Amf
+-AddReg=VioGpu3D_DeviceSettings
++CopyFiles=VioGpu3D_Files.Driver, VioGpu3D_Files.Usermode, VioGpu3D_Files.VulkanLoader, VioGpu3D_Files.VulkanLoaderWow, VioGpu3D_Files.Amf, VioGpu3D_Files.Mft
++AddReg=VioGpu3D_DeviceSettings, VioGpu3D_MftReg
+ 
+ 
+ [VioGpu3D_Inst.Services]
+diff --git a/viogpu/viogpu3d/viogpu3d.vcxproj b/viogpu/viogpu3d/viogpu3d.vcxproj
+index 5111c83..69a16e7 100644
+--- a/viogpu/viogpu3d/viogpu3d.vcxproj
++++ b/viogpu/viogpu3d/viogpu3d.vcxproj
+@@ -217,7 +217,7 @@
+       </PackageRelativeDirectory>
+     </FilesToPackage>
+     <!-- Vulkan: Mesa's Venus driver (clang-cl builds into the same prefixes) and the Khronos loader -->
+-    <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX)\bin\amfrt64.dll;$(MESA_PREFIX)\bin\amfrt64-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll">
++    <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX)\bin\amfrt64.dll;$(MESA_PREFIX)\bin\winboat_mft64.dll;$(MESA_PREFIX)\bin\amfrt64-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll">
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
+@@ -238,7 +238,7 @@
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d9_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll;$(MESA_PREFIX32)\bin\viogpu_d3d12_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_wgl_x86.dll" />
+-    <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX)\bin\amfrt64.dll;$(MESA_PREFIX)\bin\amfrt64-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll" />
++    <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX)\bin\amfrt64.dll;$(MESA_PREFIX)\bin\winboat_mft64.dll;$(MESA_PREFIX)\bin\amfrt64-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll" />
+   </ItemGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <Import Condition="Exists('$(MESA_PREFIX)\bin\viogpu_d3d10.dll')" Project="$(MSBuildProjectDirectory)\..\..\build\Driver.Common.targets" />

@@ -1,0 +1,55 @@
+vhost-user-gpu: reset the scanouts with the device
+
+When the guest reboots, the device is reset and QEMU closes the backend's
+GPU socket, so the backend's last command (disabling the scanout) never
+arrives: the console stayed on the backend's dmabuf, without a surface, and
+VGA, which takes over until the guest's driver starts again, crashed drawing
+on it (vga_update_display). Release the dmabufs and give the consoles a
+placeholder surface on reset, as virtio-gpu-gl does
+(virtio_gpu_virgl_reset_scanout). Applies on top of patch 0002.
+
+--- a/hw/display/vhost-user-gpu.c
++++ b/hw/display/vhost-user-gpu.c
+@@ -643,12 +643,42 @@
+     object_unref(OBJECT(g->vhost));
+ }
+ 
++/*
++ * The guest's scanouts end with a reset, like virtio-gpu-gl's: the backend
++ * may not get to disable them (QEMU closes its socket first), and the console
++ * mustn't keep showing a dmabuf without a surface. VGA, which takes over until
++ * the guest's driver starts again, draws on the console's surface.
++ */
++static void
++vhost_user_gpu_reset_scanouts(VhostUserGPU *g)
++{
++    int i;
++
++    for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
++        QemuConsole *con = g->parent_obj.scanout[i].con;
++        QemuDmaBuf *dmabuf = g->dmabuf[i];
++
++        if (!con) {
++            continue;
++        }
++        if (dmabuf) {
++            qemu_dmabuf_close(dmabuf);
++            qemu_console_gl_release_dmabuf(con, dmabuf);
++            qemu_dmabuf_free(dmabuf);
++            g->dmabuf[i] = NULL;
++        }
++        qemu_console_set_surface(con, NULL);
++        qemu_console_gl_scanout_disable(con);
++    }
++}
++
+ static void
+ vhost_user_gpu_reset(VirtIODevice *vdev)
+ {
+     VhostUserGPU *g = VHOST_USER_GPU(vdev);
+ 
+     virtio_gpu_base_reset(VIRTIO_GPU_BASE(vdev));
++    vhost_user_gpu_reset_scanouts(g);
+ 
+     vhost_user_backend_stop(g->vhost);
+ }

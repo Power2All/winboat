@@ -72,6 +72,14 @@ export type ComposeConfig = {
             restart: string;
             volumes: string[];
             devices: string[];
+            // Docker: GPU access through the NVIDIA Container Toolkit (virtual GPU)
+            deploy?: {
+                resources: {
+                    reservations: {
+                        devices: { driver: string; count: string | number; capabilities: string[] }[];
+                    };
+                };
+            };
         };
     };
 };
@@ -85,6 +93,13 @@ export type Metrics = {
         used: number; // RAM Usage in MB (e.g. 500)
         total: number; // RAM Total in MB (e.g. 4096)
         percentage: number; // RAM Usage in percentage (e.g. 70%)
+    };
+    // The virtual GPU driver's totals since it started (a driver without them: none)
+    gpu?: {
+        commands: number;
+        commandBytes: number; // the commands' bytes, with the data they carry (3D command streams)
+        uploadBytes: number; // texture and buffer data the host copied from Windows' memory
+        downloadBytes: number; // and into it
     };
     disk: {
         used: number; // Disk Usage in MB (e.g. 29491)

@@ -1,0 +1,4518 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: Direct3D 12 user-mode driver for viogpu
+
+A WDDM Direct3D 12 user-mode driver (viogpu_d3d12.dll, Windows x64, and
+viogpu_d3d12_x86.dll) for the viogpu3d kernel driver: the D3D12 DDI the Windows runtime calls, on
+vkd3d-proton's implementation of the D3D12 API over Vulkan (Mesa's Venus
+driver on the virtual GPU). Meson option enable_viogpu_umd.
+
+- umd_ddi.cpp speaks the DDI (D3D12DDI_SUPPORTED_0082, and 0052 for older
+  runtimes: the tables only grow and newer arguments extend older ones) with
+  the Windows SDK's and WDK's headers. vkd3d-proton's objects are the same
+  COM objects as the SDK's interfaces, so the driver calls them through
+  those; umd_bridge.c creates the vkd3d-proton device (no surfaces) on the
+  package's own Vulkan driver, loaded directly (viogpu_vk[_x86].dll next to
+  it: the Vulkan loader would also load other drivers and layers into every
+  D3D12 program, and Dozen, Vulkan on D3D12 from Microsoft's compatibility
+  pack, deadlocks inside D3D12CreateDevice), and serializes root signatures.
+  Without a usable vkd3d-proton device (no Venus, a host Vulkan short of
+  D3D12's needs) the adapter has no Direct3D 12: DXGI_ERROR_UNSUPPORTED.
+  Caps come from vkd3d-proton, kept to what the
+  runtime insists on (IOCoherent on x86, view instancing needs SM 6.1, native
+  16-bit ops SM 6.2, shader models up to 6.6 at DDI 0082, feature level 12_1
+  until the DXR/mesh/VRS/sampler feedback entries are there: reporting 12_2
+  without them fails device creation).
+- umd_state.cpp: shaders arrive as the bare program (SM4/5 tokens or the DXIL
+  program part) with nameless signatures; each gets a DXBC container with
+  made-up semantics that match on both sides of every link (WBREG/WBATTR,
+  SV_ names, tessellation factors remapped). Input layouts, blend,
+  depth-stencil and rasterizer states, root signatures (a deserialized 1.1
+  desc), pipeline states.
+- umd_resource.cpp: heaps and resources (committed, heaps, placed, reserved;
+  custom heap properties and allowed-flags converted), descriptor heaps and
+  views (2D/array/multisample rebuilt from the resource), queries, command
+  signatures, pipeline libraries that keep nothing (the runtime removes the
+  device when creating one fails; a pipeline loaded from one is created from
+  the description that comes with it). Descriptor handles, sizes and GPU
+  addresses are vkd3d-proton's.
+- umd_command.cpp: command pools (an allocator per list type), recorders,
+  lists (all 3D table entries but Blt/Present and meta commands), queues with
+  a kernel context each (the runtime signals and waits on it), fences.
+  ExecuteCommandLists returns right away: two threads per queue pass the
+  submission's place on the kernel context to vkd3d-proton (a monitored
+  fence the context signals opens a vkd3d-proton fence the lists wait for)
+  and its completion back (the context waits for a fence signaled once the
+  lists ran, so the runtime's signals follow the work). Each submission
+  therefore waits on the GPU for the one before (~100 us an empty one).
+- Presents: swap chain buffers (committed textures on a "primary" heap) also
+  get a kernel allocation, a virgl texture the viogpu3d kernel driver uploads
+  before every use (a GDI surface), which DXGI shares with DWM; Present copies
+  the image there (GPU copy to a readback buffer, CPU into the locked
+  allocation) and hands it to the runtime's redirected flip (broadcasting to
+  no other context: the queue's own one is refused). MakeResident forwards
+  those allocations to the kernel.
+- Entries not implemented are stubs that log their name
+  (VIOGPU_D3D12_LOG=<file>), each with its entry's own type (so that x86's
+  __stdcall pops the arguments); umd_tables.h comes from the WDK
+  (gen_tables.py).
+
+Through the Windows runtime: feature level 12_1, shader model 6.6 (6.2
+before Venus from Mesa 26), double precision, 64-bit atomics, resource
+binding tier 3; WinBoat's DirectX test D3D12 group 17/17 (queues, lists,
+fences, root signatures, PSOs, triangle, compute, copy queues, bundles,
+ExecuteIndirect, descriptor heaps) and presenting to a window, 18/18, in
+64- and 32-bit programs.
+---
+diff --git a/meson_options.txt b/meson_options.txt
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -4,4 +4,6 @@ option('enable_profiling',          type : 'boolean', value : false)
+ option('enable_renderdoc',          type : 'boolean', value : false)
+ option('enable_descriptor_qa',      type : 'boolean', value : false)
+ option('enable_extended_emulation', type : 'boolean', value : 'false')
++option('enable_viogpu_umd',         type : 'boolean', value : false, description : 'viogpu Direct3D 12 user-mode driver (Windows)')
++option('viogpu_umd_name',           type : 'string',  value : 'viogpu_d3d12')
+ option('enable_trace',              type : 'combo',   value : 'auto', choices : ['false', 'true', 'auto'])
+diff --git a/libs/meson.build b/libs/meson.build
+--- a/libs/meson.build
++++ b/libs/meson.build
+@@ -3,3 +3,6 @@ subdir('vkd3d-shader')
+ subdir('vkd3d')
+ subdir('d3d12core')
+ subdir('d3d12')
++if get_option('enable_viogpu_umd')
++  subdir('viogpu_umd')
++endif
+diff --git a/libs/viogpu_umd/gen_tables.py b/libs/viogpu_umd/gen_tables.py
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/gen_tables.py
+@@ -0,0 +1,33 @@
++#!/usr/bin/env python3
++# Generates umd_tables.h: the entries of the D3D12 DDI tables viogpu_d3d12 fills, in order, for the logging stubs
++# (every entry the driver doesn't implement yet says which one the runtime called): their names, and an X-macro
++# over the members (the stubs take each member's own type, so that __stdcall pops the right arguments on x86)
++import re, sys
++h12, hdxgi, out = sys.argv[1:4]
++tables = [
++    ("DEVICE", h12, "D3D12DDI_DEVICE_FUNCS_CORE_0080"),
++    ("COMMAND_LIST", h12, "D3D12DDI_COMMAND_LIST_FUNCS_3D_0074"),
++    ("COMMAND_QUEUE", h12, "D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001"),
++    ("DXGI", hdxgi, "DXGI1_4_DDI_BASE_FUNCTIONS"),
++    ("EXTENDED_FEATURES", h12, "D3D12DDI_EXTENDED_FEATURES_FUNCS_0020"),
++]
++lines = ["/* Generated by gen_tables.py from the WDK's d3d12umddi.h and dxgiddi.h: do not edit */", "#pragma once", ""]
++for tag, path, struct in tables:
++    text = open(path, encoding="utf-8", errors="replace").read()
++    m = re.search(r"typedef struct " + struct + r"\s*\{(.*?)\}\s*" + struct + ";", text, re.S)
++    body = re.sub(r"//[^\n]*|/\*.*?\*/", "", m.group(1), flags=re.S)
++    names = []
++    for decl in body.split(";"):
++        decl = decl.strip()
++        if not decl:
++            continue
++        fn = re.search(r"\*\s*(\w+)\s*\)", decl)   # function pointer declared inline: HRESULT (__stdcall * pfnX)(...)
++        names.append(fn.group(1) if fn else decl.split()[-1])
++    lines.append("#define VIOGPU_D3D12_%s_ENTRIES %d /* %s */" % (tag, len(names), struct))
++    lines.append("static const char *const viogpu_d3d12_%s_names[] = {" % tag.lower())
++    lines += ['   "%s",' % n for n in names]
++    lines += ["};", ""]
++    lines.append("#define VIOGPU_D3D12_%s_MEMBERS(X) \\" % tag)
++    lines += ["   X(%d, %s) \\" % (i, n) for i, n in enumerate(names)]
++    lines.append("")
++open(out, "w").write("\n".join(lines))
+diff --git a/libs/viogpu_umd/meson.build b/libs/viogpu_umd/meson.build
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/meson.build
+@@ -0,0 +1,15 @@
++# viogpu's Direct3D 12 user-mode driver (Windows, x64 and x86): the D3D12 DDI on vkd3d-proton. The runtime loads it as the
++# fourth name of the viogpu3d kernel driver's UserModeDriverName and calls OpenAdapter12.
++# umd_tables.h comes from the WDK's headers: gen_tables.py.
++
++# The bridge builds with vkd3d-proton's own headers, umd_ddi.cpp with the Windows SDK's and WDK's
++viogpu_umd_bridge = static_library('viogpu_umd_bridge', 'umd_bridge.c',
++  dependencies        : [ vkd3d_dep ],
++  include_directories : vkd3d_private_includes)
++
++viogpu_umd_lib = shared_library(get_option('viogpu_umd_name'), ['umd_ddi.cpp', 'umd_state.cpp', 'umd_resource.cpp', 'umd_command.cpp'],
++  name_prefix         : '',
++  link_with           : [ viogpu_umd_bridge ],
++  dependencies        : [ vkd3d_dep ],
++  vs_module_defs      : 'viogpu_umd.def',
++  install             : true)
+diff --git a/libs/viogpu_umd/umd_bridge.c b/libs/viogpu_umd/umd_bridge.c
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_bridge.c
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++#define VK_NO_PROTOTYPES
++
++#include <string.h>
++#include <wchar.h>
++#include "vkd3d_win32.h"
++#include "vkd3d.h"
++#include "vkd3d_debug.h"
++#include "umd_bridge.h"
++
++/* The package's own Vulkan driver (Venus, viogpu_vk[_x86].dll next to this DLL), used directly instead of through
++ * the Vulkan loader: the loader would also load other installed drivers and layers into every D3D12 program. One of
++ * them, Dozen (Vulkan on D3D12, from Microsoft's OpenCL, OpenGL and Vulkan Compatibility Pack), calls back into the
++ * D3D12 runtime, which deadlocks inside D3D12CreateDevice. The loader is the fallback. */
++static PFN_vkGetInstanceProcAddr bridge_get_instance_proc_addr(void)
++{
++    static PFN_vkGetInstanceProcAddr proc;
++    WCHAR path[MAX_PATH];
++    HMODULE self = NULL, vulkan;
++    DWORD length;
++    WCHAR *name;
++
++    if (proc)
++        return proc;
++    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            (LPCWSTR)(void *)bridge_get_instance_proc_addr, &self)
++            && (length = GetModuleFileNameW(self, path, ARRAY_SIZE(path))) && length < ARRAY_SIZE(path) - 32
++            && (name = wcsrchr(path, L'\\')))
++    {
++        wcscpy(name + 1, sizeof(void *) == 8 ? L"viogpu_vk.dll" : L"viogpu_vk_x86.dll");
++        if ((vulkan = LoadLibraryW(path)))
++            proc = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(vulkan, "vk_icdGetInstanceProcAddr");
++    }
++    if (!proc && (vulkan = LoadLibraryA("vulkan-1.dll")))
++        proc = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(vulkan, "vkGetInstanceProcAddr");
++    return proc;
++}
++
++long viogpu_bridge_create_device(const void *luid, unsigned int minimum_feature_level, void **device)
++{
++    struct vkd3d_instance_create_info instance_info;
++    struct vkd3d_device_create_info device_info;
++    struct vkd3d_instance *instance;
++    HRESULT hr;
++
++    *device = NULL;
++    memset(&instance_info, 0, sizeof(instance_info));
++    if (!(instance_info.pfn_vkGetInstanceProcAddr = bridge_get_instance_proc_addr()))
++    {
++        ERR("viogpu: no Vulkan driver (viogpu_vk.dll) or loader (vulkan-1.dll).\n");
++        return E_FAIL;
++    }
++    /* No surfaces: presents go through the kernel driver */
++    if (FAILED(hr = vkd3d_create_instance(&instance_info, &instance)))
++        return hr;
++
++    memset(&device_info, 0, sizeof(device_info));
++    device_info.minimum_feature_level = (D3D_FEATURE_LEVEL)minimum_feature_level;
++    device_info.instance = instance;
++    if (luid)
++        memcpy(&device_info.adapter_luid, luid, sizeof(device_info.adapter_luid));
++    hr = vkd3d_create_device(&device_info, &IID_ID3D12Device, device);
++    vkd3d_instance_decref(instance);
++    return hr;
++}
++
++long viogpu_bridge_serialize_root_signature(const void *versioned_desc, void **blob)
++{
++    return vkd3d_serialize_versioned_root_signature((const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)versioned_desc,
++            (ID3DBlob **)blob, NULL);
++}
++
++/* d3d12core.dll implements vkd3d-proton's test-suite and debug-layer controls; this driver has neither */
++bool vkd3d_debug_control_is_test_suite(void)
++{
++    return false;
++}
++
++bool vkd3d_debug_control_explode_on_vvl_error(void)
++{
++    return false;
++}
++
++bool vkd3d_debug_control_has_out_of_spec_test_behavior(VKD3D_DEBUG_CONTROL_OUT_OF_SPEC_BEHAVIOR behavior)
++{
++    return false;
++}
++
++VKD3D_DEBUG_CONTROL_BEHAVIOR_FLAGS vkd3d_debug_control_get_behavior_flags(void)
++{
++    return 0;
++}
++
++bool vkd3d_debug_control_mute_message_id(const char *vuid)
++{
++    return false;
++}
+diff --git a/libs/viogpu_umd/umd_bridge.h b/libs/viogpu_umd/umd_bridge.h
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_bridge.h
+@@ -0,0 +1,29 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* The few vkd3d-proton functions viogpu's Direct3D 12 user-mode driver needs besides the D3D12 API itself. The
++ * driver's DDI code includes the Windows SDK's d3d12.h, vkd3d-proton has headers of its own for the same API: they
++ * don't mix in one file, so these take and return the API objects as void pointers (the same COM objects; the
++ * caller casts them to the SDK's interfaces). */
++
++#ifndef VIOGPU_UMD_BRIDGE_H
++#define VIOGPU_UMD_BRIDGE_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* An ID3D12Device (vkd3d-proton) on the first Vulkan device: the virtual GPU's (Venus). luid is the adapter's,
++ * minimum_feature_level a D3D_FEATURE_LEVEL. Returns an HRESULT. */
++long viogpu_bridge_create_device(const void *luid, unsigned int minimum_feature_level, void **device);
++
++/* vkd3d_serialize_versioned_root_signature: the ID3DBlob of a D3D12_VERSIONED_ROOT_SIGNATURE_DESC */
++long viogpu_bridge_serialize_root_signature(const void *versioned_desc, void **blob);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/libs/viogpu_umd/umd_command.cpp b/libs/viogpu_umd/umd_command.cpp
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_command.cpp
+@@ -0,0 +1,1240 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* Command pools, recorders, lists and queues, fences.
++ *
++ * The DDI's command pool is an allocator without a list type: one vkd3d-proton allocator per type, made when first
++ * needed. A recorder is the pen that writes into its target pool; a list resets into its recorder's pool.
++ *
++ * The runtime implements ID3D12Fence and the queues' Signal/Wait itself, on the kernel context each queue creates
++ * here. vkd3d-proton's work reaches the GPU its own way (Venus), so for the runtime's signals to come after the work
++ * they follow, ExecuteCommandLists waits until the GPU is done with it (correct, not fast: the next step is to tie the
++ * work to the kernel context's timeline). */
++
++#include "umd_private.h"
++#include <stdlib.h>
++
++D3D12DDI_HRTTABLE viogpu_command_list_rt_tables[2];
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Pools and recorders */
++
++struct viogpu_command_pool {
++   viogpu_device *device;
++   /* by D3D12_COMMAND_LIST_TYPE: direct, bundle, compute, copy */
++   ID3D12CommandAllocator *allocators[4];
++};
++
++struct viogpu_command_recorder {
++   D3D12DDI_COMMAND_QUEUE_FLAGS queueFlags;
++   viogpu_command_pool *pool;
++};
++
++static ID3D12CommandAllocator *
++pool_allocator(viogpu_command_pool *pool, D3D12_COMMAND_LIST_TYPE type)
++{
++   if (!pool->allocators[type]) {
++      HRESULT hr = pool->device->vkd3d->CreateCommandAllocator(type, IID_PPV_ARGS(&pool->allocators[type]));
++      if (FAILED(hr))
++         viogpu_log("CreateCommandAllocator (type %d): 0x%08lx", (int)type, (unsigned long)hr);
++   }
++   return pool->allocators[type];
++}
++
++static SIZE_T APIENTRY
++calc_command_pool_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_POOL_0040 *)
++{
++   return sizeof(viogpu_command_pool);
++}
++
++static HRESULT APIENTRY
++create_command_pool(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_COMMAND_POOL_0040 *,
++                    D3D12DDI_HCOMMANDPOOL_0040 h)
++{
++   viogpu_command_pool *pool = new (h.pDrvPrivate) viogpu_command_pool();
++   pool->device = device_from(hDevice);
++   return S_OK;
++}
++
++static VOID APIENTRY
++destroy_command_pool(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDPOOL_0040 h)
++{
++   viogpu_command_pool *pool = (viogpu_command_pool *)h.pDrvPrivate;
++   for (ID3D12CommandAllocator *a : pool->allocators)
++      if (a)
++         a->Release();
++   pool->~viogpu_command_pool();
++}
++
++static VOID APIENTRY
++reset_command_pool(D3D12DDI_HDEVICE hDevice, D3D12DDI_HCOMMANDPOOL_0040 h)
++{
++   viogpu_command_pool *pool = (viogpu_command_pool *)h.pDrvPrivate;
++   for (ID3D12CommandAllocator *a : pool->allocators) {
++      if (!a)
++         continue;
++      HRESULT hr = a->Reset();
++      if (FAILED(hr))
++         viogpu_log("ResetCommandPool: 0x%08lx", (unsigned long)hr);
++   }
++}
++
++static SIZE_T APIENTRY
++calc_command_recorder_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_RECORDER_0040 *)
++{
++   return sizeof(viogpu_command_recorder);
++}
++
++static HRESULT APIENTRY
++create_command_recorder(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_RECORDER_0040 *args,
++                        D3D12DDI_HCOMMANDRECORDER_0040 h)
++{
++   viogpu_command_recorder *recorder = new (h.pDrvPrivate) viogpu_command_recorder();
++   recorder->queueFlags = args->QueueFlags;
++   return S_OK;
++}
++
++static VOID APIENTRY
++destroy_command_recorder(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDRECORDER_0040 h)
++{
++   ((viogpu_command_recorder *)h.pDrvPrivate)->~viogpu_command_recorder();
++}
++
++static VOID APIENTRY
++recorder_set_pool(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDRECORDER_0040 hRecorder, D3D12DDI_HCOMMANDPOOL_0040 hPool)
++{
++   ((viogpu_command_recorder *)hRecorder.pDrvPrivate)->pool = (viogpu_command_pool *)hPool.pDrvPrivate;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Command lists */
++
++struct viogpu_command_list {
++   viogpu_device *device;
++   D3D12DDI_HRTCOMMANDLIST hRT;
++   D3D12_COMMAND_LIST_TYPE type;
++   ID3D12GraphicsCommandList *list;
++   ID3D12GraphicsCommandList1 *list1;
++   ID3D12GraphicsCommandList2 *list2;
++   ID3D12GraphicsCommandList4 *list4;
++};
++
++static inline viogpu_command_list *
++list_from(D3D12DDI_HCOMMANDLIST h)
++{
++   return (viogpu_command_list *)h.pDrvPrivate;
++}
++
++#define L(h) (list_from(h)->list)
++
++static void
++list_error(viogpu_command_list *list, HRESULT hr)
++{
++   viogpu_log("command list error 0x%08lx", (unsigned long)hr);
++   list->device->umCallbacks->pfnSetCommandListErrorCb(list->hRT, hr);
++}
++
++static D3D12_COMMAND_LIST_TYPE
++list_type(D3D12DDI_COMMAND_LIST_TYPE type, D3D12DDI_COMMAND_QUEUE_FLAGS flags)
++{
++   if (type == D3D12DDI_COMMAND_LIST_TYPE_BUNDLE)
++      return D3D12_COMMAND_LIST_TYPE_BUNDLE;
++   if (flags & D3D12DDI_COMMAND_QUEUE_FLAG_3D)
++      return D3D12_COMMAND_LIST_TYPE_DIRECT;
++   if (flags & D3D12DDI_COMMAND_QUEUE_FLAG_COMPUTE)
++      return D3D12_COMMAND_LIST_TYPE_COMPUTE;
++   if (flags & D3D12DDI_COMMAND_QUEUE_FLAG_COPY)
++      return D3D12_COMMAND_LIST_TYPE_COPY;
++   return D3D12_COMMAND_LIST_TYPE_DIRECT;
++}
++
++static SIZE_T APIENTRY
++calc_command_list_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_LIST_0040 *)
++{
++   return sizeof(viogpu_command_list);
++}
++
++static HRESULT APIENTRY
++create_command_list(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_COMMAND_LIST_0040 *args,
++                    D3D12DDI_HCOMMANDLIST h, D3D12DDI_HRTCOMMANDLIST hRT)
++{
++   viogpu_device *device = device_from(hDevice);
++   viogpu_command_list *list = new (h.pDrvPrivate) viogpu_command_list();
++   list->device = device;
++   list->hRT = hRT;
++   list->type = list_type(args->Type, args->QueueFlags);
++
++   /* created closed, without an allocator: the first reset gives it one */
++   ID3D12Device4 *device4 = NULL;
++   HRESULT hr = device->vkd3d->QueryInterface(IID_PPV_ARGS(&device4));
++   if (SUCCEEDED(hr)) {
++      hr = device4->CreateCommandList1(args->NodeMask, list->type, D3D12_COMMAND_LIST_FLAG_NONE,
++                                       IID_PPV_ARGS(&list->list));
++      device4->Release();
++   }
++   if (FAILED(hr)) {
++      viogpu_log("CreateCommandList (type %d): 0x%08lx", (int)list->type, (unsigned long)hr);
++      return hr;
++   }
++   list->list->QueryInterface(IID_PPV_ARGS(&list->list1));
++   list->list->QueryInterface(IID_PPV_ARGS(&list->list2));
++   list->list->QueryInterface(IID_PPV_ARGS(&list->list4));
++
++   bool compute = list->type == D3D12_COMMAND_LIST_TYPE_COMPUTE || list->type == D3D12_COMMAND_LIST_TYPE_COPY;
++   device->umCallbacks->pfnSetCommandListDDITableCb(hRT, viogpu_command_list_rt_tables[compute ? 0 : 1]);
++   return S_OK;
++}
++
++static VOID APIENTRY
++destroy_command_list(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDLIST h)
++{
++   viogpu_command_list *list = list_from(h);
++   if (list->list4)
++      list->list4->Release();
++   if (list->list2)
++      list->list2->Release();
++   if (list->list1)
++      list->list1->Release();
++   if (list->list)
++      list->list->Release();
++   list->~viogpu_command_list();
++}
++
++static VOID APIENTRY
++close_command_list(D3D12DDI_HCOMMANDLIST h)
++{
++   HRESULT hr = L(h)->Close();
++   if (FAILED(hr))
++      list_error(list_from(h), hr);
++}
++
++static VOID APIENTRY
++reset_command_list(D3D12DDI_HCOMMANDLIST h, const D3D12DDIARG_RESETCOMMANDLIST_0040 *args)
++{
++   viogpu_command_list *list = list_from(h);
++   viogpu_command_recorder *recorder = (viogpu_command_recorder *)args->hDrvCommandRecorder.pDrvPrivate;
++   ID3D12CommandAllocator *allocator = recorder && recorder->pool ? pool_allocator(recorder->pool, list->type) : NULL;
++   HRESULT hr = allocator ? list->list->Reset(allocator, NULL) : E_INVALIDARG;
++   if (FAILED(hr))
++      list_error(list, hr);
++}
++
++static VOID APIENTRY
++draw_instanced(D3D12DDI_HCOMMANDLIST h, UINT vertexCount, UINT instanceCount, UINT startVertex, UINT startInstance)
++{
++   L(h)->DrawInstanced(vertexCount, instanceCount, startVertex, startInstance);
++}
++
++static VOID APIENTRY
++draw_indexed_instanced(D3D12DDI_HCOMMANDLIST h, UINT indexCount, UINT instanceCount, UINT startIndex, INT baseVertex,
++                       UINT startInstance)
++{
++   L(h)->DrawIndexedInstanced(indexCount, instanceCount, startIndex, baseVertex, startInstance);
++}
++
++static VOID APIENTRY
++dispatch(D3D12DDI_HCOMMANDLIST h, UINT x, UINT y, UINT z)
++{
++   L(h)->Dispatch(x, y, z);
++}
++
++static D3D12_GPU_DESCRIPTOR_HANDLE
++gpu_handle(D3D12DDI_GPU_DESCRIPTOR_HANDLE h)
++{
++   D3D12_GPU_DESCRIPTOR_HANDLE handle;
++   handle.ptr = h.ptr;
++   return handle;
++}
++
++static D3D12_CPU_DESCRIPTOR_HANDLE
++cpu_handle(D3D12DDI_CPU_DESCRIPTOR_HANDLE h)
++{
++   D3D12_CPU_DESCRIPTOR_HANDLE handle;
++   handle.ptr = h.ptr;
++   return handle;
++}
++
++static VOID APIENTRY
++clear_uav_uint(D3D12DDI_HCOMMANDLIST h, D3D12DDI_GPU_DESCRIPTOR_HANDLE gpu, D3D12DDI_CPU_DESCRIPTOR_HANDLE cpu,
++               D3D12DDI_HRESOURCE hResource, const UINT values[4], UINT numRects, const D3D12DDI_RECT *rects)
++{
++   L(h)->ClearUnorderedAccessViewUint(gpu_handle(gpu), cpu_handle(cpu), resource_of(hResource), values, numRects,
++                                      (const D3D12_RECT *)rects);
++}
++
++static VOID APIENTRY
++clear_uav_float(D3D12DDI_HCOMMANDLIST h, D3D12DDI_GPU_DESCRIPTOR_HANDLE gpu, D3D12DDI_CPU_DESCRIPTOR_HANDLE cpu,
++                D3D12DDI_HRESOURCE hResource, const FLOAT values[4], UINT numRects, const D3D12DDI_RECT *rects)
++{
++   L(h)->ClearUnorderedAccessViewFloat(gpu_handle(gpu), cpu_handle(cpu), resource_of(hResource), values, numRects,
++                                       (const D3D12_RECT *)rects);
++}
++
++static VOID APIENTRY
++clear_rtv(D3D12DDI_HCOMMANDLIST h, D3D12DDI_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT numRects,
++          const D3D12DDI_RECT *rects)
++{
++   L(h)->ClearRenderTargetView(cpu_handle(rtv), color, numRects, (const D3D12_RECT *)rects);
++}
++
++static VOID APIENTRY
++clear_dsv(D3D12DDI_HCOMMANDLIST h, D3D12DDI_CPU_DESCRIPTOR_HANDLE dsv, UINT flags, FLOAT depth, UINT8 stencil,
++          UINT numRects, const D3D12DDI_RECT *rects)
++{
++   L(h)->ClearDepthStencilView(cpu_handle(dsv), (D3D12_CLEAR_FLAGS)flags, depth, stencil, numRects,
++                               (const D3D12_RECT *)rects);
++}
++
++static VOID APIENTRY
++discard_resource(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HRESOURCE hResource, const D3D12DDIARG_DISCARD_RESOURCE_0003 *region)
++{
++   L(h)->DiscardResource(resource_of(hResource), (const D3D12_DISCARD_REGION *)region);
++}
++
++static bool
++is_block_compressed(DXGI_FORMAT f)
++{
++   return (f >= DXGI_FORMAT_BC1_TYPELESS && f <= DXGI_FORMAT_BC5_SNORM) ||
++          (f >= DXGI_FORMAT_BC6H_TYPELESS && f <= DXGI_FORMAT_BC7_UNORM_SRGB);
++}
++
++static D3D12_TEXTURE_COPY_LOCATION
++copy_location(const D3D12DDIARG_BUFFER_PLACEMENT *placement, D3D12DDIARG_PLACED_RESOURCE layout)
++{
++   D3D12_TEXTURE_COPY_LOCATION loc = {};
++   loc.pResource = resource_of(placement->BaseAddress.UMD.hResource);
++   switch ((UINT)layout.Layout) {
++   case D3D12DDI_RL_SELECT_SUBRESOURCE:
++      loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++      loc.SubresourceIndex = (UINT)placement->BaseAddress.UMD.Offset;
++      break;
++   case D3D12DDI_RL_PLACED_PHYSICAL_SUBRESOURCE_PITCHED: {
++      const D3D12DDIARG_PHYSICAL_SUBRESOURCE_PITCHED_LAYOUT *p =
++         (const D3D12DDIARG_PHYSICAL_SUBRESOURCE_PITCHED_LAYOUT *)layout.pLayout;
++      UINT block = is_block_compressed(p->Format) ? 4 : 1;
++      loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++      loc.PlacedFootprint.Offset = placement->BaseAddress.UMD.Offset;
++      loc.PlacedFootprint.Footprint.Format = p->Format;
++      loc.PlacedFootprint.Footprint.Width = p->PhysicalWidth * block;
++      loc.PlacedFootprint.Footprint.Height = p->PhysicalHeight * block;
++      loc.PlacedFootprint.Footprint.Depth = p->PhysicalDepth;
++      loc.PlacedFootprint.Footprint.RowPitch = p->Pitch;
++      break;
++   }
++   case D3D12DDI_RL_PLACED_VIRTUAL_SUBRESOURCE_PITCHED: {
++      const D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT *p =
++         (const D3D12DDIARG_VIRTUAL_SUBRESOURCE_PITCHED_LAYOUT *)layout.pLayout;
++      loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++      loc.PlacedFootprint.Offset = placement->BaseAddress.UMD.Offset;
++      loc.PlacedFootprint.Footprint.Format = p->Format;
++      loc.PlacedFootprint.Footprint.Width = p->VirtualWidth;
++      loc.PlacedFootprint.Footprint.Height = p->VirtualHeight;
++      loc.PlacedFootprint.Footprint.Depth = p->VirtualDepth;
++      loc.PlacedFootprint.Footprint.RowPitch = p->Pitch;
++      break;
++   }
++   default:
++      viogpu_log("CopyTextureRegion: layout %u", (UINT)layout.Layout);
++      break;
++   }
++   return loc;
++}
++
++static VOID APIENTRY
++copy_texture_region(D3D12DDI_HCOMMANDLIST h, const D3D12DDIARG_BUFFER_PLACEMENT *dst,
++                    D3D12DDIARG_PLACED_RESOURCE dstLayout, UINT dstX, UINT dstY, UINT dstZ,
++                    const D3D12DDIARG_BUFFER_PLACEMENT *src, D3D12DDIARG_PLACED_RESOURCE srcLayout,
++                    const D3D12DDI_BOX *srcBox)
++{
++   D3D12_TEXTURE_COPY_LOCATION d = copy_location(dst, dstLayout);
++   D3D12_TEXTURE_COPY_LOCATION s = copy_location(src, srcLayout);
++   L(h)->CopyTextureRegion(&d, dstX, dstY, dstZ, &s, (const D3D12_BOX *)srcBox);
++}
++
++static VOID APIENTRY
++resource_copy(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HRESOURCE dst, D3D12DDI_HRESOURCE src)
++{
++   L(h)->CopyResource(resource_of(dst), resource_of(src));
++}
++
++static VOID APIENTRY
++copy_tiles(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HRESOURCE hResource, const D3D12DDI_TILED_RESOURCE_COORDINATE *start,
++           const D3D12DDI_TILE_REGION_SIZE *size, D3D12DDI_HRESOURCE hBuffer, UINT64 offset, D3D12DDI_TILE_COPY_FLAGS flags)
++{
++   L(h)->CopyTiles(resource_of(hResource), (const D3D12_TILED_RESOURCE_COORDINATE *)start,
++                   (const D3D12_TILE_REGION_SIZE *)size, resource_of(hBuffer), offset, (D3D12_TILE_COPY_FLAGS)flags);
++}
++
++static VOID APIENTRY
++copy_buffer_region(D3D12DDI_HCOMMANDLIST h, D3D12DDIARG_BUFFER_PLACEMENT dst, D3D12DDIARG_BUFFER_PLACEMENT src,
++                   UINT64 bytes)
++{
++   L(h)->CopyBufferRegion(resource_of(dst.BaseAddress.UMD.hResource), dst.BaseAddress.UMD.Offset,
++                          resource_of(src.BaseAddress.UMD.hResource), src.BaseAddress.UMD.Offset, bytes);
++}
++
++static VOID APIENTRY
++resolve_subresource(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HRESOURCE dst, UINT dstSub, D3D12DDI_HRESOURCE src, UINT srcSub,
++                    DXGI_FORMAT format)
++{
++   L(h)->ResolveSubresource(resource_of(dst), dstSub, resource_of(src), srcSub, format);
++}
++
++static VOID APIENTRY
++execute_bundle(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HCOMMANDLIST bundle)
++{
++   L(h)->ExecuteBundle(L(bundle));
++}
++
++static VOID APIENTRY
++execute_indirect(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HCOMMANDSIGNATURE hSig, UINT maxCount,
++                 D3D12DDIARG_BUFFER_PLACEMENT args, D3D12DDIARG_BUFFER_PLACEMENT count)
++{
++   viogpu_command_signature *sig = (viogpu_command_signature *)hSig.pDrvPrivate;
++   L(h)->ExecuteIndirect(sig->signature, maxCount, resource_of(args.BaseAddress.UMD.hResource),
++                         args.BaseAddress.UMD.Offset, resource_of(count.BaseAddress.UMD.hResource),
++                         count.BaseAddress.UMD.Offset);
++}
++
++static VOID APIENTRY
++resource_barrier(D3D12DDI_HCOMMANDLIST h, UINT count, const D3D12DDIARG_RESOURCE_BARRIER_0022 *barriers)
++{
++   std::vector<D3D12_RESOURCE_BARRIER> api;
++   api.reserve(count);
++   for (UINT i = 0; i < count; i++) {
++      const D3D12DDIARG_RESOURCE_BARRIER_0022 &b = barriers[i];
++      D3D12_RESOURCE_BARRIER a = {};
++      a.Flags = (D3D12_RESOURCE_BARRIER_FLAGS)(b.Flags & (D3D12DDI_RESOURCE_BARRIER_FLAG_BEGIN_ONLY |
++                                                          D3D12DDI_RESOURCE_BARRIER_FLAG_END_ONLY));
++      switch (b.Type) {
++      case D3D12DDI_RESOURCE_BARRIER_TYPE_TRANSITION:
++         a.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++         a.Transition.pResource = resource_of(b.Transition.hResource);
++         a.Transition.Subresource = b.Transition.Subresource;
++         a.Transition.StateBefore = (D3D12_RESOURCE_STATES)b.Transition.StateBefore;
++         a.Transition.StateAfter = (D3D12_RESOURCE_STATES)b.Transition.StateAfter;
++         break;
++      case D3D12DDI_RESOURCE_BARRIER_TYPE_UAV:
++         a.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
++         a.UAV.pResource = resource_of(b.UAV.hResource);
++         break;
++      case D3D12DDI_RESOURCE_BARRIER_TYPE_0022_RANGED:
++         /* the runtime's aliasing barriers; atomic copies get a full UAV barrier */
++         if (b.Flags & D3D12DDI_RESOURCE_BARRIER_FLAG_0022_ALIASING) {
++            a.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
++            a.Aliasing.pResourceBefore = NULL;
++            a.Aliasing.pResourceAfter = resource_of(b.Ranged.hResource);
++         } else {
++            a.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
++            a.UAV.pResource = NULL;
++         }
++         break;
++      default:
++         continue;
++      }
++      api.push_back(a);
++   }
++   if (!api.empty())
++      L(h)->ResourceBarrier((UINT)api.size(), api.data());
++}
++
++static VOID APIENTRY
++begin_query(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HQUERYHEAP heap, D3D12DDI_QUERY_TYPE type, UINT index)
++{
++   L(h)->BeginQuery(((viogpu_query_heap *)heap.pDrvPrivate)->heap, (D3D12_QUERY_TYPE)type, index);
++}
++
++static VOID APIENTRY
++end_query(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HQUERYHEAP heap, D3D12DDI_QUERY_TYPE type, UINT index)
++{
++   L(h)->EndQuery(((viogpu_query_heap *)heap.pDrvPrivate)->heap, (D3D12_QUERY_TYPE)type, index);
++}
++
++static VOID APIENTRY
++resolve_query_data(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HQUERYHEAP heap, D3D12DDI_QUERY_TYPE type, UINT start, UINT count,
++                   D3D12DDI_HRESOURCE dst, UINT64 offset)
++{
++   L(h)->ResolveQueryData(((viogpu_query_heap *)heap.pDrvPrivate)->heap, (D3D12_QUERY_TYPE)type, start, count,
++                          resource_of(dst), offset);
++}
++
++static VOID APIENTRY
++set_predication(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HRESOURCE hResource, UINT64 offset, D3D12DDI_PREDICATION_OP op)
++{
++   L(h)->SetPredication(resource_of(hResource), offset, (D3D12_PREDICATION_OP)op);
++}
++
++static VOID APIENTRY
++ia_set_topology(D3D12DDI_HCOMMANDLIST h, D3D12DDI_PRIMITIVE_TOPOLOGY topology)
++{
++   L(h)->IASetPrimitiveTopology((D3D12_PRIMITIVE_TOPOLOGY)topology);
++}
++
++static VOID APIENTRY
++rs_set_viewports(D3D12DDI_HCOMMANDLIST h, UINT count, const D3D12DDI_VIEWPORT *viewports)
++{
++   L(h)->RSSetViewports(count, (const D3D12_VIEWPORT *)viewports);
++}
++
++static VOID APIENTRY
++rs_set_scissor_rects(D3D12DDI_HCOMMANDLIST h, UINT count, const D3D12DDI_RECT *rects)
++{
++   L(h)->RSSetScissorRects(count, (const D3D12_RECT *)rects);
++}
++
++static VOID APIENTRY
++om_set_blend_factor(D3D12DDI_HCOMMANDLIST h, const FLOAT factor[4])
++{
++   L(h)->OMSetBlendFactor(factor);
++}
++
++static VOID APIENTRY
++om_set_stencil_ref(D3D12DDI_HCOMMANDLIST h, UINT ref)
++{
++   L(h)->OMSetStencilRef(ref);
++}
++
++static VOID APIENTRY
++set_pipeline_state(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HPIPELINESTATE pso)
++{
++   L(h)->SetPipelineState(viogpu_pipeline_state_of(pso));
++}
++
++static VOID APIENTRY
++set_descriptor_heaps(D3D12DDI_HCOMMANDLIST h, UINT count, D3D12DDI_HDESCRIPTORHEAP *heaps)
++{
++   ID3D12DescriptorHeap *api[2] = {};
++   UINT n = 0;
++   for (UINT i = 0; i < count && n < 2; i++)
++      if (heaps[i].pDrvPrivate)
++         api[n++] = ((viogpu_descriptor_heap *)heaps[i].pDrvPrivate)->heap;
++   L(h)->SetDescriptorHeaps(n, api);
++}
++
++static VOID APIENTRY
++set_compute_root_signature(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HROOTSIGNATURE rs)
++{
++   L(h)->SetComputeRootSignature(viogpu_root_signature_of(rs));
++}
++
++static VOID APIENTRY
++set_graphics_root_signature(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HROOTSIGNATURE rs)
++{
++   L(h)->SetGraphicsRootSignature(viogpu_root_signature_of(rs));
++}
++
++static VOID APIENTRY
++set_compute_root_table(D3D12DDI_HCOMMANDLIST h, UINT index, D3D12DDI_GPU_DESCRIPTOR_HANDLE base)
++{
++   L(h)->SetComputeRootDescriptorTable(index, gpu_handle(base));
++}
++
++static VOID APIENTRY
++set_graphics_root_table(D3D12DDI_HCOMMANDLIST h, UINT index, D3D12DDI_GPU_DESCRIPTOR_HANDLE base)
++{
++   L(h)->SetGraphicsRootDescriptorTable(index, gpu_handle(base));
++}
++
++static VOID APIENTRY
++set_compute_root_constant(D3D12DDI_HCOMMANDLIST h, UINT index, UINT data, UINT offset)
++{
++   L(h)->SetComputeRoot32BitConstant(index, data, offset);
++}
++
++static VOID APIENTRY
++set_graphics_root_constant(D3D12DDI_HCOMMANDLIST h, UINT index, UINT data, UINT offset)
++{
++   L(h)->SetGraphicsRoot32BitConstant(index, data, offset);
++}
++
++static VOID APIENTRY
++set_compute_root_constants(D3D12DDI_HCOMMANDLIST h, UINT index, UINT count, const void *data, UINT offset)
++{
++   L(h)->SetComputeRoot32BitConstants(index, count, data, offset);
++}
++
++static VOID APIENTRY
++set_graphics_root_constants(D3D12DDI_HCOMMANDLIST h, UINT index, UINT count, const void *data, UINT offset)
++{
++   L(h)->SetGraphicsRoot32BitConstants(index, count, data, offset);
++}
++
++#define ROOT_VIEW(fn, method)                                                                                     \
++   static VOID APIENTRY fn(D3D12DDI_HCOMMANDLIST h, UINT index, D3D12DDI_GPU_VIRTUAL_ADDRESS address)             \
++   {                                                                                                              \
++      L(h)->method(index, address);                                                                               \
++   }
++ROOT_VIEW(set_compute_root_cbv, SetComputeRootConstantBufferView)
++ROOT_VIEW(set_graphics_root_cbv, SetGraphicsRootConstantBufferView)
++ROOT_VIEW(set_compute_root_srv, SetComputeRootShaderResourceView)
++ROOT_VIEW(set_graphics_root_srv, SetGraphicsRootShaderResourceView)
++ROOT_VIEW(set_compute_root_uav, SetComputeRootUnorderedAccessView)
++ROOT_VIEW(set_graphics_root_uav, SetGraphicsRootUnorderedAccessView)
++
++static VOID APIENTRY
++ia_set_index_buffer(D3D12DDI_HCOMMANDLIST h, const D3D12DDI_INDEX_BUFFER_VIEW *view)
++{
++   L(h)->IASetIndexBuffer((const D3D12_INDEX_BUFFER_VIEW *)view);
++}
++
++static VOID APIENTRY
++ia_set_vertex_buffers(D3D12DDI_HCOMMANDLIST h, UINT start, UINT count, const D3D12DDI_VERTEX_BUFFER_VIEW *views)
++{
++   L(h)->IASetVertexBuffers(start, count, (const D3D12_VERTEX_BUFFER_VIEW *)views);
++}
++
++static VOID APIENTRY
++so_set_targets(D3D12DDI_HCOMMANDLIST h, UINT start, UINT count, const D3D12DDI_STREAM_OUTPUT_BUFFER_VIEW *views)
++{
++   L(h)->SOSetTargets(start, count, (const D3D12_STREAM_OUTPUT_BUFFER_VIEW *)views);
++}
++
++static VOID APIENTRY
++om_set_render_targets(D3D12DDI_HCOMMANDLIST h, UINT count, const D3D12DDI_CPU_DESCRIPTOR_HANDLE *rtvs,
++                      BOOL singleRange, const D3D12DDI_CPU_DESCRIPTOR_HANDLE *dsv)
++{
++   L(h)->OMSetRenderTargets(count, (const D3D12_CPU_DESCRIPTOR_HANDLE *)rtvs, singleRange,
++                            (const D3D12_CPU_DESCRIPTOR_HANDLE *)dsv);
++}
++
++static VOID APIENTRY
++set_marker(D3D12DDI_HCOMMANDLIST, UINT64)
++{
++}
++
++static VOID APIENTRY
++clear_root_arguments(D3D12DDI_HCOMMANDLIST)
++{
++   /* vkd3d-proton resets root arguments on the next root signature */
++}
++
++static VOID APIENTRY
++om_set_depth_bounds(D3D12DDI_HCOMMANDLIST h, FLOAT min, FLOAT max)
++{
++   if (list_from(h)->list1)
++      list_from(h)->list1->OMSetDepthBounds(min, max);
++}
++
++static VOID APIENTRY
++set_sample_positions(D3D12DDI_HCOMMANDLIST h, UINT samples, UINT pixels, D3D12DDI_SAMPLE_POSITION *positions)
++{
++   if (list_from(h)->list1)
++      list_from(h)->list1->SetSamplePositions(samples, pixels, (D3D12_SAMPLE_POSITION *)positions);
++}
++
++static VOID APIENTRY
++resolve_subresource_region(D3D12DDI_HCOMMANDLIST h, D3D12DDI_HRESOURCE dst, UINT dstSub, UINT dstX, UINT dstY,
++                           D3D12DDI_HRESOURCE src, UINT srcSub, D3D12DDI_RECT *srcRect, DXGI_FORMAT format,
++                           D3D12DDI_RESOLVE_MODE mode)
++{
++   if (list_from(h)->list1)
++      list_from(h)->list1->ResolveSubresourceRegion(resource_of(dst), dstSub, dstX, dstY, resource_of(src), srcSub,
++                                                    (D3D12_RECT *)srcRect, format, (D3D12_RESOLVE_MODE)mode);
++}
++
++static VOID APIENTRY
++set_protected_resource_session(D3D12DDI_HCOMMANDLIST, D3D12DDI_HPROTECTEDRESOURCESESSION_0030)
++{
++}
++
++static VOID APIENTRY
++write_buffer_immediate(D3D12DDI_HCOMMANDLIST h, UINT count, const D3D12DDI_WRITEBUFFERIMMEDIATE_PARAMETER_0032 *params,
++                       const D3D12DDI_WRITEBUFFERIMMEDIATE_MODE_0032 *modes)
++{
++   if (list_from(h)->list2)
++      list_from(h)->list2->WriteBufferImmediate(count, (const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *)params,
++                                                (const D3D12_WRITEBUFFERIMMEDIATE_MODE *)modes);
++}
++
++static VOID APIENTRY
++set_view_instance_mask(D3D12DDI_HCOMMANDLIST h, UINT mask)
++{
++   if (list_from(h)->list1)
++      list_from(h)->list1->SetViewInstanceMask(mask);
++}
++
++struct viogpu_command_queue {
++   viogpu_device *device;
++   D3D12DDI_HRTCOMMANDQUEUE hRT;
++   ID3D12CommandQueue *queue;
++   /* the kernel context the runtime signals and waits on */
++   HANDLE hContext;
++
++   /* Submission n: the kernel context signals kmIn = n (after the runtime's waits queued before it), then waits for
++    * kmOut >= n (so the runtime's signals queued after it come once the lists ran). vkd3d-proton waits for
++    * gate >= n, runs the lists and signals done = n. gateThread opens the gate once kmIn reaches n, doneThread
++    * signals kmOut once done does.
++    * ponytail: the runtime signals and waits on the context itself, unseen (it never calls pfnSignalFence), so every
++    * submission waits for the one before to finish (~100 us an empty one). Overlapping them takes knowing where the
++    * runtime's operations are, e.g. a kernel-side queue that completes a DMA buffer per submission. */
++   ID3D12Fence *gate;
++   ID3D12Fence *done;
++   D3DKMT_HANDLE kmIn, kmOut;
++   const volatile UINT64 *kmInValue;
++   UINT64 submitted;
++   UINT64 gateNext, doneNext;
++   bool stop;
++   CRITICAL_SECTION lock;
++   CONDITION_VARIABLE wake;
++   HANDLE gateThread, doneThread;
++};
++
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Presents: the runtime presents a swap chain buffer's kernel allocation (DWM composes it). The image is
++ * vkd3d-proton's (Venus): copy it there first, through a readback buffer and the CPU */
++
++static bool
++present_init(viogpu_device *device)
++{
++   if (device->presentFence)
++      return true;
++   HRESULT hr;
++   D3D12_COMMAND_QUEUE_DESC desc = {};
++   desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++   hr = device->vkd3d->CreateCommandQueue(&desc, IID_PPV_ARGS(&device->presentQueue));
++   if (SUCCEEDED(hr))
++      hr = device->vkd3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
++                                                 IID_PPV_ARGS(&device->presentAllocator));
++   if (SUCCEEDED(hr))
++      hr = device->vkd3d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, device->presentAllocator, NULL,
++                                            IID_PPV_ARGS(&device->presentList));
++   if (SUCCEEDED(hr))
++      hr = device->presentList->Close();
++   if (SUCCEEDED(hr))
++      hr = device->vkd3d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&device->presentFence));
++   if (FAILED(hr)) {
++      viogpu_log("present setup: 0x%08lx", (unsigned long)hr);
++      return false;
++   }
++   return true;
++}
++
++void
++viogpu_present_destroy(viogpu_device *device)
++{
++   if (device->presentFence)
++      device->presentFence->Release();
++   if (device->presentList)
++      device->presentList->Release();
++   if (device->presentAllocator)
++      device->presentAllocator->Release();
++   if (device->presentQueue)
++      device->presentQueue->Release();
++}
++
++static void queue_wait_idle(viogpu_command_queue *queue);
++
++static void
++present_copy(viogpu_device *device, viogpu_resource *res)
++{
++   EnterCriticalSection(&device->presentLock);
++   if (!present_init(device)) {
++      LeaveCriticalSection(&device->presentLock);
++      return;
++   }
++
++   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
++   UINT rows = 0;
++   UINT64 rowSize = 0, total = 0;
++   device->vkd3d->GetCopyableFootprints(&res->desc, 0, 1, 0, &footprint, &rows, &rowSize, &total);
++   HRESULT hr = S_OK;
++   if (!res->readback) {
++      D3D12_HEAP_PROPERTIES props = {};
++      props.Type = D3D12_HEAP_TYPE_READBACK;
++      D3D12_RESOURCE_DESC bd = {};
++      bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++      bd.Width = total;
++      bd.Height = 1;
++      bd.DepthOrArraySize = 1;
++      bd.MipLevels = 1;
++      bd.SampleDesc.Count = 1;
++      bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++      hr = device->vkd3d->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
++                                                   NULL, IID_PPV_ARGS(&res->readback));
++   }
++
++   /* the buffer is in the PRESENT (common) state: a copy promotes it */
++   if (SUCCEEDED(hr))
++      hr = device->presentAllocator->Reset();
++   if (SUCCEEDED(hr))
++      hr = device->presentList->Reset(device->presentAllocator, NULL);
++   if (SUCCEEDED(hr)) {
++      D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
++      dst.pResource = res->readback;
++      dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++      dst.PlacedFootprint = footprint;
++      src.pResource = res->resource;
++      src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++      src.SubresourceIndex = 0;
++      device->presentList->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
++      hr = device->presentList->Close();
++   }
++   if (SUCCEEDED(hr)) {
++      ID3D12CommandList *list = device->presentList;
++      device->presentQueue->ExecuteCommandLists(1, &list);
++      hr = device->presentQueue->Signal(device->presentFence, ++device->presentFenceValue);
++   }
++   if (SUCCEEDED(hr))
++      hr = device->presentFence->SetEventOnCompletion(device->presentFenceValue, NULL);
++
++   void *pixels = NULL;
++   if (SUCCEEDED(hr))
++      hr = res->readback->Map(0, NULL, &pixels);
++   if (SUCCEEDED(hr)) {
++      D3DDDICB_LOCK2 lock = {};
++      lock.hAllocation = res->kmAllocation;
++      hr = device->ktCallbacks->pfnLock2Cb(device->hRTDevice.handle, &lock);
++      if (SUCCEEDED(hr)) {
++         UINT bytes = (UINT)(rowSize < res->kmPitch ? rowSize : res->kmPitch);
++         for (UINT y = 0; y < rows; y++)
++            memcpy((BYTE *)lock.pData + (SIZE_T)y * res->kmPitch,
++                   (const BYTE *)pixels + footprint.Offset + (SIZE_T)y * footprint.Footprint.RowPitch, bytes);
++         D3DDDICB_UNLOCK2 unlock = {};
++         unlock.hAllocation = res->kmAllocation;
++         device->ktCallbacks->pfnUnlock2Cb(device->hRTDevice.handle, &unlock);
++      }
++      D3D12_RANGE none = {0, 0};
++      res->readback->Unmap(0, &none);
++   }
++   if (FAILED(hr))
++      viogpu_log("present copy: 0x%08lx", (unsigned long)hr);
++   LeaveCriticalSection(&device->presentLock);
++}
++
++static VOID APIENTRY
++present(D3D12DDI_HCOMMANDLIST, D3D12DDI_HCOMMANDQUEUE hQueue, const D3D12DDIARG_PRESENT_0001 *args,
++        D3D12DDI_PRESENT_0051 *out, D3D12DDI_PRESENT_CONTEXTS_0051 *contexts, D3D12DDI_PRESENT_HWQUEUES_0051 *hwQueues)
++{
++   struct viogpu_command_queue *queue = (struct viogpu_command_queue *)hQueue.pDrvPrivate;
++   viogpu_device *device = queue->device;
++   memset(out, 0, sizeof(*out));
++   viogpu_resource *src =
++      args->SurfacesToPresent ? (viogpu_resource *)args->phSurfacesToPresent[0].hSurface.pDrvPrivate : NULL;
++   viogpu_resource *dst = (viogpu_resource *)args->hDstResource.pDrvPrivate;
++   if (src && src->kmAllocation) {
++      queue_wait_idle(queue);
++      present_copy(device, src);
++   }
++   static LONG logged;
++   if (InterlockedIncrement(&logged) <= 4)
++      viogpu_log("Present: %u surfaces, source allocation 0x%x, destination 0x%x, flags 0x%x", args->SurfacesToPresent,
++                 src ? src->kmAllocation : 0, dst ? dst->kmAllocation : 0, args->Flags.Value);
++   out->BroadcastSrcAllocation[0] = src ? src->kmAllocation : 0;
++   out->BroadcastDstAllocation[0] = dst ? dst->kmAllocation : 0;
++   out->AddedGpuWork = FALSE;
++   out->BackBufferMultiplicity = 1;
++   if (contexts) {
++      memset(contexts, 0, sizeof(*contexts));
++      /* the context, and no others to broadcast to (the context itself among them is refused) */
++      contexts->hContext = queue->hContext;
++      contexts->BroadcastContextCount = 0;
++   }
++   if (hwQueues)
++      memset(hwQueues, 0, sizeof(*hwQueues));
++}
++
++HRESULT
++viogpu_fill_command_list_table(void *table, SIZE_T size, UINT number, D3D12DDI_HRTTABLE hRTTable)
++{
++   if (size < sizeof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0052))
++      return E_INVALIDARG;
++   if (number < 2)
++      viogpu_command_list_rt_tables[number] = hRTTable;
++   /* entries past the runtime's table (an older DDI version's) stay unset */
++   viogpu_command_list_funcs *f = (viogpu_command_list_funcs *)table;
++   f->pfnCloseCommandList = close_command_list;
++   f->pfnResetCommandList = reset_command_list;
++   f->pfnDrawInstanced = draw_instanced;
++   f->pfnDrawIndexedInstanced = draw_indexed_instanced;
++   f->pfnDispatch = dispatch;
++   f->pfnClearUnorderedAccessViewUint = clear_uav_uint;
++   f->pfnClearUnorderedAccessViewFloat = clear_uav_float;
++   f->pfnClearRenderTargetView = clear_rtv;
++   f->pfnClearDepthStencilView = clear_dsv;
++   f->pfnDiscardResource = discard_resource;
++   f->pfnCopyTextureRegion = copy_texture_region;
++   f->pfnResourceCopy = resource_copy;
++   f->pfnCopyTiles = copy_tiles;
++   f->pfnCopyBufferRegion = copy_buffer_region;
++   f->pfnResourceResolveSubresource = resolve_subresource;
++   f->pfnExecuteBundle = execute_bundle;
++   f->pfnExecuteIndirect = execute_indirect;
++   f->pfnResourceBarrier = resource_barrier;
++   f->pfnBeginQuery = begin_query;
++   f->pfnEndQuery = end_query;
++   f->pfnResolveQueryData = resolve_query_data;
++   f->pfnSetPredication = set_predication;
++   f->pfnIaSetTopology = ia_set_topology;
++   f->pfnRsSetViewports = rs_set_viewports;
++   f->pfnRsSetScissorRects = rs_set_scissor_rects;
++   f->pfnOmSetBlendFactor = om_set_blend_factor;
++   f->pfnOmSetStencilRef = om_set_stencil_ref;
++   f->pfnSetPipelineState = set_pipeline_state;
++   f->pfnSetDescriptorHeaps = set_descriptor_heaps;
++   f->pfnSetComputeRootSignature = set_compute_root_signature;
++   f->pfnSetGraphicsRootSignature = set_graphics_root_signature;
++   f->pfnSetComputeRootDescriptorTable = set_compute_root_table;
++   f->pfnSetGraphicsRootDescriptorTable = set_graphics_root_table;
++   f->pfnSetComputeRoot32BitConstant = set_compute_root_constant;
++   f->pfnSetGraphicsRoot32BitConstant = set_graphics_root_constant;
++   f->pfnSetComputeRoot32BitConstants = set_compute_root_constants;
++   f->pfnSetGraphicsRoot32BitConstants = set_graphics_root_constants;
++   f->pfnSetComputeRootConstantBufferView = set_compute_root_cbv;
++   f->pfnSetGraphicsRootConstantBufferView = set_graphics_root_cbv;
++   f->pfnSetComputeRootShaderResourceView = set_compute_root_srv;
++   f->pfnSetGraphicsRootShaderResourceView = set_graphics_root_srv;
++   f->pfnSetComputeRootUnorderedAccessView = set_compute_root_uav;
++   f->pfnSetGraphicsRootUnorderedAccessView = set_graphics_root_uav;
++   f->pfnIASetIndexBuffer = ia_set_index_buffer;
++   f->pfnIASetVertexBuffers = ia_set_vertex_buffers;
++   f->pfnSOSetTargets = so_set_targets;
++   f->pfnOMSetRenderTargets = om_set_render_targets;
++   f->pfnSetMarker = set_marker;
++   f->pfnClearRootArguments = clear_root_arguments;
++   f->pfnAtomicCopyBufferRegion = copy_buffer_region;
++   f->pfnOMSetDepthBounds = om_set_depth_bounds;
++   f->pfnSetSamplePositions = set_sample_positions;
++   f->pfnResourceResolveSubresourceRegion = resolve_subresource_region;
++   f->pfnSetProtectedResourceSession = set_protected_resource_session;
++   f->pfnWriteBufferImmediate = write_buffer_immediate;
++   f->pfnSetViewInstanceMask = set_view_instance_mask;
++   f->pfnPresent = present;
++   /* pfnBlt, meta commands: the logging stubs */
++   return S_OK;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Queues */
++
++
++static HRESULT
++km_fence_create(viogpu_device *device, D3DKMT_HANDLE *handle, const volatile UINT64 **value)
++{
++   D3DDDICB_CREATESYNCHRONIZATIONOBJECT2 create = {};
++   create.Info.Type = D3DDDI_MONITORED_FENCE;
++   HRESULT hr = device->ktCallbacks->pfnCreateSynchronizationObject2Cb(device->hRTDevice.handle, &create);
++   *handle = create.hSyncObject;
++   if (value)
++      *value = (const volatile UINT64 *)create.Info.MonitoredFence.FenceValueCPUVirtualAddress;
++   return hr;
++}
++
++static void
++km_fence_destroy(viogpu_device *device, D3DKMT_HANDLE handle)
++{
++   if (!handle)
++      return;
++   D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT destroy = {};
++   destroy.hSyncObject = handle;
++   device->ktCallbacks->pfnDestroySynchronizationObjectCb(device->hRTDevice.handle, &destroy);
++}
++
++/* Opens vkd3d-proton's gate for the submissions whose place on the kernel context has been reached */
++static DWORD WINAPI
++gate_thread(void *param)
++{
++   viogpu_command_queue *queue = (viogpu_command_queue *)param;
++   viogpu_device *device = queue->device;
++   for (;;) {
++      EnterCriticalSection(&queue->lock);
++      while (!queue->stop && queue->gateNext > queue->submitted)
++         SleepConditionVariableCS(&queue->wake, &queue->lock, INFINITE);
++      if (queue->stop) {
++         LeaveCriticalSection(&queue->lock);
++         return 0;
++      }
++      UINT64 n = queue->gateNext;
++      UINT64 last = queue->submitted;
++      LeaveCriticalSection(&queue->lock);
++
++      if (*queue->kmInValue < n) {
++         D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
++         wait.ObjectCount = 1;
++         wait.ObjectHandleArray = &queue->kmIn;
++         wait.FenceValueArray = &n;
++         device->ktCallbacks->pfnWaitForSynchronizationObjectFromCpuCb(device->hRTDevice.handle, &wait);
++      }
++      /* everything the kernel context has reached at once */
++      UINT64 reached = *queue->kmInValue;
++      if (reached > last)
++         reached = last;
++      if (reached < n)
++         reached = n;
++      queue->gate->Signal(reached);
++      EnterCriticalSection(&queue->lock);
++      queue->gateNext = reached + 1;
++      LeaveCriticalSection(&queue->lock);
++   }
++}
++
++/* Tells the kernel context which submissions the GPU has done */
++static DWORD WINAPI
++done_thread(void *param)
++{
++   viogpu_command_queue *queue = (viogpu_command_queue *)param;
++   viogpu_device *device = queue->device;
++   for (;;) {
++      EnterCriticalSection(&queue->lock);
++      while (!queue->stop && queue->doneNext > queue->submitted)
++         SleepConditionVariableCS(&queue->wake, &queue->lock, INFINITE);
++      if (queue->stop) {
++         LeaveCriticalSection(&queue->lock);
++         return 0;
++      }
++      UINT64 n = queue->doneNext;
++      LeaveCriticalSection(&queue->lock);
++
++      queue->done->SetEventOnCompletion(n, NULL);
++      UINT64 completed = queue->done->GetCompletedValue();
++      if (completed < n)
++         completed = n;
++      D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU signal = {};
++      signal.ObjectCount = 1;
++      signal.ObjectHandleArray = &queue->kmOut;
++      signal.FenceValueArray = &completed;
++      device->ktCallbacks->pfnSignalSynchronizationObjectFromCpuCb(device->hRTDevice.handle, &signal);
++      EnterCriticalSection(&queue->lock);
++      queue->doneNext = completed + 1;
++      LeaveCriticalSection(&queue->lock);
++   }
++}
++
++/* What the queue has been given is done on the GPU (presents read its results) */
++static void
++queue_wait_idle(viogpu_command_queue *queue)
++{
++   EnterCriticalSection(&queue->lock);
++   UINT64 n = queue->submitted;
++   LeaveCriticalSection(&queue->lock);
++   if (n && queue->done->GetCompletedValue() < n)
++      queue->done->SetEventOnCompletion(n, NULL);
++}
++
++static SIZE_T APIENTRY
++calc_command_queue_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATECOMMANDQUEUE_0050 *)
++{
++   return sizeof(viogpu_command_queue);
++}
++
++static HRESULT APIENTRY
++create_command_queue(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATECOMMANDQUEUE_0050 *args,
++                     D3D12DDI_HCOMMANDQUEUE h, D3D12DDI_HRTCOMMANDQUEUE hRT)
++{
++   viogpu_device *device = device_from(hDevice);
++   viogpu_command_queue *queue = new (h.pDrvPrivate) viogpu_command_queue();
++   queue->device = device;
++   queue->hRT = hRT;
++   queue->gateNext = queue->doneNext = 1;
++   InitializeCriticalSection(&queue->lock);
++   InitializeConditionVariable(&queue->wake);
++
++   D3D12_COMMAND_QUEUE_DESC desc = {};
++   desc.Type = list_type(D3D12DDI_COMMAND_LIST_TYPE_DIRECT, args->QueueFlags);
++   desc.Priority = (args->QueueCreationFlags & D3D12DDI_COMMAND_QUEUE_CREATION_FLAG_GLOBAL_REALTIME_PRIORITY)
++                      ? D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME
++                      : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
++   desc.NodeMask = args->NodeMask;
++   HRESULT hr = device->vkd3d->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue->queue));
++   if (SUCCEEDED(hr))
++      hr = device->vkd3d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue->gate));
++   if (SUCCEEDED(hr))
++      hr = device->vkd3d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue->done));
++   if (SUCCEEDED(hr)) {
++      D3DDDICB_CREATECONTEXTVIRTUAL context = {};
++      context.NodeOrdinal = 0;
++      context.EngineAffinity = 1;
++      hr = device->umCallbacks->pfnCreateContextVirtualCb(hRT, &context);
++      queue->hContext = context.hContext;
++   }
++   if (SUCCEEDED(hr))
++      hr = km_fence_create(device, &queue->kmIn, &queue->kmInValue);
++   if (SUCCEEDED(hr))
++      hr = km_fence_create(device, &queue->kmOut, NULL);
++   if (SUCCEEDED(hr)) {
++      queue->gateThread = CreateThread(NULL, 0, gate_thread, queue, 0, NULL);
++      queue->doneThread = CreateThread(NULL, 0, done_thread, queue, 0, NULL);
++      if (!queue->gateThread || !queue->doneThread)
++         hr = E_OUTOFMEMORY;
++   }
++   if (FAILED(hr))
++      viogpu_log("CreateCommandQueue (flags 0x%x): 0x%08lx", (UINT)args->QueueFlags, (unsigned long)hr);
++   return hr;
++}
++
++static VOID APIENTRY
++destroy_command_queue(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDQUEUE h)
++{
++   viogpu_command_queue *queue = (viogpu_command_queue *)h.pDrvPrivate;
++   viogpu_device *device = queue->device;
++   /* the runtime waits for the queue before destroying it: the threads have nothing left to do */
++   if (queue->done)
++      queue_wait_idle(queue);
++   EnterCriticalSection(&queue->lock);
++   queue->stop = true;
++   LeaveCriticalSection(&queue->lock);
++   WakeAllConditionVariable(&queue->wake);
++   for (HANDLE t : {queue->gateThread, queue->doneThread}) {
++      if (t) {
++         WaitForSingleObject(t, INFINITE);
++         CloseHandle(t);
++      }
++   }
++   km_fence_destroy(device, queue->kmIn);
++   km_fence_destroy(device, queue->kmOut);
++   if (queue->hContext) {
++      D3DDDICB_DESTROYCONTEXT destroy = {};
++      destroy.hContext = queue->hContext;
++      device->umCallbacks->pfnDestroyContextCb(queue->hRT, &destroy);
++   }
++   if (queue->done)
++      queue->done->Release();
++   if (queue->gate)
++      queue->gate->Release();
++   if (queue->queue)
++      queue->queue->Release();
++   DeleteCriticalSection(&queue->lock);
++   queue->~viogpu_command_queue();
++}
++
++/* temporary timing */
++
++static VOID APIENTRY
++execute_command_lists(D3D12DDI_HCOMMANDQUEUE h, UINT count, const D3D12DDI_HCOMMANDLIST *lists)
++{
++   viogpu_command_queue *queue = (viogpu_command_queue *)h.pDrvPrivate;
++   viogpu_device *device = queue->device;
++   std::vector<ID3D12CommandList *> api(count);
++   for (UINT i = 0; i < count; i++)
++      api[i] = list_from(lists[i])->list;
++
++   EnterCriticalSection(&queue->lock);
++   UINT64 n = queue->submitted + 1;
++   /* its place on the kernel context (see viogpu_command_queue) */
++   D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMGPU signal = {};
++   signal.hContext = queue->hContext;
++   signal.ObjectCount = 1;
++   signal.ObjectHandleArray = &queue->kmIn;
++   signal.MonitoredFenceValueArray = &n;
++   HRESULT hr = device->ktCallbacks->pfnSignalSynchronizationObjectFromGpuCb(device->hRTDevice.handle, &signal);
++   /* vkd3d-proton takes the lists now (the application may reset them right away) and runs them once the gate
++    * opens */
++   if (SUCCEEDED(hr))
++      hr = queue->queue->Wait(queue->gate, n);
++   if (SUCCEEDED(hr)) {
++      queue->queue->ExecuteCommandLists(count, api.data());
++      hr = queue->queue->Signal(queue->done, n);
++   }
++   if (SUCCEEDED(hr)) {
++      D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wait = {};
++      wait.hContext = queue->hContext;
++      wait.ObjectCount = 1;
++      wait.ObjectHandleArray = &queue->kmOut;
++      wait.MonitoredFenceValueArray = &n;
++      hr = device->ktCallbacks->pfnWaitForSynchronizationObjectFromGpuCb(device->hRTDevice.handle, &wait);
++      queue->submitted = n;
++   }
++   LeaveCriticalSection(&queue->lock);
++   WakeAllConditionVariable(&queue->wake);
++   if (FAILED(hr))
++      viogpu_device_error(device, hr);
++}
++
++static VOID APIENTRY
++update_tile_mappings(D3D12DDI_HCOMMANDQUEUE h, D3D12DDI_HRESOURCE hResource, UINT numRegions,
++                     const D3D12DDI_TILED_RESOURCE_COORDINATE *coords, const D3D12DDI_TILE_REGION_SIZE *sizes,
++                     D3D12DDI_HHEAP hHeap, UINT numRanges, const D3D12DDI_TILE_RANGE_FLAGS *rangeFlags,
++                     const UINT *heapOffsets, const UINT *rangeCounts, D3D12DDI_TILE_MAPPING_FLAGS flags)
++{
++   viogpu_command_queue *queue = (viogpu_command_queue *)h.pDrvPrivate;
++   queue->queue->UpdateTileMappings(resource_of(hResource), numRegions, (const D3D12_TILED_RESOURCE_COORDINATE *)coords,
++                                    (const D3D12_TILE_REGION_SIZE *)sizes, heap_of(hHeap), numRanges,
++                                    (const D3D12_TILE_RANGE_FLAGS *)rangeFlags, heapOffsets, rangeCounts,
++                                    (D3D12_TILE_MAPPING_FLAGS)flags);
++}
++
++static VOID APIENTRY
++copy_tile_mappings(D3D12DDI_HCOMMANDQUEUE h, D3D12DDI_HRESOURCE dst, const D3D12DDI_TILED_RESOURCE_COORDINATE *dstStart,
++                   D3D12DDI_HRESOURCE src, const D3D12DDI_TILED_RESOURCE_COORDINATE *srcStart,
++                   const D3D12DDI_TILE_REGION_SIZE *size, D3D12DDI_TILE_MAPPING_FLAGS flags)
++{
++   viogpu_command_queue *queue = (viogpu_command_queue *)h.pDrvPrivate;
++   queue->queue->CopyTileMappings(resource_of(dst), (const D3D12_TILED_RESOURCE_COORDINATE *)dstStart,
++                                  resource_of(src), (const D3D12_TILED_RESOURCE_COORDINATE *)srcStart,
++                                  (const D3D12_TILE_REGION_SIZE *)size, (D3D12_TILE_MAPPING_FLAGS)flags);
++}
++
++/* The runtime signals and waits on the queue's kernel context itself (see viogpu_command_queue) */
++static void APIENTRY
++signal_fence(D3D12DDI_HCOMMANDQUEUE, D3D12DDIARG_FENCE_OPERATION *op)
++{
++   op->PhysicalAdapterMask = 1;
++}
++
++static void APIENTRY
++wait_for_fence(D3D12DDI_HCOMMANDQUEUE, D3D12DDIARG_FENCE_OPERATION *op)
++{
++   op->PhysicalAdapterMask = 1;
++}
++
++HRESULT
++viogpu_fill_command_queue_table(void *table, SIZE_T size)
++{
++   if (size < sizeof(D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001))
++      return E_INVALIDARG;
++   D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 *f = (D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 *)table;
++   f->pfnExecuteCommandLists = execute_command_lists;
++   f->pfnUnused = NULL;
++   f->pfnUnused2 = NULL;
++   f->pfnUpdateTileMappings = update_tile_mappings;
++   f->pfnCopyTileMappings = copy_tile_mappings;
++   f->pfnSignalFence = signal_fence;
++   f->pfnWaitForFence = wait_for_fence;
++   return S_OK;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Fences: the runtime's (kernel monitored fences); the driver only hears about them */
++
++static SIZE_T APIENTRY
++calc_fence_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_FENCE *)
++{
++   return sizeof(void *);
++}
++
++static HRESULT APIENTRY
++create_fence(D3D12DDI_HDEVICE, D3D12DDI_HFENCE, const D3D12DDIARG_CREATE_FENCE *)
++{
++   return S_OK;
++}
++
++static VOID APIENTRY
++destroy_fence(D3D12DDI_HDEVICE, D3D12DDI_HFENCE)
++{
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++
++void
++viogpu_fill_command_funcs(viogpu_device_funcs *f)
++{
++   f->pfnCalcPrivateCommandQueueSize = calc_command_queue_size;
++   f->pfnCreateCommandQueue = create_command_queue;
++   f->pfnDestroyCommandQueue = destroy_command_queue;
++   f->pfnCalcPrivateCommandPoolSize = calc_command_pool_size;
++   f->pfnCreateCommandPool = create_command_pool;
++   f->pfnDestroyCommandPool = destroy_command_pool;
++   f->pfnResetCommandPool = reset_command_pool;
++   f->pfnCalcPrivateCommandListSize = calc_command_list_size;
++   f->pfnCreateCommandList = create_command_list;
++   f->pfnDestroyCommandList = destroy_command_list;
++   f->pfnCalcPrivateFenceSize = calc_fence_size;
++   f->pfnCreateFence = create_fence;
++   f->pfnDestroyFence = destroy_fence;
++   f->pfnCalcPrivateCommandRecorderSize = calc_command_recorder_size;
++   f->pfnCreateCommandRecorder = create_command_recorder;
++   f->pfnDestroyCommandRecorder = destroy_command_recorder;
++   f->pfnCommandRecorderSetCommandPoolAsTarget = recorder_set_pool;
++}
+diff --git a/libs/viogpu_umd/umd_compat.h b/libs/viogpu_umd/umd_compat.h
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_compat.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* What the WDK's display driver headers (d3d10umddi.h pulls in the kernel-mode d3dkmddi.h) expect from the kernel
++ * headers, for user-mode code */
++
++#ifndef VIOGPU_UMD_COMPAT_H
++#define VIOGPU_UMD_COMPAT_H
++
++#define WIN32_NO_STATUS
++#include <windows.h>
++#undef WIN32_NO_STATUS
++#include <ntstatus.h>
++#include <winternl.h>
++
++typedef LARGE_INTEGER PHYSICAL_ADDRESS;
++
++#ifndef NT_SUCCESS
++#define NT_SUCCESS(status) ((NTSTATUS)(status) >= 0)
++#endif
++
++#endif
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -0,0 +1,622 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* viogpu's Direct3D 12 user-mode driver: the D3D12 DDI the Windows runtime calls, on vkd3d-proton's implementation of
++ * the D3D12 API (Vulkan, on the virtual GPU's Venus driver). This file speaks the DDI with the Windows SDK's and
++ * WDK's headers; vkd3d-proton's objects are the same COM objects as the SDK's interfaces, so they are called through
++ * those directly, and umd_bridge.c holds the rest of vkd3d-proton the driver uses.
++ *
++ * Every DDI table entry the driver doesn't implement yet is a stub that logs which entry the runtime called
++ * (OutputDebugString, and the file VIOGPU_D3D12_LOG names) and returns 0. Each stub has its entry's own type, so that
++ * on x86 it pops the caller's arguments (__stdcall).
++ *
++ * DDI versions: D3D12DDI_SUPPORTED_0082 (interface R8, build 2: shader model 6.6) and, for older runtimes,
++ * D3D12DDI_SUPPORTED_0052 (R5, build 2, the version of Microsoft's compute-only sample driver). The tables and caps
++ * are 0082's; an older runtime's are a prefix of them (umd_private.h).
++ */
++
++#include "umd_private.h"
++#include "umd_tables.h"
++
++#include <type_traits>
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Log */
++
++void
++viogpu_log(const char *format, ...)
++{
++   char line[512];
++   va_list args;
++   va_start(args, format);
++   int n = _vsnprintf_s(line, sizeof(line) - 2, _TRUNCATE, format, args);
++   va_end(args);
++   if (n < 0)
++      n = (int)strlen(line);
++   line[n++] = '\n';
++   line[n] = 0;
++   OutputDebugStringA("viogpu_d3d12: ");
++   OutputDebugStringA(line);
++
++   static char path[MAX_PATH];
++   static LONG pathState; /* 0: not read yet, 1: no log file, 2: path */
++   if (pathState == 0)
++      pathState = GetEnvironmentVariableA("VIOGPU_D3D12_LOG", path, sizeof(path)) ? 2 : 1;
++   if (pathState == 2) {
++      HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
++                                FILE_ATTRIBUTE_NORMAL, NULL);
++      if (file != INVALID_HANDLE_VALUE) {
++         char prefixed[600];
++         int length = _snprintf_s(prefixed, sizeof(prefixed), _TRUNCATE, "[%lu] %s", GetCurrentProcessId(), line);
++         DWORD written;
++         WriteFile(file, prefixed, length > 0 ? (DWORD)length : 0, &written, NULL);
++         CloseHandle(file);
++      }
++   }
++}
++
++void
++viogpu_device_error(viogpu_device *device, HRESULT hr)
++{
++   viogpu_log("device error 0x%08lx", (unsigned long)hr);
++   device->umCallbacks->pfnSetErrorCb(device->hRTDevice, hr);
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Stubs: one function per table entry, so that each knows which entry it stands for */
++
++enum viogpu_table {
++   TABLE_DEVICE,
++   TABLE_COMMAND_LIST,
++   TABLE_COMMAND_QUEUE,
++   TABLE_DXGI,
++   TABLE_EXTENDED_FEATURES,
++};
++
++static const char *const *const table_names[] = {
++   viogpu_d3d12_device_names,
++   viogpu_d3d12_command_list_names,
++   viogpu_d3d12_command_queue_names,
++   viogpu_d3d12_dxgi_names,
++   viogpu_d3d12_extended_features_names,
++};
++static const char *const table_tags[] = { "device", "command list", "command queue", "DXGI", "extended features" };
++
++static void
++stub_called(int table, int entry)
++{
++   /* every call of the first ones, then every 1000th, so a draw loop doesn't flood the log */
++   static LONG counts[5][128];
++   LONG count = InterlockedIncrement(&counts[table][entry & 127]);
++   if (count <= 20 || count % 1000 == 0)
++      viogpu_log("not implemented: %s %s (call %ld)", table_tags[table], table_names[table][entry], count);
++}
++
++template <int Table, int Entry, typename F>
++struct stub {
++   /* entries that aren't functions (pfnUnused): never called */
++   static_assert(std::is_same<F, void *>::value, "a DDI entry with an unexpected calling convention");
++   static SIZE_T APIENTRY fn() { stub_called(Table, Entry); return 0; }
++   static void *get() { return (void *)&fn; }
++};
++template <int Table, int Entry, typename R, typename... A>
++struct stub<Table, Entry, R (APIENTRY *)(A...)> {
++   static R APIENTRY fn(A...) { stub_called(Table, Entry); return R(); }
++   static R (APIENTRY *get())(A...) { return &fn; }
++};
++
++/* the runtime's table of size bytes: a stub in every entry of Funcs that fits */
++#define STUB_ENTRY(i, m)                                                                                         \
++   if ((char *)&funcs->m - (char *)funcs < (ptrdiff_t)size)                                                      \
++      funcs->m = stub<table_, i, decltype(funcs->m)>::get();
++#define FILL_STUBS(tag, Funcs, table, size)                                                                     \
++   do {                                                                                                          \
++      constexpr int table_ = TABLE_##tag;                                                                        \
++      Funcs *funcs = (Funcs *)(table);                                                                           \
++      VIOGPU_D3D12_##tag##_MEMBERS(STUB_ENTRY)                                                                   \
++   } while (0)
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Device */
++
++
++static void APIENTRY
++device_check_format_support(D3D12DDI_HDEVICE, DXGI_FORMAT format, UINT *support)
++{
++   /* What the feature level requires, the runtime knows; these bits are the optional extras. None yet, besides
++    * the formats DXGI swap chains show */
++   switch (format) {
++   case DXGI_FORMAT_R8G8B8A8_UNORM:
++   case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++   case DXGI_FORMAT_B8G8R8A8_UNORM:
++   case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++   case DXGI_FORMAT_R10G10B10A2_UNORM:
++   case DXGI_FORMAT_R16G16B16A16_FLOAT:
++      *support = D3D12DDI_FORMAT_SUPPORT_DISPLAY;
++      break;
++   case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
++      *support = D3D12DDI_FORMAT_SUPPORT_NOT_SUPPORTED;
++      break;
++   default:
++      *support = 0;
++      break;
++   }
++}
++
++static void APIENTRY
++device_check_multisample_quality_levels(D3D12DDI_HDEVICE, DXGI_FORMAT, UINT sampleCount,
++                                        D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS, UINT *levels)
++{
++   *levels = sampleCount == 1 ? 1 : 0;
++}
++
++static UINT APIENTRY
++device_get_implicit_physical_adapter_mask(D3D12DDI_HDEVICE)
++{
++   return 1;
++}
++
++static VOID APIENTRY
++device_query_node_map(D3D12DDI_HDEVICE, UINT numPhysicalAdapters, UINT *map)
++{
++   for (UINT i = 0; i < numPhysicalAdapters; i++)
++      map[i] = i;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Extended features (video, shader cache, render passes, meta commands...): none */
++
++static HRESULT APIENTRY
++device_get_supported_extended_features(D3D12DDI_HDEVICE, UINT32 *count, D3D12DDI_FEATURE_0020 *)
++{
++   *count = 0;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++device_get_supported_extended_feature_versions(D3D12DDI_HDEVICE, D3D12DDI_FEATURE_0020, UINT32 *count, UINT32 *)
++{
++   *count = 0;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++device_enable_extended_feature(D3D12DDI_HDEVICE, D3D12DDI_FEATURE_0020 feature, UINT32 version)
++{
++   viogpu_log("EnableExtendedFeature %d version %u: not supported", (int)feature, version);
++   return E_INVALIDARG;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Adapter */
++
++struct viogpu_caps;
++
++struct viogpu_adapter {
++   D3D12DDI_HRTADAPTER hRTAdapter;
++   const D3DDDI_ADAPTERCALLBACKS *callbacks;
++   /* vkd3d-proton's device, made on first use (the caps come from it): the runtime keeps one D3D12 device per
++    * adapter and process, which uses this one */
++   ID3D12Device *vkd3d;
++   HRESULT vkd3dResult;
++   bool vkd3dTried;
++   viogpu_caps *caps;
++};
++
++static ID3D12Device *
++adapter_vkd3d(viogpu_adapter *adapter)
++{
++   if (!adapter->vkd3dTried) {
++      adapter->vkd3dTried = true;
++      void *device = NULL;
++      HRESULT hr = viogpu_bridge_create_device(NULL, D3D_FEATURE_LEVEL_11_0, &device);
++      adapter->vkd3d = (ID3D12Device *)device;
++      viogpu_log("vkd3d-proton device: 0x%08lx", (unsigned long)hr);
++      /* No Venus, or a host whose Vulkan lacks what D3D12 needs: the GPU has no Direct3D 12, as a vendor driver
++       * of such a GPU says */
++      adapter->vkd3dResult = SUCCEEDED(hr) ? hr : DXGI_ERROR_UNSUPPORTED;
++   }
++   return adapter->vkd3d;
++}
++
++static const UINT64 supported_versions[] = { D3D12DDI_SUPPORTED_0082 };
++
++static HRESULT APIENTRY
++adapter_get_supported_versions(D3D12DDI_HADAPTER, UINT32 *entries, UINT64 *versions)
++{
++   if (versions && *entries < ARRAYSIZE(supported_versions))
++      return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++   *entries = ARRAYSIZE(supported_versions);
++   if (versions)
++      memcpy(versions, supported_versions, sizeof(supported_versions));
++   return S_OK;
++}
++
++/* the caps struct, as much of it as the runtime's version has room for */
++template <typename T>
++static HRESULT
++answer(const D3D12DDIARG_GETCAPS *caps, const T &value)
++{
++   if (!caps->pData || caps->DataSize == 0)
++      return E_INVALIDARG;
++   memset(caps->pData, 0, caps->DataSize);
++   memcpy(caps->pData, &value, caps->DataSize < sizeof(T) ? caps->DataSize : sizeof(T));
++   return S_OK;
++}
++
++/* What the device can do, from vkd3d-proton's answers, in the DDI's terms */
++struct viogpu_caps {
++   D3D12DDI_3DPIPELINELEVEL level;
++   BOOL uma, cacheCoherentUma;
++   D3D12DDI_SHADER_CAPS_0082 shader;
++   D3D12DDI_D3D12_OPTIONS_DATA_0081 options;
++   UINT gpuvaBits;
++   /* highest shader model, in D3D_SHADER_MODEL's terms (0x51, 0x60...) */
++   UINT shaderModel;
++};
++
++static void
++caps_from_vkd3d(ID3D12Device *device, viogpu_caps *caps)
++{
++   static const D3D_FEATURE_LEVEL levels[] = {
++      D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1,
++      D3D_FEATURE_LEVEL_12_2,
++   };
++   D3D12_FEATURE_DATA_FEATURE_LEVELS fl = {};
++   fl.NumFeatureLevels = ARRAYSIZE(levels);
++   fl.pFeatureLevelsRequested = levels;
++   device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl));
++   switch (fl.MaxSupportedFeatureLevel) {
++   /* ponytail: 12_2 (DirectX 12 Ultimate) needs ray tracing, mesh shaders, VRS and sampler feedback through the
++    * DDI (state objects, DispatchRays/DispatchMesh, shading rate entries), none of them passed on yet: 12_1 */
++   case D3D_FEATURE_LEVEL_12_2:
++   case D3D_FEATURE_LEVEL_12_1: caps->level = D3D12DDI_3DPIPELINELEVEL_12_1; break;
++   case D3D_FEATURE_LEVEL_12_0: caps->level = D3D12DDI_3DPIPELINELEVEL_12_0; break;
++   case D3D_FEATURE_LEVEL_11_1: caps->level = D3D12DDI_3DPIPELINELEVEL_11_1; break;
++   default: caps->level = D3D12DDI_3DPIPELINELEVEL_11_0; break;
++   }
++
++   D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
++   D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
++   D3D12_FEATURE_DATA_D3D12_OPTIONS2 o2 = {};
++   D3D12_FEATURE_DATA_D3D12_OPTIONS3 o3 = {};
++   D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = {};
++   D3D12_FEATURE_DATA_D3D12_OPTIONS5 o5 = {};
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1));
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof(o2));
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &o3, sizeof(o3));
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof(o4));
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &o5, sizeof(o5));
++
++   /* The DDI's enums have the API's values */
++   D3D12DDI_SHADER_CAPS_0082 &shader = caps->shader;
++   shader.MinPrecision = (D3D12DDI_SHADER_MIN_PRECISION)o.MinPrecisionSupport;
++   shader.DoubleOps = o.DoublePrecisionFloatShaderOps;
++   shader.ShaderSpecifiedStencilRef = o.PSSpecifiedStencilRefSupported;
++   shader.TypedUAVLoadAdditionalFormats = o.TypedUAVLoadAdditionalFormats;
++   shader.ROVs = o.ROVsSupported;
++   shader.WaveOps = o1.WaveOps;
++   /* valid even without wave operations: at least 4 */
++   shader.WaveLaneCountMin = o1.WaveLaneCountMin >= 4 ? o1.WaveLaneCountMin : 4;
++   shader.WaveLaneCountMax = o1.WaveLaneCountMax >= shader.WaveLaneCountMin ? o1.WaveLaneCountMax
++                                                                            : shader.WaveLaneCountMin;
++   shader.TotalLaneCount = o1.TotalLaneCount >= shader.WaveLaneCountMax ? o1.TotalLaneCount : shader.WaveLaneCountMax;
++   shader.Int64Ops = o1.Int64ShaderOps;
++   shader.Native16BitOps = o4.Native16BitShaderOpsSupported;
++   /* 0082: 64-bit atomics on typed resources and in group shared memory (shader model 6.6) */
++   D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9 = {};
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof(o9));
++   shader.AtomicInt64OnTypedResource = o9.AtomicInt64OnTypedResourceSupported;
++   shader.AtomicInt64OnGroupShared = o9.AtomicInt64OnGroupSharedSupported;
++
++   D3D12DDI_D3D12_OPTIONS_DATA_0081 &options = caps->options;
++   options.ResourceBindingTier = (D3D12DDI_RESOURCE_BINDING_TIER)o.ResourceBindingTier;
++   options.ConservativeRasterizationTier = (D3D12DDI_CONSERVATIVE_RASTERIZATION_TIER)o.ConservativeRasterizationTier;
++   options.TiledResourcesTier = (D3D12DDI_TILED_RESOURCES_TIER)o.TiledResourcesTier;
++   options.CrossNodeSharingTier = D3D12DDI_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
++   options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation =
++      o.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation;
++   options.OutputMergerLogicOp = o.OutputMergerLogicOp;
++   options.ResourceHeapTier = (D3D12DDI_RESOURCE_HEAP_TIER)o.ResourceHeapTier;
++   options.DepthBoundsTestSupported = o2.DepthBoundsTestSupported;
++   options.ProgrammableSamplePositionsTier =
++      (D3D12DDI_PROGRAMMABLE_SAMPLE_POSITIONS_TIER)o2.ProgrammableSamplePositionsTier;
++   options.CopyQueueTimestampQueriesSupported = o3.CopyQueueTimestampQueriesSupported;
++   /* WriteBufferImmediate isn't implemented yet */
++   options.WriteBufferImmediateQueueFlags = D3D12DDI_COMMAND_QUEUE_FLAG_NONE;
++   options.ViewInstancingTier = (D3D12DDI_VIEW_INSTANCING_TIER)o3.ViewInstancingTier;
++   options.BarycentricsSupported = o3.BarycentricsSupported;
++   options.ReservedBufferPlacementSupported = o4.MSAA64KBAlignedTextureSupported;
++   options.SRVOnlyTiledResourceTier3 = o5.SRVOnlyTiledResourceTier3;
++
++   /* the heaps the runtime makes out of DEFAULT/UPLOAD/READBACK follow this, vkd3d-proton's custom heaps too */
++   D3D12_FEATURE_DATA_ARCHITECTURE arch = {};
++   device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof(arch));
++   caps->uma = arch.UMA;
++   caps->cacheCoherentUma = arch.CacheCoherentUMA;
++
++   D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT va = {};
++   device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, &va, sizeof(va));
++   caps->gpuvaBits = va.MaxGPUVirtualAddressBitsPerResource ? va.MaxGPUVirtualAddressBitsPerResource : 32;
++
++   /* the highest shader model DDI 0082 knows is 6.6 */
++   D3D12_FEATURE_DATA_SHADER_MODEL sm = {};
++   sm.HighestShaderModel = D3D_SHADER_MODEL_6_6;
++   if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))))
++      sm.HighestShaderModel = D3D_SHADER_MODEL_5_1;
++   caps->shaderModel = sm.HighestShaderModel;
++
++   /* What the runtime insists on: view instancing needs shader model 6.1, native 16-bit operations 6.2 */
++   if (caps->shaderModel < D3D_SHADER_MODEL_6_1)
++      options.ViewInstancingTier = D3D12DDI_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
++   if (caps->shaderModel < D3D_SHADER_MODEL_6_2)
++      shader.Native16BitOps = FALSE;
++
++   viogpu_log("caps: pipeline level %d, shader model 0x%x, binding tier %d, heap tier %d, VA bits %u",
++              (int)caps->level, caps->shaderModel, (int)options.ResourceBindingTier, (int)options.ResourceHeapTier,
++              caps->gpuvaBits);
++}
++
++static const viogpu_caps *
++adapter_caps(viogpu_adapter *adapter)
++{
++   if (!adapter->caps) {
++      ID3D12Device *device = adapter_vkd3d(adapter);
++      if (!device)
++         return NULL;
++      adapter->caps = new (std::nothrow) viogpu_caps();
++      if (adapter->caps)
++         caps_from_vkd3d(device, adapter->caps);
++   }
++   return adapter->caps;
++}
++
++static HRESULT
++adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps);
++
++static HRESULT APIENTRY
++adapter_get_caps(D3D12DDI_HADAPTER hAdapter, const D3D12DDIARG_GETCAPS *caps)
++{
++   HRESULT hr = adapter_get_caps_answer((viogpu_adapter *)hAdapter.pDrvPrivate, caps);
++   viogpu_log("GetCaps: type %d, %u bytes: 0x%08lx", (int)caps->Type, caps->DataSize, (unsigned long)hr);
++   return hr;
++}
++
++static HRESULT
++adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps)
++{
++   const viogpu_caps *dev = adapter_caps(adapter);
++   if (!dev)
++      return adapter->vkd3dResult;
++
++   switch (caps->Type) {
++   case D3D12DDICAPS_TYPE_3DPIPELINESUPPORT:
++      return answer(caps, dev->level);
++
++   case D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1: {
++      D3D12DDI_3DPIPELINESUPPORT1_DATA_0081 *data = (D3D12DDI_3DPIPELINESUPPORT1_DATA_0081 *)caps->pData;
++      if (!data || caps->DataSize < sizeof(*data))
++         return E_INVALIDARG;
++      data->MaximumDriverSupportedFeatureLevel =
++         dev->level < data->HighestRuntimeSupportedFeatureLevel ? dev->level : data->HighestRuntimeSupportedFeatureLevel;
++      return S_OK;
++   }
++
++   case D3D12DDICAPS_TYPE_SHADER:
++      return answer(caps, dev->shader);
++
++   case D3D12DDICAPS_TYPE_D3D12_OPTIONS:
++      return answer(caps, dev->options);
++
++   case D3D12DDICAPS_TYPE_ARCHITECTURE_INFO: {
++      D3D12DDI_ARCHITECTURE_INFO_DATA info = {};
++      return answer(caps, info);
++   }
++
++   case D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE: {
++      /* vkd3d-proton's (its custom heaps follow it too). IOCoherent is required on x86/amd64: the runtime refuses
++       * the device otherwise */
++      D3D12DDI_MEMORY_ARCHITECTURE_CAPS_0041 memory = {};
++      memory.UMA = dev->uma;
++      memory.IOCoherent = TRUE;
++      memory.CacheCoherent = dev->cacheCoherentUma;
++      memory.HeapSerializationTier = D3D12DDI_HEAP_SERIALIZATION_TIER_0041_0;
++      memory.ResourceSerializationTier = D3D12DDI_RESOURCE_SERIALIZATION_TIER_0041_0;
++      return answer(caps, memory);
++   }
++
++   case D3D12DDICAPS_TYPE_GPUVA_CAPS: {
++      D3D12DDI_GPUVA_CAPS_0004 gpuva = {};
++      gpuva.MaxGPUVirtualAddressBitsPerResource = dev->gpuvaBits;
++      return answer(caps, gpuva);
++   }
++
++   case D3D12DDICAPS_TYPE_TEXTURE_LAYOUT: {
++      D3D12DDI_TEXTURE_LAYOUT_CAPS_0001 layout = {};
++      return answer(caps, layout);
++   }
++
++   case D3D12DDICAPS_TYPE_0022_TEXTURE_LAYOUT: {
++      D3D12DDI_TEXTURE_LAYOUT_CAPS_0026 layout = {};
++      return answer(caps, layout);
++   }
++
++   case D3D12DDICAPS_TYPE_TEXTURE_LAYOUT_SETS: {
++      /* pInfo = UINT[2] { layout, functional unit }: the only layout offered is row major (cross-adapter textures),
++       * with the alignments of D3D12's copy footprints */
++      const UINT *info = (const UINT *)caps->pInfo;
++      if (!info || info[0] != D3D12DDI_TL_ROW_MAJOR)
++         return E_NOTIMPL;
++      D3D12DDI_ROW_MAJOR_LAYOUT_CAPS layout = {};
++      layout.SubCaps[0].MaxElementSize = 0xFFFF;
++      layout.SubCaps[0].BaseOffsetAlignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
++      layout.SubCaps[0].PitchAlignment = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
++      layout.SubCaps[0].DepthPitchAlignment = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
++      layout.Flags = D3D12DDI_ROW_MAJOR_LAYOUT_FLAG_NONE;
++      return answer(caps, layout);
++   }
++
++   case D3D12DDICAPS_TYPE_0011_SHADER_MODELS: {
++      /* every release model up to the highest: 5.1, then 6.x (the DDI's value is major << 16 | minor << 4 | 5) */
++      D3D12DDI_SHADER_MODEL models[8];
++      UINT count = 0;
++      models[count++] = D3D12DDI_SHADER_MODEL_5_1_RELEASE_0011;
++      for (UINT minor = 0; dev->shaderModel >= 0x60 + minor && minor <= 6; minor++)
++         models[count++] = (D3D12DDI_SHADER_MODEL)((6 << 16) | (minor << 4) | 5);
++      D3D12DDI_D3D12_SHADER_MODELS_DATA_0011 *data = (D3D12DDI_D3D12_SHADER_MODELS_DATA_0011 *)caps->pData;
++      if (!data || !data->pNumShaderModelsSupported)
++         return E_INVALIDARG;
++      if (data->pShaderModelsSupported) {
++         UINT n = *data->pNumShaderModelsSupported < count ? *data->pNumShaderModelsSupported : count;
++         memcpy(data->pShaderModelsSupported, models, n * sizeof(models[0]));
++      }
++      *data->pNumShaderModelsSupported = count;
++      return S_OK;
++   }
++
++   case D3D12DDICAPS_TYPE_0022_CPU_PAGE_TABLE_FALSE_POSITIVES:
++   case D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY:
++   case D3D12DDICAPS_TYPE_0033_ADAPTER_COMPUTE_ONLY:
++   case D3D12DDICAPS_TYPE_0050_HARDWARE_SCHEDULING_CAPS:
++   case D3D12DDICAPS_TYPE_EXECUTECOMMANDLISTS_PARALLELISM:
++   case D3D12DDICAPS_TYPE_0073_SUPPORT_BATCHED_MARKERS:
++      /* none of it: queue flags 0, not compute-only, no hardware scheduling, FALSE */
++      if (!caps->pData)
++         return E_INVALIDARG;
++      memset(caps->pData, 0, caps->DataSize);
++      return S_OK;
++
++   default:
++      return E_NOTIMPL;
++   }
++}
++
++static HRESULT APIENTRY
++adapter_get_optional_ddi_tables(D3D12DDI_HADAPTER, UINT32 *entries, D3D12DDI_TABLE_REQUEST *)
++{
++   *entries = 0;
++   return S_OK;
++}
++
++static SIZE_T APIENTRY
++adapter_calc_private_device_size(D3D12DDI_HADAPTER, const D3D12DDIARG_CALCPRIVATEDEVICESIZE *)
++{
++   return sizeof(viogpu_device);
++}
++
++static HRESULT APIENTRY
++adapter_create_device(D3D12DDI_HADAPTER hAdapter, const D3D12DDIARG_CREATEDEVICE_0003 *args)
++{
++   viogpu_adapter *adapter = (viogpu_adapter *)hAdapter.pDrvPrivate;
++   ID3D12Device *vkd3d = adapter_vkd3d(adapter);
++   if (!vkd3d)
++      return adapter->vkd3dResult;
++   viogpu_log("CreateDevice: interface 0x%x version 0x%x flags 0x%x", args->Interface, args->Version,
++              (UINT)args->Flags);
++   if (args->Interface != D3D12DDI_INTERFACE_VERSION_R5 && args->Interface != D3D12DDI_INTERFACE_VERSION_R8)
++      return E_INVALIDARG;
++   viogpu_device *device = new (args->hDrvDevice.pDrvPrivate) viogpu_device();
++   device->vkd3d = vkd3d;
++   vkd3d->AddRef();
++   InitializeCriticalSection(&device->presentLock);
++   device->hRTDevice = args->hRTDevice;
++   device->interfaceVersion = args->Interface;
++   device->version = args->Version;
++   device->ktCallbacks = args->pKTCallbacks;
++   device->umCallbacks = args->p12UMCallbacks_0050;
++   return S_OK;
++}
++
++static VOID APIENTRY
++adapter_destroy_device(D3D12DDI_HDEVICE hDevice)
++{
++   viogpu_log("DestroyDevice");
++   viogpu_device *device = (viogpu_device *)hDevice.pDrvPrivate;
++   viogpu_present_destroy(device);
++   DeleteCriticalSection(&device->presentLock);
++   device->vkd3d->Release();
++   device->~viogpu_device();
++}
++
++static HRESULT APIENTRY
++adapter_fill_ddi_table(D3D12DDI_HADAPTER, D3D12DDI_TABLE_TYPE type, VOID *table, SIZE_T size, UINT number,
++                       D3D12DDI_HRTTABLE hRTTable)
++{
++   viogpu_log("FillDDITable: type %d, %zu bytes, table %u", (int)type, size, number);
++   switch (type) {
++   case D3D12DDI_TABLE_TYPE_DEVICE_CORE: {
++      if (size < sizeof(D3D12DDI_DEVICE_FUNCS_CORE_0052))
++         return E_INVALIDARG;
++      FILL_STUBS(DEVICE, viogpu_device_funcs, table, size);
++      viogpu_device_funcs *funcs = (viogpu_device_funcs *)table;
++      funcs->pfnCheckFormatSupport = device_check_format_support;
++      funcs->pfnCheckMultisampleQualityLevels = device_check_multisample_quality_levels;
++      funcs->pfnGetImplicitPhysicalAdapterMask = device_get_implicit_physical_adapter_mask;
++      funcs->pfnQueryNodeMap = device_query_node_map;
++      viogpu_fill_state_funcs(funcs);
++      viogpu_fill_resource_funcs(funcs);
++      viogpu_fill_command_funcs(funcs);
++      return S_OK;
++   }
++   case D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D:
++      FILL_STUBS(COMMAND_LIST, viogpu_command_list_funcs, table, size);
++      return viogpu_fill_command_list_table(table, size, number, hRTTable);
++   case D3D12DDI_TABLE_TYPE_COMMAND_QUEUE_3D:
++      FILL_STUBS(COMMAND_QUEUE, D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001, table, size);
++      return viogpu_fill_command_queue_table(table, size);
++   case D3D12DDI_TABLE_TYPE_DXGI:
++      FILL_STUBS(DXGI, DXGI1_4_DDI_BASE_FUNCTIONS, table, size);
++      return S_OK;
++   case D3D12DDI_TABLE_TYPE_0020_EXTENDED_FEATURES: {
++      if (size < sizeof(D3D12DDI_EXTENDED_FEATURES_FUNCS_0020))
++         return E_INVALIDARG;
++      FILL_STUBS(EXTENDED_FEATURES, D3D12DDI_EXTENDED_FEATURES_FUNCS_0020, table, size);
++      D3D12DDI_EXTENDED_FEATURES_FUNCS_0020 *funcs = (D3D12DDI_EXTENDED_FEATURES_FUNCS_0020 *)table;
++      funcs->pfnGetSupportedExtendedFeatures = device_get_supported_extended_features;
++      funcs->pfnGetSupportedExtendedFeatureVersions = device_get_supported_extended_feature_versions;
++      funcs->pfnEnableExtendedFeature = device_enable_extended_feature;
++      return S_OK;
++   }
++   default:
++      /* video, content protection, shader cache, render passes, meta commands: not offered */
++      return E_UNEXPECTED;
++   }
++}
++
++static HRESULT APIENTRY
++adapter_close(D3D12DDI_HADAPTER hAdapter)
++{
++   viogpu_log("CloseAdapter");
++   viogpu_adapter *adapter = (viogpu_adapter *)hAdapter.pDrvPrivate;
++   if (adapter->vkd3d)
++      adapter->vkd3d->Release();
++   delete adapter->caps;
++   delete adapter;
++   return S_OK;
++}
++
++extern "C" __declspec(dllexport) HRESULT APIENTRY
++OpenAdapter12(D3D12DDIARG_OPENADAPTER *args)
++{
++   viogpu_log("OpenAdapter12");
++   viogpu_adapter *adapter = new (std::nothrow) viogpu_adapter();
++   if (!adapter)
++      return E_OUTOFMEMORY;
++   adapter->hRTAdapter = args->hRTAdapter;
++   adapter->callbacks = args->pAdapterCallbacks;
++
++   D3D12DDI_ADAPTERFUNCS *funcs = args->pAdapterFuncs;
++   funcs->pfnCalcPrivateDeviceSize = adapter_calc_private_device_size;
++   funcs->pfnCreateDevice = adapter_create_device;
++   funcs->pfnCloseAdapter = adapter_close;
++   funcs->pfnGetSupportedVersions = adapter_get_supported_versions;
++   funcs->pfnGetCaps = adapter_get_caps;
++   funcs->pfnGetOptionalDDITables = adapter_get_optional_ddi_tables;
++   funcs->pfnFillDDITable = adapter_fill_ddi_table;
++   funcs->pfnDestroyDevice = adapter_destroy_device;
++   args->hAdapter.pDrvPrivate = adapter;
++   return S_OK;
++}
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_private.h
+@@ -0,0 +1,127 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* Shared by the files of viogpu's Direct3D 12 user-mode driver (umd_ddi.cpp has the overview) */
++
++#ifndef VIOGPU_UMD_PRIVATE_H
++#define VIOGPU_UMD_PRIVATE_H
++
++#include "umd_compat.h"
++#include <stdio.h>
++#include <stdarg.h>
++#include <string.h>
++#include <new>
++
++#define D3D10DDI_MINOR_HEADER_VERSION 2
++/* d3d10umddi.h defines the D3D10 constants as variables: d3d10_1.h first avoids duplicate symbols */
++#include <d3d10_1.h>
++#include <d3d12.h>
++#include <d3d10umddi.h>
++#include <d3d12umddi.h>
++
++#include "umd_bridge.h"
++
++#include <string>
++#include <utility>
++#include <vector>
++
++void viogpu_log(const char *format, ...);
++
++/* The tables of the newest DDI version the driver offers (umd_ddi.cpp); a runtime of an older version gets the part
++ * its own tables have (the tables only grow, and arguments of a newer version extend the older ones) */
++typedef D3D12DDI_DEVICE_FUNCS_CORE_0080 viogpu_device_funcs;
++typedef D3D12DDI_COMMAND_LIST_FUNCS_3D_0074 viogpu_command_list_funcs;
++
++struct viogpu_device {
++   /* vkd3d-proton's device (the adapter's, referenced) */
++   ID3D12Device *vkd3d;
++   /* presents: copies of swap chain buffers into their kernel allocations (umd_command.cpp) */
++   CRITICAL_SECTION presentLock;
++   ID3D12CommandQueue *presentQueue;
++   ID3D12CommandAllocator *presentAllocator;
++   ID3D12GraphicsCommandList *presentList;
++   ID3D12Fence *presentFence;
++   UINT64 presentFenceValue;
++   D3D12DDI_HRTDEVICE hRTDevice;
++   UINT interfaceVersion;
++   UINT version;
++   const D3DDDI_DEVICECALLBACKS *ktCallbacks;
++   const D3D12DDI_CORELAYER_DEVICECALLBACKS_0050 *umCallbacks;
++};
++
++static inline viogpu_device *
++device_from(D3D12DDI_HDEVICE h)
++{
++   return (viogpu_device *)h.pDrvPrivate;
++}
++
++/* Device-level errors from DDIs without a return value */
++void viogpu_device_error(viogpu_device *device, HRESULT hr);
++
++/* Objects other files reach (each lives in the runtime's memory at its handle's pDrvPrivate) */
++
++/* A heap: from CreateHeap (heap; mapBuffer spans it when the CPU can map it), or the implicit heap of a committed
++ * resource (committed borrows the resource) */
++struct viogpu_resource;
++
++struct viogpu_heap {
++   ID3D12Heap *heap;
++   ID3D12Resource *committed;
++   struct viogpu_resource *committedResource;
++   ID3D12Resource *mapBuffer;
++   void *mapped;
++};
++
++/* A swap chain buffer (a committed texture on a "primary" heap) also has a kernel allocation, a virgl texture DWM
++ * opens: presents copy the image into it, through a readback buffer */
++struct viogpu_resource {
++   ID3D12Resource *resource;
++   D3D12_RESOURCE_DESC desc;
++   D3D12DDI_HRTRESOURCE hRT;
++   D3DKMT_HANDLE kmAllocation;
++   UINT kmPitch;
++   ID3D12Resource *readback;
++};
++
++struct viogpu_descriptor_heap {
++   ID3D12DescriptorHeap *heap;
++};
++
++struct viogpu_query_heap {
++   ID3D12QueryHeap *heap;
++};
++
++struct viogpu_command_signature {
++   ID3D12CommandSignature *signature;
++};
++
++static inline ID3D12Resource *
++resource_of(D3D12DDI_HRESOURCE h)
++{
++   return h.pDrvPrivate ? ((viogpu_resource *)h.pDrvPrivate)->resource : NULL;
++}
++
++static inline ID3D12Heap *
++heap_of(D3D12DDI_HHEAP h)
++{
++   return h.pDrvPrivate ? ((viogpu_heap *)h.pDrvPrivate)->heap : NULL;
++}
++
++/* umd_state.cpp: shaders, input layouts, blend/depth-stencil/rasterizer states, root signatures, pipeline states */
++void viogpu_fill_state_funcs(viogpu_device_funcs *funcs);
++ID3D12RootSignature *viogpu_root_signature_of(D3D12DDI_HROOTSIGNATURE h);
++ID3D12PipelineState *viogpu_pipeline_state_of(D3D12DDI_HPIPELINESTATE h);
++
++/* umd_resource.cpp: heaps, resources, descriptor heaps and views, query heaps, command signatures, residency */
++void viogpu_fill_resource_funcs(viogpu_device_funcs *funcs);
++
++/* umd_command.cpp: command pools, recorders, lists and queues, fences, presents */
++void viogpu_present_destroy(viogpu_device *device);
++void viogpu_fill_command_funcs(viogpu_device_funcs *funcs);
++HRESULT viogpu_fill_command_list_table(void *table, SIZE_T size, UINT number, D3D12DDI_HRTTABLE hRTTable);
++HRESULT viogpu_fill_command_queue_table(void *table, SIZE_T size);
++extern D3D12DDI_HRTTABLE viogpu_command_list_rt_tables[2];
++
++#endif
+diff --git a/libs/viogpu_umd/umd_resource.cpp b/libs/viogpu_umd/umd_resource.cpp
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_resource.cpp
+@@ -0,0 +1,1008 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* Heaps and resources, descriptor heaps and views, query heaps, command signatures, residency.
++ *
++ * Descriptor handles, descriptor sizes and GPU virtual addresses are vkd3d-proton's own: the runtime only hands them
++ * back, so they pass through unchanged. The DDI's heap is always "custom" (memory pool + CPU page property, each one
++ * below the API's values), says which resources it allows where the API says which it denies, and its views say
++ * "2D" for 2D, 2D array and multisampled alike: the resource's desc tells which. */
++
++#include "umd_private.h"
++#include "umd_viogpu.h"
++#include <stdlib.h>
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Heaps and resources */
++
++static D3D12_HEAP_PROPERTIES
++heap_properties(const D3D12DDIARG_CREATEHEAP_0001 *desc)
++{
++   D3D12_HEAP_PROPERTIES p = {};
++   p.Type = D3D12_HEAP_TYPE_CUSTOM;
++   p.CPUPageProperty = (D3D12_CPU_PAGE_PROPERTY)(desc->CPUPageProperty + 1);
++   p.MemoryPoolPreference = (D3D12_MEMORY_POOL)(desc->MemoryPool + 1);
++   p.CreationNodeMask = desc->CreationNodeMask;
++   p.VisibleNodeMask = desc->VisibleNodeMask;
++   return p;
++}
++
++static D3D12_HEAP_FLAGS
++heap_flags(const D3D12DDIARG_CREATEHEAP_0001 *desc)
++{
++   D3D12_HEAP_FLAGS f = D3D12_HEAP_FLAG_NONE;
++   if (!(desc->Flags & D3D12DDI_HEAP_FLAG_BUFFERS))
++      f |= D3D12_HEAP_FLAG_DENY_BUFFERS;
++   if (!(desc->Flags & D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES))
++      f |= D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES;
++   if (!(desc->Flags & D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES))
++      f |= D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
++   if (desc->Flags & D3D12DDI_HEAP_FLAG_PRIMARY)
++      f |= D3D12_HEAP_FLAG_ALLOW_DISPLAY;
++   if (desc->Flags & D3D12DDI_HEAP_FLAG_COHERENT_SYSTEMWIDE)
++      f |= D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER | D3D12_HEAP_FLAG_SHARED;
++   return f;
++}
++
++static D3D12_RESOURCE_DESC
++resource_desc(const D3D12DDIARG_CREATERESOURCE_0075 *r)
++{
++   D3D12_RESOURCE_DESC d = {};
++   d.Dimension = (D3D12_RESOURCE_DIMENSION)r->ResourceType;
++   d.Alignment = 0;
++   d.Width = r->Width;
++   d.Height = r->Height;
++   d.DepthOrArraySize = r->DepthOrArraySize;
++   d.MipLevels = r->MipLevels;
++   d.Format = r->Format;
++   d.SampleDesc = r->SampleDesc;
++   d.Layout = (D3D12_TEXTURE_LAYOUT)r->Layout;
++   D3D12_RESOURCE_FLAGS f = D3D12_RESOURCE_FLAG_NONE;
++   if (r->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET)
++      f |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++   if (r->Flags & D3D12DDI_RESOURCE_FLAG_0003_DEPTH_STENCIL) {
++      f |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
++      if (!(r->Flags & D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE))
++         f |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
++   }
++   if (r->Flags & D3D12DDI_RESOURCE_FLAG_0022_UNORDERED_ACCESS)
++      f |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++   if (r->Flags & D3D12DDI_RESOURCE_FLAG_0003_CROSS_ADAPTER)
++      f |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
++   if (r->Flags & D3D12DDI_RESOURCE_FLAG_0003_SIMULTANEOUS_ACCESS)
++      f |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
++   if (r->Flags & D3D12DDI_RESOURCE_FLAG_0020_VIDEO_DECODE_REFERENCE_ONLY)
++      f |= D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY;
++   if (r->Flags & D3D12DDI_RESOURCE_FLAG_0080_VIDEO_ENCODE_REFERENCE_ONLY)
++      f |= D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY;
++   if (r->Flags & D3D12DDI_RESOURCE_FLAG_0088_RAYTRACING_ACCELERATION_STRUCTURE)
++      f |= D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE;
++   d.Flags = f;
++   return d;
++}
++
++/* A swap chain buffer's kernel allocation: a virgl texture of its size and format, which DWM's driver opens (as it
++ * would one of the D3D10/11 driver's) and the kernel driver uploads before each use (a "GDI surface") */
++static ULONG
++virgl_format(DXGI_FORMAT format, UINT *bytes)
++{
++   *bytes = 4;
++   switch (format) {
++   case DXGI_FORMAT_B8G8R8A8_UNORM: return VIOGPU_UMD_VIRGL_FORMAT_B8G8R8A8_UNORM;
++   case DXGI_FORMAT_B8G8R8X8_UNORM: return VIOGPU_UMD_VIRGL_FORMAT_B8G8R8X8_UNORM;
++   case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return VIOGPU_UMD_VIRGL_FORMAT_B8G8R8A8_SRGB;
++   case DXGI_FORMAT_R8G8B8A8_UNORM: return VIOGPU_UMD_VIRGL_FORMAT_R8G8B8A8_UNORM;
++   case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return VIOGPU_UMD_VIRGL_FORMAT_R8G8B8A8_SRGB;
++   case DXGI_FORMAT_R10G10B10A2_UNORM: return VIOGPU_UMD_VIRGL_FORMAT_R10G10B10A2_UNORM;
++   case DXGI_FORMAT_R16G16B16A16_FLOAT: *bytes = 8; return VIOGPU_UMD_VIRGL_FORMAT_R16G16B16A16_FLOAT;
++   default: return 0;
++   }
++}
++
++static HRESULT
++create_km_allocation(viogpu_device *device, viogpu_resource *res)
++{
++   UINT bytes;
++   ULONG format = virgl_format(res->desc.Format, &bytes);
++   if (!format || res->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
++      viogpu_log("swap chain buffer: format %d not presentable", (int)res->desc.Format);
++      return S_OK;
++   }
++   VIOGPU_UMD_CREATE_ALLOCATION_EXCHANGE allocation = {};
++   allocation.ResourceOptions.target = VIOGPU_UMD_PIPE_TEXTURE_2D;
++   allocation.ResourceOptions.format = format;
++   allocation.ResourceOptions.bind = VIOGPU_UMD_VIRGL_BIND_RENDER_TARGET | VIOGPU_UMD_VIRGL_BIND_SAMPLER_VIEW;
++   allocation.ResourceOptions.width = (ULONG)res->desc.Width;
++   allocation.ResourceOptions.height = res->desc.Height;
++   allocation.ResourceOptions.depth = 1;
++   allocation.ResourceOptions.array_size = 1;
++   allocation.ResourceOptions.flags = VIOGPU_UMD_VIRGL_RESOURCE_FLAG_MAP_COHERENT | VIOGPU_UMD_RESOURCE_FLAG_GDI_SURFACE;
++   allocation.Size = res->desc.Width * res->desc.Height * bytes;
++   VIOGPU_UMD_CREATE_RESOURCE_EXCHANGE resource = {};
++
++   D3D12DDI_ALLOCATION_INFO_0022 info = {};
++   info.pPrivateDriverData = &allocation;
++   info.PrivateDriverDataSize = sizeof(allocation);
++   D3D12DDICB_ALLOCATE_0022 allocate = {};
++   allocate.pPrivateDriverData = &resource;
++   allocate.PrivateDriverDataSize = sizeof(resource);
++   /* the runtime's resource: it shares it with DWM and keeps it resident (through MakeResident) */
++   allocate.hResource = (HANDLE)res->hRT.handle;
++   allocate.NumAllocations = 1;
++   allocate.pAllocationInfo = &info;
++   HRESULT hr = device->umCallbacks->pfnAllocateCb(device->hRTDevice, &allocate);
++   if (FAILED(hr)) {
++      viogpu_log("swap chain buffer allocation: 0x%08lx", (unsigned long)hr);
++      return hr;
++   }
++   res->kmAllocation = info.hAllocation;
++   res->kmPitch = (UINT)res->desc.Width * bytes;
++   return S_OK;
++}
++
++static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY
++calc_heap_and_resource_sizes(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATEHEAP_0001 *, const D3D12DDIARG_CREATERESOURCE_0075 *,
++                             D3D12DDI_HPROTECTEDRESOURCESESSION_0030)
++{
++   D3D12DDI_HEAP_AND_RESOURCE_SIZES sizes = {};
++   sizes.Heap = sizeof(viogpu_heap);
++   sizes.Resource = sizeof(viogpu_resource);
++   return sizes;
++}
++
++/* Committed (heap desc + resource desc), a heap (heap desc only), placed (resource desc into the existing heap
++ * hHeap, at ReuseBufferGPUVA's offset) or reserved (resource desc only) */
++static HRESULT APIENTRY
++create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_0001 *heapDesc, D3D12DDI_HHEAP hHeap,
++                         D3D12DDI_HRTRESOURCE hRTResource, const D3D12DDIARG_CREATERESOURCE_0075 *resDesc,
++                         const D3D12DDI_CLEAR_VALUES *clear, D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
++                         D3D12DDI_HRESOURCE hResource)
++{
++   viogpu_device *device = device_from(hDevice);
++   const D3D12_CLEAR_VALUE *clearValue = (const D3D12_CLEAR_VALUE *)clear;
++   HRESULT hr = S_OK;
++   if (getenv("VIOGPU_D3D12_TRACE_RESOURCES"))
++      viogpu_log("CreateHeapAndResource: heap %s (pool %d, cpu %d, flags 0x%x, %llu bytes), heap handle %p, rt %p, "
++                 "resource %s (type %d, %llux%u, format %d, flags 0x%x, layout %d)",
++                 heapDesc ? "yes" : "no", heapDesc ? (int)heapDesc->MemoryPool : -1,
++                 heapDesc ? (int)heapDesc->CPUPageProperty : -1, heapDesc ? (UINT)heapDesc->Flags : 0,
++                 heapDesc ? (unsigned long long)heapDesc->ByteSize : 0ull, hHeap.pDrvPrivate, hRTResource.handle,
++                 resDesc ? "yes" : "no", resDesc ? (int)resDesc->ResourceType : 0,
++                 resDesc ? (unsigned long long)resDesc->Width : 0ull, resDesc ? resDesc->Height : 0,
++                 resDesc ? (int)resDesc->Format : 0, resDesc ? (UINT)resDesc->Flags : 0,
++                 resDesc ? (int)resDesc->Layout : 0);
++
++   viogpu_resource *res = NULL;
++   D3D12_RESOURCE_DESC desc = {};
++   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
++   if (resDesc) {
++      res = new (hResource.pDrvPrivate) viogpu_resource();
++      res->hRT = hRTResource;
++      desc = resource_desc(resDesc);
++      state = (D3D12_RESOURCE_STATES)resDesc->InitialResourceState;
++      /* clear values only for render targets and depth-stencil buffers */
++      if (!(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
++         clearValue = NULL;
++   }
++
++   if (heapDesc && resDesc) {
++      viogpu_heap *heap = new (hHeap.pDrvPrivate) viogpu_heap();
++      D3D12_HEAP_PROPERTIES props = heap_properties(heapDesc);
++      hr = device->vkd3d->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, clearValue,
++                                                   IID_PPV_ARGS(&res->resource));
++      heap->committed = res->resource;
++      heap->committedResource = res;
++      if (SUCCEEDED(hr) && (heapDesc->Flags & D3D12DDI_HEAP_FLAG_PRIMARY)) {
++         res->desc = res->resource->GetDesc();
++         hr = create_km_allocation(device, res);
++      }
++   } else if (heapDesc) {
++      viogpu_heap *heap = new (hHeap.pDrvPrivate) viogpu_heap();
++      D3D12_HEAP_DESC hd = {};
++      hd.SizeInBytes = heapDesc->ByteSize;
++      hd.Properties = heap_properties(heapDesc);
++      hd.Alignment = heapDesc->Alignment;
++      hd.Flags = heap_flags(heapDesc);
++      hr = device->vkd3d->CreateHeap(&hd, IID_PPV_ARGS(&heap->heap));
++      /* MapHeap maps the whole heap: a buffer over all of it, where the CPU can map it and buffers may live */
++      if (SUCCEEDED(hr) && hd.Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
++          !(hd.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS)) {
++         D3D12_RESOURCE_DESC bd = {};
++         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++         bd.Width = heapDesc->ByteSize;
++         bd.Height = 1;
++         bd.DepthOrArraySize = 1;
++         bd.MipLevels = 1;
++         bd.SampleDesc.Count = 1;
++         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++         if (FAILED(device->vkd3d->CreatePlacedResource(heap->heap, 0, &bd, D3D12_RESOURCE_STATE_COMMON, NULL,
++                                                        IID_PPV_ARGS(&heap->mapBuffer))))
++            heap->mapBuffer = NULL;
++      }
++   } else if (resDesc && hHeap.pDrvPrivate) {
++      viogpu_heap *heap = (viogpu_heap *)hHeap.pDrvPrivate;
++      hr = device->vkd3d->CreatePlacedResource(heap->heap, resDesc->ReuseBufferGPUVA.BaseAddress.UMD.Offset, &desc,
++                                               state, clearValue, IID_PPV_ARGS(&res->resource));
++   } else if (resDesc) {
++      hr = device->vkd3d->CreateReservedResource(&desc, state, clearValue, IID_PPV_ARGS(&res->resource));
++   }
++
++   if (res && res->resource)
++      res->desc = res->resource->GetDesc();
++   if (FAILED(hr))
++      viogpu_log("CreateHeapAndResource (heap %d, resource %d, dimension %d, %llux%u, format %d): 0x%08lx",
++                 heapDesc != NULL, resDesc != NULL, resDesc ? (int)resDesc->ResourceType : 0,
++                 resDesc ? (unsigned long long)resDesc->Width : 0ull, resDesc ? resDesc->Height : 0,
++                 resDesc ? (int)resDesc->Format : 0, (unsigned long)hr);
++   return hr;
++}
++
++static VOID APIENTRY
++destroy_heap_and_resource(D3D12DDI_HDEVICE hDevice, D3D12DDI_HHEAP hHeap, D3D12DDI_HRESOURCE hResource)
++{
++   if (hResource.pDrvPrivate) {
++      viogpu_resource *res = (viogpu_resource *)hResource.pDrvPrivate;
++      if (res->kmAllocation) {
++         viogpu_device *device = device_from(hDevice);
++         D3D12DDICB_DEALLOCATE_0022 deallocate = {};
++         deallocate.NumAllocations = 1;
++         deallocate.HandleList = &res->kmAllocation;
++         device->umCallbacks->pfnDeallocateCb(device->hRTDevice, &deallocate);
++      }
++      if (res->readback)
++         res->readback->Release();
++      if (res->resource)
++         res->resource->Release();
++      res->~viogpu_resource();
++   }
++   if (hHeap.pDrvPrivate) {
++      /* a committed resource's heap only borrows it */
++      viogpu_heap *heap = (viogpu_heap *)hHeap.pDrvPrivate;
++      if (heap->mapBuffer)
++         heap->mapBuffer->Release();
++      if (heap->heap)
++         heap->heap->Release();
++      heap->~viogpu_heap();
++   }
++}
++
++static HRESULT APIENTRY
++map_heap(D3D12DDI_HDEVICE, D3D12DDI_HHEAP hHeap, VOID **data)
++{
++   viogpu_heap *heap = (viogpu_heap *)hHeap.pDrvPrivate;
++   if (!heap->mapped) {
++      ID3D12Resource *buffer = heap->committed ? heap->committed : heap->mapBuffer;
++      if (!buffer)
++         return E_INVALIDARG;
++      HRESULT hr = buffer->Map(0, NULL, &heap->mapped);
++      if (FAILED(hr)) {
++         viogpu_log("MapHeap: 0x%08lx", (unsigned long)hr);
++         return hr;
++      }
++   }
++   *data = heap->mapped;
++   return S_OK;
++}
++
++static VOID APIENTRY
++unmap_heap(D3D12DDI_HDEVICE, D3D12DDI_HHEAP)
++{
++   /* vkd3d-proton keeps host-visible memory mapped: so does the heap, until it goes */
++}
++
++static D3D12DDI_GPU_VIRTUAL_ADDRESS APIENTRY
++check_resource_virtual_address(D3D12DDI_HDEVICE, D3D12DDI_HRESOURCE hResource)
++{
++   viogpu_resource *res = (viogpu_resource *)hResource.pDrvPrivate;
++   if (!res->resource || res->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
++      return 0;
++   return res->resource->GetGPUVirtualAddress();
++}
++
++static void
++allocation_info(viogpu_device *device, const D3D12_RESOURCE_DESC &desc, UINT visibleNodeMask,
++                D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
++{
++   D3D12_RESOURCE_ALLOCATION_INFO a = device->vkd3d->GetResourceAllocationInfo(visibleNodeMask, 1, &desc);
++   memset(info, 0, sizeof(*info));
++   info->ResourceDataSize = a.SizeInBytes;
++   info->ResourceDataAlignment = (UINT32)a.Alignment;
++   info->AdditionalDataHeaderAlignment = 1;
++   info->AdditionalDataAlignment = 1;
++   info->Layout = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12DDI_TL_ROW_MAJOR
++                                                                    : (D3D12DDI_TEXTURE_LAYOUT)desc.Layout;
++}
++
++static VOID APIENTRY
++check_resource_allocation_info(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATERESOURCE_0075 *resDesc,
++                               D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS, UINT32 alignmentRestriction,
++                               UINT visibleNodeMask, D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
++{
++   D3D12_RESOURCE_DESC desc = resource_desc(resDesc);
++   desc.Alignment = alignmentRestriction;
++   allocation_info(device_from(hDevice), desc, visibleNodeMask, info);
++}
++
++static VOID APIENTRY
++check_existing_resource_allocation_info(D3D12DDI_HDEVICE hDevice, D3D12DDI_HRESOURCE hResource,
++                                        D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
++{
++   viogpu_resource *res = (viogpu_resource *)hResource.pDrvPrivate;
++   allocation_info(device_from(hDevice), res->desc, 0, info);
++}
++
++/* Where a subresource is in the mapped heap memory (Map, WriteToSubresource): a buffer is its own bytes, a texture
++ * the CPU can map is laid out as its copy footprints */
++static VOID APIENTRY
++check_subresource_info(D3D12DDI_HDEVICE hDevice, D3D12DDI_HRESOURCE hResource, UINT subresource,
++                       D3D12DDI_SUBRESOURCE_INFO *info)
++{
++   viogpu_resource *res = (viogpu_resource *)hResource.pDrvPrivate;
++   memset(info, 0, sizeof(*info));
++   if (res->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
++      info->RowStride = res->desc.Width;
++      info->DepthStride = res->desc.Width;
++      return;
++   }
++   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
++   UINT rows = 0;
++   UINT64 rowSize = 0, total = 0;
++   device_from(hDevice)->vkd3d->GetCopyableFootprints(&res->desc, subresource, 1, 0, &footprint, &rows, &rowSize,
++                                                     &total);
++   info->Offset = footprint.Offset;
++   info->RowStride = footprint.Footprint.RowPitch;
++   info->DepthStride = (UINT64)footprint.Footprint.RowPitch * rows;
++}
++
++static D3DKMT_HANDLE APIENTRY
++check_resource_allocation_handle(D3D12DDI_HDEVICE, D3D10DDI_HRESOURCE hResource)
++{
++   /* only swap chain buffers have a kernel allocation */
++   viogpu_resource *res = (viogpu_resource *)hResource.pDrvPrivate;
++   return res ? res->kmAllocation : 0;
++}
++
++static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY
++calc_opened_heap_and_resource_sizes(D3D12DDI_HDEVICE, const D3D12DDIARG_OPENHEAP_0003 *,
++                                    D3D12DDI_HPROTECTEDRESOURCESESSION_0030)
++{
++   D3D12DDI_HEAP_AND_RESOURCE_SIZES sizes = {};
++   sizes.Heap = sizeof(viogpu_heap);
++   sizes.Resource = sizeof(viogpu_resource);
++   return sizes;
++}
++
++static HRESULT APIENTRY
++open_heap_and_resource(D3D12DDI_HDEVICE, const D3D12DDIARG_OPENHEAP_0003 *, D3D12DDI_HHEAP, D3D12DDI_HRTRESOURCE,
++                       D3D12DDI_HPROTECTEDRESOURCESESSION_0030, D3D12DDI_HRESOURCE)
++{
++   /* shared resources aren't supported (yet); E_OUTOFMEMORY fails the call without removing the device */
++   viogpu_log("OpenHeapAndResource: not supported");
++   return E_OUTOFMEMORY;
++}
++
++/* Residency: vkd3d-proton keeps its memory resident; swap chain buffers' kernel allocations go to the kernel */
++static HRESULT APIENTRY
++make_resident(D3D12DDI_HDEVICE hDevice, D3D12DDIARG_MAKERESIDENT_0001 *args)
++{
++   args->WaitMask = 0;
++   std::vector<D3DKMT_HANDLE> allocations;
++   for (UINT i = 0; i < args->NumObjects; i++) {
++      const D3D12DDI_HANDLE_AND_TYPE &o = args->pObjects[i];
++      viogpu_resource *res = NULL;
++      if (o.Type == D3D12DDI_HT_HEAP && o.Handle)
++         res = ((viogpu_heap *)o.Handle)->committedResource;
++      else if (o.Type == D3D12DDI_HT_0012_RESOURCE)
++         res = (viogpu_resource *)o.Handle;
++      if (res && res->kmAllocation)
++         allocations.push_back(res->kmAllocation);
++   }
++   if (allocations.empty() || !args->NumAdapters)
++      return S_OK;
++
++   viogpu_device *device = device_from(hDevice);
++   D3DDDI_MAKERESIDENT resident = {};
++   resident.NumAllocations = (UINT)allocations.size();
++   resident.AllocationList = allocations.data();
++   resident.Flags = args->Flags;
++   HRESULT hr = device->umCallbacks->pfnMakeResidentCb(device->hRTDevice, args->pRTPagingQueue[0], &resident);
++   if (hr == E_PENDING) {
++      args->pPagingFenceValue[0] = resident.PagingFenceValue;
++      args->WaitMask = 1;
++   } else if (FAILED(hr)) {
++      viogpu_log("MakeResident: 0x%08lx", (unsigned long)hr);
++   }
++   return hr;
++}
++
++static HRESULT APIENTRY
++evict(D3D12DDI_HDEVICE, const D3D12DDIARG_EVICT *)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++offer_resources(D3D12DDI_HDEVICE, const D3D12DDIARG_OFFERRESOURCES *)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++reclaim_resources(D3D12DDI_HDEVICE, D3D12DDIARG_RECLAIMRESOURCES_0001 *args)
++{
++   for (UINT i = 0; args->pDiscarded && i < args->NumObjects; i++)
++      args->pDiscarded[i] = FALSE;
++   args->WaitMask = 0;
++   return S_OK;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Descriptor heaps and views */
++
++static SIZE_T APIENTRY
++calc_descriptor_heap_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001 *)
++{
++   return sizeof(viogpu_descriptor_heap);
++}
++
++static HRESULT APIENTRY
++create_descriptor_heap(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001 *args,
++                       D3D12DDI_HDESCRIPTORHEAP h)
++{
++   viogpu_descriptor_heap *heap = new (h.pDrvPrivate) viogpu_descriptor_heap();
++   D3D12_DESCRIPTOR_HEAP_DESC desc = {};
++   desc.Type = (D3D12_DESCRIPTOR_HEAP_TYPE)args->Type;
++   desc.NumDescriptors = args->NumDescriptors;
++   desc.Flags = (args->Flags & D3D12DDI_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
++                                                                           : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
++   desc.NodeMask = args->NodeMask;
++   HRESULT hr = device_from(hDevice)->vkd3d->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap->heap));
++   if (FAILED(hr))
++      viogpu_log("CreateDescriptorHeap (type %d, %u): 0x%08lx", (int)desc.Type, desc.NumDescriptors,
++                 (unsigned long)hr);
++   return hr;
++}
++
++static VOID APIENTRY
++destroy_descriptor_heap(D3D12DDI_HDEVICE, D3D12DDI_HDESCRIPTORHEAP h)
++{
++   viogpu_descriptor_heap *heap = (viogpu_descriptor_heap *)h.pDrvPrivate;
++   if (heap->heap)
++      heap->heap->Release();
++   heap->~viogpu_descriptor_heap();
++}
++
++static UINT APIENTRY
++get_descriptor_size(D3D12DDI_HDEVICE hDevice, D3D12DDI_DESCRIPTOR_HEAP_TYPE type)
++{
++   return device_from(hDevice)->vkd3d->GetDescriptorHandleIncrementSize((D3D12_DESCRIPTOR_HEAP_TYPE)type);
++}
++
++static D3D12DDI_CPU_DESCRIPTOR_HANDLE APIENTRY
++get_cpu_heap_start(D3D12DDI_HDEVICE, D3D12DDI_HDESCRIPTORHEAP h)
++{
++   D3D12DDI_CPU_DESCRIPTOR_HANDLE handle;
++   handle.ptr = ((viogpu_descriptor_heap *)h.pDrvPrivate)->heap->GetCPUDescriptorHandleForHeapStart().ptr;
++   return handle;
++}
++
++static D3D12DDI_GPU_DESCRIPTOR_HANDLE APIENTRY
++get_gpu_heap_start(D3D12DDI_HDEVICE, D3D12DDI_HDESCRIPTORHEAP h)
++{
++   D3D12DDI_GPU_DESCRIPTOR_HANDLE handle;
++   handle.ptr = ((viogpu_descriptor_heap *)h.pDrvPrivate)->heap->GetGPUDescriptorHandleForHeapStart().ptr;
++   return handle;
++}
++
++static D3D12_CPU_DESCRIPTOR_HANDLE
++cpu_handle(D3D12DDI_CPU_DESCRIPTOR_HANDLE h)
++{
++   D3D12_CPU_DESCRIPTOR_HANDLE handle;
++   handle.ptr = h.ptr;
++   return handle;
++}
++
++static bool
++resource_is_array(const viogpu_resource *res)
++{
++   return res && res->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D && res->desc.DepthOrArraySize > 1;
++}
++
++static bool
++resource_is_ms(const viogpu_resource *res)
++{
++   return res && res->desc.SampleDesc.Count > 1;
++}
++
++static VOID APIENTRY
++create_srv(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_SHADER_RESOURCE_VIEW_0002 *args,
++           D3D12DDI_CPU_DESCRIPTOR_HANDLE dest)
++{
++   viogpu_resource *res = (viogpu_resource *)args->hDrvResource.pDrvPrivate;
++   D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
++   d.Format = args->Format;
++   d.Shader4ComponentMapping = args->Shader4ComponentMapping;
++   bool array = resource_is_array(res);
++   switch (args->ResourceDimension) {
++   case D3D12DDI_RD_BUFFER:
++      d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++      d.Buffer.FirstElement = args->Buffer.FirstElement;
++      d.Buffer.NumElements = args->Buffer.NumElements;
++      d.Buffer.StructureByteStride = args->Buffer.StructureByteStride;
++      d.Buffer.Flags = (D3D12_BUFFER_SRV_FLAGS)args->Buffer.Flags;
++      break;
++   case D3D12DDI_RD_TEXTURE1D:
++      if (array) {
++         d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
++         d.Texture1DArray.MostDetailedMip = args->Tex1D.MostDetailedMip;
++         d.Texture1DArray.MipLevels = args->Tex1D.MipLevels;
++         d.Texture1DArray.FirstArraySlice = args->Tex1D.FirstArraySlice;
++         d.Texture1DArray.ArraySize = args->Tex1D.ArraySize;
++         d.Texture1DArray.ResourceMinLODClamp = args->Tex1D.ResourceMinLODClamp;
++      } else {
++         d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
++         d.Texture1D.MostDetailedMip = args->Tex1D.MostDetailedMip;
++         d.Texture1D.MipLevels = args->Tex1D.MipLevels;
++         d.Texture1D.ResourceMinLODClamp = args->Tex1D.ResourceMinLODClamp;
++      }
++      break;
++   case D3D12DDI_RD_TEXTURE2D:
++      if (resource_is_ms(res)) {
++         if (array) {
++            d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
++            d.Texture2DMSArray.FirstArraySlice = args->Tex2D.FirstArraySlice;
++            d.Texture2DMSArray.ArraySize = args->Tex2D.ArraySize;
++         } else {
++            d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
++         }
++      } else if (array) {
++         d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
++         d.Texture2DArray.MostDetailedMip = args->Tex2D.MostDetailedMip;
++         d.Texture2DArray.MipLevels = args->Tex2D.MipLevels;
++         d.Texture2DArray.FirstArraySlice = args->Tex2D.FirstArraySlice;
++         d.Texture2DArray.ArraySize = args->Tex2D.ArraySize;
++         d.Texture2DArray.PlaneSlice = args->Tex2D.PlaneSlice;
++         d.Texture2DArray.ResourceMinLODClamp = args->Tex2D.ResourceMinLODClamp;
++      } else {
++         d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++         d.Texture2D.MostDetailedMip = args->Tex2D.MostDetailedMip;
++         d.Texture2D.MipLevels = args->Tex2D.MipLevels;
++         d.Texture2D.PlaneSlice = args->Tex2D.PlaneSlice;
++         d.Texture2D.ResourceMinLODClamp = args->Tex2D.ResourceMinLODClamp;
++      }
++      break;
++   case D3D12DDI_RD_TEXTURE3D:
++      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
++      d.Texture3D.MostDetailedMip = args->Tex3D.MostDetailedMip;
++      d.Texture3D.MipLevels = args->Tex3D.MipLevels;
++      d.Texture3D.ResourceMinLODClamp = args->Tex3D.ResourceMinLODClamp;
++      break;
++   case D3D12DDI_RD_TEXTURECUBE:
++      if (res && res->desc.DepthOrArraySize > 6) {
++         d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
++         d.TextureCubeArray.MostDetailedMip = args->TexCube.MostDetailedMip;
++         d.TextureCubeArray.MipLevels = args->TexCube.MipLevels;
++         d.TextureCubeArray.First2DArrayFace = args->TexCube.First2DArrayFace;
++         d.TextureCubeArray.NumCubes = args->TexCube.NumCubes;
++         d.TextureCubeArray.ResourceMinLODClamp = args->TexCube.ResourceMinLODClamp;
++      } else {
++         d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
++         d.TextureCube.MostDetailedMip = args->TexCube.MostDetailedMip;
++         d.TextureCube.MipLevels = args->TexCube.MipLevels;
++         d.TextureCube.ResourceMinLODClamp = args->TexCube.ResourceMinLODClamp;
++      }
++      break;
++   case D3D12DDI_RD_RAYTRACING_ACCELERATION_STRUCTURE_0042:
++      d.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
++      d.RaytracingAccelerationStructure.Location = args->RaytracingAccelerationStructure.Location;
++      break;
++   }
++   device_from(hDevice)->vkd3d->CreateShaderResourceView(res ? res->resource : NULL, &d, cpu_handle(dest));
++}
++
++static VOID APIENTRY
++create_cbv(D3D12DDI_HDEVICE hDevice, const D3D12DDI_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12DDI_CPU_DESCRIPTOR_HANDLE dest)
++{
++   D3D12_CONSTANT_BUFFER_VIEW_DESC d = {};
++   d.BufferLocation = desc->BufferLocation;
++   d.SizeInBytes = desc->SizeInBytes;
++   device_from(hDevice)->vkd3d->CreateConstantBufferView(&d, cpu_handle(dest));
++}
++
++static VOID APIENTRY
++create_sampler(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_SAMPLER *args, D3D12DDI_CPU_DESCRIPTOR_HANDLE dest)
++{
++   static_assert(sizeof(D3D12DDI_SAMPLER_DESC) == sizeof(D3D12_SAMPLER_DESC), "sampler desc");
++   device_from(hDevice)->vkd3d->CreateSampler((const D3D12_SAMPLER_DESC *)args->pSamplerDesc, cpu_handle(dest));
++}
++
++static VOID APIENTRY
++create_uav(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_UNORDERED_ACCESS_VIEW_0002 *args,
++           D3D12DDI_CPU_DESCRIPTOR_HANDLE dest)
++{
++   viogpu_resource *res = (viogpu_resource *)args->hDrvResource.pDrvPrivate;
++   ID3D12Resource *counter = NULL;
++   D3D12_UNORDERED_ACCESS_VIEW_DESC d = {};
++   d.Format = args->Format;
++   bool array = resource_is_array(res);
++   switch (args->ResourceDimension) {
++   case D3D12DDI_RD_BUFFER:
++      d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++      d.Buffer.FirstElement = args->Buffer.FirstElement;
++      d.Buffer.NumElements = args->Buffer.NumElements;
++      d.Buffer.StructureByteStride = args->Buffer.StructureByteStride;
++      d.Buffer.CounterOffsetInBytes = args->Buffer.CounterOffsetInBytes;
++      d.Buffer.Flags = (D3D12_BUFFER_UAV_FLAGS)args->Buffer.Flags;
++      counter = resource_of(args->Buffer.hDrvCounterResource);
++      break;
++   case D3D12DDI_RD_TEXTURE1D:
++      if (array) {
++         d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
++         d.Texture1DArray.MipSlice = args->Tex1D.MipSlice;
++         d.Texture1DArray.FirstArraySlice = args->Tex1D.FirstArraySlice;
++         d.Texture1DArray.ArraySize = args->Tex1D.ArraySize;
++      } else {
++         d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
++         d.Texture1D.MipSlice = args->Tex1D.MipSlice;
++      }
++      break;
++   case D3D12DDI_RD_TEXTURE2D:
++      if (array) {
++         d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
++         d.Texture2DArray.MipSlice = args->Tex2D.MipSlice;
++         d.Texture2DArray.FirstArraySlice = args->Tex2D.FirstArraySlice;
++         d.Texture2DArray.ArraySize = args->Tex2D.ArraySize;
++         d.Texture2DArray.PlaneSlice = args->Tex2D.PlaneSlice;
++      } else {
++         d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++         d.Texture2D.MipSlice = args->Tex2D.MipSlice;
++         d.Texture2D.PlaneSlice = args->Tex2D.PlaneSlice;
++      }
++      break;
++   case D3D12DDI_RD_TEXTURE3D:
++      d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
++      d.Texture3D.MipSlice = args->Tex3D.MipSlice;
++      d.Texture3D.FirstWSlice = args->Tex3D.FirstW;
++      d.Texture3D.WSize = args->Tex3D.WSize;
++      break;
++   default:
++      viogpu_log("CreateUnorderedAccessView: dimension %d", (int)args->ResourceDimension);
++      return;
++   }
++   device_from(hDevice)->vkd3d->CreateUnorderedAccessView(res ? res->resource : NULL, counter, &d, cpu_handle(dest));
++}
++
++static VOID APIENTRY
++create_rtv(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_RENDER_TARGET_VIEW_0002 *args,
++           D3D12DDI_CPU_DESCRIPTOR_HANDLE dest)
++{
++   viogpu_resource *res = (viogpu_resource *)args->hDrvResource.pDrvPrivate;
++   D3D12_RENDER_TARGET_VIEW_DESC d = {};
++   d.Format = args->Format;
++   bool array = resource_is_array(res);
++   switch (args->ResourceDimension) {
++   case D3D12DDI_RD_BUFFER:
++      d.ViewDimension = D3D12_RTV_DIMENSION_BUFFER;
++      d.Buffer.FirstElement = args->Buffer.FirstElement;
++      d.Buffer.NumElements = args->Buffer.NumElements;
++      break;
++   case D3D12DDI_RD_TEXTURE1D:
++      if (array) {
++         d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
++         d.Texture1DArray.MipSlice = args->Tex1D.MipSlice;
++         d.Texture1DArray.FirstArraySlice = args->Tex1D.FirstArraySlice;
++         d.Texture1DArray.ArraySize = args->Tex1D.ArraySize;
++      } else {
++         d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1D;
++         d.Texture1D.MipSlice = args->Tex1D.MipSlice;
++      }
++      break;
++   case D3D12DDI_RD_TEXTURE2D:
++   case D3D12DDI_RD_TEXTURECUBE:
++      if (resource_is_ms(res)) {
++         if (array) {
++            d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
++            d.Texture2DMSArray.FirstArraySlice = args->Tex2D.FirstArraySlice;
++            d.Texture2DMSArray.ArraySize = args->Tex2D.ArraySize;
++         } else {
++            d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
++         }
++      } else if (array || args->ResourceDimension == D3D12DDI_RD_TEXTURECUBE) {
++         d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
++         d.Texture2DArray.MipSlice = args->Tex2D.MipSlice;
++         d.Texture2DArray.FirstArraySlice = args->Tex2D.FirstArraySlice;
++         d.Texture2DArray.ArraySize = args->Tex2D.ArraySize;
++         d.Texture2DArray.PlaneSlice = args->Tex2D.PlaneSlice;
++      } else {
++         d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
++         d.Texture2D.MipSlice = args->Tex2D.MipSlice;
++         d.Texture2D.PlaneSlice = args->Tex2D.PlaneSlice;
++      }
++      break;
++   case D3D12DDI_RD_TEXTURE3D:
++      d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
++      d.Texture3D.MipSlice = args->Tex3D.MipSlice;
++      d.Texture3D.FirstWSlice = args->Tex3D.FirstW;
++      d.Texture3D.WSize = args->Tex3D.WSize;
++      break;
++   default:
++      viogpu_log("CreateRenderTargetView: dimension %d", (int)args->ResourceDimension);
++      return;
++   }
++   device_from(hDevice)->vkd3d->CreateRenderTargetView(res ? res->resource : NULL, &d, cpu_handle(dest));
++}
++
++static VOID APIENTRY
++create_dsv(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_DEPTH_STENCIL_VIEW *args,
++           D3D12DDI_CPU_DESCRIPTOR_HANDLE dest)
++{
++   viogpu_resource *res = (viogpu_resource *)args->hDrvResource.pDrvPrivate;
++   D3D12_DEPTH_STENCIL_VIEW_DESC d = {};
++   d.Format = args->Format;
++   d.Flags = (D3D12_DSV_FLAGS)args->Flags;
++   bool array = resource_is_array(res);
++   switch (args->ResourceDimension) {
++   case D3D12DDI_RD_TEXTURE1D:
++      if (array) {
++         d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE1DARRAY;
++         d.Texture1DArray.MipSlice = args->Tex1D.MipSlice;
++         d.Texture1DArray.FirstArraySlice = args->Tex1D.FirstArraySlice;
++         d.Texture1DArray.ArraySize = args->Tex1D.ArraySize;
++      } else {
++         d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE1D;
++         d.Texture1D.MipSlice = args->Tex1D.MipSlice;
++      }
++      break;
++   case D3D12DDI_RD_TEXTURE2D:
++   case D3D12DDI_RD_TEXTURECUBE:
++      if (resource_is_ms(res)) {
++         if (array) {
++            d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
++            d.Texture2DMSArray.FirstArraySlice = args->Tex2D.FirstArraySlice;
++            d.Texture2DMSArray.ArraySize = args->Tex2D.ArraySize;
++         } else {
++            d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
++         }
++      } else if (array || args->ResourceDimension == D3D12DDI_RD_TEXTURECUBE) {
++         d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
++         d.Texture2DArray.MipSlice = args->Tex2D.MipSlice;
++         d.Texture2DArray.FirstArraySlice = args->Tex2D.FirstArraySlice;
++         d.Texture2DArray.ArraySize = args->Tex2D.ArraySize;
++      } else {
++         d.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
++         d.Texture2D.MipSlice = args->Tex2D.MipSlice;
++      }
++      break;
++   default:
++      viogpu_log("CreateDepthStencilView: dimension %d", (int)args->ResourceDimension);
++      return;
++   }
++   device_from(hDevice)->vkd3d->CreateDepthStencilView(res ? res->resource : NULL, &d, cpu_handle(dest));
++}
++
++static VOID APIENTRY
++copy_descriptors(D3D12DDI_HDEVICE hDevice, UINT numDest, const D3D12DDI_CPU_DESCRIPTOR_HANDLE *destStarts,
++                 const UINT *destSizes, UINT numSrc, const D3D12DDI_CPU_DESCRIPTOR_HANDLE *srcStarts,
++                 const UINT *srcSizes, D3D12DDI_DESCRIPTOR_HEAP_TYPE type)
++{
++   static_assert(sizeof(D3D12DDI_CPU_DESCRIPTOR_HANDLE) == sizeof(D3D12_CPU_DESCRIPTOR_HANDLE), "handle");
++   device_from(hDevice)->vkd3d->CopyDescriptors(numDest, (const D3D12_CPU_DESCRIPTOR_HANDLE *)destStarts, destSizes,
++                                                numSrc, (const D3D12_CPU_DESCRIPTOR_HANDLE *)srcStarts, srcSizes,
++                                                (D3D12_DESCRIPTOR_HEAP_TYPE)type);
++}
++
++static VOID APIENTRY
++copy_descriptors_simple(D3D12DDI_HDEVICE hDevice, UINT count, D3D12DDI_CPU_DESCRIPTOR_HANDLE dest,
++                        D3D12DDI_CPU_DESCRIPTOR_HANDLE src, D3D12DDI_DESCRIPTOR_HEAP_TYPE type)
++{
++   device_from(hDevice)->vkd3d->CopyDescriptorsSimple(count, cpu_handle(dest), cpu_handle(src),
++                                                      (D3D12_DESCRIPTOR_HEAP_TYPE)type);
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Query heaps and command signatures */
++
++static SIZE_T APIENTRY
++calc_query_heap_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_QUERY_HEAP_0001 *)
++{
++   return sizeof(viogpu_query_heap);
++}
++
++static HRESULT APIENTRY
++create_query_heap(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_QUERY_HEAP_0001 *args, D3D12DDI_HQUERYHEAP h)
++{
++   viogpu_query_heap *heap = new (h.pDrvPrivate) viogpu_query_heap();
++   D3D12_QUERY_HEAP_DESC desc = {};
++   desc.Type = (D3D12_QUERY_HEAP_TYPE)args->Type;
++   desc.Count = args->Count;
++   desc.NodeMask = args->NodeMask;
++   return device_from(hDevice)->vkd3d->CreateQueryHeap(&desc, IID_PPV_ARGS(&heap->heap));
++}
++
++static VOID APIENTRY
++destroy_query_heap(D3D12DDI_HDEVICE, D3D12DDI_HQUERYHEAP h)
++{
++   viogpu_query_heap *heap = (viogpu_query_heap *)h.pDrvPrivate;
++   if (heap->heap)
++      heap->heap->Release();
++   heap->~viogpu_query_heap();
++}
++
++static SIZE_T APIENTRY
++calc_command_signature_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 *)
++{
++   return sizeof(viogpu_command_signature);
++}
++
++static HRESULT APIENTRY
++create_command_signature(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 *args,
++                         D3D12DDI_HCOMMANDSIGNATURE h)
++{
++   static_assert(sizeof(D3D12DDI_INDIRECT_ARGUMENT_DESC) == sizeof(D3D12_INDIRECT_ARGUMENT_DESC), "argument desc");
++   viogpu_command_signature *sig = new (h.pDrvPrivate) viogpu_command_signature();
++   D3D12_COMMAND_SIGNATURE_DESC desc = {};
++   desc.ByteStride = args->ByteStride;
++   desc.NumArgumentDescs = args->NumArgumentDescs;
++   desc.pArgumentDescs = (const D3D12_INDIRECT_ARGUMENT_DESC *)args->pArgumentDescs;
++   desc.NodeMask = args->NodeMask;
++   HRESULT hr = device_from(hDevice)->vkd3d->CreateCommandSignature(
++      &desc, viogpu_root_signature_of(args->hRootSignature), IID_PPV_ARGS(&sig->signature));
++   if (FAILED(hr))
++      viogpu_log("CreateCommandSignature: 0x%08lx", (unsigned long)hr);
++   return hr;
++}
++
++static VOID APIENTRY
++destroy_command_signature(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDSIGNATURE h)
++{
++   viogpu_command_signature *sig = (viogpu_command_signature *)h.pDrvPrivate;
++   if (sig->signature)
++      sig->signature->Release();
++   sig->~viogpu_command_signature();
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* What isn't offered: pipeline libraries, meta commands, scheduling groups, shader comments, debug info */
++
++static HRESULT APIENTRY
++create_pipeline_library(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010 *, D3D12DDI_HPIPELINELIBRARY)
++{
++   /* A pipeline library that keeps nothing: the runtime takes a failure here for a driver error and removes the
++    * device (OpenCLOn12 caches its kernels in one). A pipeline loaded from it is created from the description the
++    * runtime passes along with the library reference, and vkd3d-proton's own disk cache keeps the compiled code. */
++   return S_OK;
++}
++
++static SIZE_T APIENTRY
++calc_pipeline_library_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010 *)
++{
++   return sizeof(void *);
++}
++
++static VOID APIENTRY
++destroy_pipeline_library(D3D12DDI_HDEVICE, D3D12DDI_HPIPELINELIBRARY)
++{
++}
++
++static HRESULT APIENTRY
++add_pipeline_state_to_library(D3D12DDI_HDEVICE, D3D12DDI_HPIPELINELIBRARY, D3D12DDI_HPIPELINESTATE, UINT)
++{
++   return S_OK;
++}
++
++/* the serialized library is the runtime's (names, descriptions, the driver's version) plus this driver's part */
++static const char viogpu_library_magic[4] = {'v', 'g', 'p', 'l'};
++
++static SIZE_T APIENTRY
++calc_serialized_library_size(D3D12DDI_HDEVICE, D3D12DDI_HPIPELINELIBRARY)
++{
++   return sizeof(viogpu_library_magic);
++}
++
++static HRESULT APIENTRY
++serialize_library(D3D12DDI_HDEVICE, D3D12DDI_HPIPELINELIBRARY, VOID *blob)
++{
++   memcpy(blob, viogpu_library_magic, sizeof(viogpu_library_magic));
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++enumerate_meta_commands(D3D12DDI_HDEVICE, UINT *count, D3D12DDIARG_META_COMMAND_DESC *)
++{
++   *count = 0;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++retrieve_shader_comment(D3D12DDI_HDEVICE, D3D12DDI_HPIPELINESTATE, WCHAR *, SIZE_T *)
++{
++   return E_NOTIMPL;
++}
++
++static VOID APIENTRY
++get_debug_allocation_info(D3D12DDI_HDEVICE, D3D12DDI_HANDLE_AND_TYPE, UINT *numVA,
++                          D3D12DDI_DEBUG_VIRTUAL_ADDRESS_ALLOCATION_INFO_0012 *, UINT *numKMT,
++                          D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014 *)
++{
++   *numVA = 0;
++   *numKMT = 0;
++}
++
++static UINT APIENTRY
++get_present_private_driver_data_size(D3D12DDI_HDEVICE, const D3D12DDIARG_PRESENT_0001 *)
++{
++   return 0;
++}
++
++static SIZE_T APIENTRY
++calc_scheduling_group_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATESCHEDULINGGROUP_0050 *)
++{
++   return sizeof(void *);
++}
++
++static HRESULT APIENTRY
++create_scheduling_group(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATESCHEDULINGGROUP_0050 *,
++                        D3D12DDI_HSCHEDULINGGROUP_0050, D3D12DDI_HRTSCHEDULINGGROUP_0050)
++{
++   return E_NOINTERFACE;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++
++void
++viogpu_fill_resource_funcs(viogpu_device_funcs *f)
++{
++   f->pfnCalcPrivateHeapAndResourceSizes = calc_heap_and_resource_sizes;
++   f->pfnCreateHeapAndResource = create_heap_and_resource;
++   f->pfnDestroyHeapAndResource = destroy_heap_and_resource;
++   f->pfnMapHeap = map_heap;
++   f->pfnUnmapHeap = unmap_heap;
++   f->pfnCheckResourceVirtualAddress = check_resource_virtual_address;
++   f->pfnCheckResourceAllocationInfo = check_resource_allocation_info;
++   f->pfnCheckExistingResourceAllocationInfo = check_existing_resource_allocation_info;
++   f->pfnCheckSubresourceInfo = check_subresource_info;
++   f->pfnCheckResourceAllocationHandle = check_resource_allocation_handle;
++   f->pfnCalcPrivateOpenedHeapAndResourceSizes = calc_opened_heap_and_resource_sizes;
++   f->pfnOpenHeapAndResource = open_heap_and_resource;
++   f->pfnMakeResident = make_resident;
++   f->pfnEvict = evict;
++   f->pfnOfferResources = offer_resources;
++   f->pfnReclaimResources = reclaim_resources;
++
++   f->pfnCalcPrivateDescriptorHeapSize = calc_descriptor_heap_size;
++   f->pfnCreateDescriptorHeap = create_descriptor_heap;
++   f->pfnDestroyDescriptorHeap = destroy_descriptor_heap;
++   f->pfnGetDescriptorSizeInBytes = get_descriptor_size;
++   f->pfnGetCPUDescriptorHandleForHeapStart = get_cpu_heap_start;
++   f->pfnGetGPUDescriptorHandleForHeapStart = get_gpu_heap_start;
++   f->pfnCreateShaderResourceView = create_srv;
++   f->pfnCreateConstantBufferView = create_cbv;
++   f->pfnCreateSampler = create_sampler;
++   f->pfnCreateUnorderedAccessView = create_uav;
++   f->pfnCreateRenderTargetView = create_rtv;
++   f->pfnCreateDepthStencilView = create_dsv;
++   f->pfnCopyDescriptors = copy_descriptors;
++   f->pfnCopyDescriptorsSimple = copy_descriptors_simple;
++
++   f->pfnCalcPrivateQueryHeapSize = calc_query_heap_size;
++   f->pfnCreateQueryHeap = create_query_heap;
++   f->pfnDestroyQueryHeap = destroy_query_heap;
++   f->pfnCalcPrivateCommandSignatureSize = calc_command_signature_size;
++   f->pfnCreateCommandSignature = create_command_signature;
++   f->pfnDestroyCommandSignature = destroy_command_signature;
++
++   f->pfnCalcPrivatePipelineLibrarySize = calc_pipeline_library_size;
++   f->pfnCreatePipelineLibrary = create_pipeline_library;
++   f->pfnDestroyPipelineLibrary = destroy_pipeline_library;
++   f->pfnAddPipelineStateToLibrary = add_pipeline_state_to_library;
++   f->pfnCalcSerializedLibrarySize = calc_serialized_library_size;
++   f->pfnSerializeLibrary = serialize_library;
++   f->pfnEnumerateMetaCommands = enumerate_meta_commands;
++   f->pfnRetrieveShaderComment = retrieve_shader_comment;
++   f->pfnGetDebugAllocationInfo = get_debug_allocation_info;
++   f->pfnGetPresentPrivateDriverDataSize = get_present_private_driver_data_size;
++   f->pfnCalcPrivateSchedulingGroupSize = calc_scheduling_group_size;
++   f->pfnCreateSchedulingGroup = create_scheduling_group;
++}
+diff --git a/libs/viogpu_umd/umd_state.cpp b/libs/viogpu_umd/umd_state.cpp
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_state.cpp
+@@ -0,0 +1,638 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* Shaders, input layouts, blend/depth-stencil/rasterizer states, root signatures and pipeline states.
++ *
++ * The runtime hands shaders over as the bare program (the SM4/5 token stream, or the DXIL program part) with
++ * signatures that list registers and system values but no semantic names. vkd3d-proton wants DXBC containers and
++ * matches input layouts and stages by semantic: each shader gets a container with made-up names that are the same on
++ * both sides of every link (stages link by register): WBREG<register * 4 + first component> for plain varyings,
++ * WBATTR<register> for vertex inputs (input layouts use the same names), SV_Target<register> for pixel shader
++ * outputs, the usual SV_ names for system values. */
++
++#include "umd_private.h"
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* DXBC containers */
++
++enum viogpu_stage { STAGE_VS, STAGE_PS, STAGE_GS, STAGE_HS, STAGE_DS, STAGE_CS };
++
++struct viogpu_sig_entry {
++   D3D12DDIARG_SIGNATURE_ENTRY_0012 e;
++};
++
++struct viogpu_shader {
++   viogpu_stage stage;
++   std::vector<BYTE> container;
++   /* stream output (a geometry shader created with it, or the vertex/domain shader's, code-less) */
++   std::vector<D3D12_SO_DECLARATION_ENTRY> soDecl;
++   std::vector<UINT> soStrides;
++   UINT rasterizedStream;
++};
++
++static void
++put32(std::vector<BYTE> &v, UINT x)
++{
++   v.push_back(x & 0xff);
++   v.push_back((x >> 8) & 0xff);
++   v.push_back((x >> 16) & 0xff);
++   v.push_back((x >> 24) & 0xff);
++}
++
++static void
++set32(std::vector<BYTE> &v, size_t offset, UINT x)
++{
++   memcpy(&v[offset], &x, 4);
++}
++
++static UINT
++fourcc(const char *c)
++{
++   return (UINT)c[0] | ((UINT)c[1] << 8) | ((UINT)c[2] << 16) | ((UINT)c[3] << 24);
++}
++
++static UINT
++first_component(BYTE mask)
++{
++   for (UINT i = 0; i < 4; i++)
++      if (mask & (1 << i))
++         return i;
++   return 0;
++}
++
++/* The semantic of a signature entry: name, index and D3D_NAME. Clip/cull distances count up per signature. */
++static void
++entry_semantic(const D3D12DDIARG_SIGNATURE_ENTRY_0012 &e, viogpu_stage stage, bool input, bool patchConstant,
++               UINT clipCount, UINT cullCount, const char **name, UINT *index, UINT *sysval)
++{
++   *index = 0;
++   *sysval = D3D_NAME_UNDEFINED;
++   switch ((UINT)e.SystemValue) {
++   case D3D10_SB_NAME_UNDEFINED:
++      if (stage == STAGE_PS && !input) {
++         *name = "SV_Target";
++         *index = e.Register;
++         *sysval = D3D_NAME_TARGET;
++      } else if (stage == STAGE_VS && input) {
++         *name = "WBATTR";
++         *index = e.Register;
++      } else {
++         *name = patchConstant ? "WBPATCH" : "WBREG";
++         *index = e.Register * 4 + first_component(e.Mask);
++      }
++      return;
++   case D3D10_SB_NAME_POSITION: *name = "SV_Position"; *sysval = D3D_NAME_POSITION; return;
++   case D3D10_SB_NAME_CLIP_DISTANCE: *name = "SV_ClipDistance"; *index = clipCount; *sysval = D3D_NAME_CLIP_DISTANCE; return;
++   case D3D10_SB_NAME_CULL_DISTANCE: *name = "SV_CullDistance"; *index = cullCount; *sysval = D3D_NAME_CULL_DISTANCE; return;
++   case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX:
++      *name = "SV_RenderTargetArrayIndex"; *sysval = D3D_NAME_RENDER_TARGET_ARRAY_INDEX; return;
++   case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX:
++      *name = "SV_ViewportArrayIndex"; *sysval = D3D_NAME_VIEWPORT_ARRAY_INDEX; return;
++   case D3D10_SB_NAME_VERTEX_ID: *name = "SV_VertexID"; *sysval = D3D_NAME_VERTEX_ID; return;
++   case D3D10_SB_NAME_PRIMITIVE_ID: *name = "SV_PrimitiveID"; *sysval = D3D_NAME_PRIMITIVE_ID; return;
++   case D3D10_SB_NAME_INSTANCE_ID: *name = "SV_InstanceID"; *sysval = D3D_NAME_INSTANCE_ID; return;
++   case D3D10_SB_NAME_IS_FRONT_FACE: *name = "SV_IsFrontFace"; *sysval = D3D_NAME_IS_FRONT_FACE; return;
++   case D3D10_SB_NAME_SAMPLE_INDEX: *name = "SV_SampleIndex"; *sysval = D3D_NAME_SAMPLE_INDEX; return;
++   /* the token stream has one name per tessellation factor, signatures one per kind with an index */
++   case D3D11_SB_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR:
++   case D3D11_SB_NAME_FINAL_QUAD_V_EQ_0_EDGE_TESSFACTOR:
++   case D3D11_SB_NAME_FINAL_QUAD_U_EQ_1_EDGE_TESSFACTOR:
++   case D3D11_SB_NAME_FINAL_QUAD_V_EQ_1_EDGE_TESSFACTOR:
++      *name = "SV_TessFactor";
++      *index = (UINT)e.SystemValue - D3D11_SB_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR;
++      *sysval = D3D_NAME_FINAL_QUAD_EDGE_TESSFACTOR;
++      return;
++   case D3D11_SB_NAME_FINAL_QUAD_U_INSIDE_TESSFACTOR:
++   case D3D11_SB_NAME_FINAL_QUAD_V_INSIDE_TESSFACTOR:
++      *name = "SV_InsideTessFactor";
++      *index = (UINT)e.SystemValue - D3D11_SB_NAME_FINAL_QUAD_U_INSIDE_TESSFACTOR;
++      *sysval = D3D_NAME_FINAL_QUAD_INSIDE_TESSFACTOR;
++      return;
++   case D3D11_SB_NAME_FINAL_TRI_U_EQ_0_EDGE_TESSFACTOR:
++   case D3D11_SB_NAME_FINAL_TRI_V_EQ_0_EDGE_TESSFACTOR:
++   case D3D11_SB_NAME_FINAL_TRI_W_EQ_0_EDGE_TESSFACTOR:
++      *name = "SV_TessFactor";
++      *index = (UINT)e.SystemValue - D3D11_SB_NAME_FINAL_TRI_U_EQ_0_EDGE_TESSFACTOR;
++      *sysval = D3D_NAME_FINAL_TRI_EDGE_TESSFACTOR;
++      return;
++   case D3D11_SB_NAME_FINAL_TRI_INSIDE_TESSFACTOR:
++      *name = "SV_InsideTessFactor"; *sysval = D3D_NAME_FINAL_TRI_INSIDE_TESSFACTOR; return;
++   case D3D11_SB_NAME_FINAL_LINE_DETAIL_TESSFACTOR:
++      *name = "SV_TessFactor"; *index = 1; *sysval = D3D_NAME_FINAL_LINE_DETAIL_TESSFACTOR; return;
++   case D3D11_SB_NAME_FINAL_LINE_DENSITY_TESSFACTOR:
++      *name = "SV_TessFactor"; *sysval = D3D_NAME_FINAL_LINE_DENSITY_TESSFACTOR; return;
++   default:
++      viogpu_log("signature: unknown system value %u", (UINT)e.SystemValue);
++      *name = "WBREG";
++      *index = e.Register * 4 + first_component(e.Mask);
++      return;
++   }
++}
++
++/* A signature chunk: ISGN/OSGN/PCSG (24-byte entries), OSG5 (28: stream first) or ISG1/OSG1/PSG1 (32: stream, then
++ * the minimum precision at the end) */
++static std::vector<BYTE>
++signature_chunk(const D3D12DDIARG_SIGNATURE_ENTRY_0012 *entries, UINT count, viogpu_stage stage, bool input,
++                bool patchConstant, const char **tag)
++{
++   bool minPrecision = false, streams = false;
++   for (UINT i = 0; i < count; i++) {
++      minPrecision |= entries[i].MinPrecision != D3D11_SB_OPERAND_MIN_PRECISION_DEFAULT;
++      streams |= entries[i].Stream != 0;
++   }
++   UINT entrySize;
++   if (minPrecision) {
++      *tag = patchConstant ? "PSG1" : input ? "ISG1" : "OSG1";
++      entrySize = 32;
++   } else if (streams && !input) {
++      *tag = "OSG5";
++      entrySize = 28;
++   } else {
++      *tag = patchConstant ? "PCSG" : input ? "ISGN" : "OSGN";
++      entrySize = 24;
++   }
++
++   std::vector<BYTE> chunk;
++   put32(chunk, count);
++   put32(chunk, 8);
++   std::vector<std::pair<size_t, std::string>> names;
++   UINT clipCount = 0, cullCount = 0;
++   for (UINT i = 0; i < count; i++) {
++      const D3D12DDIARG_SIGNATURE_ENTRY_0012 &e = entries[i];
++      const char *name;
++      UINT index, sysval;
++      entry_semantic(e, stage, input, patchConstant, clipCount, cullCount, &name, &index, &sysval);
++      clipCount += e.SystemValue == D3D10_SB_NAME_CLIP_DISTANCE;
++      cullCount += e.SystemValue == D3D10_SB_NAME_CULL_DISTANCE;
++      if (entrySize != 24)
++         put32(chunk, e.Stream);
++      names.push_back({chunk.size(), name});
++      put32(chunk, 0); /* name offset, below */
++      put32(chunk, index);
++      put32(chunk, sysval);
++      put32(chunk, (UINT)e.RegisterComponentType);
++      put32(chunk, e.Register);
++      chunk.push_back(e.Mask);
++      /* inputs: the components read; outputs: the ones never written */
++      chunk.push_back(input ? e.Mask : 0);
++      chunk.push_back(0);
++      chunk.push_back(0);
++      if (entrySize == 32)
++         put32(chunk, (UINT)e.MinPrecision);
++   }
++   for (auto &n : names) {
++      set32(chunk, n.first, (UINT)chunk.size());
++      chunk.insert(chunk.end(), n.second.begin(), n.second.end());
++      chunk.push_back(0);
++   }
++   while (chunk.size() & 3)
++      chunk.push_back(0xab);
++   return chunk;
++}
++
++static std::vector<BYTE>
++build_container(const std::vector<std::pair<const char *, std::vector<BYTE>>> &chunks)
++{
++   std::vector<BYTE> c;
++   put32(c, fourcc("DXBC"));
++   for (int i = 0; i < 4; i++)
++      put32(c, 0); /* checksum: vkd3d-proton doesn't check it */
++   put32(c, 1);
++   size_t sizeAt = c.size();
++   put32(c, 0);
++   put32(c, (UINT)chunks.size());
++   size_t offsetsAt = c.size();
++   for (size_t i = 0; i < chunks.size(); i++)
++      put32(c, 0);
++   for (size_t i = 0; i < chunks.size(); i++) {
++      set32(c, offsetsAt + i * 4, (UINT)c.size());
++      put32(c, fourcc(chunks[i].first));
++      put32(c, (UINT)chunks[i].second.size());
++      c.insert(c.end(), chunks[i].second.begin(), chunks[i].second.end());
++   }
++   set32(c, sizeAt, (UINT)c.size());
++   return c;
++}
++
++static void
++shader_build(viogpu_shader *shader, viogpu_stage stage, const D3D12DDIARG_CREATE_SHADER_0026 *args)
++{
++   shader->stage = stage;
++   shader->rasterizedStream = 0;
++   const UINT *code = args->pShaderCode;
++   if (!code)
++      return;
++
++   std::vector<std::pair<const char *, std::vector<BYTE>>> chunks;
++   const char *tag;
++   if (stage == STAGE_HS || stage == STAGE_DS) {
++      const D3D12DDIARG_TESSELLATION_IO_SIGNATURES *sig = args->IOSignatures.Tessellation;
++      if (sig) {
++         std::vector<BYTE> in = signature_chunk(sig->pInputSignature, sig->NumInputSignatureEntries, stage, true,
++                                                false, &tag);
++         chunks.push_back({tag, in});
++         std::vector<BYTE> out = signature_chunk(sig->pOutputSignature, sig->NumOutputSignatureEntries, stage, false,
++                                                 false, &tag);
++         chunks.push_back({tag, out});
++         std::vector<BYTE> patch = signature_chunk(sig->pPatchConstantSignature,
++                                                   sig->NumPatchConstantSignatureEntries, stage,
++                                                   stage == STAGE_DS, true, &tag);
++         chunks.push_back({tag, patch});
++      }
++   } else {
++      const D3D12DDIARG_STAGE_IO_SIGNATURES *sig = args->IOSignatures.Standard;
++      if (sig) {
++         std::vector<BYTE> in = signature_chunk(sig->pInputSignature, sig->NumInputSignatureEntries, stage, true,
++                                                false, &tag);
++         chunks.push_back({tag, in});
++         std::vector<BYTE> out = signature_chunk(sig->pOutputSignature, sig->NumOutputSignatureEntries, stage, false,
++                                                 false, &tag);
++         chunks.push_back({tag, out});
++      }
++   }
++
++   /* The program: a DXBC container already (then as is), the SM4/5 token stream, or the DXIL program part */
++   if (code[0] == fourcc("DXBC")) {
++      const BYTE *bytes = (const BYTE *)code;
++      shader->container.assign(bytes, bytes + code[6]);
++      return;
++   }
++   UINT major = (code[0] >> 4) & 0xf;
++   std::vector<BYTE> program((const BYTE *)code, (const BYTE *)(code + code[1]));
++   chunks.push_back({major >= 6 ? "DXIL" : major == 5 ? "SHEX" : "SHDR", program});
++   shader->container = build_container(chunks);
++}
++
++static SIZE_T APIENTRY
++calc_shader_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_SHADER_0026 *)
++{
++   return sizeof(viogpu_shader);
++}
++
++static SIZE_T APIENTRY
++calc_gs_so_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026 *)
++{
++   return sizeof(viogpu_shader);
++}
++
++#define CREATE_SHADER(fn, stage)                                                                                  \
++   static VOID APIENTRY fn(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_SHADER_0026 *args, D3D12DDI_HSHADER h)      \
++   {                                                                                                              \
++      viogpu_shader *shader = new (h.pDrvPrivate) viogpu_shader();                                                \
++      shader_build(shader, stage, args);                                                                          \
++   }
++CREATE_SHADER(create_vertex_shader, STAGE_VS)
++CREATE_SHADER(create_pixel_shader, STAGE_PS)
++CREATE_SHADER(create_geometry_shader, STAGE_GS)
++CREATE_SHADER(create_compute_shader, STAGE_CS)
++CREATE_SHADER(create_hull_shader, STAGE_HS)
++CREATE_SHADER(create_domain_shader, STAGE_DS)
++
++/* Stream output: entries name output registers; the same names as the output signature's */
++static VOID APIENTRY
++create_gs_with_so(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026 *args,
++                  D3D12DDI_HSHADER h)
++{
++   viogpu_shader *shader = new (h.pDrvPrivate) viogpu_shader();
++   shader_build(shader, STAGE_GS, &args->CreateShader);
++   /* names must outlive the shader: one static string, indices carry the register */
++   for (UINT i = 0; i < args->NumEntries; i++) {
++      const D3D12DDIARG_STREAM_OUTPUT_DECLARATION_ENTRY &d = args->pOutputStreamDecl[i];
++      D3D12_SO_DECLARATION_ENTRY e = {};
++      e.Stream = d.Stream;
++      e.OutputSlot = (BYTE)d.OutputSlot;
++      if (d.RegisterIndex == (UINT)-1) {
++         /* a gap */
++         e.SemanticName = NULL;
++         e.ComponentCount = (BYTE)__popcnt(d.RegisterMask);
++      } else {
++         /* the output signature's entry holding these components: its name, and where they start in it */
++         UINT first = first_component(d.RegisterMask);
++         UINT entryFirst = first;
++         const D3D12DDIARG_STAGE_IO_SIGNATURES *sig = args->CreateShader.IOSignatures.Standard;
++         for (UINT j = 0; sig && j < sig->NumOutputSignatureEntries; j++) {
++            const D3D12DDIARG_SIGNATURE_ENTRY_0012 &o = sig->pOutputSignature[j];
++            if (o.Register == d.RegisterIndex && (o.Mask & d.RegisterMask) == d.RegisterMask) {
++               entryFirst = first_component(o.Mask);
++               break;
++            }
++         }
++         e.SemanticName = "WBREG";
++         e.SemanticIndex = d.RegisterIndex * 4 + entryFirst;
++         e.StartComponent = (BYTE)(first - entryFirst);
++         e.ComponentCount = (BYTE)__popcnt(d.RegisterMask);
++      }
++      shader->soDecl.push_back(e);
++   }
++   shader->soStrides.assign(args->BufferStridesInBytes, args->BufferStridesInBytes + args->NumStrides);
++   shader->rasterizedStream = args->RasterizedStream;
++}
++
++static VOID APIENTRY
++destroy_shader(D3D12DDI_HDEVICE, D3D12DDI_HSHADER h)
++{
++   ((viogpu_shader *)h.pDrvPrivate)->~viogpu_shader();
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Input layouts and states: kept as the API's descs */
++
++struct viogpu_element_layout {
++   std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
++};
++
++static SIZE_T APIENTRY
++calc_element_layout_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATEELEMENTLAYOUT_0010 *)
++{
++   return sizeof(viogpu_element_layout);
++}
++
++static VOID APIENTRY
++create_element_layout(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATEELEMENTLAYOUT_0010 *args, D3D12DDI_HELEMENTLAYOUT h)
++{
++   viogpu_element_layout *layout = new (h.pDrvPrivate) viogpu_element_layout();
++   for (UINT i = 0; i < args->NumElements; i++) {
++      const D3D12DDIARG_INPUT_ELEMENT_DESC &d = args->pVertexElements[i];
++      D3D12_INPUT_ELEMENT_DESC e = {};
++      e.SemanticName = "WBATTR";
++      e.SemanticIndex = d.InputRegister;
++      e.Format = d.Format;
++      e.InputSlot = d.InputSlot;
++      e.AlignedByteOffset = d.AlignedByteOffset;
++      e.InputSlotClass = (D3D12_INPUT_CLASSIFICATION)d.InputSlotClass;
++      e.InstanceDataStepRate = d.InstanceDataStepRate;
++      layout->elements.push_back(e);
++   }
++}
++
++static VOID APIENTRY
++destroy_element_layout(D3D12DDI_HDEVICE, D3D12DDI_HELEMENTLAYOUT h)
++{
++   ((viogpu_element_layout *)h.pDrvPrivate)->~viogpu_element_layout();
++}
++
++static SIZE_T APIENTRY
++calc_blend_size(D3D12DDI_HDEVICE, const D3D12DDI_BLEND_DESC_0010 *)
++{
++   return sizeof(D3D12_BLEND_DESC);
++}
++
++static VOID APIENTRY
++create_blend(D3D12DDI_HDEVICE, const D3D12DDI_BLEND_DESC_0010 *desc, D3D12DDI_HBLENDSTATE h)
++{
++   /* the API's desc, then the library reference */
++   memcpy(h.pDrvPrivate, desc, sizeof(D3D12_BLEND_DESC));
++}
++
++static VOID APIENTRY
++destroy_blend(D3D12DDI_HDEVICE, D3D12DDI_HBLENDSTATE)
++{
++}
++
++static SIZE_T APIENTRY
++calc_depth_stencil_size(D3D12DDI_HDEVICE, const D3D12DDI_DEPTH_STENCIL_DESC_0025 *)
++{
++   return sizeof(D3D12_DEPTH_STENCIL_DESC1);
++}
++
++static VOID APIENTRY
++create_depth_stencil(D3D12DDI_HDEVICE, const D3D12DDI_DEPTH_STENCIL_DESC_0025 *desc, D3D12DDI_HDEPTHSTENCILSTATE h)
++{
++   D3D12_DEPTH_STENCIL_DESC1 *d = (D3D12_DEPTH_STENCIL_DESC1 *)h.pDrvPrivate;
++   d->DepthEnable = desc->DepthEnable;
++   d->DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)desc->DepthWriteMask;
++   d->DepthFunc = (D3D12_COMPARISON_FUNC)desc->DepthFunc;
++   d->StencilEnable = desc->StencilEnable;
++   d->StencilReadMask = desc->StencilReadMask;
++   d->StencilWriteMask = desc->StencilWriteMask;
++   memcpy(&d->FrontFace, &desc->FrontFace, sizeof(d->FrontFace));
++   memcpy(&d->BackFace, &desc->BackFace, sizeof(d->BackFace));
++   d->DepthBoundsTestEnable = desc->DepthBoundsTestEnable;
++}
++
++static VOID APIENTRY
++destroy_depth_stencil(D3D12DDI_HDEVICE, D3D12DDI_HDEPTHSTENCILSTATE)
++{
++}
++
++static SIZE_T APIENTRY
++calc_rasterizer_size(D3D12DDI_HDEVICE, const D3D12DDI_RASTERIZER_DESC_0010 *)
++{
++   return sizeof(D3D12_RASTERIZER_DESC);
++}
++
++static VOID APIENTRY
++create_rasterizer(D3D12DDI_HDEVICE, const D3D12DDI_RASTERIZER_DESC_0010 *desc, D3D12DDI_HRASTERIZERSTATE h)
++{
++   D3D12_RASTERIZER_DESC *d = (D3D12_RASTERIZER_DESC *)h.pDrvPrivate;
++   d->FillMode = (D3D12_FILL_MODE)desc->FillMode;
++   d->CullMode = (D3D12_CULL_MODE)desc->CullMode;
++   d->FrontCounterClockwise = desc->FrontCounterClockwise;
++   d->DepthBias = desc->DepthBias;
++   d->DepthBiasClamp = desc->DepthBiasClamp;
++   d->SlopeScaledDepthBias = desc->SlopeScaledDepthBias;
++   d->DepthClipEnable = desc->DepthClipEnable;
++   d->MultisampleEnable = desc->MultisampleEnable;
++   d->AntialiasedLineEnable = desc->AntialiasedLineEnable;
++   d->ForcedSampleCount = desc->ForcedSampleCount;
++   d->ConservativeRaster = (D3D12_CONSERVATIVE_RASTERIZATION_MODE)desc->ConservativeRasterizationMode;
++}
++
++static VOID APIENTRY
++destroy_rasterizer(D3D12DDI_HDEVICE, D3D12DDI_HRASTERIZERSTATE)
++{
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Root signatures: the runtime passes a deserialized 1.1 desc, laid out as the API's D3D12_ROOT_SIGNATURE_DESC1 */
++
++static_assert(sizeof(D3D12DDI_ROOT_SIGNATURE_0013) == sizeof(D3D12_ROOT_SIGNATURE_DESC1), "root signature desc");
++static_assert(sizeof(D3D12DDI_ROOT_PARAMETER_0013) == sizeof(D3D12_ROOT_PARAMETER1), "root parameter");
++static_assert(sizeof(D3D12DDI_DESCRIPTOR_RANGE_0013) == sizeof(D3D12_DESCRIPTOR_RANGE1), "descriptor range");
++static_assert(sizeof(D3D12DDI_STATIC_SAMPLER) == sizeof(D3D12_STATIC_SAMPLER_DESC), "static sampler");
++
++struct viogpu_root_signature {
++   ID3D12RootSignature *rs;
++};
++
++ID3D12RootSignature *
++viogpu_root_signature_of(D3D12DDI_HROOTSIGNATURE h)
++{
++   return h.pDrvPrivate ? ((viogpu_root_signature *)h.pDrvPrivate)->rs : NULL;
++}
++
++static SIZE_T APIENTRY
++calc_root_signature_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0013 *)
++{
++   return sizeof(viogpu_root_signature);
++}
++
++static HRESULT APIENTRY
++create_root_signature(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_ROOT_SIGNATURE_0013 *args,
++                      D3D12DDI_HROOTSIGNATURE h)
++{
++   viogpu_device *device = device_from(hDevice);
++   viogpu_root_signature *rs = new (h.pDrvPrivate) viogpu_root_signature();
++   D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = {};
++   desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
++   memcpy(&desc.Desc_1_1, args->pRootSignature_1_1, sizeof(desc.Desc_1_1));
++   ID3DBlob *blob = NULL;
++   HRESULT hr = viogpu_bridge_serialize_root_signature(&desc, (void **)&blob);
++   if (SUCCEEDED(hr)) {
++      hr = device->vkd3d->CreateRootSignature(args->NodeMask, blob->GetBufferPointer(), blob->GetBufferSize(),
++                                              IID_PPV_ARGS(&rs->rs));
++      blob->Release();
++   }
++   if (FAILED(hr))
++      viogpu_log("CreateRootSignature: 0x%08lx", (unsigned long)hr);
++   return hr;
++}
++
++static VOID APIENTRY
++destroy_root_signature(D3D12DDI_HDEVICE, D3D12DDI_HROOTSIGNATURE h)
++{
++   viogpu_root_signature *rs = (viogpu_root_signature *)h.pDrvPrivate;
++   if (rs->rs)
++      rs->rs->Release();
++   rs->~viogpu_root_signature();
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Pipeline states */
++
++struct viogpu_pipeline_state {
++   ID3D12PipelineState *pso;
++   D3D12DDI_HRTPIPELINESTATE hRT;
++};
++
++ID3D12PipelineState *
++viogpu_pipeline_state_of(D3D12DDI_HPIPELINESTATE h)
++{
++   return h.pDrvPrivate ? ((viogpu_pipeline_state *)h.pDrvPrivate)->pso : NULL;
++}
++
++static D3D12_SHADER_BYTECODE
++bytecode(D3D12DDI_HSHADER h)
++{
++   D3D12_SHADER_BYTECODE b = {};
++   viogpu_shader *shader = (viogpu_shader *)h.pDrvPrivate;
++   if (shader && !shader->container.empty()) {
++      b.pShaderBytecode = shader->container.data();
++      b.BytecodeLength = shader->container.size();
++   }
++   return b;
++}
++
++static SIZE_T APIENTRY
++calc_pipeline_state_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_PIPELINE_STATE_0075 *)
++{
++   return sizeof(viogpu_pipeline_state);
++}
++
++static HRESULT APIENTRY
++create_pipeline_state(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_PIPELINE_STATE_0075 *args,
++                      D3D12DDI_HPIPELINESTATE h, D3D12DDI_HRTPIPELINESTATE hRT)
++{
++   viogpu_device *device = device_from(hDevice);
++   viogpu_pipeline_state *pso = new (h.pDrvPrivate) viogpu_pipeline_state();
++   pso->hRT = hRT;
++   HRESULT hr;
++
++   if (args->hComputeShader.pDrvPrivate) {
++      D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
++      desc.pRootSignature = viogpu_root_signature_of(args->hRootSignature);
++      desc.CS = bytecode(args->hComputeShader);
++      desc.NodeMask = args->NodeMask;
++      hr = device->vkd3d->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso->pso));
++   } else {
++      D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
++      desc.pRootSignature = viogpu_root_signature_of(args->hRootSignature);
++      desc.VS = bytecode(args->hVertexShader);
++      desc.PS = bytecode(args->hPixelShader);
++      desc.DS = bytecode(args->hDomainShader);
++      desc.HS = bytecode(args->hHullShader);
++      desc.GS = bytecode(args->hGeometryShader);
++      /* stream output: from the geometry shader's object, or the last stage's when there is none */
++      viogpu_shader *so = (viogpu_shader *)args->hGeometryShader.pDrvPrivate;
++      if (so && !so->soDecl.empty()) {
++         desc.StreamOutput.pSODeclaration = so->soDecl.data();
++         desc.StreamOutput.NumEntries = (UINT)so->soDecl.size();
++         desc.StreamOutput.pBufferStrides = so->soStrides.data();
++         desc.StreamOutput.NumStrides = (UINT)so->soStrides.size();
++         desc.StreamOutput.RasterizedStream = so->rasterizedStream;
++      }
++      if (args->hBlendState.pDrvPrivate)
++         desc.BlendState = *(const D3D12_BLEND_DESC *)args->hBlendState.pDrvPrivate;
++      desc.SampleMask = args->SampleMask;
++      if (args->hRasterizerState.pDrvPrivate)
++         desc.RasterizerState = *(const D3D12_RASTERIZER_DESC *)args->hRasterizerState.pDrvPrivate;
++      if (args->hDepthStencilState.pDrvPrivate) {
++         /* the plain desc has no depth bounds test; it's DESC1's prefix */
++         memcpy(&desc.DepthStencilState, args->hDepthStencilState.pDrvPrivate, sizeof(desc.DepthStencilState));
++      }
++      viogpu_element_layout *layout = (viogpu_element_layout *)args->hElementLayout.pDrvPrivate;
++      if (layout) {
++         desc.InputLayout.pInputElementDescs = layout->elements.data();
++         desc.InputLayout.NumElements = (UINT)layout->elements.size();
++      }
++      desc.IBStripCutValue = (D3D12_INDEX_BUFFER_STRIP_CUT_VALUE)args->IBStripCutValue;
++      desc.PrimitiveTopologyType = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)args->PrimitiveTopologyType;
++      desc.NumRenderTargets = args->NumRenderTargets;
++      memcpy(desc.RTVFormats, args->RTVFormats, sizeof(desc.RTVFormats));
++      desc.DSVFormat = args->DSVFormat;
++      desc.SampleDesc = args->SampleDesc;
++      desc.NodeMask = args->NodeMask;
++      hr = device->vkd3d->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso->pso));
++   }
++   if (FAILED(hr))
++      viogpu_log("CreatePipelineState (%s): 0x%08lx", args->hComputeShader.pDrvPrivate ? "compute" : "graphics",
++                 (unsigned long)hr);
++   return hr;
++}
++
++static VOID APIENTRY
++destroy_pipeline_state(D3D12DDI_HDEVICE, D3D12DDI_HPIPELINESTATE h)
++{
++   viogpu_pipeline_state *pso = (viogpu_pipeline_state *)h.pDrvPrivate;
++   if (pso->pso)
++      pso->pso->Release();
++   pso->~viogpu_pipeline_state();
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++
++void
++viogpu_fill_state_funcs(viogpu_device_funcs *f)
++{
++   f->pfnCalcPrivateElementLayoutSize = calc_element_layout_size;
++   f->pfnCreateElementLayout = create_element_layout;
++   f->pfnDestroyElementLayout = destroy_element_layout;
++   f->pfnCalcPrivateBlendStateSize = calc_blend_size;
++   f->pfnCreateBlendState = create_blend;
++   f->pfnDestroyBlendState = destroy_blend;
++   f->pfnCalcPrivateDepthStencilStateSize = calc_depth_stencil_size;
++   f->pfnCreateDepthStencilState = create_depth_stencil;
++   f->pfnDestroyDepthStencilState = destroy_depth_stencil;
++   f->pfnCalcPrivateRasterizerStateSize = calc_rasterizer_size;
++   f->pfnCreateRasterizerState = create_rasterizer;
++   f->pfnDestroyRasterizerState = destroy_rasterizer;
++   f->pfnCalcPrivateShaderSize = calc_shader_size;
++   f->pfnCreateVertexShader = create_vertex_shader;
++   f->pfnCreatePixelShader = create_pixel_shader;
++   f->pfnCreateGeometryShader = create_geometry_shader;
++   f->pfnCreateComputeShader = create_compute_shader;
++   f->pfnCalcPrivateGeometryShaderWithStreamOutput = calc_gs_so_size;
++   f->pfnCreateGeometryShaderWithStreamOutput = create_gs_with_so;
++   f->pfnCalcPrivateTessellationShaderSize = calc_shader_size;
++   f->pfnCreateHullShader = create_hull_shader;
++   f->pfnCreateDomainShader = create_domain_shader;
++   f->pfnDestroyShader = destroy_shader;
++   f->pfnCalcPrivateRootSignatureSize = calc_root_signature_size;
++   f->pfnCreateRootSignature = create_root_signature;
++   f->pfnDestroyRootSignature = destroy_root_signature;
++   f->pfnCalcPrivatePipelineStateSize = calc_pipeline_state_size;
++   f->pfnCreatePipelineState = create_pipeline_state;
++   f->pfnDestroyPipelineState = destroy_pipeline_state;
++}
+diff --git a/libs/viogpu_umd/umd_tables.h b/libs/viogpu_umd/umd_tables.h
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_tables.h
+@@ -0,0 +1,474 @@
++/* Generated by gen_tables.py from the WDK's d3d12umddi.h and dxgiddi.h: do not edit */
++#pragma once
++
++#define VIOGPU_D3D12_DEVICE_ENTRIES 122 /* D3D12DDI_DEVICE_FUNCS_CORE_0080 */
++static const char *const viogpu_d3d12_device_names[] = {
++   "pfnCheckFormatSupport",
++   "pfnCheckMultisampleQualityLevels",
++   "pfnGetMipPacking",
++   "pfnCalcPrivateElementLayoutSize",
++   "pfnCreateElementLayout",
++   "pfnDestroyElementLayout",
++   "pfnCalcPrivateBlendStateSize",
++   "pfnCreateBlendState",
++   "pfnDestroyBlendState",
++   "pfnCalcPrivateDepthStencilStateSize",
++   "pfnCreateDepthStencilState",
++   "pfnDestroyDepthStencilState",
++   "pfnCalcPrivateRasterizerStateSize",
++   "pfnCreateRasterizerState",
++   "pfnDestroyRasterizerState",
++   "pfnCalcPrivateShaderSize",
++   "pfnCreateVertexShader",
++   "pfnCreatePixelShader",
++   "pfnCreateGeometryShader",
++   "pfnCreateComputeShader",
++   "pfnCalcPrivateGeometryShaderWithStreamOutput",
++   "pfnCreateGeometryShaderWithStreamOutput",
++   "pfnCalcPrivateTessellationShaderSize",
++   "pfnCreateHullShader",
++   "pfnCreateDomainShader",
++   "pfnDestroyShader",
++   "pfnCalcPrivateCommandQueueSize",
++   "pfnCreateCommandQueue",
++   "pfnDestroyCommandQueue",
++   "pfnCalcPrivateCommandPoolSize",
++   "pfnCreateCommandPool",
++   "pfnDestroyCommandPool",
++   "pfnResetCommandPool",
++   "pfnCalcPrivatePipelineStateSize",
++   "pfnCreatePipelineState",
++   "pfnDestroyPipelineState",
++   "pfnCalcPrivateCommandListSize",
++   "pfnCreateCommandList",
++   "pfnDestroyCommandList",
++   "pfnCalcPrivateFenceSize",
++   "pfnCreateFence",
++   "pfnDestroyFence",
++   "pfnCalcPrivateDescriptorHeapSize",
++   "pfnCreateDescriptorHeap",
++   "pfnDestroyDescriptorHeap",
++   "pfnGetDescriptorSizeInBytes",
++   "pfnGetCPUDescriptorHandleForHeapStart",
++   "pfnGetGPUDescriptorHandleForHeapStart",
++   "pfnCreateShaderResourceView",
++   "pfnCreateConstantBufferView",
++   "pfnCreateSampler",
++   "pfnCreateUnorderedAccessView",
++   "pfnCreateRenderTargetView",
++   "pfnCreateDepthStencilView",
++   "pfnCalcPrivateRootSignatureSize",
++   "pfnCreateRootSignature",
++   "pfnDestroyRootSignature",
++   "pfnMapHeap",
++   "pfnUnmapHeap",
++   "pfnCalcPrivateHeapAndResourceSizes",
++   "pfnCreateHeapAndResource",
++   "pfnDestroyHeapAndResource",
++   "pfnMakeResident",
++   "pfnEvict",
++   "pfnCalcPrivateOpenedHeapAndResourceSizes",
++   "pfnOpenHeapAndResource",
++   "pfnCopyDescriptors",
++   "pfnCopyDescriptorsSimple",
++   "pfnCalcPrivateQueryHeapSize",
++   "pfnCreateQueryHeap",
++   "pfnDestroyQueryHeap",
++   "pfnCalcPrivateCommandSignatureSize",
++   "pfnCreateCommandSignature",
++   "pfnDestroyCommandSignature",
++   "pfnCheckResourceVirtualAddress",
++   "pfnCheckResourceAllocationInfo",
++   "pfnCheckSubresourceInfo",
++   "pfnCheckExistingResourceAllocationInfo",
++   "pfnOfferResources",
++   "pfnReclaimResources",
++   "pfnGetImplicitPhysicalAdapterMask",
++   "pfnGetPresentPrivateDriverDataSize",
++   "pfnQueryNodeMap",
++   "pfnRetrieveShaderComment",
++   "pfnCheckResourceAllocationHandle",
++   "pfnCalcPrivatePipelineLibrarySize",
++   "pfnCreatePipelineLibrary",
++   "pfnDestroyPipelineLibrary",
++   "pfnAddPipelineStateToLibrary",
++   "pfnCalcSerializedLibrarySize",
++   "pfnSerializeLibrary",
++   "pfnGetDebugAllocationInfo",
++   "pfnCalcPrivateCommandRecorderSize",
++   "pfnCreateCommandRecorder",
++   "pfnDestroyCommandRecorder",
++   "pfnCommandRecorderSetCommandPoolAsTarget",
++   "pfnCalcPrivateSchedulingGroupSize",
++   "pfnCreateSchedulingGroup",
++   "pfnDestroySchedulingGroup",
++   "pfnEnumerateMetaCommands",
++   "pfnEnumerateMetaCommandParameters",
++   "pfnCalcPrivateMetaCommandSize",
++   "pfnCreateMetaCommand",
++   "pfnDestroyMetaCommand",
++   "pfnGetMetaCommandRequiredParameterInfo",
++   "pfnCalcPrivateStateObjectSize",
++   "pfnCreateStateObject",
++   "pfnDestroyStateObject",
++   "pfnGetRaytracingAccelerationStructurePrebuildInfo",
++   "pfnCheckDriverMatchingIdentifier",
++   "pfnGetShaderIdentifier",
++   "pfnGetShaderStackSize",
++   "pfnGetPipelineStackSize",
++   "pfnSetPipelineStackSize",
++   "pfnSetBackgroundProcessingMode",
++   "pfnCalcPrivateAddToStateObjectSize",
++   "pfnAddToStateObject",
++   "pfnCreateSamplerFeedbackUnorderedAccessView",
++   "pfnCreateAmplificationShader",
++   "pfnCreateMeshShader",
++   "pfnCalcPrivateMeshShaderSize",
++   "pfnImplicitShaderCacheControl",
++};
++
++#define VIOGPU_D3D12_DEVICE_MEMBERS(X) \
++   X(0, pfnCheckFormatSupport) \
++   X(1, pfnCheckMultisampleQualityLevels) \
++   X(2, pfnGetMipPacking) \
++   X(3, pfnCalcPrivateElementLayoutSize) \
++   X(4, pfnCreateElementLayout) \
++   X(5, pfnDestroyElementLayout) \
++   X(6, pfnCalcPrivateBlendStateSize) \
++   X(7, pfnCreateBlendState) \
++   X(8, pfnDestroyBlendState) \
++   X(9, pfnCalcPrivateDepthStencilStateSize) \
++   X(10, pfnCreateDepthStencilState) \
++   X(11, pfnDestroyDepthStencilState) \
++   X(12, pfnCalcPrivateRasterizerStateSize) \
++   X(13, pfnCreateRasterizerState) \
++   X(14, pfnDestroyRasterizerState) \
++   X(15, pfnCalcPrivateShaderSize) \
++   X(16, pfnCreateVertexShader) \
++   X(17, pfnCreatePixelShader) \
++   X(18, pfnCreateGeometryShader) \
++   X(19, pfnCreateComputeShader) \
++   X(20, pfnCalcPrivateGeometryShaderWithStreamOutput) \
++   X(21, pfnCreateGeometryShaderWithStreamOutput) \
++   X(22, pfnCalcPrivateTessellationShaderSize) \
++   X(23, pfnCreateHullShader) \
++   X(24, pfnCreateDomainShader) \
++   X(25, pfnDestroyShader) \
++   X(26, pfnCalcPrivateCommandQueueSize) \
++   X(27, pfnCreateCommandQueue) \
++   X(28, pfnDestroyCommandQueue) \
++   X(29, pfnCalcPrivateCommandPoolSize) \
++   X(30, pfnCreateCommandPool) \
++   X(31, pfnDestroyCommandPool) \
++   X(32, pfnResetCommandPool) \
++   X(33, pfnCalcPrivatePipelineStateSize) \
++   X(34, pfnCreatePipelineState) \
++   X(35, pfnDestroyPipelineState) \
++   X(36, pfnCalcPrivateCommandListSize) \
++   X(37, pfnCreateCommandList) \
++   X(38, pfnDestroyCommandList) \
++   X(39, pfnCalcPrivateFenceSize) \
++   X(40, pfnCreateFence) \
++   X(41, pfnDestroyFence) \
++   X(42, pfnCalcPrivateDescriptorHeapSize) \
++   X(43, pfnCreateDescriptorHeap) \
++   X(44, pfnDestroyDescriptorHeap) \
++   X(45, pfnGetDescriptorSizeInBytes) \
++   X(46, pfnGetCPUDescriptorHandleForHeapStart) \
++   X(47, pfnGetGPUDescriptorHandleForHeapStart) \
++   X(48, pfnCreateShaderResourceView) \
++   X(49, pfnCreateConstantBufferView) \
++   X(50, pfnCreateSampler) \
++   X(51, pfnCreateUnorderedAccessView) \
++   X(52, pfnCreateRenderTargetView) \
++   X(53, pfnCreateDepthStencilView) \
++   X(54, pfnCalcPrivateRootSignatureSize) \
++   X(55, pfnCreateRootSignature) \
++   X(56, pfnDestroyRootSignature) \
++   X(57, pfnMapHeap) \
++   X(58, pfnUnmapHeap) \
++   X(59, pfnCalcPrivateHeapAndResourceSizes) \
++   X(60, pfnCreateHeapAndResource) \
++   X(61, pfnDestroyHeapAndResource) \
++   X(62, pfnMakeResident) \
++   X(63, pfnEvict) \
++   X(64, pfnCalcPrivateOpenedHeapAndResourceSizes) \
++   X(65, pfnOpenHeapAndResource) \
++   X(66, pfnCopyDescriptors) \
++   X(67, pfnCopyDescriptorsSimple) \
++   X(68, pfnCalcPrivateQueryHeapSize) \
++   X(69, pfnCreateQueryHeap) \
++   X(70, pfnDestroyQueryHeap) \
++   X(71, pfnCalcPrivateCommandSignatureSize) \
++   X(72, pfnCreateCommandSignature) \
++   X(73, pfnDestroyCommandSignature) \
++   X(74, pfnCheckResourceVirtualAddress) \
++   X(75, pfnCheckResourceAllocationInfo) \
++   X(76, pfnCheckSubresourceInfo) \
++   X(77, pfnCheckExistingResourceAllocationInfo) \
++   X(78, pfnOfferResources) \
++   X(79, pfnReclaimResources) \
++   X(80, pfnGetImplicitPhysicalAdapterMask) \
++   X(81, pfnGetPresentPrivateDriverDataSize) \
++   X(82, pfnQueryNodeMap) \
++   X(83, pfnRetrieveShaderComment) \
++   X(84, pfnCheckResourceAllocationHandle) \
++   X(85, pfnCalcPrivatePipelineLibrarySize) \
++   X(86, pfnCreatePipelineLibrary) \
++   X(87, pfnDestroyPipelineLibrary) \
++   X(88, pfnAddPipelineStateToLibrary) \
++   X(89, pfnCalcSerializedLibrarySize) \
++   X(90, pfnSerializeLibrary) \
++   X(91, pfnGetDebugAllocationInfo) \
++   X(92, pfnCalcPrivateCommandRecorderSize) \
++   X(93, pfnCreateCommandRecorder) \
++   X(94, pfnDestroyCommandRecorder) \
++   X(95, pfnCommandRecorderSetCommandPoolAsTarget) \
++   X(96, pfnCalcPrivateSchedulingGroupSize) \
++   X(97, pfnCreateSchedulingGroup) \
++   X(98, pfnDestroySchedulingGroup) \
++   X(99, pfnEnumerateMetaCommands) \
++   X(100, pfnEnumerateMetaCommandParameters) \
++   X(101, pfnCalcPrivateMetaCommandSize) \
++   X(102, pfnCreateMetaCommand) \
++   X(103, pfnDestroyMetaCommand) \
++   X(104, pfnGetMetaCommandRequiredParameterInfo) \
++   X(105, pfnCalcPrivateStateObjectSize) \
++   X(106, pfnCreateStateObject) \
++   X(107, pfnDestroyStateObject) \
++   X(108, pfnGetRaytracingAccelerationStructurePrebuildInfo) \
++   X(109, pfnCheckDriverMatchingIdentifier) \
++   X(110, pfnGetShaderIdentifier) \
++   X(111, pfnGetShaderStackSize) \
++   X(112, pfnGetPipelineStackSize) \
++   X(113, pfnSetPipelineStackSize) \
++   X(114, pfnSetBackgroundProcessingMode) \
++   X(115, pfnCalcPrivateAddToStateObjectSize) \
++   X(116, pfnAddToStateObject) \
++   X(117, pfnCreateSamplerFeedbackUnorderedAccessView) \
++   X(118, pfnCreateAmplificationShader) \
++   X(119, pfnCreateMeshShader) \
++   X(120, pfnCalcPrivateMeshShaderSize) \
++   X(121, pfnImplicitShaderCacheControl) \
++
++#define VIOGPU_D3D12_COMMAND_LIST_ENTRIES 68 /* D3D12DDI_COMMAND_LIST_FUNCS_3D_0074 */
++static const char *const viogpu_d3d12_command_list_names[] = {
++   "pfnCloseCommandList",
++   "pfnResetCommandList",
++   "pfnDrawInstanced",
++   "pfnDrawIndexedInstanced",
++   "pfnDispatch",
++   "pfnClearUnorderedAccessViewUint",
++   "pfnClearUnorderedAccessViewFloat",
++   "pfnClearRenderTargetView",
++   "pfnClearDepthStencilView",
++   "pfnDiscardResource",
++   "pfnCopyTextureRegion",
++   "pfnResourceCopy",
++   "pfnCopyTiles",
++   "pfnCopyBufferRegion",
++   "pfnResourceResolveSubresource",
++   "pfnExecuteBundle",
++   "pfnExecuteIndirect",
++   "pfnResourceBarrier",
++   "pfnBlt",
++   "pfnPresent",
++   "pfnBeginQuery",
++   "pfnEndQuery",
++   "pfnResolveQueryData",
++   "pfnSetPredication",
++   "pfnIaSetTopology",
++   "pfnRsSetViewports",
++   "pfnRsSetScissorRects",
++   "pfnOmSetBlendFactor",
++   "pfnOmSetStencilRef",
++   "pfnSetPipelineState",
++   "pfnSetDescriptorHeaps",
++   "pfnSetComputeRootSignature",
++   "pfnSetGraphicsRootSignature",
++   "pfnSetComputeRootDescriptorTable",
++   "pfnSetGraphicsRootDescriptorTable",
++   "pfnSetComputeRoot32BitConstant",
++   "pfnSetGraphicsRoot32BitConstant",
++   "pfnSetComputeRoot32BitConstants",
++   "pfnSetGraphicsRoot32BitConstants",
++   "pfnSetComputeRootConstantBufferView",
++   "pfnSetGraphicsRootConstantBufferView",
++   "pfnSetComputeRootShaderResourceView",
++   "pfnSetGraphicsRootShaderResourceView",
++   "pfnSetComputeRootUnorderedAccessView",
++   "pfnSetGraphicsRootUnorderedAccessView",
++   "pfnIASetIndexBuffer",
++   "pfnIASetVertexBuffers",
++   "pfnSOSetTargets",
++   "pfnOMSetRenderTargets",
++   "pfnSetMarker",
++   "pfnClearRootArguments",
++   "pfnAtomicCopyBufferRegion",
++   "pfnOMSetDepthBounds",
++   "pfnSetSamplePositions",
++   "pfnResourceResolveSubresourceRegion",
++   "pfnSetProtectedResourceSession",
++   "pfnWriteBufferImmediate",
++   "pfnSetViewInstanceMask",
++   "pfnInitializeMetaCommand",
++   "pfnExecuteMetaCommand",
++   "pfnBuildRaytracingAccelerationStructure",
++   "pfnEmitRaytracingAccelerationStructurePostbuildInfo",
++   "pfnCopyRaytracingAccelerationStructure",
++   "pfnSetPipelineState1",
++   "pfnDispatchRays",
++   "pfnRSSetShadingRate",
++   "pfnRSSetShadingRateImage",
++   "pfnDispatchMesh",
++};
++
++#define VIOGPU_D3D12_COMMAND_LIST_MEMBERS(X) \
++   X(0, pfnCloseCommandList) \
++   X(1, pfnResetCommandList) \
++   X(2, pfnDrawInstanced) \
++   X(3, pfnDrawIndexedInstanced) \
++   X(4, pfnDispatch) \
++   X(5, pfnClearUnorderedAccessViewUint) \
++   X(6, pfnClearUnorderedAccessViewFloat) \
++   X(7, pfnClearRenderTargetView) \
++   X(8, pfnClearDepthStencilView) \
++   X(9, pfnDiscardResource) \
++   X(10, pfnCopyTextureRegion) \
++   X(11, pfnResourceCopy) \
++   X(12, pfnCopyTiles) \
++   X(13, pfnCopyBufferRegion) \
++   X(14, pfnResourceResolveSubresource) \
++   X(15, pfnExecuteBundle) \
++   X(16, pfnExecuteIndirect) \
++   X(17, pfnResourceBarrier) \
++   X(18, pfnBlt) \
++   X(19, pfnPresent) \
++   X(20, pfnBeginQuery) \
++   X(21, pfnEndQuery) \
++   X(22, pfnResolveQueryData) \
++   X(23, pfnSetPredication) \
++   X(24, pfnIaSetTopology) \
++   X(25, pfnRsSetViewports) \
++   X(26, pfnRsSetScissorRects) \
++   X(27, pfnOmSetBlendFactor) \
++   X(28, pfnOmSetStencilRef) \
++   X(29, pfnSetPipelineState) \
++   X(30, pfnSetDescriptorHeaps) \
++   X(31, pfnSetComputeRootSignature) \
++   X(32, pfnSetGraphicsRootSignature) \
++   X(33, pfnSetComputeRootDescriptorTable) \
++   X(34, pfnSetGraphicsRootDescriptorTable) \
++   X(35, pfnSetComputeRoot32BitConstant) \
++   X(36, pfnSetGraphicsRoot32BitConstant) \
++   X(37, pfnSetComputeRoot32BitConstants) \
++   X(38, pfnSetGraphicsRoot32BitConstants) \
++   X(39, pfnSetComputeRootConstantBufferView) \
++   X(40, pfnSetGraphicsRootConstantBufferView) \
++   X(41, pfnSetComputeRootShaderResourceView) \
++   X(42, pfnSetGraphicsRootShaderResourceView) \
++   X(43, pfnSetComputeRootUnorderedAccessView) \
++   X(44, pfnSetGraphicsRootUnorderedAccessView) \
++   X(45, pfnIASetIndexBuffer) \
++   X(46, pfnIASetVertexBuffers) \
++   X(47, pfnSOSetTargets) \
++   X(48, pfnOMSetRenderTargets) \
++   X(49, pfnSetMarker) \
++   X(50, pfnClearRootArguments) \
++   X(51, pfnAtomicCopyBufferRegion) \
++   X(52, pfnOMSetDepthBounds) \
++   X(53, pfnSetSamplePositions) \
++   X(54, pfnResourceResolveSubresourceRegion) \
++   X(55, pfnSetProtectedResourceSession) \
++   X(56, pfnWriteBufferImmediate) \
++   X(57, pfnSetViewInstanceMask) \
++   X(58, pfnInitializeMetaCommand) \
++   X(59, pfnExecuteMetaCommand) \
++   X(60, pfnBuildRaytracingAccelerationStructure) \
++   X(61, pfnEmitRaytracingAccelerationStructurePostbuildInfo) \
++   X(62, pfnCopyRaytracingAccelerationStructure) \
++   X(63, pfnSetPipelineState1) \
++   X(64, pfnDispatchRays) \
++   X(65, pfnRSSetShadingRate) \
++   X(66, pfnRSSetShadingRateImage) \
++   X(67, pfnDispatchMesh) \
++
++#define VIOGPU_D3D12_COMMAND_QUEUE_ENTRIES 7 /* D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 */
++static const char *const viogpu_d3d12_command_queue_names[] = {
++   "pfnExecuteCommandLists",
++   "pfnUnused",
++   "pfnUnused2",
++   "pfnUpdateTileMappings",
++   "pfnCopyTileMappings",
++   "pfnSignalFence",
++   "pfnWaitForFence",
++};
++
++#define VIOGPU_D3D12_COMMAND_QUEUE_MEMBERS(X) \
++   X(0, pfnExecuteCommandLists) \
++   X(1, pfnUnused) \
++   X(2, pfnUnused2) \
++   X(3, pfnUpdateTileMappings) \
++   X(4, pfnCopyTileMappings) \
++   X(5, pfnSignalFence) \
++   X(6, pfnWaitForFence) \
++
++#define VIOGPU_D3D12_DXGI_ENTRIES 21 /* DXGI1_4_DDI_BASE_FUNCTIONS */
++static const char *const viogpu_d3d12_dxgi_names[] = {
++   "pfnPresent",
++   "pfnGetGammaCaps",
++   "pfnSetDisplayMode",
++   "pfnSetResourcePriority",
++   "pfnQueryResourceResidency",
++   "pfnRotateResourceIdentities",
++   "pfnBlt",
++   "pfnResolveSharedResource",
++   "pfnBlt1",
++   "pfnOfferResources",
++   "pfnReclaimResources",
++   "pfnGetMultiplaneOverlayCaps",
++   "pfnGetMultiplaneOverlayGroupCaps",
++   "pfnReserved1",
++   "pfnPresentMultiplaneOverlay",
++   "pfnReserved2",
++   "pfnPresent1",
++   "pfnCheckPresentDurationSupport",
++   "pfnTrimResidencySet",
++   "pfnCheckMultiplaneOverlayColorSpaceSupport",
++   "pfnPresentMultiplaneOverlay1",
++};
++
++#define VIOGPU_D3D12_DXGI_MEMBERS(X) \
++   X(0, pfnPresent) \
++   X(1, pfnGetGammaCaps) \
++   X(2, pfnSetDisplayMode) \
++   X(3, pfnSetResourcePriority) \
++   X(4, pfnQueryResourceResidency) \
++   X(5, pfnRotateResourceIdentities) \
++   X(6, pfnBlt) \
++   X(7, pfnResolveSharedResource) \
++   X(8, pfnBlt1) \
++   X(9, pfnOfferResources) \
++   X(10, pfnReclaimResources) \
++   X(11, pfnGetMultiplaneOverlayCaps) \
++   X(12, pfnGetMultiplaneOverlayGroupCaps) \
++   X(13, pfnReserved1) \
++   X(14, pfnPresentMultiplaneOverlay) \
++   X(15, pfnReserved2) \
++   X(16, pfnPresent1) \
++   X(17, pfnCheckPresentDurationSupport) \
++   X(18, pfnTrimResidencySet) \
++   X(19, pfnCheckMultiplaneOverlayColorSpaceSupport) \
++   X(20, pfnPresentMultiplaneOverlay1) \
++
++#define VIOGPU_D3D12_EXTENDED_FEATURES_ENTRIES 3 /* D3D12DDI_EXTENDED_FEATURES_FUNCS_0020 */
++static const char *const viogpu_d3d12_extended_features_names[] = {
++   "pfnGetSupportedExtendedFeatures",
++   "pfnGetSupportedExtendedFeatureVersions",
++   "pfnEnableExtendedFeature",
++};
++
++#define VIOGPU_D3D12_EXTENDED_FEATURES_MEMBERS(X) \
++   X(0, pfnGetSupportedExtendedFeatures) \
++   X(1, pfnGetSupportedExtendedFeatureVersions) \
++   X(2, pfnEnableExtendedFeature) \
+diff --git a/libs/viogpu_umd/umd_viogpu.h b/libs/viogpu_umd/umd_viogpu.h
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/umd_viogpu.h
+@@ -0,0 +1,54 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* The viogpu3d kernel driver's allocation private data (its shared/viogpum.h, as Mesa's viogpu_wddm_driver.h has
++ * it) and the virgl values in it: what the D3D10/11 driver that opens a shared surface (DWM's) reads */
++
++#ifndef VIOGPU_UMD_VIOGPU_H
++#define VIOGPU_UMD_VIOGPU_H
++
++#include <windows.h>
++
++#pragma pack(push, 1)
++typedef struct VIOGPU_UMD_RESOURCE_OPTIONS {
++   ULONG target;
++   ULONG format;
++   ULONG bind;
++   ULONG width;
++   ULONG height;
++   ULONG depth;
++   ULONG array_size;
++   ULONG last_level;
++   ULONG nr_samples;
++   ULONG flags;
++} VIOGPU_UMD_RESOURCE_OPTIONS;
++
++typedef struct VIOGPU_UMD_CREATE_RESOURCE_EXCHANGE {
++   ULONG magic;
++} VIOGPU_UMD_CREATE_RESOURCE_EXCHANGE;
++
++typedef struct VIOGPU_UMD_CREATE_ALLOCATION_EXCHANGE {
++   VIOGPU_UMD_RESOURCE_OPTIONS ResourceOptions;
++   ULONGLONG Size;
++} VIOGPU_UMD_CREATE_ALLOCATION_EXCHANGE;
++#pragma pack(pop)
++
++/* The kernel driver copies a GDI surface's pages to the host before every submission that uses it */
++#define VIOGPU_UMD_RESOURCE_FLAG_GDI_SURFACE 0x80000000u
++
++#define VIOGPU_UMD_PIPE_TEXTURE_2D 2
++#define VIOGPU_UMD_VIRGL_BIND_RENDER_TARGET (1u << 1)
++#define VIOGPU_UMD_VIRGL_BIND_SAMPLER_VIEW (1u << 3)
++#define VIOGPU_UMD_VIRGL_RESOURCE_FLAG_MAP_COHERENT (1u << 2)
++
++#define VIOGPU_UMD_VIRGL_FORMAT_B8G8R8A8_UNORM 1
++#define VIOGPU_UMD_VIRGL_FORMAT_B8G8R8X8_UNORM 2
++#define VIOGPU_UMD_VIRGL_FORMAT_R10G10B10A2_UNORM 8
++#define VIOGPU_UMD_VIRGL_FORMAT_R8G8B8A8_UNORM 67
++#define VIOGPU_UMD_VIRGL_FORMAT_R16G16B16A16_FLOAT 94
++#define VIOGPU_UMD_VIRGL_FORMAT_B8G8R8A8_SRGB 100
++#define VIOGPU_UMD_VIRGL_FORMAT_R8G8B8A8_SRGB 104
++
++#endif
+diff --git a/libs/viogpu_umd/viogpu_umd.def b/libs/viogpu_umd/viogpu_umd.def
+new file mode 100644
+--- /dev/null
++++ b/libs/viogpu_umd/viogpu_umd.def
+@@ -0,0 +1,2 @@
++EXPORTS
++    OpenAdapter12

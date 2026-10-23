@@ -205,9 +205,13 @@
                             :src="`data:image/png;charset=utf-8;base64,${app.Icon}`"
                             alt="App Icon"
                         />
-                        <x-label class="truncate text-ellipsis">{{ app.Name }}</x-label>
+                        <div class="flex flex-col min-w-0">
+                            <x-label class="truncate text-ellipsis">{{ app.Name }}</x-label>
+                            <x-label v-if="winboat.isStarting(app)" class="text-xs opacity-70">Starting…</x-label>
+                        </div>
                     </div>
-                    <Icon icon="cuida:caret-right-outline"></Icon>
+                    <x-throbber v-if="winboat.isStarting(app)" class="size-5 shrink-0"></x-throbber>
+                    <Icon v-else icon="cuida:caret-right-outline"></Icon>
                 </x-card>
             </TransitionGroup>
             <div v-else class="flex justify-center items-center mt-40">

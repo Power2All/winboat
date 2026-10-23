@@ -1,0 +1,11077 @@
+{
+ "cuArray3DCreate_v2": [
+  {
+   "name": "pHandle",
+   "type": "CUarray *pHandle",
+   "kind": "out"
+  },
+  {
+   "name": "pAllocateArray",
+   "type": "const CUDA_ARRAY3D_DESCRIPTOR_v2 *pAllocateArray",
+   "kind": "in"
+  }
+ ],
+ "cuArray3DGetDescriptor_v2": [
+  {
+   "name": "pArrayDescriptor",
+   "type": "CUDA_ARRAY3D_DESCRIPTOR_v2 *pArrayDescriptor",
+   "kind": "out"
+  },
+  {
+   "name": "hArray",
+   "type": "CUarray hArray",
+   "kind": "value"
+  }
+ ],
+ "cuArrayCreate_v2": [
+  {
+   "name": "pHandle",
+   "type": "CUarray *pHandle",
+   "kind": "out"
+  },
+  {
+   "name": "pAllocateArray",
+   "type": "const CUDA_ARRAY_DESCRIPTOR_v2 *pAllocateArray",
+   "kind": "in"
+  }
+ ],
+ "cuArrayDestroy": [
+  {
+   "name": "hArray",
+   "type": "CUarray hArray",
+   "kind": "value"
+  }
+ ],
+ "cuArrayGetDescriptor_v2": [
+  {
+   "name": "pArrayDescriptor",
+   "type": "CUDA_ARRAY_DESCRIPTOR_v2 *pArrayDescriptor",
+   "kind": "out"
+  },
+  {
+   "name": "hArray",
+   "type": "CUarray hArray",
+   "kind": "value"
+  }
+ ],
+ "cuArrayGetMemoryRequirements": [
+  {
+   "name": "memoryRequirements",
+   "type": "CUDA_ARRAY_MEMORY_REQUIREMENTS_v1 *memoryRequirements",
+   "kind": "out"
+  },
+  {
+   "name": "array",
+   "type": "CUarray array",
+   "kind": "value"
+  },
+  {
+   "name": "device",
+   "type": "CUdevice device",
+   "kind": "value"
+  }
+ ],
+ "cuArrayGetPlane": [
+  {
+   "name": "pPlaneArray",
+   "type": "CUarray *pPlaneArray",
+   "kind": "out"
+  },
+  {
+   "name": "hArray",
+   "type": "CUarray hArray",
+   "kind": "value"
+  },
+  {
+   "name": "planeIdx",
+   "type": "unsigned int planeIdx",
+   "kind": "value"
+  }
+ ],
+ "cuArrayGetSparseProperties": [
+  {
+   "name": "sparseProperties",
+   "type": "CUDA_ARRAY_SPARSE_PROPERTIES_v1 *sparseProperties",
+   "kind": "out"
+  },
+  {
+   "name": "array",
+   "type": "CUarray array",
+   "kind": "value"
+  }
+ ],
+ "cuCheckpointOperationComplete": [
+  {
+   "name": "handle",
+   "type": "CUcheckpointOperationHandle handle",
+   "kind": "value"
+  }
+ ],
+ "cuCheckpointProcessCheckpoint": [
+  {
+   "name": "pid",
+   "type": "int pid",
+   "kind": "value"
+  },
+  {
+   "name": "args",
+   "type": "CUcheckpointCheckpointArgs *args",
+   "kind": "out"
+  }
+ ],
+ "cuCheckpointProcessGetRestoreThreadId": [
+  {
+   "name": "pid",
+   "type": "int pid",
+   "kind": "value"
+  },
+  {
+   "name": "tid",
+   "type": "int *tid",
+   "kind": "out"
+  }
+ ],
+ "cuCheckpointProcessGetState": [
+  {
+   "name": "pid",
+   "type": "int pid",
+   "kind": "value"
+  },
+  {
+   "name": "state",
+   "type": "CUprocessState *state",
+   "kind": "out"
+  }
+ ],
+ "cuCheckpointProcessLock": [
+  {
+   "name": "pid",
+   "type": "int pid",
+   "kind": "value"
+  },
+  {
+   "name": "args",
+   "type": "CUcheckpointLockArgs *args",
+   "kind": "out"
+  }
+ ],
+ "cuCheckpointProcessRestore": [
+  {
+   "name": "pid",
+   "type": "int pid",
+   "kind": "value"
+  },
+  {
+   "name": "args",
+   "type": "CUcheckpointRestoreArgs *args",
+   "kind": "out"
+  }
+ ],
+ "cuCheckpointProcessUnlock": [
+  {
+   "name": "pid",
+   "type": "int pid",
+   "kind": "value"
+  },
+  {
+   "name": "args",
+   "type": "CUcheckpointUnlockArgs *args",
+   "kind": "out"
+  }
+ ],
+ "cuCoredumpDeregisterCompleteCallback": [
+  {
+   "name": "callback",
+   "type": "CUcoredumpCallbackHandle callback",
+   "kind": "value"
+  }
+ ],
+ "cuCoredumpDeregisterStartCallback": [
+  {
+   "name": "callback",
+   "type": "CUcoredumpCallbackHandle callback",
+   "kind": "value"
+  }
+ ],
+ "cuCoredumpGetAttribute": [
+  {
+   "name": "get",
+   "type": "CUcoredumpSettings get",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "void *value",
+   "kind": "manual"
+  },
+  {
+   "name": "size",
+   "type": "size_t *size",
+   "kind": "out"
+  }
+ ],
+ "cuCoredumpGetAttributeGlobal": [
+  {
+   "name": "get",
+   "type": "CUcoredumpSettings get",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "void *value",
+   "kind": "manual"
+  },
+  {
+   "name": "size",
+   "type": "size_t *size",
+   "kind": "out"
+  }
+ ],
+ "cuCoredumpRegisterCompleteCallback": [
+  {
+   "name": "callback",
+   "type": "CUcoredumpStatusCallback callback",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  },
+  {
+   "name": "callbackOut",
+   "type": "CUcoredumpCallbackHandle *callbackOut",
+   "kind": "out"
+  }
+ ],
+ "cuCoredumpRegisterStartCallback": [
+  {
+   "name": "callback",
+   "type": "CUcoredumpStatusCallback callback",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  },
+  {
+   "name": "callbackOut",
+   "type": "CUcoredumpCallbackHandle *callbackOut",
+   "kind": "out"
+  }
+ ],
+ "cuCoredumpSetAttribute": [
+  {
+   "name": "set",
+   "type": "CUcoredumpSettings set",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "void *value",
+   "kind": "manual"
+  },
+  {
+   "name": "size",
+   "type": "size_t *size",
+   "kind": "out"
+  }
+ ],
+ "cuCoredumpSetAttributeGlobal": [
+  {
+   "name": "set",
+   "type": "CUcoredumpSettings set",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "void *value",
+   "kind": "manual"
+  },
+  {
+   "name": "size",
+   "type": "size_t *size",
+   "kind": "out"
+  }
+ ],
+ "cuCtxAttach": [
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuCtxCreate_v2": [
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuCtxCreate_v3": [
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  },
+  {
+   "name": "paramsArray",
+   "type": "CUexecAffinityParam *paramsArray",
+   "kind": "out"
+  },
+  {
+   "name": "numParams",
+   "type": "int numParams",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuCtxCreate_v4": [
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  },
+  {
+   "name": "ctxCreateParams",
+   "type": "CUctxCreateParams *ctxCreateParams",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuCtxDestroy_v2": [
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuCtxDetach": [
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuCtxDisablePeerAccess": [
+  {
+   "name": "peerContext",
+   "type": "CUcontext peerContext",
+   "kind": "value"
+  }
+ ],
+ "cuCtxEnablePeerAccess": [
+  {
+   "name": "peerContext",
+   "type": "CUcontext peerContext",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuCtxFromGreenCtx": [
+  {
+   "name": "pContext",
+   "type": "CUcontext *pContext",
+   "kind": "out"
+  },
+  {
+   "name": "hCtx",
+   "type": "CUgreenCtx hCtx",
+   "kind": "value"
+  }
+ ],
+ "cuCtxGetApiVersion": [
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  },
+  {
+   "name": "version",
+   "type": "unsigned int *version",
+   "kind": "out"
+  }
+ ],
+ "cuCtxGetCacheConfig": [
+  {
+   "name": "pconfig",
+   "type": "CUfunc_cache *pconfig",
+   "kind": "out"
+  }
+ ],
+ "cuCtxGetCurrent": [
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  }
+ ],
+ "cuCtxGetDevResource": [
+  {
+   "name": "hCtx",
+   "type": "CUcontext hCtx",
+   "kind": "value"
+  },
+  {
+   "name": "result",
+   "type": "CUdevResource *result",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUdevResourceType type",
+   "kind": "value"
+  }
+ ],
+ "cuCtxGetDevice": [
+  {
+   "name": "device",
+   "type": "CUdevice_v1 *device",
+   "kind": "out"
+  }
+ ],
+ "cuCtxGetDevice_v2": [
+  {
+   "name": "device",
+   "type": "CUdevice *device",
+   "kind": "out"
+  },
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuCtxGetExecAffinity": [
+  {
+   "name": "pExecAffinity",
+   "type": "CUexecAffinityParam *pExecAffinity",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUexecAffinityType type",
+   "kind": "value"
+  }
+ ],
+ "cuCtxGetFlags": [
+  {
+   "name": "flags",
+   "type": "unsigned int *flags",
+   "kind": "out"
+  }
+ ],
+ "cuCtxGetId": [
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  },
+  {
+   "name": "ctxId",
+   "type": "unsigned long long *ctxId",
+   "kind": "out"
+  }
+ ],
+ "cuCtxGetLimit": [
+  {
+   "name": "pvalue",
+   "type": "size_t *pvalue",
+   "kind": "out"
+  },
+  {
+   "name": "limit",
+   "type": "CUlimit limit",
+   "kind": "value"
+  }
+ ],
+ "cuCtxGetSharedMemConfig": [
+  {
+   "name": "pConfig",
+   "type": "CUsharedconfig *pConfig",
+   "kind": "out"
+  }
+ ],
+ "cuCtxGetStreamPriorityRange": [
+  {
+   "name": "leastPriority",
+   "type": "int *leastPriority",
+   "kind": "out"
+  },
+  {
+   "name": "greatestPriority",
+   "type": "int *greatestPriority",
+   "kind": "out"
+  }
+ ],
+ "cuCtxPopCurrent_v2": [
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  }
+ ],
+ "cuCtxPushCurrent_v2": [
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuCtxRecordEvent": [
+  {
+   "name": "hCtx",
+   "type": "CUcontext hCtx",
+   "kind": "value"
+  },
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  }
+ ],
+ "cuCtxResetPersistingL2Cache": [],
+ "cuCtxSetCacheConfig": [
+  {
+   "name": "config",
+   "type": "CUfunc_cache config",
+   "kind": "value"
+  }
+ ],
+ "cuCtxSetCurrent": [
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuCtxSetFlags": [
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuCtxSetLimit": [
+  {
+   "name": "limit",
+   "type": "CUlimit limit",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "size_t value",
+   "kind": "value"
+  }
+ ],
+ "cuCtxSetSharedMemConfig": [
+  {
+   "name": "config",
+   "type": "CUsharedconfig config",
+   "kind": "value"
+  }
+ ],
+ "cuCtxSynchronize": [],
+ "cuCtxSynchronize_v2": [
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuCtxWaitEvent": [
+  {
+   "name": "hCtx",
+   "type": "CUcontext hCtx",
+   "kind": "value"
+  },
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  }
+ ],
+ "cuDestroyExternalMemory": [
+  {
+   "name": "extMem",
+   "type": "CUexternalMemory extMem",
+   "kind": "value"
+  }
+ ],
+ "cuDestroyExternalSemaphore": [
+  {
+   "name": "extSem",
+   "type": "CUexternalSemaphore extSem",
+   "kind": "value"
+  }
+ ],
+ "cuDevResourceGenerateDesc": [
+  {
+   "name": "phDesc",
+   "type": "CUdevResourceDesc *phDesc",
+   "kind": "out"
+  },
+  {
+   "name": "resources",
+   "type": "CUdevResource *resources",
+   "kind": "out"
+  },
+  {
+   "name": "nbResources",
+   "type": "unsigned int nbResources",
+   "kind": "value"
+  }
+ ],
+ "cuDevSmResourceSplit": [
+  {
+   "name": "result",
+   "type": "CUdevResource *result",
+   "kind": "out"
+  },
+  {
+   "name": "nbGroups",
+   "type": "unsigned int nbGroups",
+   "kind": "value"
+  },
+  {
+   "name": "input",
+   "type": "const CUdevResource *input",
+   "kind": "in"
+  },
+  {
+   "name": "remainder",
+   "type": "CUdevResource *remainder",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "groupParams",
+   "type": "CU_DEV_SM_RESOURCE_GROUP_PARAMS *groupParams",
+   "kind": "out"
+  }
+ ],
+ "cuDevSmResourceSplitByCount": [
+  {
+   "name": "result",
+   "type": "CUdevResource *result",
+   "kind": "out"
+  },
+  {
+   "name": "nbGroups",
+   "type": "unsigned int *nbGroups",
+   "kind": "out"
+  },
+  {
+   "name": "input",
+   "type": "const CUdevResource *input",
+   "kind": "in"
+  },
+  {
+   "name": "remaining",
+   "type": "CUdevResource *remaining",
+   "kind": "out"
+  },
+  {
+   "name": "useFlags",
+   "type": "unsigned int useFlags",
+   "kind": "value"
+  },
+  {
+   "name": "minCount",
+   "type": "unsigned int minCount",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceCanAccessPeer": [
+  {
+   "name": "canAccessPeer",
+   "type": "int *canAccessPeer",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  },
+  {
+   "name": "peerDev",
+   "type": "CUdevice_v1 peerDev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceComputeCapability": [
+  {
+   "name": "major",
+   "type": "int *major",
+   "kind": "out"
+  },
+  {
+   "name": "minor",
+   "type": "int *minor",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGet": [
+  {
+   "name": "device",
+   "type": "CUdevice_v1 *device",
+   "kind": "out"
+  },
+  {
+   "name": "ordinal",
+   "type": "int ordinal",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetAttribute": [
+  {
+   "name": "pi",
+   "type": "int *pi",
+   "kind": "out"
+  },
+  {
+   "name": "attrib",
+   "type": "CUdevice_attribute attrib",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetByPCIBusId": [
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 *dev",
+   "kind": "out"
+  },
+  {
+   "name": "pciBusId",
+   "type": "const char *pciBusId",
+   "kind": "string"
+  }
+ ],
+ "cuDeviceGetCliqueCount": [
+  {
+   "name": "count",
+   "type": "size_t *count",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetCliqueInfo": [
+  {
+   "name": "cliqueInfo",
+   "type": "CUcliqueInfo *cliqueInfo",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t *count",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetCount": [
+  {
+   "name": "count",
+   "type": "int *count",
+   "kind": "out"
+  }
+ ],
+ "cuDeviceGetDefaultMemPool": [
+  {
+   "name": "pool_out",
+   "type": "CUmemoryPool *pool_out",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetDevResource": [
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  },
+  {
+   "name": "result",
+   "type": "CUdevResource *result",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUdevResourceType type",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetExecAffinitySupport": [
+  {
+   "name": "pi",
+   "type": "int *pi",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUexecAffinityType type",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetFabricClusterUuid": [
+  {
+   "name": "uuid",
+   "type": "CUuuid *uuid",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetGraphMemAttribute": [
+  {
+   "name": "device",
+   "type": "CUdevice device",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUgraphMem_attribute attr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "void *value",
+   "kind": "manual"
+  }
+ ],
+ "cuDeviceGetHostAtomicCapabilities": [
+  {
+   "name": "capabilities",
+   "type": "unsigned int *capabilities",
+   "kind": "out"
+  },
+  {
+   "name": "operations",
+   "type": "const CUatomicOperation *operations",
+   "kind": "in"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetLuid": [
+  {
+   "name": "luid",
+   "type": "char *luid",
+   "kind": "manual"
+  },
+  {
+   "name": "deviceNodeMask",
+   "type": "unsigned int *deviceNodeMask",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetMemPool": [
+  {
+   "name": "pool",
+   "type": "CUmemoryPool *pool",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetName": [
+  {
+   "name": "name",
+   "type": "char *name",
+   "kind": "manual"
+  },
+  {
+   "name": "len",
+   "type": "int len",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetNvSciSyncAttributes": [
+  {
+   "name": "nvSciSyncAttrList",
+   "type": "void *nvSciSyncAttrList",
+   "kind": "manual"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "int flags",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetP2PAtomicCapabilities": [
+  {
+   "name": "capabilities",
+   "type": "unsigned int *capabilities",
+   "kind": "out"
+  },
+  {
+   "name": "operations",
+   "type": "const CUatomicOperation *operations",
+   "kind": "in"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdevice srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstDevice",
+   "type": "CUdevice dstDevice",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetP2PAttribute": [
+  {
+   "name": "value",
+   "type": "int *value",
+   "kind": "out"
+  },
+  {
+   "name": "attrib",
+   "type": "CUdevice_P2PAttribute attrib",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdevice_v1 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstDevice",
+   "type": "CUdevice_v1 dstDevice",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetPCIBusId": [
+  {
+   "name": "pciBusId",
+   "type": "char *pciBusId",
+   "kind": "manual"
+  },
+  {
+   "name": "len",
+   "type": "int len",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetProperties": [
+  {
+   "name": "prop",
+   "type": "CUdevprop_v1 *prop",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetTexture1DLinearMaxWidth": [
+  {
+   "name": "maxWidthInElements",
+   "type": "size_t *maxWidthInElements",
+   "kind": "out"
+  },
+  {
+   "name": "format",
+   "type": "CUarray_format format",
+   "kind": "value"
+  },
+  {
+   "name": "numChannels",
+   "type": "unsigned numChannels",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetUuid": [
+  {
+   "name": "uuid",
+   "type": "CUuuid *uuid",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGetUuid_v2": [
+  {
+   "name": "uuid",
+   "type": "CUuuid *uuid",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceGraphMemTrim": [
+  {
+   "name": "device",
+   "type": "CUdevice device",
+   "kind": "value"
+  }
+ ],
+ "cuDevicePrimaryCtxGetState": [
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int *flags",
+   "kind": "out"
+  },
+  {
+   "name": "active",
+   "type": "int *active",
+   "kind": "out"
+  }
+ ],
+ "cuDevicePrimaryCtxRelease_v2": [
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDevicePrimaryCtxReset_v2": [
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDevicePrimaryCtxRetain": [
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDevicePrimaryCtxSetFlags_v2": [
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceRegisterAsyncNotification": [
+  {
+   "name": "device",
+   "type": "CUdevice device",
+   "kind": "value"
+  },
+  {
+   "name": "callbackFunc",
+   "type": "CUasyncCallback callbackFunc",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  },
+  {
+   "name": "callback",
+   "type": "CUasyncCallbackHandle *callback",
+   "kind": "out"
+  }
+ ],
+ "cuDeviceSetGraphMemAttribute": [
+  {
+   "name": "device",
+   "type": "CUdevice device",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUgraphMem_attribute attr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "void *value",
+   "kind": "manual"
+  }
+ ],
+ "cuDeviceSetMemPool": [
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  },
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceTotalMem_v2": [
+  {
+   "name": "bytes",
+   "type": "size_t *bytes",
+   "kind": "out"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice_v1 dev",
+   "kind": "value"
+  }
+ ],
+ "cuDeviceUnregisterAsyncNotification": [
+  {
+   "name": "device",
+   "type": "CUdevice device",
+   "kind": "value"
+  },
+  {
+   "name": "callback",
+   "type": "CUasyncCallbackHandle callback",
+   "kind": "value"
+  }
+ ],
+ "cuDriverGetVersion": [
+  {
+   "name": "driverVersion",
+   "type": "int *driverVersion",
+   "kind": "out"
+  }
+ ],
+ "cuEventCreate": [
+  {
+   "name": "phEvent",
+   "type": "CUevent *phEvent",
+   "kind": "out"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuEventDestroy_v2": [
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  }
+ ],
+ "cuEventElapsedTime": [
+  {
+   "name": "pMilliseconds",
+   "type": "float *pMilliseconds",
+   "kind": "out"
+  },
+  {
+   "name": "hStart",
+   "type": "CUevent hStart",
+   "kind": "value"
+  },
+  {
+   "name": "hEnd",
+   "type": "CUevent hEnd",
+   "kind": "value"
+  }
+ ],
+ "cuEventElapsedTime_v2": [
+  {
+   "name": "pMilliseconds",
+   "type": "float *pMilliseconds",
+   "kind": "out"
+  },
+  {
+   "name": "hStart",
+   "type": "CUevent hStart",
+   "kind": "value"
+  },
+  {
+   "name": "hEnd",
+   "type": "CUevent hEnd",
+   "kind": "value"
+  }
+ ],
+ "cuEventQuery": [
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  }
+ ],
+ "cuEventRecord": [
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuEventRecordWithFlags": [
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuEventRecordWithFlags_ptsz": [
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuEventRecord_ptsz": [
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuEventSynchronize": [
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  }
+ ],
+ "cuExternalMemoryGetMappedBuffer": [
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 *devPtr",
+   "kind": "out"
+  },
+  {
+   "name": "extMem",
+   "type": "CUexternalMemory extMem",
+   "kind": "value"
+  },
+  {
+   "name": "bufferDesc",
+   "type": "const CUDA_EXTERNAL_MEMORY_BUFFER_DESC_v1 *bufferDesc",
+   "kind": "in"
+  }
+ ],
+ "cuExternalMemoryGetMappedMipmappedArray": [
+  {
+   "name": "mipmap",
+   "type": "CUmipmappedArray *mipmap",
+   "kind": "out"
+  },
+  {
+   "name": "extMem",
+   "type": "CUexternalMemory extMem",
+   "kind": "value"
+  },
+  {
+   "name": "mipmapDesc",
+   "type": "const CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC_v1 *mipmapDesc",
+   "kind": "in"
+  }
+ ],
+ "cuFlushGPUDirectRDMAWrites": [
+  {
+   "name": "target",
+   "type": "CUflushGPUDirectRDMAWritesTarget target",
+   "kind": "value"
+  },
+  {
+   "name": "scope",
+   "type": "CUflushGPUDirectRDMAWritesScope scope",
+   "kind": "value"
+  }
+ ],
+ "cuFuncGetAttribute": [
+  {
+   "name": "pi",
+   "type": "int *pi",
+   "kind": "out"
+  },
+  {
+   "name": "attrib",
+   "type": "CUfunction_attribute attrib",
+   "kind": "value"
+  },
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  }
+ ],
+ "cuFuncGetModule": [
+  {
+   "name": "hmod",
+   "type": "CUmodule *hmod",
+   "kind": "out"
+  },
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  }
+ ],
+ "cuFuncGetName": [
+  {
+   "name": "name",
+   "type": "const char **name",
+   "kind": "manual"
+  },
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  }
+ ],
+ "cuFuncGetParamCount": [
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "paramCount",
+   "type": "size_t *paramCount",
+   "kind": "out"
+  }
+ ],
+ "cuFuncGetParamInfo": [
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "paramIndex",
+   "type": "size_t paramIndex",
+   "kind": "value"
+  },
+  {
+   "name": "paramOffset",
+   "type": "size_t *paramOffset",
+   "kind": "out"
+  },
+  {
+   "name": "paramSize",
+   "type": "size_t *paramSize",
+   "kind": "out"
+  }
+ ],
+ "cuFuncIsLoaded": [
+  {
+   "name": "state",
+   "type": "CUfunctionLoadingState *state",
+   "kind": "out"
+  },
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  }
+ ],
+ "cuFuncLoad": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  }
+ ],
+ "cuFuncSetAttribute": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "attrib",
+   "type": "CUfunction_attribute attrib",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "int value",
+   "kind": "value"
+  }
+ ],
+ "cuFuncSetBlockShape": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "x",
+   "type": "int x",
+   "kind": "value"
+  },
+  {
+   "name": "y",
+   "type": "int y",
+   "kind": "value"
+  },
+  {
+   "name": "z",
+   "type": "int z",
+   "kind": "value"
+  }
+ ],
+ "cuFuncSetCacheConfig": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "config",
+   "type": "CUfunc_cache config",
+   "kind": "value"
+  }
+ ],
+ "cuFuncSetSharedMemConfig": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "config",
+   "type": "CUsharedconfig config",
+   "kind": "value"
+  }
+ ],
+ "cuFuncSetSharedSize": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "bytes",
+   "type": "unsigned int bytes",
+   "kind": "value"
+  }
+ ],
+ "cuGetErrorName": [
+  {
+   "name": "error",
+   "type": "CUresult error",
+   "kind": "value"
+  },
+  {
+   "name": "pStr",
+   "type": "const char **pStr",
+   "kind": "manual"
+  }
+ ],
+ "cuGetErrorString": [
+  {
+   "name": "error",
+   "type": "CUresult error",
+   "kind": "value"
+  },
+  {
+   "name": "pStr",
+   "type": "const char **pStr",
+   "kind": "manual"
+  }
+ ],
+ "cuGetExportTable": [
+  {
+   "name": "ppExportTable",
+   "type": "const void **ppExportTable",
+   "kind": "manual"
+  },
+  {
+   "name": "pExportTableId",
+   "type": "const CUuuid *pExportTableId",
+   "kind": "in"
+  }
+ ],
+ "cuGetProcAddress": [
+  {
+   "name": "symbol",
+   "type": "const char *symbol",
+   "kind": "string"
+  },
+  {
+   "name": "pfn",
+   "type": "void **pfn",
+   "kind": "manual"
+  },
+  {
+   "name": "driverVersion",
+   "type": "int driverVersion",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "cuuint64_t flags",
+   "kind": "value"
+  }
+ ],
+ "cuGetProcAddress_v2": [
+  {
+   "name": "symbol",
+   "type": "const char *symbol",
+   "kind": "string"
+  },
+  {
+   "name": "pfn",
+   "type": "void **pfn",
+   "kind": "manual"
+  },
+  {
+   "name": "driverVersion",
+   "type": "int driverVersion",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "cuuint64_t flags",
+   "kind": "value"
+  },
+  {
+   "name": "symbolFound",
+   "type": "CUdriverProcAddressQueryResult *symbolFound",
+   "kind": "out"
+  }
+ ],
+ "cuGraphAddBatchMemOpNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_BATCH_MEM_OP_NODE_PARAMS *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphAddChildGraphNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "childGraph",
+   "type": "CUgraph childGraph",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddDependencies": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "from",
+   "type": "const CUgraphNode *from",
+   "kind": "in"
+  },
+  {
+   "name": "to",
+   "type": "const CUgraphNode *to",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddDependencies_v2": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "from",
+   "type": "const CUgraphNode *from",
+   "kind": "in"
+  },
+  {
+   "name": "to",
+   "type": "const CUgraphNode *to",
+   "kind": "in"
+  },
+  {
+   "name": "edgeData",
+   "type": "const CUgraphEdgeData *edgeData",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddEmptyNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddEventRecordNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "event",
+   "type": "CUevent event",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddEventWaitNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "event",
+   "type": "CUevent event",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddExternalSemaphoresSignalNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_EXT_SEM_SIGNAL_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphAddExternalSemaphoresWaitNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_EXT_SEM_WAIT_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphAddHostNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_HOST_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphAddKernelNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_KERNEL_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphAddKernelNode_v2": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_KERNEL_NODE_PARAMS_v2 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphAddMemAllocNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUDA_MEM_ALLOC_NODE_PARAMS *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphAddMemFreeNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr dptr",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddMemcpyNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "copyParams",
+   "type": "const CUDA_MEMCPY3D_v2 *copyParams",
+   "kind": "in"
+  },
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddMemsetNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "memsetParams",
+   "type": "const CUDA_MEMSET_NODE_PARAMS_v1 *memsetParams",
+   "kind": "in"
+  },
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuGraphAddNode": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUgraphNodeParams *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphAddNode_v2": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "dependencyData",
+   "type": "const CUgraphEdgeData *dependencyData",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUgraphNodeParams *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphAddNode_v3": [
+  {
+   "name": "phGraphNode",
+   "type": "CUgraphNode *phGraphNode",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "dependencyData",
+   "type": "const CUgraphEdgeData *dependencyData",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUgraphNodeParams *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphBatchMemOpNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams_out",
+   "type": "CUDA_BATCH_MEM_OP_NODE_PARAMS *nodeParams_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphBatchMemOpNodeSetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_BATCH_MEM_OP_NODE_PARAMS *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphChildGraphNodeGetGraph": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "phGraph",
+   "type": "CUgraph *phGraph",
+   "kind": "out"
+  }
+ ],
+ "cuGraphClone": [
+  {
+   "name": "phGraphClone",
+   "type": "CUgraph *phGraphClone",
+   "kind": "out"
+  },
+  {
+   "name": "originalGraph",
+   "type": "CUgraph originalGraph",
+   "kind": "value"
+  }
+ ],
+ "cuGraphConditionalHandleCreate": [
+  {
+   "name": "pHandle_out",
+   "type": "CUgraphConditionalHandle *pHandle_out",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  },
+  {
+   "name": "defaultLaunchValue",
+   "type": "unsigned int defaultLaunchValue",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuGraphCreate": [
+  {
+   "name": "phGraph",
+   "type": "CUgraph *phGraph",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuGraphDebugDotPrint": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "path",
+   "type": "const char *path",
+   "kind": "string"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuGraphDestroy": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  }
+ ],
+ "cuGraphDestroyNode": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  }
+ ],
+ "cuGraphEventRecordNodeGetEvent": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "event_out",
+   "type": "CUevent *event_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphEventRecordNodeSetEvent": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "event",
+   "type": "CUevent event",
+   "kind": "value"
+  }
+ ],
+ "cuGraphEventWaitNodeGetEvent": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "event_out",
+   "type": "CUevent *event_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphEventWaitNodeSetEvent": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "event",
+   "type": "CUevent event",
+   "kind": "value"
+  }
+ ],
+ "cuGraphExecBatchMemOpNodeSetParams": [
+  {
+   "name": "graphExec",
+   "type": "CUgraphExec graphExec",
+   "kind": "value"
+  },
+  {
+   "name": "node",
+   "type": "CUgraphNode node",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_BATCH_MEM_OP_NODE_PARAMS *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphExecChildGraphNodeSetParams": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "childGraph",
+   "type": "CUgraph childGraph",
+   "kind": "value"
+  }
+ ],
+ "cuGraphExecDestroy": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  }
+ ],
+ "cuGraphExecEventRecordNodeSetEvent": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "event",
+   "type": "CUevent event",
+   "kind": "value"
+  }
+ ],
+ "cuGraphExecEventWaitNodeSetEvent": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "event",
+   "type": "CUevent event",
+   "kind": "value"
+  }
+ ],
+ "cuGraphExecExternalSemaphoresSignalNodeSetParams": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_EXT_SEM_SIGNAL_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphExecExternalSemaphoresWaitNodeSetParams": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_EXT_SEM_WAIT_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphExecGetFlags": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "cuuint64_t *flags",
+   "kind": "out"
+  }
+ ],
+ "cuGraphExecGetId": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "graphId",
+   "type": "unsigned int *graphId",
+   "kind": "out"
+  }
+ ],
+ "cuGraphExecHostNodeSetParams": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_HOST_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphExecKernelNodeSetParams": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_KERNEL_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphExecKernelNodeSetParams_v2": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_KERNEL_NODE_PARAMS_v2 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphExecMemcpyNodeSetParams": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "copyParams",
+   "type": "const CUDA_MEMCPY3D_v2 *copyParams",
+   "kind": "in"
+  },
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuGraphExecMemsetNodeSetParams": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "memsetParams",
+   "type": "const CUDA_MEMSET_NODE_PARAMS_v1 *memsetParams",
+   "kind": "in"
+  },
+  {
+   "name": "ctx",
+   "type": "CUcontext ctx",
+   "kind": "value"
+  }
+ ],
+ "cuGraphExecNodeSetParams": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUgraphNodeParams *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphExecUpdate": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "hErrorNode_out",
+   "type": "CUgraphNode *hErrorNode_out",
+   "kind": "out"
+  },
+  {
+   "name": "updateResult_out",
+   "type": "CUgraphExecUpdateResult *updateResult_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphExecUpdate_v2": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "resultInfo",
+   "type": "CUgraphExecUpdateResultInfo *resultInfo",
+   "kind": "out"
+  }
+ ],
+ "cuGraphExternalSemaphoresSignalNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "params_out",
+   "type": "CUDA_EXT_SEM_SIGNAL_NODE_PARAMS_v1 *params_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphExternalSemaphoresSignalNodeSetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_EXT_SEM_SIGNAL_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphExternalSemaphoresWaitNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "params_out",
+   "type": "CUDA_EXT_SEM_WAIT_NODE_PARAMS_v1 *params_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphExternalSemaphoresWaitNodeSetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_EXT_SEM_WAIT_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphGetEdges": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "from",
+   "type": "CUgraphNode *from",
+   "kind": "out"
+  },
+  {
+   "name": "to",
+   "type": "CUgraphNode *to",
+   "kind": "out"
+  },
+  {
+   "name": "numEdges",
+   "type": "size_t *numEdges",
+   "kind": "out"
+  }
+ ],
+ "cuGraphGetEdges_v2": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "from",
+   "type": "CUgraphNode *from",
+   "kind": "out"
+  },
+  {
+   "name": "to",
+   "type": "CUgraphNode *to",
+   "kind": "out"
+  },
+  {
+   "name": "edgeData",
+   "type": "CUgraphEdgeData *edgeData",
+   "kind": "out"
+  },
+  {
+   "name": "numEdges",
+   "type": "size_t *numEdges",
+   "kind": "out"
+  }
+ ],
+ "cuGraphGetId": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "graphId",
+   "type": "unsigned int *graphId",
+   "kind": "out"
+  }
+ ],
+ "cuGraphGetNodes": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "nodes",
+   "type": "CUgraphNode *nodes",
+   "kind": "out"
+  },
+  {
+   "name": "numNodes",
+   "type": "size_t *numNodes",
+   "kind": "out"
+  }
+ ],
+ "cuGraphGetRootNodes": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "rootNodes",
+   "type": "CUgraphNode *rootNodes",
+   "kind": "out"
+  },
+  {
+   "name": "numRootNodes",
+   "type": "size_t *numRootNodes",
+   "kind": "out"
+  }
+ ],
+ "cuGraphHostNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUDA_HOST_NODE_PARAMS_v1 *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphHostNodeSetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_HOST_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphInstantiateWithFlags": [
+  {
+   "name": "phGraphExec",
+   "type": "CUgraphExec *phGraphExec",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuGraphInstantiateWithParams": [
+  {
+   "name": "phGraphExec",
+   "type": "CUgraphExec *phGraphExec",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "instantiateParams",
+   "type": "CUDA_GRAPH_INSTANTIATE_PARAMS *instantiateParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphInstantiateWithParams_ptsz": [
+  {
+   "name": "phGraphExec",
+   "type": "CUgraphExec *phGraphExec",
+   "kind": "out"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "instantiateParams",
+   "type": "CUDA_GRAPH_INSTANTIATE_PARAMS *instantiateParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphKernelNodeCopyAttributes": [
+  {
+   "name": "dst",
+   "type": "CUgraphNode dst",
+   "kind": "value"
+  },
+  {
+   "name": "src",
+   "type": "CUgraphNode src",
+   "kind": "value"
+  }
+ ],
+ "cuGraphKernelNodeGetAttribute": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUkernelNodeAttrID attr",
+   "kind": "value"
+  },
+  {
+   "name": "value_out",
+   "type": "CUkernelNodeAttrValue_v1 *value_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphKernelNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUDA_KERNEL_NODE_PARAMS_v1 *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphKernelNodeGetParams_v2": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUDA_KERNEL_NODE_PARAMS_v2 *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphKernelNodeSetAttribute": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUkernelNodeAttrID attr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "const CUkernelNodeAttrValue_v1 *value",
+   "kind": "in"
+  }
+ ],
+ "cuGraphKernelNodeSetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_KERNEL_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphKernelNodeSetParams_v2": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_KERNEL_NODE_PARAMS_v2 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphLaunch": [
+  {
+   "name": "hGraph",
+   "type": "CUgraphExec hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuGraphLaunch_ptsz": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuGraphMemAllocNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "params_out",
+   "type": "CUDA_MEM_ALLOC_NODE_PARAMS *params_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphMemFreeNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "dptr_out",
+   "type": "CUdeviceptr *dptr_out",
+   "kind": "out"
+  }
+ ],
+ "cuGraphMemcpyNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUDA_MEMCPY3D_v2 *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphMemcpyNodeSetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_MEMCPY3D_v2 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphMemsetNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUDA_MEMSET_NODE_PARAMS_v1 *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphMemsetNodeSetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "const CUDA_MEMSET_NODE_PARAMS_v1 *nodeParams",
+   "kind": "in"
+  }
+ ],
+ "cuGraphNodeFindInClone": [
+  {
+   "name": "phNode",
+   "type": "CUgraphNode *phNode",
+   "kind": "out"
+  },
+  {
+   "name": "hOriginalNode",
+   "type": "CUgraphNode hOriginalNode",
+   "kind": "value"
+  },
+  {
+   "name": "hClonedGraph",
+   "type": "CUgraph hClonedGraph",
+   "kind": "value"
+  }
+ ],
+ "cuGraphNodeGetContainingGraph": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "phGraph",
+   "type": "CUgraph *phGraph",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetDependencies": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "CUgraphNode *dependencies",
+   "kind": "out"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t *numDependencies",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetDependencies_v2": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "CUgraphNode *dependencies",
+   "kind": "out"
+  },
+  {
+   "name": "edgeData",
+   "type": "CUgraphEdgeData *edgeData",
+   "kind": "out"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t *numDependencies",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetDependentNodes": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "dependentNodes",
+   "type": "CUgraphNode *dependentNodes",
+   "kind": "out"
+  },
+  {
+   "name": "numDependentNodes",
+   "type": "size_t *numDependentNodes",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetDependentNodes_v2": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "dependentNodes",
+   "type": "CUgraphNode *dependentNodes",
+   "kind": "out"
+  },
+  {
+   "name": "edgeData",
+   "type": "CUgraphEdgeData *edgeData",
+   "kind": "out"
+  },
+  {
+   "name": "numDependentNodes",
+   "type": "size_t *numDependentNodes",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetEnabled": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "isEnabled",
+   "type": "unsigned int *isEnabled",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetLocalId": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeId",
+   "type": "unsigned int *nodeId",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUgraphNodeParams *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetToolsId": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeId",
+   "type": "unsigned long long *nodeId",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeGetType": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "type",
+   "type": "CUgraphNodeType *type",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeSetEnabled": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "isEnabled",
+   "type": "unsigned int isEnabled",
+   "kind": "value"
+  }
+ ],
+ "cuGraphNodeSetParams": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUgraphNodeParams *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphNodeSetParams_v2": [
+  {
+   "name": "hNode",
+   "type": "CUgraphNode hNode",
+   "kind": "value"
+  },
+  {
+   "name": "nodeParams",
+   "type": "CUgraphNodeParams *nodeParams",
+   "kind": "out"
+  }
+ ],
+ "cuGraphReleaseUserObject": [
+  {
+   "name": "graph",
+   "type": "CUgraph graph",
+   "kind": "value"
+  },
+  {
+   "name": "object",
+   "type": "CUuserObject object",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  }
+ ],
+ "cuGraphRemoveDependencies": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "from",
+   "type": "const CUgraphNode *from",
+   "kind": "in"
+  },
+  {
+   "name": "to",
+   "type": "const CUgraphNode *to",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  }
+ ],
+ "cuGraphRemoveDependencies_v2": [
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "from",
+   "type": "const CUgraphNode *from",
+   "kind": "in"
+  },
+  {
+   "name": "to",
+   "type": "const CUgraphNode *to",
+   "kind": "in"
+  },
+  {
+   "name": "edgeData",
+   "type": "const CUgraphEdgeData *edgeData",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  }
+ ],
+ "cuGraphRetainUserObject": [
+  {
+   "name": "graph",
+   "type": "CUgraph graph",
+   "kind": "value"
+  },
+  {
+   "name": "object",
+   "type": "CUuserObject object",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuGraphUpload": [
+  {
+   "name": "hGraph",
+   "type": "CUgraphExec hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuGraphUpload_ptsz": [
+  {
+   "name": "hGraphExec",
+   "type": "CUgraphExec hGraphExec",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsMapResources": [
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "resources",
+   "type": "CUgraphicsResource *resources",
+   "kind": "out"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsMapResources_ptsz": [
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "resources",
+   "type": "CUgraphicsResource *resources",
+   "kind": "out"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsResourceGetMappedMipmappedArray": [
+  {
+   "name": "pMipmappedArray",
+   "type": "CUmipmappedArray *pMipmappedArray",
+   "kind": "out"
+  },
+  {
+   "name": "resource",
+   "type": "CUgraphicsResource resource",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsResourceGetMappedPointer_v2": [
+  {
+   "name": "pDevPtr",
+   "type": "CUdeviceptr_v2 *pDevPtr",
+   "kind": "out"
+  },
+  {
+   "name": "pSize",
+   "type": "size_t *pSize",
+   "kind": "out"
+  },
+  {
+   "name": "resource",
+   "type": "CUgraphicsResource resource",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsResourceSetMapFlags_v2": [
+  {
+   "name": "resource",
+   "type": "CUgraphicsResource resource",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsSubResourceGetMappedArray": [
+  {
+   "name": "pArray",
+   "type": "CUarray *pArray",
+   "kind": "out"
+  },
+  {
+   "name": "resource",
+   "type": "CUgraphicsResource resource",
+   "kind": "value"
+  },
+  {
+   "name": "arrayIndex",
+   "type": "unsigned int arrayIndex",
+   "kind": "value"
+  },
+  {
+   "name": "mipLevel",
+   "type": "unsigned int mipLevel",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsUnmapResources": [
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "resources",
+   "type": "CUgraphicsResource *resources",
+   "kind": "out"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsUnmapResources_ptsz": [
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "resources",
+   "type": "CUgraphicsResource *resources",
+   "kind": "out"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuGraphicsUnregisterResource": [
+  {
+   "name": "resource",
+   "type": "CUgraphicsResource resource",
+   "kind": "value"
+  }
+ ],
+ "cuGreenCtxCreate": [
+  {
+   "name": "phCtx",
+   "type": "CUgreenCtx *phCtx",
+   "kind": "out"
+  },
+  {
+   "name": "desc",
+   "type": "CUdevResourceDesc desc",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuGreenCtxDestroy": [
+  {
+   "name": "hCtx",
+   "type": "CUgreenCtx hCtx",
+   "kind": "value"
+  }
+ ],
+ "cuGreenCtxGetDevResource": [
+  {
+   "name": "hCtx",
+   "type": "CUgreenCtx hCtx",
+   "kind": "value"
+  },
+  {
+   "name": "result",
+   "type": "CUdevResource *result",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUdevResourceType type",
+   "kind": "value"
+  }
+ ],
+ "cuGreenCtxGetId": [
+  {
+   "name": "greenCtx",
+   "type": "CUgreenCtx greenCtx",
+   "kind": "value"
+  },
+  {
+   "name": "greenCtxId",
+   "type": "unsigned long long *greenCtxId",
+   "kind": "out"
+  }
+ ],
+ "cuGreenCtxRecordEvent": [
+  {
+   "name": "hCtx",
+   "type": "CUgreenCtx hCtx",
+   "kind": "value"
+  },
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  }
+ ],
+ "cuGreenCtxStreamCreate": [
+  {
+   "name": "phStream",
+   "type": "CUstream *phStream",
+   "kind": "out"
+  },
+  {
+   "name": "greenCtx",
+   "type": "CUgreenCtx greenCtx",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "priority",
+   "type": "int priority",
+   "kind": "value"
+  }
+ ],
+ "cuGreenCtxWaitEvent": [
+  {
+   "name": "hCtx",
+   "type": "CUgreenCtx hCtx",
+   "kind": "value"
+  },
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  }
+ ],
+ "cuImportExternalMemory": [
+  {
+   "name": "extMem_out",
+   "type": "CUexternalMemory *extMem_out",
+   "kind": "out"
+  },
+  {
+   "name": "memHandleDesc",
+   "type": "const CUDA_EXTERNAL_MEMORY_HANDLE_DESC_v1 *memHandleDesc",
+   "kind": "in"
+  }
+ ],
+ "cuImportExternalSemaphore": [
+  {
+   "name": "extSem_out",
+   "type": "CUexternalSemaphore *extSem_out",
+   "kind": "out"
+  },
+  {
+   "name": "semHandleDesc",
+   "type": "const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC_v1 *semHandleDesc",
+   "kind": "in"
+  }
+ ],
+ "cuInit": [
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuIpcCloseMemHandle": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  }
+ ],
+ "cuIpcGetEventHandle": [
+  {
+   "name": "pHandle",
+   "type": "CUipcEventHandle_v1 *pHandle",
+   "kind": "out"
+  },
+  {
+   "name": "event",
+   "type": "CUevent event",
+   "kind": "value"
+  }
+ ],
+ "cuIpcGetMemHandle": [
+  {
+   "name": "pHandle",
+   "type": "CUipcMemHandle_v1 *pHandle",
+   "kind": "out"
+  },
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  }
+ ],
+ "cuIpcOpenEventHandle": [
+  {
+   "name": "phEvent",
+   "type": "CUevent *phEvent",
+   "kind": "out"
+  },
+  {
+   "name": "handle",
+   "type": "CUipcEventHandle_v1 handle",
+   "kind": "value"
+  }
+ ],
+ "cuIpcOpenMemHandle_v2": [
+  {
+   "name": "pdptr",
+   "type": "CUdeviceptr_v2 *pdptr",
+   "kind": "out"
+  },
+  {
+   "name": "handle",
+   "type": "CUipcMemHandle_v1 handle",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuKernelGetAttribute": [
+  {
+   "name": "pi",
+   "type": "int *pi",
+   "kind": "out"
+  },
+  {
+   "name": "attrib",
+   "type": "CUfunction_attribute attrib",
+   "kind": "value"
+  },
+  {
+   "name": "kernel",
+   "type": "CUkernel kernel",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuKernelGetFunction": [
+  {
+   "name": "pFunc",
+   "type": "CUfunction *pFunc",
+   "kind": "out"
+  },
+  {
+   "name": "kernel",
+   "type": "CUkernel kernel",
+   "kind": "value"
+  }
+ ],
+ "cuKernelGetLibrary": [
+  {
+   "name": "pLib",
+   "type": "CUlibrary *pLib",
+   "kind": "out"
+  },
+  {
+   "name": "kernel",
+   "type": "CUkernel kernel",
+   "kind": "value"
+  }
+ ],
+ "cuKernelGetName": [
+  {
+   "name": "name",
+   "type": "const char **name",
+   "kind": "manual"
+  },
+  {
+   "name": "hfunc",
+   "type": "CUkernel hfunc",
+   "kind": "value"
+  }
+ ],
+ "cuKernelGetParamCount": [
+  {
+   "name": "kernel",
+   "type": "CUkernel kernel",
+   "kind": "value"
+  },
+  {
+   "name": "paramCount",
+   "type": "size_t *paramCount",
+   "kind": "out"
+  }
+ ],
+ "cuKernelGetParamInfo": [
+  {
+   "name": "kernel",
+   "type": "CUkernel kernel",
+   "kind": "value"
+  },
+  {
+   "name": "paramIndex",
+   "type": "size_t paramIndex",
+   "kind": "value"
+  },
+  {
+   "name": "paramOffset",
+   "type": "size_t *paramOffset",
+   "kind": "out"
+  },
+  {
+   "name": "paramSize",
+   "type": "size_t *paramSize",
+   "kind": "out"
+  }
+ ],
+ "cuKernelSetAttribute": [
+  {
+   "name": "attrib",
+   "type": "CUfunction_attribute attrib",
+   "kind": "value"
+  },
+  {
+   "name": "val",
+   "type": "int val",
+   "kind": "value"
+  },
+  {
+   "name": "kernel",
+   "type": "CUkernel kernel",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuKernelSetCacheConfig": [
+  {
+   "name": "kernel",
+   "type": "CUkernel kernel",
+   "kind": "value"
+  },
+  {
+   "name": "config",
+   "type": "CUfunc_cache config",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuLaunch": [
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  }
+ ],
+ "cuLaunchCooperativeKernel": [
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimX",
+   "type": "unsigned int gridDimX",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimY",
+   "type": "unsigned int gridDimY",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimZ",
+   "type": "unsigned int gridDimZ",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimX",
+   "type": "unsigned int blockDimX",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimY",
+   "type": "unsigned int blockDimY",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimZ",
+   "type": "unsigned int blockDimZ",
+   "kind": "value"
+  },
+  {
+   "name": "sharedMemBytes",
+   "type": "unsigned int sharedMemBytes",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "kernelParams",
+   "type": "void **kernelParams",
+   "kind": "manual"
+  }
+ ],
+ "cuLaunchCooperativeKernelMultiDevice": [
+  {
+   "name": "launchParamsList",
+   "type": "CUDA_LAUNCH_PARAMS_v1 *launchParamsList",
+   "kind": "out"
+  },
+  {
+   "name": "numDevices",
+   "type": "unsigned int numDevices",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuLaunchCooperativeKernel_ptsz": [
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimX",
+   "type": "unsigned int gridDimX",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimY",
+   "type": "unsigned int gridDimY",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimZ",
+   "type": "unsigned int gridDimZ",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimX",
+   "type": "unsigned int blockDimX",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimY",
+   "type": "unsigned int blockDimY",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimZ",
+   "type": "unsigned int blockDimZ",
+   "kind": "value"
+  },
+  {
+   "name": "sharedMemBytes",
+   "type": "unsigned int sharedMemBytes",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "kernelParams",
+   "type": "void **kernelParams",
+   "kind": "manual"
+  }
+ ],
+ "cuLaunchGrid": [
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  },
+  {
+   "name": "grid_width",
+   "type": "int grid_width",
+   "kind": "value"
+  },
+  {
+   "name": "grid_height",
+   "type": "int grid_height",
+   "kind": "value"
+  }
+ ],
+ "cuLaunchGridAsync": [
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  },
+  {
+   "name": "grid_width",
+   "type": "int grid_width",
+   "kind": "value"
+  },
+  {
+   "name": "grid_height",
+   "type": "int grid_height",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuLaunchHostFunc": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "fn",
+   "type": "CUhostFn fn",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  }
+ ],
+ "cuLaunchHostFunc_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "fn",
+   "type": "CUhostFn fn",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  }
+ ],
+ "cuLaunchHostFunc_v2": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "fn",
+   "type": "CUhostFn fn",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  },
+  {
+   "name": "syncMode",
+   "type": "unsigned int syncMode",
+   "kind": "value"
+  }
+ ],
+ "cuLaunchHostFunc_v2_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "fn",
+   "type": "CUhostFn fn",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  },
+  {
+   "name": "syncMode",
+   "type": "unsigned int syncMode",
+   "kind": "value"
+  }
+ ],
+ "cuLaunchKernel": [
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimX",
+   "type": "unsigned int gridDimX",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimY",
+   "type": "unsigned int gridDimY",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimZ",
+   "type": "unsigned int gridDimZ",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimX",
+   "type": "unsigned int blockDimX",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimY",
+   "type": "unsigned int blockDimY",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimZ",
+   "type": "unsigned int blockDimZ",
+   "kind": "value"
+  },
+  {
+   "name": "sharedMemBytes",
+   "type": "unsigned int sharedMemBytes",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "kernelParams",
+   "type": "void **kernelParams",
+   "kind": "manual"
+  },
+  {
+   "name": "extra",
+   "type": "void **extra",
+   "kind": "manual"
+  }
+ ],
+ "cuLaunchKernelEx": [
+  {
+   "name": "config",
+   "type": "const CUlaunchConfig *config",
+   "kind": "in"
+  },
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  },
+  {
+   "name": "kernelParams",
+   "type": "void **kernelParams",
+   "kind": "manual"
+  },
+  {
+   "name": "extra",
+   "type": "void **extra",
+   "kind": "manual"
+  }
+ ],
+ "cuLaunchKernelEx_ptsz": [
+  {
+   "name": "config",
+   "type": "const CUlaunchConfig *config",
+   "kind": "in"
+  },
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  },
+  {
+   "name": "kernelParams",
+   "type": "void **kernelParams",
+   "kind": "manual"
+  },
+  {
+   "name": "extra",
+   "type": "void **extra",
+   "kind": "manual"
+  }
+ ],
+ "cuLaunchKernel_ptsz": [
+  {
+   "name": "f",
+   "type": "CUfunction f",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimX",
+   "type": "unsigned int gridDimX",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimY",
+   "type": "unsigned int gridDimY",
+   "kind": "value"
+  },
+  {
+   "name": "gridDimZ",
+   "type": "unsigned int gridDimZ",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimX",
+   "type": "unsigned int blockDimX",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimY",
+   "type": "unsigned int blockDimY",
+   "kind": "value"
+  },
+  {
+   "name": "blockDimZ",
+   "type": "unsigned int blockDimZ",
+   "kind": "value"
+  },
+  {
+   "name": "sharedMemBytes",
+   "type": "unsigned int sharedMemBytes",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "kernelParams",
+   "type": "void **kernelParams",
+   "kind": "manual"
+  },
+  {
+   "name": "extra",
+   "type": "void **extra",
+   "kind": "manual"
+  }
+ ],
+ "cuLibraryEnumerateKernels": [
+  {
+   "name": "kernels",
+   "type": "CUkernel *kernels",
+   "kind": "out"
+  },
+  {
+   "name": "numKernels",
+   "type": "unsigned int numKernels",
+   "kind": "value"
+  },
+  {
+   "name": "lib",
+   "type": "CUlibrary lib",
+   "kind": "value"
+  }
+ ],
+ "cuLibraryGetGlobal": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytes",
+   "type": "size_t *bytes",
+   "kind": "out"
+  },
+  {
+   "name": "library",
+   "type": "CUlibrary library",
+   "kind": "value"
+  },
+  {
+   "name": "name",
+   "type": "const char *name",
+   "kind": "string"
+  }
+ ],
+ "cuLibraryGetKernel": [
+  {
+   "name": "pKernel",
+   "type": "CUkernel *pKernel",
+   "kind": "out"
+  },
+  {
+   "name": "library",
+   "type": "CUlibrary library",
+   "kind": "value"
+  },
+  {
+   "name": "name",
+   "type": "const char *name",
+   "kind": "string"
+  }
+ ],
+ "cuLibraryGetKernelCount": [
+  {
+   "name": "count",
+   "type": "unsigned int *count",
+   "kind": "out"
+  },
+  {
+   "name": "lib",
+   "type": "CUlibrary lib",
+   "kind": "value"
+  }
+ ],
+ "cuLibraryGetManaged": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytes",
+   "type": "size_t *bytes",
+   "kind": "out"
+  },
+  {
+   "name": "library",
+   "type": "CUlibrary library",
+   "kind": "value"
+  },
+  {
+   "name": "name",
+   "type": "const char *name",
+   "kind": "string"
+  }
+ ],
+ "cuLibraryGetModule": [
+  {
+   "name": "pMod",
+   "type": "CUmodule *pMod",
+   "kind": "out"
+  },
+  {
+   "name": "library",
+   "type": "CUlibrary library",
+   "kind": "value"
+  }
+ ],
+ "cuLibraryGetUnifiedFunction": [
+  {
+   "name": "fptr",
+   "type": "void **fptr",
+   "kind": "manual"
+  },
+  {
+   "name": "library",
+   "type": "CUlibrary library",
+   "kind": "value"
+  },
+  {
+   "name": "symbol",
+   "type": "const char *symbol",
+   "kind": "string"
+  }
+ ],
+ "cuLibraryLoadData": [
+  {
+   "name": "library",
+   "type": "CUlibrary *library",
+   "kind": "out"
+  },
+  {
+   "name": "code",
+   "type": "const void *code",
+   "kind": "manual"
+  },
+  {
+   "name": "jitOptions",
+   "type": "CUjit_option *jitOptions",
+   "kind": "out"
+  },
+  {
+   "name": "jitOptionsValues",
+   "type": "void **jitOptionsValues",
+   "kind": "manual"
+  },
+  {
+   "name": "numJitOptions",
+   "type": "unsigned int numJitOptions",
+   "kind": "value"
+  },
+  {
+   "name": "libraryOptions",
+   "type": "CUlibraryOption *libraryOptions",
+   "kind": "out"
+  },
+  {
+   "name": "libraryOptionValues",
+   "type": "void **libraryOptionValues",
+   "kind": "manual"
+  },
+  {
+   "name": "numLibraryOptions",
+   "type": "unsigned int numLibraryOptions",
+   "kind": "value"
+  }
+ ],
+ "cuLibraryLoadFromFile": [
+  {
+   "name": "library",
+   "type": "CUlibrary *library",
+   "kind": "out"
+  },
+  {
+   "name": "fileName",
+   "type": "const char *fileName",
+   "kind": "string"
+  },
+  {
+   "name": "jitOptions",
+   "type": "CUjit_option *jitOptions",
+   "kind": "out"
+  },
+  {
+   "name": "jitOptionsValues",
+   "type": "void **jitOptionsValues",
+   "kind": "manual"
+  },
+  {
+   "name": "numJitOptions",
+   "type": "unsigned int numJitOptions",
+   "kind": "value"
+  },
+  {
+   "name": "libraryOptions",
+   "type": "CUlibraryOption *libraryOptions",
+   "kind": "out"
+  },
+  {
+   "name": "libraryOptionValues",
+   "type": "void **libraryOptionValues",
+   "kind": "manual"
+  },
+  {
+   "name": "numLibraryOptions",
+   "type": "unsigned int numLibraryOptions",
+   "kind": "value"
+  }
+ ],
+ "cuLibraryUnload": [
+  {
+   "name": "library",
+   "type": "CUlibrary library",
+   "kind": "value"
+  }
+ ],
+ "cuLinkAddData_v2": [
+  {
+   "name": "state",
+   "type": "CUlinkState state",
+   "kind": "value"
+  },
+  {
+   "name": "type",
+   "type": "CUjitInputType type",
+   "kind": "value"
+  },
+  {
+   "name": "data",
+   "type": "void *data",
+   "kind": "manual"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "name",
+   "type": "const char *name",
+   "kind": "string"
+  },
+  {
+   "name": "numOptions",
+   "type": "unsigned int numOptions",
+   "kind": "value"
+  },
+  {
+   "name": "options",
+   "type": "CUjit_option *options",
+   "kind": "out"
+  },
+  {
+   "name": "optionValues",
+   "type": "void **optionValues",
+   "kind": "manual"
+  }
+ ],
+ "cuLinkAddFile_v2": [
+  {
+   "name": "state",
+   "type": "CUlinkState state",
+   "kind": "value"
+  },
+  {
+   "name": "type",
+   "type": "CUjitInputType type",
+   "kind": "value"
+  },
+  {
+   "name": "path",
+   "type": "const char *path",
+   "kind": "string"
+  },
+  {
+   "name": "numOptions",
+   "type": "unsigned int numOptions",
+   "kind": "value"
+  },
+  {
+   "name": "options",
+   "type": "CUjit_option *options",
+   "kind": "out"
+  },
+  {
+   "name": "optionValues",
+   "type": "void **optionValues",
+   "kind": "manual"
+  }
+ ],
+ "cuLinkComplete": [
+  {
+   "name": "state",
+   "type": "CUlinkState state",
+   "kind": "value"
+  },
+  {
+   "name": "cubinOut",
+   "type": "void **cubinOut",
+   "kind": "manual"
+  },
+  {
+   "name": "sizeOut",
+   "type": "size_t *sizeOut",
+   "kind": "out"
+  }
+ ],
+ "cuLinkCreate_v2": [
+  {
+   "name": "numOptions",
+   "type": "unsigned int numOptions",
+   "kind": "value"
+  },
+  {
+   "name": "options",
+   "type": "CUjit_option *options",
+   "kind": "out"
+  },
+  {
+   "name": "optionValues",
+   "type": "void **optionValues",
+   "kind": "manual"
+  },
+  {
+   "name": "stateOut",
+   "type": "CUlinkState *stateOut",
+   "kind": "out"
+  }
+ ],
+ "cuLinkDestroy": [
+  {
+   "name": "state",
+   "type": "CUlinkState state",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointAddDevice": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointBindAddr": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  },
+  {
+   "name": "offset",
+   "type": "cuuint64_t offset",
+   "kind": "value"
+  },
+  {
+   "name": "ptr",
+   "type": "void *ptr",
+   "kind": "manual"
+  },
+  {
+   "name": "size",
+   "type": "cuuint64_t size",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointBindMem": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  },
+  {
+   "name": "offset",
+   "type": "cuuint64_t offset",
+   "kind": "value"
+  },
+  {
+   "name": "memHandle",
+   "type": "CUmemGenericAllocationHandle memHandle",
+   "kind": "value"
+  },
+  {
+   "name": "memOffset",
+   "type": "cuuint64_t memOffset",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "cuuint64_t size",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointCreate": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "prop",
+   "type": "const CUlogicalEndpointProp *prop",
+   "kind": "in"
+  }
+ ],
+ "cuLogicalEndpointDestroy": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointExport": [
+  {
+   "name": "handle",
+   "type": "void *handle",
+   "kind": "manual"
+  },
+  {
+   "name": "leId",
+   "type": "const CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "handleType",
+   "type": "CUlogicalEndpointIpcHandleType handleType",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointGetLimits": [
+  {
+   "name": "bindAlignment",
+   "type": "cuuint64_t *bindAlignment",
+   "kind": "out"
+  },
+  {
+   "name": "maxSize",
+   "type": "cuuint64_t *maxSize",
+   "kind": "out"
+  },
+  {
+   "name": "prop",
+   "type": "const CUlogicalEndpointProp *prop",
+   "kind": "in"
+  }
+ ],
+ "cuLogicalEndpointIdRelease": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "cuuint32_t count",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointIdReserve": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId *leId",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "cuuint32_t count",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointImport": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "handle",
+   "type": "const void *handle",
+   "kind": "manual"
+  },
+  {
+   "name": "handleType",
+   "type": "CUlogicalEndpointIpcHandleType handleType",
+   "kind": "value"
+  }
+ ],
+ "cuLogicalEndpointQuery": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "cuuint32_t count",
+   "kind": "value"
+  },
+  {
+   "name": "queryStatus",
+   "type": "int *queryStatus",
+   "kind": "out"
+  }
+ ],
+ "cuLogicalEndpointUnbind": [
+  {
+   "name": "leId",
+   "type": "CUlogicalEndpointId leId",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  },
+  {
+   "name": "offset",
+   "type": "cuuint64_t offset",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "cuuint64_t size",
+   "kind": "value"
+  }
+ ],
+ "cuLogsCurrent": [
+  {
+   "name": "iterator",
+   "type": "CUlogIterator *iterator",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuLogsDumpToFile": [
+  {
+   "name": "iterator",
+   "type": "CUlogIterator *iterator",
+   "kind": "out"
+  },
+  {
+   "name": "pathToFile",
+   "type": "const char *pathToFile",
+   "kind": "string"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuLogsDumpToMemory": [
+  {
+   "name": "iterator",
+   "type": "CUlogIterator *iterator",
+   "kind": "out"
+  },
+  {
+   "name": "buffer",
+   "type": "char *buffer",
+   "kind": "manual"
+  },
+  {
+   "name": "size",
+   "type": "size_t *size",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuLogsRegisterCallback": [
+  {
+   "name": "callbackFunc",
+   "type": "CUlogsCallback callbackFunc",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  },
+  {
+   "name": "callback",
+   "type": "CUlogsCallbackHandle *callback",
+   "kind": "out"
+  }
+ ],
+ "cuLogsUnregisterCallback": [
+  {
+   "name": "callback",
+   "type": "CUlogsCallbackHandle callback",
+   "kind": "value"
+  }
+ ],
+ "cuMemAddressFree": [
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  }
+ ],
+ "cuMemAddressReserve": [
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 *ptr",
+   "kind": "out"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "alignment",
+   "type": "size_t alignment",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemAdvise": [
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 devPtr",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "advice",
+   "type": "CUmem_advise advice",
+   "kind": "value"
+  },
+  {
+   "name": "device",
+   "type": "CUdevice_v1 device",
+   "kind": "value"
+  }
+ ],
+ "cuMemAdvise_v2": [
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 devPtr",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "advice",
+   "type": "CUmem_advise advice",
+   "kind": "value"
+  },
+  {
+   "name": "location",
+   "type": "CUmemLocation_v1 location",
+   "kind": "value"
+  }
+ ],
+ "cuMemAllocAsync": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemAllocAsync_ptsz": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemAllocFromPoolAsync": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  },
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemAllocFromPoolAsync_ptsz": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  },
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemAllocHost_v2": [
+  {
+   "name": "pp",
+   "type": "void **pp",
+   "kind": "manual"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  }
+ ],
+ "cuMemAllocManaged": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemAllocPitch_v2": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "pPitch",
+   "type": "size_t *pPitch",
+   "kind": "out"
+  },
+  {
+   "name": "WidthInBytes",
+   "type": "size_t WidthInBytes",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  },
+  {
+   "name": "ElementSizeBytes",
+   "type": "unsigned int ElementSizeBytes",
+   "kind": "value"
+  }
+ ],
+ "cuMemAlloc_v2": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  }
+ ],
+ "cuMemBatchDecompressAsync": [
+  {
+   "name": "paramsArray",
+   "type": "CUmemDecompressParams *paramsArray",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "errorIndex",
+   "type": "size_t *errorIndex",
+   "kind": "out"
+  },
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  }
+ ],
+ "cuMemBatchDecompressAsync_ptsz": [
+  {
+   "name": "paramsArray",
+   "type": "CUmemDecompressParams *paramsArray",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "errorIndex",
+   "type": "size_t *errorIndex",
+   "kind": "out"
+  },
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  }
+ ],
+ "cuMemCreate": [
+  {
+   "name": "handle",
+   "type": "CUmemGenericAllocationHandle_v1 *handle",
+   "kind": "out"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "prop",
+   "type": "const CUmemAllocationProp_v1 *prop",
+   "kind": "in"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemDiscardAndPrefetchBatchAsync": [
+  {
+   "name": "dptrs",
+   "type": "CUdeviceptr_v2 *dptrs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "prefetchLocs",
+   "type": "CUmemLocation_v1 *prefetchLocs",
+   "kind": "out"
+  },
+  {
+   "name": "prefetchLocIdxs",
+   "type": "size_t *prefetchLocIdxs",
+   "kind": "out"
+  },
+  {
+   "name": "numPrefetchLocs",
+   "type": "size_t numPrefetchLocs",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemDiscardAndPrefetchBatchAsync_ptsz": [
+  {
+   "name": "dptrs",
+   "type": "CUdeviceptr_v2 *dptrs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "prefetchLocs",
+   "type": "CUmemLocation_v1 *prefetchLocs",
+   "kind": "out"
+  },
+  {
+   "name": "prefetchLocIdxs",
+   "type": "size_t *prefetchLocIdxs",
+   "kind": "out"
+  },
+  {
+   "name": "numPrefetchLocs",
+   "type": "size_t numPrefetchLocs",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemDiscardBatchAsync": [
+  {
+   "name": "dptrs",
+   "type": "CUdeviceptr_v2 *dptrs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemDiscardBatchAsync_ptsz": [
+  {
+   "name": "dptrs",
+   "type": "CUdeviceptr_v2 *dptrs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemExportToShareableHandle": [
+  {
+   "name": "shareableHandle",
+   "type": "void *shareableHandle",
+   "kind": "manual"
+  },
+  {
+   "name": "handle",
+   "type": "CUmemGenericAllocationHandle_v1 handle",
+   "kind": "value"
+  },
+  {
+   "name": "handleType",
+   "type": "CUmemAllocationHandleType handleType",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemFreeAsync": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemFreeAsync_ptsz": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemFreeHost": [
+  {
+   "name": "p",
+   "type": "void *p",
+   "kind": "manual"
+  }
+ ],
+ "cuMemFree_v2": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  }
+ ],
+ "cuMemGetAccess": [
+  {
+   "name": "flags",
+   "type": "unsigned long long *flags",
+   "kind": "out"
+  },
+  {
+   "name": "location",
+   "type": "const CUmemLocation_v1 *location",
+   "kind": "in"
+  },
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  }
+ ],
+ "cuMemGetAddressRange_v2": [
+  {
+   "name": "pbase",
+   "type": "CUdeviceptr_v2 *pbase",
+   "kind": "out"
+  },
+  {
+   "name": "psize",
+   "type": "size_t *psize",
+   "kind": "out"
+  },
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  }
+ ],
+ "cuMemGetAllocationGranularity": [
+  {
+   "name": "granularity",
+   "type": "size_t *granularity",
+   "kind": "out"
+  },
+  {
+   "name": "prop",
+   "type": "const CUmemAllocationProp_v1 *prop",
+   "kind": "in"
+  },
+  {
+   "name": "option",
+   "type": "CUmemAllocationGranularity_flags option",
+   "kind": "value"
+  }
+ ],
+ "cuMemGetAllocationPropertiesFromHandle": [
+  {
+   "name": "prop",
+   "type": "CUmemAllocationProp_v1 *prop",
+   "kind": "out"
+  },
+  {
+   "name": "handle",
+   "type": "CUmemGenericAllocationHandle_v1 handle",
+   "kind": "value"
+  }
+ ],
+ "cuMemGetDefaultMemPool": [
+  {
+   "name": "pool_out",
+   "type": "CUmemoryPool *pool_out",
+   "kind": "out"
+  },
+  {
+   "name": "location",
+   "type": "CUmemLocation *location",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUmemAllocationType type",
+   "kind": "value"
+  }
+ ],
+ "cuMemGetHandleForAddressRange": [
+  {
+   "name": "handle",
+   "type": "void *handle",
+   "kind": "manual"
+  },
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr dptr",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "handleType",
+   "type": "CUmemRangeHandleType handleType",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemGetInfo_v2": [
+  {
+   "name": "free",
+   "type": "size_t *free",
+   "kind": "out"
+  },
+  {
+   "name": "total",
+   "type": "size_t *total",
+   "kind": "out"
+  }
+ ],
+ "cuMemGetLocationInfo": [
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "summaryGranularity",
+   "type": "size_t summaryGranularity",
+   "kind": "value"
+  },
+  {
+   "name": "samplingGranularity",
+   "type": "size_t samplingGranularity",
+   "kind": "value"
+  },
+  {
+   "name": "location_out",
+   "type": "CUmemLocation_v1 *location_out",
+   "kind": "out"
+  }
+ ],
+ "cuMemGetMemPool": [
+  {
+   "name": "pool_out",
+   "type": "CUmemoryPool *pool_out",
+   "kind": "out"
+  },
+  {
+   "name": "location",
+   "type": "CUmemLocation *location",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUmemAllocationType type",
+   "kind": "value"
+  }
+ ],
+ "cuMemHostAlloc": [
+  {
+   "name": "pp",
+   "type": "void **pp",
+   "kind": "manual"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemHostGetDevicePointer_v2": [
+  {
+   "name": "pdptr",
+   "type": "CUdeviceptr_v2 *pdptr",
+   "kind": "out"
+  },
+  {
+   "name": "p",
+   "type": "void *p",
+   "kind": "manual"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemHostGetFlags": [
+  {
+   "name": "pFlags",
+   "type": "unsigned int *pFlags",
+   "kind": "out"
+  },
+  {
+   "name": "p",
+   "type": "void *p",
+   "kind": "manual"
+  }
+ ],
+ "cuMemHostRegister_v2": [
+  {
+   "name": "p",
+   "type": "void *p",
+   "kind": "manual"
+  },
+  {
+   "name": "bytesize",
+   "type": "size_t bytesize",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemHostUnregister": [
+  {
+   "name": "p",
+   "type": "void *p",
+   "kind": "manual"
+  }
+ ],
+ "cuMemImportFromShareableHandle": [
+  {
+   "name": "handle",
+   "type": "CUmemGenericAllocationHandle_v1 *handle",
+   "kind": "out"
+  },
+  {
+   "name": "osHandle",
+   "type": "void *osHandle",
+   "kind": "manual"
+  },
+  {
+   "name": "shHandleType",
+   "type": "CUmemAllocationHandleType shHandleType",
+   "kind": "value"
+  }
+ ],
+ "cuMemMap": [
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "offset",
+   "type": "size_t offset",
+   "kind": "value"
+  },
+  {
+   "name": "handle",
+   "type": "CUmemGenericAllocationHandle_v1 handle",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemMapArrayAsync": [
+  {
+   "name": "mapInfoList",
+   "type": "CUarrayMapInfo_v1 *mapInfoList",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemMapArrayAsync_ptsz": [
+  {
+   "name": "mapInfoList",
+   "type": "CUarrayMapInfo_v1 *mapInfoList",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemPoolCreate": [
+  {
+   "name": "pool",
+   "type": "CUmemoryPool *pool",
+   "kind": "out"
+  },
+  {
+   "name": "poolProps",
+   "type": "const CUmemPoolProps_v1 *poolProps",
+   "kind": "in"
+  }
+ ],
+ "cuMemPoolDestroy": [
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  }
+ ],
+ "cuMemPoolExportPointer": [
+  {
+   "name": "shareData_out",
+   "type": "CUmemPoolPtrExportData_v1 *shareData_out",
+   "kind": "out"
+  },
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  }
+ ],
+ "cuMemPoolExportToShareableHandle": [
+  {
+   "name": "handle_out",
+   "type": "void *handle_out",
+   "kind": "manual"
+  },
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  },
+  {
+   "name": "handleType",
+   "type": "CUmemAllocationHandleType handleType",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemPoolGetAccess": [
+  {
+   "name": "flags",
+   "type": "CUmemAccess_flags *flags",
+   "kind": "out"
+  },
+  {
+   "name": "memPool",
+   "type": "CUmemoryPool memPool",
+   "kind": "value"
+  },
+  {
+   "name": "location",
+   "type": "CUmemLocation_v1 *location",
+   "kind": "out"
+  }
+ ],
+ "cuMemPoolGetAttribute": [
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUmemPool_attribute attr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "void *value",
+   "kind": "manual"
+  }
+ ],
+ "cuMemPoolImportFromShareableHandle": [
+  {
+   "name": "pool_out",
+   "type": "CUmemoryPool *pool_out",
+   "kind": "out"
+  },
+  {
+   "name": "handle",
+   "type": "void *handle",
+   "kind": "manual"
+  },
+  {
+   "name": "handleType",
+   "type": "CUmemAllocationHandleType handleType",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMemPoolImportPointer": [
+  {
+   "name": "ptr_out",
+   "type": "CUdeviceptr_v2 *ptr_out",
+   "kind": "out"
+  },
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  },
+  {
+   "name": "shareData",
+   "type": "CUmemPoolPtrExportData_v1 *shareData",
+   "kind": "out"
+  }
+ ],
+ "cuMemPoolSetAccess": [
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  },
+  {
+   "name": "map",
+   "type": "const CUmemAccessDesc_v1 *map",
+   "kind": "in"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  }
+ ],
+ "cuMemPoolSetAttribute": [
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUmemPool_attribute attr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "void *value",
+   "kind": "manual"
+  }
+ ],
+ "cuMemPoolTrimTo": [
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  },
+  {
+   "name": "minBytesToKeep",
+   "type": "size_t minBytesToKeep",
+   "kind": "value"
+  }
+ ],
+ "cuMemPrefetchAsync": [
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 devPtr",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "dstDevice",
+   "type": "CUdevice_v1 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemPrefetchAsync_ptsz": [
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 devPtr",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "dstDevice",
+   "type": "CUdevice_v1 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemPrefetchAsync_v2": [
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 devPtr",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "location",
+   "type": "CUmemLocation_v1 location",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemPrefetchAsync_v2_ptsz": [
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 devPtr",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "location",
+   "type": "CUmemLocation_v1 location",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemPrefetchBatchAsync": [
+  {
+   "name": "dptrs",
+   "type": "CUdeviceptr_v2 *dptrs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "prefetchLocs",
+   "type": "CUmemLocation_v1 *prefetchLocs",
+   "kind": "out"
+  },
+  {
+   "name": "prefetchLocIdxs",
+   "type": "size_t *prefetchLocIdxs",
+   "kind": "out"
+  },
+  {
+   "name": "numPrefetchLocs",
+   "type": "size_t numPrefetchLocs",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemPrefetchBatchAsync_ptsz": [
+  {
+   "name": "dptrs",
+   "type": "CUdeviceptr_v2 *dptrs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "prefetchLocs",
+   "type": "CUmemLocation_v1 *prefetchLocs",
+   "kind": "out"
+  },
+  {
+   "name": "prefetchLocIdxs",
+   "type": "size_t *prefetchLocIdxs",
+   "kind": "out"
+  },
+  {
+   "name": "numPrefetchLocs",
+   "type": "size_t numPrefetchLocs",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemRangeGetAttribute": [
+  {
+   "name": "data",
+   "type": "void *data",
+   "kind": "manual"
+  },
+  {
+   "name": "dataSize",
+   "type": "size_t dataSize",
+   "kind": "value"
+  },
+  {
+   "name": "attribute",
+   "type": "CUmem_range_attribute attribute",
+   "kind": "value"
+  },
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 devPtr",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  }
+ ],
+ "cuMemRangeGetAttributes": [
+  {
+   "name": "data",
+   "type": "void **data",
+   "kind": "manual"
+  },
+  {
+   "name": "dataSizes",
+   "type": "size_t *dataSizes",
+   "kind": "out"
+  },
+  {
+   "name": "attributes",
+   "type": "CUmem_range_attribute *attributes",
+   "kind": "out"
+  },
+  {
+   "name": "numAttributes",
+   "type": "size_t numAttributes",
+   "kind": "value"
+  },
+  {
+   "name": "devPtr",
+   "type": "CUdeviceptr_v2 devPtr",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  }
+ ],
+ "cuMemRelease": [
+  {
+   "name": "handle",
+   "type": "CUmemGenericAllocationHandle_v1 handle",
+   "kind": "value"
+  }
+ ],
+ "cuMemRetainAllocationHandle": [
+  {
+   "name": "handle",
+   "type": "CUmemGenericAllocationHandle_v1 *handle",
+   "kind": "out"
+  },
+  {
+   "name": "addr",
+   "type": "void *addr",
+   "kind": "manual"
+  }
+ ],
+ "cuMemSetAccess": [
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "desc",
+   "type": "const CUmemAccessDesc_v1 *desc",
+   "kind": "in"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  }
+ ],
+ "cuMemSetMemPool": [
+  {
+   "name": "location",
+   "type": "CUmemLocation *location",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUmemAllocationType type",
+   "kind": "value"
+  },
+  {
+   "name": "pool",
+   "type": "CUmemoryPool pool",
+   "kind": "value"
+  }
+ ],
+ "cuMemUnmap": [
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy": [
+  {
+   "name": "dst",
+   "type": "CUdeviceptr_v2 dst",
+   "kind": "value"
+  },
+  {
+   "name": "src",
+   "type": "CUdeviceptr_v2 src",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy2DAsync_v2": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY2D_v2 *pCopy",
+   "kind": "in"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy2DAsync_v2_ptsz": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY2D_v2 *pCopy",
+   "kind": "in"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy2DUnaligned_v2": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY2D_v2 *pCopy",
+   "kind": "in"
+  }
+ ],
+ "cuMemcpy2DUnaligned_v2_ptds": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY2D_v2 *pCopy",
+   "kind": "in"
+  }
+ ],
+ "cuMemcpy2D_v2": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY2D_v2 *pCopy",
+   "kind": "in"
+  }
+ ],
+ "cuMemcpy2D_v2_ptds": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY2D_v2 *pCopy",
+   "kind": "in"
+  }
+ ],
+ "cuMemcpy3DAsync_v2": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY3D_v2 *pCopy",
+   "kind": "in"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DAsync_v2_ptsz": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY3D_v2 *pCopy",
+   "kind": "in"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DBatchAsync": [
+  {
+   "name": "numParams",
+   "type": "size_t numParams",
+   "kind": "value"
+  },
+  {
+   "name": "opList",
+   "type": "CUDA_MEMCPY3D_BATCH_OP_v1 *opList",
+   "kind": "out"
+  },
+  {
+   "name": "failIdx",
+   "type": "size_t *failIdx",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DBatchAsync_ptsz": [
+  {
+   "name": "numParams",
+   "type": "size_t numParams",
+   "kind": "value"
+  },
+  {
+   "name": "opList",
+   "type": "CUDA_MEMCPY3D_BATCH_OP_v1 *opList",
+   "kind": "out"
+  },
+  {
+   "name": "failIdx",
+   "type": "size_t *failIdx",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DBatchAsync_v2": [
+  {
+   "name": "numParams",
+   "type": "size_t numParams",
+   "kind": "value"
+  },
+  {
+   "name": "opList",
+   "type": "CUDA_MEMCPY3D_BATCH_OP_v1 *opList",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DBatchAsync_v2_ptsz": [
+  {
+   "name": "numParams",
+   "type": "size_t numParams",
+   "kind": "value"
+  },
+  {
+   "name": "opList",
+   "type": "CUDA_MEMCPY3D_BATCH_OP_v1 *opList",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DPeer": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY3D_PEER_v1 *pCopy",
+   "kind": "in"
+  }
+ ],
+ "cuMemcpy3DPeerAsync": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY3D_PEER_v1 *pCopy",
+   "kind": "in"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DPeerAsync_ptsz": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY3D_PEER_v1 *pCopy",
+   "kind": "in"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DPeer_ptds": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY3D_PEER_v1 *pCopy",
+   "kind": "in"
+  }
+ ],
+ "cuMemcpy3DWithAttributesAsync": [
+  {
+   "name": "op",
+   "type": "CUDA_MEMCPY3D_BATCH_OP_v1 *op",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3DWithAttributesAsync_ptsz": [
+  {
+   "name": "op",
+   "type": "CUDA_MEMCPY3D_BATCH_OP_v1 *op",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy3D_v2": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY3D_v2 *pCopy",
+   "kind": "in"
+  }
+ ],
+ "cuMemcpy3D_v2_ptds": [
+  {
+   "name": "pCopy",
+   "type": "const CUDA_MEMCPY3D_v2 *pCopy",
+   "kind": "in"
+  }
+ ],
+ "cuMemcpyAsync": [
+  {
+   "name": "dst",
+   "type": "CUdeviceptr_v2 dst",
+   "kind": "value"
+  },
+  {
+   "name": "src",
+   "type": "CUdeviceptr_v2 src",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAsync_ptsz": [
+  {
+   "name": "dst",
+   "type": "CUdeviceptr_v2 dst",
+   "kind": "value"
+  },
+  {
+   "name": "src",
+   "type": "CUdeviceptr_v2 src",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAtoA_v2": [
+  {
+   "name": "dstArray",
+   "type": "CUarray dstArray",
+   "kind": "value"
+  },
+  {
+   "name": "dstOffset",
+   "type": "size_t dstOffset",
+   "kind": "value"
+  },
+  {
+   "name": "srcArray",
+   "type": "CUarray srcArray",
+   "kind": "value"
+  },
+  {
+   "name": "srcOffset",
+   "type": "size_t srcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAtoA_v2_ptds": [
+  {
+   "name": "dstArray",
+   "type": "CUarray dstArray",
+   "kind": "value"
+  },
+  {
+   "name": "dstOffset",
+   "type": "size_t dstOffset",
+   "kind": "value"
+  },
+  {
+   "name": "srcArray",
+   "type": "CUarray srcArray",
+   "kind": "value"
+  },
+  {
+   "name": "srcOffset",
+   "type": "size_t srcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAtoD_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcArray",
+   "type": "CUarray srcArray",
+   "kind": "value"
+  },
+  {
+   "name": "srcOffset",
+   "type": "size_t srcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAtoD_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcArray",
+   "type": "CUarray srcArray",
+   "kind": "value"
+  },
+  {
+   "name": "srcOffset",
+   "type": "size_t srcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAtoHAsync_v2": [
+  {
+   "name": "dstHost",
+   "type": "void *dstHost",
+   "kind": "manual"
+  },
+  {
+   "name": "srcArray",
+   "type": "CUarray srcArray",
+   "kind": "value"
+  },
+  {
+   "name": "srcOffset",
+   "type": "size_t srcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAtoHAsync_v2_ptsz": [
+  {
+   "name": "dstHost",
+   "type": "void *dstHost",
+   "kind": "manual"
+  },
+  {
+   "name": "srcArray",
+   "type": "CUarray srcArray",
+   "kind": "value"
+  },
+  {
+   "name": "srcOffset",
+   "type": "size_t srcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAtoH_v2": [
+  {
+   "name": "dstHost",
+   "type": "void *dstHost",
+   "kind": "manual"
+  },
+  {
+   "name": "srcArray",
+   "type": "CUarray srcArray",
+   "kind": "value"
+  },
+  {
+   "name": "srcOffset",
+   "type": "size_t srcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyAtoH_v2_ptds": [
+  {
+   "name": "dstHost",
+   "type": "void *dstHost",
+   "kind": "manual"
+  },
+  {
+   "name": "srcArray",
+   "type": "CUarray srcArray",
+   "kind": "value"
+  },
+  {
+   "name": "srcOffset",
+   "type": "size_t srcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyBatchAsync": [
+  {
+   "name": "dsts",
+   "type": "CUdeviceptr_v2 *dsts",
+   "kind": "out"
+  },
+  {
+   "name": "srcs",
+   "type": "CUdeviceptr_v2 *srcs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "attrs",
+   "type": "CUmemcpyAttributes_v1 *attrs",
+   "kind": "out"
+  },
+  {
+   "name": "attrIdxs",
+   "type": "size_t *attrIdxs",
+   "kind": "out"
+  },
+  {
+   "name": "numAttrs",
+   "type": "size_t numAttrs",
+   "kind": "value"
+  },
+  {
+   "name": "failIdx",
+   "type": "size_t *failIdx",
+   "kind": "out"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyBatchAsync_ptsz": [
+  {
+   "name": "dsts",
+   "type": "CUdeviceptr_v2 *dsts",
+   "kind": "out"
+  },
+  {
+   "name": "srcs",
+   "type": "CUdeviceptr_v2 *srcs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "attrs",
+   "type": "CUmemcpyAttributes_v1 *attrs",
+   "kind": "out"
+  },
+  {
+   "name": "attrIdxs",
+   "type": "size_t *attrIdxs",
+   "kind": "out"
+  },
+  {
+   "name": "numAttrs",
+   "type": "size_t numAttrs",
+   "kind": "value"
+  },
+  {
+   "name": "failIdx",
+   "type": "size_t *failIdx",
+   "kind": "out"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyBatchAsync_v2": [
+  {
+   "name": "dsts",
+   "type": "CUdeviceptr_v2 *dsts",
+   "kind": "out"
+  },
+  {
+   "name": "srcs",
+   "type": "CUdeviceptr_v2 *srcs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "attrs",
+   "type": "CUmemcpyAttributes_v1 *attrs",
+   "kind": "out"
+  },
+  {
+   "name": "attrIdxs",
+   "type": "size_t *attrIdxs",
+   "kind": "out"
+  },
+  {
+   "name": "numAttrs",
+   "type": "size_t numAttrs",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyBatchAsync_v2_ptsz": [
+  {
+   "name": "dsts",
+   "type": "CUdeviceptr_v2 *dsts",
+   "kind": "out"
+  },
+  {
+   "name": "srcs",
+   "type": "CUdeviceptr_v2 *srcs",
+   "kind": "out"
+  },
+  {
+   "name": "sizes",
+   "type": "size_t *sizes",
+   "kind": "out"
+  },
+  {
+   "name": "count",
+   "type": "size_t count",
+   "kind": "value"
+  },
+  {
+   "name": "attrs",
+   "type": "CUmemcpyAttributes_v1 *attrs",
+   "kind": "out"
+  },
+  {
+   "name": "attrIdxs",
+   "type": "size_t *attrIdxs",
+   "kind": "out"
+  },
+  {
+   "name": "numAttrs",
+   "type": "size_t numAttrs",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoA_v2": [
+  {
+   "name": "dstArray",
+   "type": "CUarray dstArray",
+   "kind": "value"
+  },
+  {
+   "name": "dstOffset",
+   "type": "size_t dstOffset",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoA_v2_ptds": [
+  {
+   "name": "dstArray",
+   "type": "CUarray dstArray",
+   "kind": "value"
+  },
+  {
+   "name": "dstOffset",
+   "type": "size_t dstOffset",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoDAsync_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoDAsync_v2_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoD_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoD_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoHAsync_v2": [
+  {
+   "name": "dstHost",
+   "type": "void *dstHost",
+   "kind": "manual"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoHAsync_v2_ptsz": [
+  {
+   "name": "dstHost",
+   "type": "void *dstHost",
+   "kind": "manual"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoH_v2": [
+  {
+   "name": "dstHost",
+   "type": "void *dstHost",
+   "kind": "manual"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyDtoH_v2_ptds": [
+  {
+   "name": "dstHost",
+   "type": "void *dstHost",
+   "kind": "manual"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyHtoAAsync_v2": [
+  {
+   "name": "dstArray",
+   "type": "CUarray dstArray",
+   "kind": "value"
+  },
+  {
+   "name": "dstOffset",
+   "type": "size_t dstOffset",
+   "kind": "value"
+  },
+  {
+   "name": "srcHost",
+   "type": "const void *srcHost",
+   "kind": "manual"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyHtoAAsync_v2_ptsz": [
+  {
+   "name": "dstArray",
+   "type": "CUarray dstArray",
+   "kind": "value"
+  },
+  {
+   "name": "dstOffset",
+   "type": "size_t dstOffset",
+   "kind": "value"
+  },
+  {
+   "name": "srcHost",
+   "type": "const void *srcHost",
+   "kind": "manual"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyHtoA_v2": [
+  {
+   "name": "dstArray",
+   "type": "CUarray dstArray",
+   "kind": "value"
+  },
+  {
+   "name": "dstOffset",
+   "type": "size_t dstOffset",
+   "kind": "value"
+  },
+  {
+   "name": "srcHost",
+   "type": "const void *srcHost",
+   "kind": "manual"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyHtoA_v2_ptds": [
+  {
+   "name": "dstArray",
+   "type": "CUarray dstArray",
+   "kind": "value"
+  },
+  {
+   "name": "dstOffset",
+   "type": "size_t dstOffset",
+   "kind": "value"
+  },
+  {
+   "name": "srcHost",
+   "type": "const void *srcHost",
+   "kind": "manual"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyHtoDAsync_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcHost",
+   "type": "const void *srcHost",
+   "kind": "manual"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyHtoDAsync_v2_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcHost",
+   "type": "const void *srcHost",
+   "kind": "manual"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyHtoD_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcHost",
+   "type": "const void *srcHost",
+   "kind": "manual"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyHtoD_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcHost",
+   "type": "const void *srcHost",
+   "kind": "manual"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyPeer": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstContext",
+   "type": "CUcontext dstContext",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcContext",
+   "type": "CUcontext srcContext",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyPeerAsync": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstContext",
+   "type": "CUcontext dstContext",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcContext",
+   "type": "CUcontext srcContext",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyPeerAsync_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstContext",
+   "type": "CUcontext dstContext",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcContext",
+   "type": "CUcontext srcContext",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyPeer_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstContext",
+   "type": "CUcontext dstContext",
+   "kind": "value"
+  },
+  {
+   "name": "srcDevice",
+   "type": "CUdeviceptr_v2 srcDevice",
+   "kind": "value"
+  },
+  {
+   "name": "srcContext",
+   "type": "CUcontext srcContext",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyWithAttributesAsync": [
+  {
+   "name": "dst",
+   "type": "CUdeviceptr_v2 dst",
+   "kind": "value"
+  },
+  {
+   "name": "src",
+   "type": "CUdeviceptr_v2 src",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUmemcpyAttributes_v1 *attr",
+   "kind": "out"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpyWithAttributesAsync_ptsz": [
+  {
+   "name": "dst",
+   "type": "CUdeviceptr_v2 dst",
+   "kind": "value"
+  },
+  {
+   "name": "src",
+   "type": "CUdeviceptr_v2 src",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUmemcpyAttributes_v1 *attr",
+   "kind": "out"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemcpy_ptds": [
+  {
+   "name": "dst",
+   "type": "CUdeviceptr_v2 dst",
+   "kind": "value"
+  },
+  {
+   "name": "src",
+   "type": "CUdeviceptr_v2 src",
+   "kind": "value"
+  },
+  {
+   "name": "ByteCount",
+   "type": "size_t ByteCount",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD16Async": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "us",
+   "type": "unsigned short us",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD16Async_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "us",
+   "type": "unsigned short us",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD16_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "us",
+   "type": "unsigned short us",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD16_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "us",
+   "type": "unsigned short us",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D16Async": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "us",
+   "type": "unsigned short us",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D16Async_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "us",
+   "type": "unsigned short us",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D16_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "us",
+   "type": "unsigned short us",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D16_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "us",
+   "type": "unsigned short us",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D32Async": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "ui",
+   "type": "unsigned int ui",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D32Async_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "ui",
+   "type": "unsigned int ui",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D32_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "ui",
+   "type": "unsigned int ui",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D32_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "ui",
+   "type": "unsigned int ui",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D8Async": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "uc",
+   "type": "unsigned char uc",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D8Async_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "uc",
+   "type": "unsigned char uc",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D8_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "uc",
+   "type": "unsigned char uc",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD2D8_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "dstPitch",
+   "type": "size_t dstPitch",
+   "kind": "value"
+  },
+  {
+   "name": "uc",
+   "type": "unsigned char uc",
+   "kind": "value"
+  },
+  {
+   "name": "Width",
+   "type": "size_t Width",
+   "kind": "value"
+  },
+  {
+   "name": "Height",
+   "type": "size_t Height",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD32Async": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ui",
+   "type": "unsigned int ui",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD32Async_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ui",
+   "type": "unsigned int ui",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD32_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ui",
+   "type": "unsigned int ui",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD32_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "ui",
+   "type": "unsigned int ui",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD8Async": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "uc",
+   "type": "unsigned char uc",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD8Async_ptsz": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "uc",
+   "type": "unsigned char uc",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  },
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD8_v2": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "uc",
+   "type": "unsigned char uc",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  }
+ ],
+ "cuMemsetD8_v2_ptds": [
+  {
+   "name": "dstDevice",
+   "type": "CUdeviceptr_v2 dstDevice",
+   "kind": "value"
+  },
+  {
+   "name": "uc",
+   "type": "unsigned char uc",
+   "kind": "value"
+  },
+  {
+   "name": "N",
+   "type": "size_t N",
+   "kind": "value"
+  }
+ ],
+ "cuMipmappedArrayCreate": [
+  {
+   "name": "pHandle",
+   "type": "CUmipmappedArray *pHandle",
+   "kind": "out"
+  },
+  {
+   "name": "pMipmappedArrayDesc",
+   "type": "const CUDA_ARRAY3D_DESCRIPTOR_v2 *pMipmappedArrayDesc",
+   "kind": "in"
+  },
+  {
+   "name": "numMipmapLevels",
+   "type": "unsigned int numMipmapLevels",
+   "kind": "value"
+  }
+ ],
+ "cuMipmappedArrayDestroy": [
+  {
+   "name": "hMipmappedArray",
+   "type": "CUmipmappedArray hMipmappedArray",
+   "kind": "value"
+  }
+ ],
+ "cuMipmappedArrayGetLevel": [
+  {
+   "name": "pLevelArray",
+   "type": "CUarray *pLevelArray",
+   "kind": "out"
+  },
+  {
+   "name": "hMipmappedArray",
+   "type": "CUmipmappedArray hMipmappedArray",
+   "kind": "value"
+  },
+  {
+   "name": "level",
+   "type": "unsigned int level",
+   "kind": "value"
+  }
+ ],
+ "cuMipmappedArrayGetMemoryRequirements": [
+  {
+   "name": "memoryRequirements",
+   "type": "CUDA_ARRAY_MEMORY_REQUIREMENTS_v1 *memoryRequirements",
+   "kind": "out"
+  },
+  {
+   "name": "mipmap",
+   "type": "CUmipmappedArray mipmap",
+   "kind": "value"
+  },
+  {
+   "name": "device",
+   "type": "CUdevice device",
+   "kind": "value"
+  }
+ ],
+ "cuMipmappedArrayGetSparseProperties": [
+  {
+   "name": "sparseProperties",
+   "type": "CUDA_ARRAY_SPARSE_PROPERTIES_v1 *sparseProperties",
+   "kind": "out"
+  },
+  {
+   "name": "mipmap",
+   "type": "CUmipmappedArray mipmap",
+   "kind": "value"
+  }
+ ],
+ "cuModuleEnumerateFunctions": [
+  {
+   "name": "functions",
+   "type": "CUfunction *functions",
+   "kind": "out"
+  },
+  {
+   "name": "numFunctions",
+   "type": "unsigned int numFunctions",
+   "kind": "value"
+  },
+  {
+   "name": "mod",
+   "type": "CUmodule mod",
+   "kind": "value"
+  }
+ ],
+ "cuModuleGetFunction": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction *hfunc",
+   "kind": "out"
+  },
+  {
+   "name": "hmod",
+   "type": "CUmodule hmod",
+   "kind": "value"
+  },
+  {
+   "name": "name",
+   "type": "const char *name",
+   "kind": "string"
+  }
+ ],
+ "cuModuleGetFunctionCount": [
+  {
+   "name": "count",
+   "type": "unsigned int *count",
+   "kind": "out"
+  },
+  {
+   "name": "hmod",
+   "type": "CUmodule hmod",
+   "kind": "value"
+  }
+ ],
+ "cuModuleGetGlobal_v2": [
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 *dptr",
+   "kind": "out"
+  },
+  {
+   "name": "bytes",
+   "type": "size_t *bytes",
+   "kind": "out"
+  },
+  {
+   "name": "hmod",
+   "type": "CUmodule hmod",
+   "kind": "value"
+  },
+  {
+   "name": "name",
+   "type": "const char *name",
+   "kind": "string"
+  }
+ ],
+ "cuModuleGetLoadingMode": [
+  {
+   "name": "mode",
+   "type": "CUmoduleLoadingMode *mode",
+   "kind": "out"
+  }
+ ],
+ "cuModuleGetSurfRef": [
+  {
+   "name": "pSurfRef",
+   "type": "CUsurfref *pSurfRef",
+   "kind": "out"
+  },
+  {
+   "name": "hmod",
+   "type": "CUmodule hmod",
+   "kind": "value"
+  },
+  {
+   "name": "name",
+   "type": "const char *name",
+   "kind": "string"
+  }
+ ],
+ "cuModuleGetTexRef": [
+  {
+   "name": "pTexRef",
+   "type": "CUtexref *pTexRef",
+   "kind": "out"
+  },
+  {
+   "name": "hmod",
+   "type": "CUmodule hmod",
+   "kind": "value"
+  },
+  {
+   "name": "name",
+   "type": "const char *name",
+   "kind": "string"
+  }
+ ],
+ "cuModuleLoad": [
+  {
+   "name": "module",
+   "type": "CUmodule *module",
+   "kind": "out"
+  },
+  {
+   "name": "fname",
+   "type": "const char *fname",
+   "kind": "string"
+  }
+ ],
+ "cuModuleLoadData": [
+  {
+   "name": "module",
+   "type": "CUmodule *module",
+   "kind": "out"
+  },
+  {
+   "name": "image",
+   "type": "const void *image",
+   "kind": "manual"
+  }
+ ],
+ "cuModuleLoadDataEx": [
+  {
+   "name": "module",
+   "type": "CUmodule *module",
+   "kind": "out"
+  },
+  {
+   "name": "image",
+   "type": "const void *image",
+   "kind": "manual"
+  },
+  {
+   "name": "numOptions",
+   "type": "unsigned int numOptions",
+   "kind": "value"
+  },
+  {
+   "name": "options",
+   "type": "CUjit_option *options",
+   "kind": "out"
+  },
+  {
+   "name": "optionValues",
+   "type": "void **optionValues",
+   "kind": "manual"
+  }
+ ],
+ "cuModuleLoadFatBinary": [
+  {
+   "name": "module",
+   "type": "CUmodule *module",
+   "kind": "out"
+  },
+  {
+   "name": "fatCubin",
+   "type": "const void *fatCubin",
+   "kind": "manual"
+  }
+ ],
+ "cuModuleUnload": [
+  {
+   "name": "hmod",
+   "type": "CUmodule hmod",
+   "kind": "value"
+  }
+ ],
+ "cuMulticastAddDevice": [
+  {
+   "name": "mcHandle",
+   "type": "CUmemGenericAllocationHandle mcHandle",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  }
+ ],
+ "cuMulticastBindAddr": [
+  {
+   "name": "mcHandle",
+   "type": "CUmemGenericAllocationHandle mcHandle",
+   "kind": "value"
+  },
+  {
+   "name": "mcOffset",
+   "type": "size_t mcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "memptr",
+   "type": "CUdeviceptr memptr",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMulticastBindAddr_v2": [
+  {
+   "name": "mcHandle",
+   "type": "CUmemGenericAllocationHandle mcHandle",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  },
+  {
+   "name": "mcOffset",
+   "type": "size_t mcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "memptr",
+   "type": "CUdeviceptr memptr",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMulticastBindMem": [
+  {
+   "name": "mcHandle",
+   "type": "CUmemGenericAllocationHandle mcHandle",
+   "kind": "value"
+  },
+  {
+   "name": "mcOffset",
+   "type": "size_t mcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "memHandle",
+   "type": "CUmemGenericAllocationHandle memHandle",
+   "kind": "value"
+  },
+  {
+   "name": "memOffset",
+   "type": "size_t memOffset",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMulticastBindMem_v2": [
+  {
+   "name": "mcHandle",
+   "type": "CUmemGenericAllocationHandle mcHandle",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  },
+  {
+   "name": "mcOffset",
+   "type": "size_t mcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "memHandle",
+   "type": "CUmemGenericAllocationHandle memHandle",
+   "kind": "value"
+  },
+  {
+   "name": "memOffset",
+   "type": "size_t memOffset",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned long long flags",
+   "kind": "value"
+  }
+ ],
+ "cuMulticastCreate": [
+  {
+   "name": "mcHandle",
+   "type": "CUmemGenericAllocationHandle *mcHandle",
+   "kind": "out"
+  },
+  {
+   "name": "prop",
+   "type": "const CUmulticastObjectProp *prop",
+   "kind": "in"
+  }
+ ],
+ "cuMulticastGetGranularity": [
+  {
+   "name": "granularity",
+   "type": "size_t *granularity",
+   "kind": "out"
+  },
+  {
+   "name": "prop",
+   "type": "const CUmulticastObjectProp *prop",
+   "kind": "in"
+  },
+  {
+   "name": "option",
+   "type": "CUmulticastGranularity_flags option",
+   "kind": "value"
+  }
+ ],
+ "cuMulticastUnbind": [
+  {
+   "name": "mcHandle",
+   "type": "CUmemGenericAllocationHandle mcHandle",
+   "kind": "value"
+  },
+  {
+   "name": "dev",
+   "type": "CUdevice dev",
+   "kind": "value"
+  },
+  {
+   "name": "mcOffset",
+   "type": "size_t mcOffset",
+   "kind": "value"
+  },
+  {
+   "name": "size",
+   "type": "size_t size",
+   "kind": "value"
+  }
+ ],
+ "cuOccupancyAvailableDynamicSMemPerBlock": [
+  {
+   "name": "dynamicSmemSize",
+   "type": "size_t *dynamicSmemSize",
+   "kind": "out"
+  },
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "numBlocks",
+   "type": "int numBlocks",
+   "kind": "value"
+  },
+  {
+   "name": "blockSize",
+   "type": "int blockSize",
+   "kind": "value"
+  }
+ ],
+ "cuOccupancyMaxActiveBlocksPerMultiprocessor": [
+  {
+   "name": "numBlocks",
+   "type": "int *numBlocks",
+   "kind": "out"
+  },
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "blockSize",
+   "type": "int blockSize",
+   "kind": "value"
+  },
+  {
+   "name": "dynamicSMemSize",
+   "type": "size_t dynamicSMemSize",
+   "kind": "value"
+  }
+ ],
+ "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags": [
+  {
+   "name": "numBlocks",
+   "type": "int *numBlocks",
+   "kind": "out"
+  },
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "blockSize",
+   "type": "int blockSize",
+   "kind": "value"
+  },
+  {
+   "name": "dynamicSMemSize",
+   "type": "size_t dynamicSMemSize",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuOccupancyMaxActiveClusters": [
+  {
+   "name": "numClusters",
+   "type": "int *numClusters",
+   "kind": "out"
+  },
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "config",
+   "type": "const CUlaunchConfig *config",
+   "kind": "in"
+  }
+ ],
+ "cuOccupancyMaxPotentialBlockSize": [
+  {
+   "name": "minGridSize",
+   "type": "int *minGridSize",
+   "kind": "out"
+  },
+  {
+   "name": "blockSize",
+   "type": "int *blockSize",
+   "kind": "out"
+  },
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "blockSizeToDynamicSMemSize",
+   "type": "CUoccupancyB2DSize blockSizeToDynamicSMemSize",
+   "kind": "value"
+  },
+  {
+   "name": "dynamicSMemSize",
+   "type": "size_t dynamicSMemSize",
+   "kind": "value"
+  },
+  {
+   "name": "blockSizeLimit",
+   "type": "int blockSizeLimit",
+   "kind": "value"
+  }
+ ],
+ "cuOccupancyMaxPotentialBlockSizeWithFlags": [
+  {
+   "name": "minGridSize",
+   "type": "int *minGridSize",
+   "kind": "out"
+  },
+  {
+   "name": "blockSize",
+   "type": "int *blockSize",
+   "kind": "out"
+  },
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "blockSizeToDynamicSMemSize",
+   "type": "CUoccupancyB2DSize blockSizeToDynamicSMemSize",
+   "kind": "value"
+  },
+  {
+   "name": "dynamicSMemSize",
+   "type": "size_t dynamicSMemSize",
+   "kind": "value"
+  },
+  {
+   "name": "blockSizeLimit",
+   "type": "int blockSizeLimit",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuOccupancyMaxPotentialClusterSize": [
+  {
+   "name": "clusterSize",
+   "type": "int *clusterSize",
+   "kind": "out"
+  },
+  {
+   "name": "func",
+   "type": "CUfunction func",
+   "kind": "value"
+  },
+  {
+   "name": "config",
+   "type": "const CUlaunchConfig *config",
+   "kind": "in"
+  }
+ ],
+ "cuParamSetSize": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "numbytes",
+   "type": "unsigned int numbytes",
+   "kind": "value"
+  }
+ ],
+ "cuParamSetTexRef": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "texunit",
+   "type": "int texunit",
+   "kind": "value"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuParamSetf": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "offset",
+   "type": "int offset",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "float value",
+   "kind": "value"
+  }
+ ],
+ "cuParamSeti": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "offset",
+   "type": "int offset",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "unsigned int value",
+   "kind": "value"
+  }
+ ],
+ "cuParamSetv": [
+  {
+   "name": "hfunc",
+   "type": "CUfunction hfunc",
+   "kind": "value"
+  },
+  {
+   "name": "offset",
+   "type": "int offset",
+   "kind": "value"
+  },
+  {
+   "name": "ptr",
+   "type": "void *ptr",
+   "kind": "manual"
+  },
+  {
+   "name": "numbytes",
+   "type": "unsigned int numbytes",
+   "kind": "value"
+  }
+ ],
+ "cuPointerGetAttribute": [
+  {
+   "name": "data",
+   "type": "void *data",
+   "kind": "manual"
+  },
+  {
+   "name": "attribute",
+   "type": "CUpointer_attribute attribute",
+   "kind": "value"
+  },
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  }
+ ],
+ "cuPointerGetAttributes": [
+  {
+   "name": "numAttributes",
+   "type": "unsigned int numAttributes",
+   "kind": "value"
+  },
+  {
+   "name": "attributes",
+   "type": "CUpointer_attribute *attributes",
+   "kind": "out"
+  },
+  {
+   "name": "data",
+   "type": "void **data",
+   "kind": "manual"
+  },
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  }
+ ],
+ "cuPointerSetAttribute": [
+  {
+   "name": "value",
+   "type": "const void *value",
+   "kind": "manual"
+  },
+  {
+   "name": "attribute",
+   "type": "CUpointer_attribute attribute",
+   "kind": "value"
+  },
+  {
+   "name": "ptr",
+   "type": "CUdeviceptr_v2 ptr",
+   "kind": "value"
+  }
+ ],
+ "cuSignalExternalSemaphoresAsync": [
+  {
+   "name": "extSemArray",
+   "type": "const CUexternalSemaphore *extSemArray",
+   "kind": "in"
+  },
+  {
+   "name": "paramsArray",
+   "type": "const CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS_v1 *paramsArray",
+   "kind": "in"
+  },
+  {
+   "name": "numExtSems",
+   "type": "unsigned int numExtSems",
+   "kind": "value"
+  },
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  }
+ ],
+ "cuSignalExternalSemaphoresAsync_ptsz": [
+  {
+   "name": "extSemArray",
+   "type": "const CUexternalSemaphore *extSemArray",
+   "kind": "in"
+  },
+  {
+   "name": "paramsArray",
+   "type": "const CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS_v1 *paramsArray",
+   "kind": "in"
+  },
+  {
+   "name": "numExtSems",
+   "type": "unsigned int numExtSems",
+   "kind": "value"
+  },
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamAddCallback": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "callback",
+   "type": "CUstreamCallback callback",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamAddCallback_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "callback",
+   "type": "CUstreamCallback callback",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamAttachMemAsync": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  },
+  {
+   "name": "length",
+   "type": "size_t length",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamAttachMemAsync_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  },
+  {
+   "name": "length",
+   "type": "size_t length",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBatchMemOp": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "paramArray",
+   "type": "CUstreamBatchMemOpParams *paramArray",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBatchMemOp_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "paramArray",
+   "type": "CUstreamBatchMemOpParams_v1 *paramArray",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBatchMemOp_v2": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "paramArray",
+   "type": "CUstreamBatchMemOpParams *paramArray",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBatchMemOp_v2_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  },
+  {
+   "name": "paramArray",
+   "type": "CUstreamBatchMemOpParams *paramArray",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBeginCaptureToCig": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "streamCigCaptureParams",
+   "type": "CUstreamCigCaptureParams *streamCigCaptureParams",
+   "kind": "out"
+  }
+ ],
+ "cuStreamBeginCaptureToCig_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "streamCigCaptureParams",
+   "type": "CUstreamCigCaptureParams *streamCigCaptureParams",
+   "kind": "out"
+  }
+ ],
+ "cuStreamBeginCaptureToGraph": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "dependencyData",
+   "type": "const CUgraphEdgeData *dependencyData",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "mode",
+   "type": "CUstreamCaptureMode mode",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBeginCaptureToGraph_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "const CUgraphNode *dependencies",
+   "kind": "in"
+  },
+  {
+   "name": "dependencyData",
+   "type": "const CUgraphEdgeData *dependencyData",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "mode",
+   "type": "CUstreamCaptureMode mode",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBeginCapture_v2": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "mode",
+   "type": "CUstreamCaptureMode mode",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBeginCapture_v2_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "mode",
+   "type": "CUstreamCaptureMode mode",
+   "kind": "value"
+  }
+ ],
+ "cuStreamBeginRecaptureToGraph": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "mode",
+   "type": "CUstreamCaptureMode mode",
+   "kind": "value"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "callbackFunc",
+   "type": "CUgraphRecaptureCallback callbackFunc",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  }
+ ],
+ "cuStreamBeginRecaptureToGraph_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "mode",
+   "type": "CUstreamCaptureMode mode",
+   "kind": "value"
+  },
+  {
+   "name": "hGraph",
+   "type": "CUgraph hGraph",
+   "kind": "value"
+  },
+  {
+   "name": "callbackFunc",
+   "type": "CUgraphRecaptureCallback callbackFunc",
+   "kind": "value"
+  },
+  {
+   "name": "userData",
+   "type": "void *userData",
+   "kind": "manual"
+  }
+ ],
+ "cuStreamCopyAttributes": [
+  {
+   "name": "dstStream",
+   "type": "CUstream dstStream",
+   "kind": "value"
+  },
+  {
+   "name": "srcStream",
+   "type": "CUstream srcStream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamCopyAttributes_ptsz": [
+  {
+   "name": "dst",
+   "type": "CUstream dst",
+   "kind": "value"
+  },
+  {
+   "name": "src",
+   "type": "CUstream src",
+   "kind": "value"
+  }
+ ],
+ "cuStreamCreate": [
+  {
+   "name": "phStream",
+   "type": "CUstream *phStream",
+   "kind": "out"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamCreateWithPriority": [
+  {
+   "name": "phStream",
+   "type": "CUstream *phStream",
+   "kind": "out"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  },
+  {
+   "name": "priority",
+   "type": "int priority",
+   "kind": "value"
+  }
+ ],
+ "cuStreamDestroy_v2": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamEndCapture": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "phGraph",
+   "type": "CUgraph *phGraph",
+   "kind": "out"
+  }
+ ],
+ "cuStreamEndCaptureToCig": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamEndCaptureToCig_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamEndCapture_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "phGraph",
+   "type": "CUgraph *phGraph",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetAttribute": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUstreamAttrID attr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "CUstreamAttrValue_v1 *value",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetAttribute_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUstreamAttrID attr",
+   "kind": "value"
+  },
+  {
+   "name": "value_out",
+   "type": "CUstreamAttrValue_v1 *value_out",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCaptureInfo": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "captureStatus_out",
+   "type": "CUstreamCaptureStatus *captureStatus_out",
+   "kind": "out"
+  },
+  {
+   "name": "id_out",
+   "type": "cuuint64_t *id_out",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCaptureInfo_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "captureStatus_out",
+   "type": "CUstreamCaptureStatus *captureStatus_out",
+   "kind": "out"
+  },
+  {
+   "name": "id_out",
+   "type": "cuuint64_t *id_out",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCaptureInfo_v2": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "captureStatus_out",
+   "type": "CUstreamCaptureStatus *captureStatus_out",
+   "kind": "out"
+  },
+  {
+   "name": "id_out",
+   "type": "cuuint64_t *id_out",
+   "kind": "out"
+  },
+  {
+   "name": "graph_out",
+   "type": "CUgraph *graph_out",
+   "kind": "out"
+  },
+  {
+   "name": "dependencies_out",
+   "type": "const CUgraphNode **dependencies_out",
+   "kind": "manual"
+  },
+  {
+   "name": "numDependencies_out",
+   "type": "size_t *numDependencies_out",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCaptureInfo_v2_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "captureStatus_out",
+   "type": "CUstreamCaptureStatus *captureStatus_out",
+   "kind": "out"
+  },
+  {
+   "name": "id_out",
+   "type": "cuuint64_t *id_out",
+   "kind": "out"
+  },
+  {
+   "name": "graph_out",
+   "type": "CUgraph *graph_out",
+   "kind": "out"
+  },
+  {
+   "name": "dependencies_out",
+   "type": "const CUgraphNode **dependencies_out",
+   "kind": "manual"
+  },
+  {
+   "name": "numDependencies_out",
+   "type": "size_t *numDependencies_out",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCaptureInfo_v3": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "captureStatus_out",
+   "type": "CUstreamCaptureStatus *captureStatus_out",
+   "kind": "out"
+  },
+  {
+   "name": "id_out",
+   "type": "cuuint64_t *id_out",
+   "kind": "out"
+  },
+  {
+   "name": "graph_out",
+   "type": "CUgraph *graph_out",
+   "kind": "out"
+  },
+  {
+   "name": "dependencies_out",
+   "type": "const CUgraphNode **dependencies_out",
+   "kind": "manual"
+  },
+  {
+   "name": "edgeData_out",
+   "type": "const CUgraphEdgeData **edgeData_out",
+   "kind": "manual"
+  },
+  {
+   "name": "numDependencies_out",
+   "type": "size_t *numDependencies_out",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCaptureInfo_v3_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "captureStatus_out",
+   "type": "CUstreamCaptureStatus *captureStatus_out",
+   "kind": "out"
+  },
+  {
+   "name": "id_out",
+   "type": "cuuint64_t *id_out",
+   "kind": "out"
+  },
+  {
+   "name": "graph_out",
+   "type": "CUgraph *graph_out",
+   "kind": "out"
+  },
+  {
+   "name": "dependencies_out",
+   "type": "const CUgraphNode **dependencies_out",
+   "kind": "manual"
+  },
+  {
+   "name": "edgeData_out",
+   "type": "const CUgraphEdgeData **edgeData_out",
+   "kind": "manual"
+  },
+  {
+   "name": "numDependencies_out",
+   "type": "size_t *numDependencies_out",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCtx": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCtx_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCtx_v2": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  },
+  {
+   "name": "pGreenCtx",
+   "type": "CUgreenCtx *pGreenCtx",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetCtx_v2_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "pctx",
+   "type": "CUcontext *pctx",
+   "kind": "out"
+  },
+  {
+   "name": "pGreenCtx",
+   "type": "CUgreenCtx *pGreenCtx",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetDevResource": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "result",
+   "type": "CUdevResource *result",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUdevResourceType type",
+   "kind": "value"
+  }
+ ],
+ "cuStreamGetDevResource_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "result",
+   "type": "CUdevResource *result",
+   "kind": "out"
+  },
+  {
+   "name": "type",
+   "type": "CUdevResourceType type",
+   "kind": "value"
+  }
+ ],
+ "cuStreamGetDevice": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "device",
+   "type": "CUdevice *device",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetDevice_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "device",
+   "type": "CUdevice *device",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetFlags": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int *flags",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetFlags_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int *flags",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetGreenCtx": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "phCtx",
+   "type": "CUgreenCtx *phCtx",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetId": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "streamId",
+   "type": "unsigned long long *streamId",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetId_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "streamId",
+   "type": "unsigned long long *streamId",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetPriority": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "priority",
+   "type": "int *priority",
+   "kind": "out"
+  }
+ ],
+ "cuStreamGetPriority_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "priority",
+   "type": "int *priority",
+   "kind": "out"
+  }
+ ],
+ "cuStreamIsCapturing": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "captureStatus",
+   "type": "CUstreamCaptureStatus *captureStatus",
+   "kind": "out"
+  }
+ ],
+ "cuStreamIsCapturing_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "captureStatus",
+   "type": "CUstreamCaptureStatus *captureStatus",
+   "kind": "out"
+  }
+ ],
+ "cuStreamQuery": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamQuery_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamSetAttribute": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUstreamAttrID attr",
+   "kind": "value"
+  },
+  {
+   "name": "param",
+   "type": "const CUstreamAttrValue_v1 *param",
+   "kind": "in"
+  }
+ ],
+ "cuStreamSetAttribute_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "attr",
+   "type": "CUstreamAttrID attr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "const CUstreamAttrValue_v1 *value",
+   "kind": "in"
+  }
+ ],
+ "cuStreamSynchronize": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamSynchronize_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  }
+ ],
+ "cuStreamUpdateCaptureDependencies": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "CUgraphNode *dependencies",
+   "kind": "out"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamUpdateCaptureDependencies_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "CUgraphNode *dependencies",
+   "kind": "out"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamUpdateCaptureDependencies_v2": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "CUgraphNode *dependencies",
+   "kind": "out"
+  },
+  {
+   "name": "dependencyData",
+   "type": "const CUgraphEdgeData *dependencyData",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamUpdateCaptureDependencies_v2_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "dependencies",
+   "type": "CUgraphNode *dependencies",
+   "kind": "out"
+  },
+  {
+   "name": "dependencyData",
+   "type": "const CUgraphEdgeData *dependencyData",
+   "kind": "in"
+  },
+  {
+   "name": "numDependencies",
+   "type": "size_t numDependencies",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitEvent": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitEvent_ptsz": [
+  {
+   "name": "hStream",
+   "type": "CUstream hStream",
+   "kind": "value"
+  },
+  {
+   "name": "hEvent",
+   "type": "CUevent hEvent",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitValue32": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint32_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitValue32_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint32_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitValue32_v2": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint32_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitValue32_v2_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint32_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitValue64": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint64_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitValue64_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint64_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitValue64_v2": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint64_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWaitValue64_v2_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint64_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWriteValue32": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint32_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWriteValue32_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint32_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWriteValue32_v2": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint32_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWriteValue32_v2_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint32_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWriteValue64": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint64_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWriteValue64_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint64_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWriteValue64_v2": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint64_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuStreamWriteValue64_v2_ptsz": [
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  },
+  {
+   "name": "addr",
+   "type": "CUdeviceptr_v2 addr",
+   "kind": "value"
+  },
+  {
+   "name": "value",
+   "type": "cuuint64_t value",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuSurfObjectCreate": [
+  {
+   "name": "pSurfObject",
+   "type": "CUsurfObject_v1 *pSurfObject",
+   "kind": "out"
+  },
+  {
+   "name": "pResDesc",
+   "type": "const CUDA_RESOURCE_DESC_v1 *pResDesc",
+   "kind": "in"
+  }
+ ],
+ "cuSurfObjectDestroy": [
+  {
+   "name": "surfObject",
+   "type": "CUsurfObject_v1 surfObject",
+   "kind": "value"
+  }
+ ],
+ "cuSurfObjectGetResourceDesc": [
+  {
+   "name": "pResDesc",
+   "type": "CUDA_RESOURCE_DESC_v1 *pResDesc",
+   "kind": "out"
+  },
+  {
+   "name": "surfObject",
+   "type": "CUsurfObject_v1 surfObject",
+   "kind": "value"
+  }
+ ],
+ "cuSurfRefGetArray": [
+  {
+   "name": "phArray",
+   "type": "CUarray *phArray",
+   "kind": "out"
+  },
+  {
+   "name": "hSurfRef",
+   "type": "CUsurfref hSurfRef",
+   "kind": "value"
+  }
+ ],
+ "cuSurfRefSetArray": [
+  {
+   "name": "hSurfRef",
+   "type": "CUsurfref hSurfRef",
+   "kind": "value"
+  },
+  {
+   "name": "hArray",
+   "type": "CUarray hArray",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuTensorMapEncodeIm2col": [
+  {
+   "name": "tensorMap",
+   "type": "CUtensorMap *tensorMap",
+   "kind": "out"
+  },
+  {
+   "name": "tensorDataType",
+   "type": "CUtensorMapDataType tensorDataType",
+   "kind": "value"
+  },
+  {
+   "name": "tensorRank",
+   "type": "cuuint32_t tensorRank",
+   "kind": "value"
+  },
+  {
+   "name": "globalAddress",
+   "type": "void *globalAddress",
+   "kind": "manual"
+  },
+  {
+   "name": "globalDim",
+   "type": "const cuuint64_t *globalDim",
+   "kind": "in"
+  },
+  {
+   "name": "globalStrides",
+   "type": "const cuuint64_t *globalStrides",
+   "kind": "in"
+  },
+  {
+   "name": "pixelBoxLowerCorner",
+   "type": "const int *pixelBoxLowerCorner",
+   "kind": "in"
+  },
+  {
+   "name": "pixelBoxUpperCorner",
+   "type": "const int *pixelBoxUpperCorner",
+   "kind": "in"
+  },
+  {
+   "name": "channelsPerPixel",
+   "type": "cuuint32_t channelsPerPixel",
+   "kind": "value"
+  },
+  {
+   "name": "pixelsPerColumn",
+   "type": "cuuint32_t pixelsPerColumn",
+   "kind": "value"
+  },
+  {
+   "name": "elementStrides",
+   "type": "const cuuint32_t *elementStrides",
+   "kind": "in"
+  },
+  {
+   "name": "interleave",
+   "type": "CUtensorMapInterleave interleave",
+   "kind": "value"
+  },
+  {
+   "name": "swizzle",
+   "type": "CUtensorMapSwizzle swizzle",
+   "kind": "value"
+  },
+  {
+   "name": "l2Promotion",
+   "type": "CUtensorMapL2promotion l2Promotion",
+   "kind": "value"
+  },
+  {
+   "name": "oobFill",
+   "type": "CUtensorMapFloatOOBfill oobFill",
+   "kind": "value"
+  }
+ ],
+ "cuTensorMapEncodeIm2colWide": [
+  {
+   "name": "tensorMap",
+   "type": "CUtensorMap *tensorMap",
+   "kind": "out"
+  },
+  {
+   "name": "tensorDataType",
+   "type": "CUtensorMapDataType tensorDataType",
+   "kind": "value"
+  },
+  {
+   "name": "tensorRank",
+   "type": "cuuint32_t tensorRank",
+   "kind": "value"
+  },
+  {
+   "name": "globalAddress",
+   "type": "void *globalAddress",
+   "kind": "manual"
+  },
+  {
+   "name": "globalDim",
+   "type": "const cuuint64_t *globalDim",
+   "kind": "in"
+  },
+  {
+   "name": "globalStrides",
+   "type": "const cuuint64_t *globalStrides",
+   "kind": "in"
+  },
+  {
+   "name": "pixelBoxLowerCornerWidth",
+   "type": "int pixelBoxLowerCornerWidth",
+   "kind": "value"
+  },
+  {
+   "name": "pixelBoxUpperCornerWidth",
+   "type": "int pixelBoxUpperCornerWidth",
+   "kind": "value"
+  },
+  {
+   "name": "channelsPerPixel",
+   "type": "cuuint32_t channelsPerPixel",
+   "kind": "value"
+  },
+  {
+   "name": "pixelsPerColumn",
+   "type": "cuuint32_t pixelsPerColumn",
+   "kind": "value"
+  },
+  {
+   "name": "elementStrides",
+   "type": "const cuuint32_t *elementStrides",
+   "kind": "in"
+  },
+  {
+   "name": "interleave",
+   "type": "CUtensorMapInterleave interleave",
+   "kind": "value"
+  },
+  {
+   "name": "mode",
+   "type": "CUtensorMapIm2ColWideMode mode",
+   "kind": "value"
+  },
+  {
+   "name": "swizzle",
+   "type": "CUtensorMapSwizzle swizzle",
+   "kind": "value"
+  },
+  {
+   "name": "l2Promotion",
+   "type": "CUtensorMapL2promotion l2Promotion",
+   "kind": "value"
+  },
+  {
+   "name": "oobFill",
+   "type": "CUtensorMapFloatOOBfill oobFill",
+   "kind": "value"
+  }
+ ],
+ "cuTensorMapEncodeTiled": [
+  {
+   "name": "tensorMap",
+   "type": "CUtensorMap *tensorMap",
+   "kind": "out"
+  },
+  {
+   "name": "tensorDataType",
+   "type": "CUtensorMapDataType tensorDataType",
+   "kind": "value"
+  },
+  {
+   "name": "tensorRank",
+   "type": "cuuint32_t tensorRank",
+   "kind": "value"
+  },
+  {
+   "name": "globalAddress",
+   "type": "void *globalAddress",
+   "kind": "manual"
+  },
+  {
+   "name": "globalDim",
+   "type": "const cuuint64_t *globalDim",
+   "kind": "in"
+  },
+  {
+   "name": "globalStrides",
+   "type": "const cuuint64_t *globalStrides",
+   "kind": "in"
+  },
+  {
+   "name": "boxDim",
+   "type": "const cuuint32_t *boxDim",
+   "kind": "in"
+  },
+  {
+   "name": "elementStrides",
+   "type": "const cuuint32_t *elementStrides",
+   "kind": "in"
+  },
+  {
+   "name": "interleave",
+   "type": "CUtensorMapInterleave interleave",
+   "kind": "value"
+  },
+  {
+   "name": "swizzle",
+   "type": "CUtensorMapSwizzle swizzle",
+   "kind": "value"
+  },
+  {
+   "name": "l2Promotion",
+   "type": "CUtensorMapL2promotion l2Promotion",
+   "kind": "value"
+  },
+  {
+   "name": "oobFill",
+   "type": "CUtensorMapFloatOOBfill oobFill",
+   "kind": "value"
+  }
+ ],
+ "cuTensorMapReplaceAddress": [
+  {
+   "name": "tensorMap",
+   "type": "CUtensorMap *tensorMap",
+   "kind": "out"
+  },
+  {
+   "name": "globalAddress",
+   "type": "void *globalAddress",
+   "kind": "manual"
+  }
+ ],
+ "cuTexObjectCreate": [
+  {
+   "name": "pTexObject",
+   "type": "CUtexObject_v1 *pTexObject",
+   "kind": "out"
+  },
+  {
+   "name": "pResDesc",
+   "type": "const CUDA_RESOURCE_DESC_v1 *pResDesc",
+   "kind": "in"
+  },
+  {
+   "name": "pTexDesc",
+   "type": "const CUDA_TEXTURE_DESC_v1 *pTexDesc",
+   "kind": "in"
+  },
+  {
+   "name": "pResViewDesc",
+   "type": "const CUDA_RESOURCE_VIEW_DESC_v1 *pResViewDesc",
+   "kind": "in"
+  }
+ ],
+ "cuTexObjectDestroy": [
+  {
+   "name": "texObject",
+   "type": "CUtexObject_v1 texObject",
+   "kind": "value"
+  }
+ ],
+ "cuTexObjectGetResourceDesc": [
+  {
+   "name": "pResDesc",
+   "type": "CUDA_RESOURCE_DESC_v1 *pResDesc",
+   "kind": "out"
+  },
+  {
+   "name": "texObject",
+   "type": "CUtexObject_v1 texObject",
+   "kind": "value"
+  }
+ ],
+ "cuTexObjectGetResourceViewDesc": [
+  {
+   "name": "pResViewDesc",
+   "type": "CUDA_RESOURCE_VIEW_DESC_v1 *pResViewDesc",
+   "kind": "out"
+  },
+  {
+   "name": "texObject",
+   "type": "CUtexObject_v1 texObject",
+   "kind": "value"
+  }
+ ],
+ "cuTexObjectGetTextureDesc": [
+  {
+   "name": "pTexDesc",
+   "type": "CUDA_TEXTURE_DESC_v1 *pTexDesc",
+   "kind": "out"
+  },
+  {
+   "name": "texObject",
+   "type": "CUtexObject_v1 texObject",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefCreate": [
+  {
+   "name": "pTexRef",
+   "type": "CUtexref *pTexRef",
+   "kind": "out"
+  }
+ ],
+ "cuTexRefDestroy": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetAddressMode": [
+  {
+   "name": "pam",
+   "type": "CUaddress_mode *pam",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "dim",
+   "type": "int dim",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetAddress_v2": [
+  {
+   "name": "pdptr",
+   "type": "CUdeviceptr_v2 *pdptr",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetArray": [
+  {
+   "name": "phArray",
+   "type": "CUarray *phArray",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetBorderColor": [
+  {
+   "name": "pBorderColor",
+   "type": "float *pBorderColor",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetFilterMode": [
+  {
+   "name": "pfm",
+   "type": "CUfilter_mode *pfm",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetFlags": [
+  {
+   "name": "pFlags",
+   "type": "unsigned int *pFlags",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetFormat": [
+  {
+   "name": "pFormat",
+   "type": "CUarray_format *pFormat",
+   "kind": "out"
+  },
+  {
+   "name": "pNumChannels",
+   "type": "int *pNumChannels",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetMaxAnisotropy": [
+  {
+   "name": "pmaxAniso",
+   "type": "int *pmaxAniso",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetMipmapFilterMode": [
+  {
+   "name": "pfm",
+   "type": "CUfilter_mode *pfm",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetMipmapLevelBias": [
+  {
+   "name": "pbias",
+   "type": "float *pbias",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetMipmapLevelClamp": [
+  {
+   "name": "pminMipmapLevelClamp",
+   "type": "float *pminMipmapLevelClamp",
+   "kind": "out"
+  },
+  {
+   "name": "pmaxMipmapLevelClamp",
+   "type": "float *pmaxMipmapLevelClamp",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefGetMipmappedArray": [
+  {
+   "name": "phMipmappedArray",
+   "type": "CUmipmappedArray *phMipmappedArray",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetAddress2D_v3": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "desc",
+   "type": "const CUDA_ARRAY_DESCRIPTOR_v2 *desc",
+   "kind": "in"
+  },
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  },
+  {
+   "name": "Pitch",
+   "type": "size_t Pitch",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetAddressMode": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "dim",
+   "type": "int dim",
+   "kind": "value"
+  },
+  {
+   "name": "am",
+   "type": "CUaddress_mode am",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetAddress_v2": [
+  {
+   "name": "ByteOffset",
+   "type": "size_t *ByteOffset",
+   "kind": "out"
+  },
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "dptr",
+   "type": "CUdeviceptr_v2 dptr",
+   "kind": "value"
+  },
+  {
+   "name": "bytes",
+   "type": "size_t bytes",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetArray": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "hArray",
+   "type": "CUarray hArray",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetBorderColor": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "pBorderColor",
+   "type": "float *pBorderColor",
+   "kind": "out"
+  }
+ ],
+ "cuTexRefSetFilterMode": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "fm",
+   "type": "CUfilter_mode fm",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetFlags": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetFormat": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "fmt",
+   "type": "CUarray_format fmt",
+   "kind": "value"
+  },
+  {
+   "name": "NumPackedComponents",
+   "type": "int NumPackedComponents",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetMaxAnisotropy": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "maxAniso",
+   "type": "unsigned int maxAniso",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetMipmapFilterMode": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "fm",
+   "type": "CUfilter_mode fm",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetMipmapLevelBias": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "bias",
+   "type": "float bias",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetMipmapLevelClamp": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "minMipmapLevelClamp",
+   "type": "float minMipmapLevelClamp",
+   "kind": "value"
+  },
+  {
+   "name": "maxMipmapLevelClamp",
+   "type": "float maxMipmapLevelClamp",
+   "kind": "value"
+  }
+ ],
+ "cuTexRefSetMipmappedArray": [
+  {
+   "name": "hTexRef",
+   "type": "CUtexref hTexRef",
+   "kind": "value"
+  },
+  {
+   "name": "hMipmappedArray",
+   "type": "CUmipmappedArray hMipmappedArray",
+   "kind": "value"
+  },
+  {
+   "name": "Flags",
+   "type": "unsigned int Flags",
+   "kind": "value"
+  }
+ ],
+ "cuThreadExchangeStreamCaptureMode": [
+  {
+   "name": "mode",
+   "type": "CUstreamCaptureMode *mode",
+   "kind": "out"
+  }
+ ],
+ "cuUserObjectCreate": [
+  {
+   "name": "object_out",
+   "type": "CUuserObject *object_out",
+   "kind": "out"
+  },
+  {
+   "name": "ptr",
+   "type": "void *ptr",
+   "kind": "manual"
+  },
+  {
+   "name": "destroy",
+   "type": "CUhostFn destroy",
+   "kind": "value"
+  },
+  {
+   "name": "initialRefcount",
+   "type": "unsigned int initialRefcount",
+   "kind": "value"
+  },
+  {
+   "name": "flags",
+   "type": "unsigned int flags",
+   "kind": "value"
+  }
+ ],
+ "cuUserObjectRelease": [
+  {
+   "name": "object",
+   "type": "CUuserObject object",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  }
+ ],
+ "cuUserObjectRetain": [
+  {
+   "name": "object",
+   "type": "CUuserObject object",
+   "kind": "value"
+  },
+  {
+   "name": "count",
+   "type": "unsigned int count",
+   "kind": "value"
+  }
+ ],
+ "cuWaitExternalSemaphoresAsync": [
+  {
+   "name": "extSemArray",
+   "type": "const CUexternalSemaphore *extSemArray",
+   "kind": "in"
+  },
+  {
+   "name": "paramsArray",
+   "type": "const CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS_v1 *paramsArray",
+   "kind": "in"
+  },
+  {
+   "name": "numExtSems",
+   "type": "unsigned int numExtSems",
+   "kind": "value"
+  },
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  }
+ ],
+ "cuWaitExternalSemaphoresAsync_ptsz": [
+  {
+   "name": "extSemArray",
+   "type": "const CUexternalSemaphore *extSemArray",
+   "kind": "in"
+  },
+  {
+   "name": "paramsArray",
+   "type": "const CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS_v1 *paramsArray",
+   "kind": "in"
+  },
+  {
+   "name": "numExtSems",
+   "type": "unsigned int numExtSems",
+   "kind": "value"
+  },
+  {
+   "name": "stream",
+   "type": "CUstream stream",
+   "kind": "value"
+  }
+ ]
+}

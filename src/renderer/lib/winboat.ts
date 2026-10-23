@@ -6,6 +6,18 @@ import { AppIcons } from "../data/appicons";
 import { InternalApps } from "../data/internalapps";
 import { getFreeRDP } from "../utils/getFreeRDP";
 import { guestAuthHeaders, guestServerUpdateZipPath } from "../utils/guestServer";
+import {
+    DisplayRoute,
+    displayRoute,
+    openSpiceViewer,
+    showSeamlessApp,
+    waitForAppWindow,
+    type GuestGpuStatus,
+    isVirtualGpuEnabled,
+    onViewerFps,
+    virtualGpuRenderNode,
+} from "./virtualGpu";
+import { GpuMonitor, type GpuMetrics } from "./gpuMetrics";
 import { setIntervalImmediately } from "../utils/interval";
 import { createLogger } from "../utils/log";
 import { openLink } from "../utils/openLink";
@@ -98,6 +110,8 @@ const customAppCallbacks: CustomAppCallbacks = {
 const QMP_WAIT_MS = 2000;
 const FETCH_TIMEOUT = 1000;
 const GUEST_ONLINE_TIMEOUT_MS = 60_000;
+// Installing the virtual GPU driver signs and installs ~50 MB of files
+const VIRTUAL_GPU_SCRIPT_TIMEOUT_MS = 5 * 60_000;
 
 class AppManager {
     appCache: WinApp[] = [];
@@ -228,6 +242,28 @@ export class Winboat {
 
     // Variables
     isOnline: Ref<boolean> = ref(false);
+    /** The VM's use of the host GPU, measured while somebody watches it (watchGpu) */
+    gpuMetrics: Ref<GpuMetrics> = ref<GpuMetrics>({
+        state: "measuring",
+        usage: 0,
+        name: "",
+        memoryUsed: null,
+        hostUsage: null,
+        commandsPerSecond: null,
+    });
+    /**
+     * What goes through the virtual GPU: the driver's bytes per second (its counters, in the metrics) and the frames
+     * per second the SPICE viewer gets (null: not known)
+     */
+    gpuTraffic: Ref<{ bytesPerSecond: number | null; framesPerSecond: number | null }> = ref({
+        bytesPerSecond: null,
+        framesPerSecond: null,
+    });
+    #lastGpuCounters: { bytes: number; at: number } | null = null;
+    #gpuMonitor: GpuMonitor | null = null;
+    #gpuWatchers = 0;
+    /** Apps starting on the SPICE desktop: the app list shows them as starting until their windows show */
+    startingApps: Ref<WinApp[]> = ref([]);
     isUpdatingGuestServer: Ref<boolean> = ref(false);
     containerStatus: Ref<ContainerStatus> = ref(ContainerStatus.EXITED);
     containerActionLoading: Ref<boolean> = ref(false);
@@ -261,6 +297,7 @@ export class Winboat {
     private constructor() {
         this.#wbConfig = WinboatConfig.getInstance();
         this.containerMgr = createContainer(this.#wbConfig.config.containerRuntime);
+        onViewerFps(fps => (this.gpuTraffic.value = { ...this.gpuTraffic.value, framesPerSecond: fps }));
 
         // This is a special interval which will never be destroyed
         setInterval(async () => {
@@ -309,8 +346,11 @@ export class Winboat {
 
                 if (this.isOnline.value) {
                     await this.checkVersionAndUpdateGuestServer();
+                } else {
+                    this.#appliedTheme = null;
                 }
             }
+            if (this.isOnline.value && !this.isUpdatingGuestServer.value) this.#keepWindowsTheme();
         }, HEALTH_WAIT_MS);
 
         // *** Metrics Interval ***
@@ -324,6 +364,7 @@ export class Winboat {
             // If the guest is offline or updating, don't bother checking metrics
             if (!this.isOnline.value || this.isUpdatingGuestServer.value) return;
             this.metrics.value = await this.getMetrics();
+            this.#updateGpuTraffic();
         }, METRICS_WAIT_MS);
 
         // *** RDP Connection Status Interval ***
@@ -433,6 +474,291 @@ export class Winboat {
         });
         const status = (await res.json()) as { rdpConnected: boolean };
         return status.rdpConnected;
+    }
+
+    /** The virtual GPU driver's state in Windows (guest_server/scripts/gpu-driver.ps1) */
+    async getVirtualGpuStatus(): Promise<GuestGpuStatus> {
+        const res = await nodeFetch(`${WINBOAT_API_URL}/gpu`, {
+            headers: guestAuthHeaders(),
+            signal: AbortSignal.timeout(VIRTUAL_GPU_SCRIPT_TIMEOUT_MS),
+        });
+        if (res.status === 404) {
+            throw new Error("The Guest Server in Windows is too old for the virtual GPU, restart WinBoat to update it");
+        }
+        const body = (await res.json()) as GuestGpuStatus & { error?: string };
+        if (!res.ok || body.error) {
+            throw new Error(body.error ?? `Guest Server returned ${res.status} for /gpu`);
+        }
+        return body;
+    }
+
+    /**
+     * Installs or uninstalls the virtual GPU driver bundled with the Guest Server. Both need Windows to restart:
+     * with reboot, the Guest Server restarts it right after answering.
+     */
+    /** Starts an app on the Windows desktop the SPICE display route shows (as the user signed in there) */
+    async launchOnDesktop(app: WinApp): Promise<number> {
+        const res = await nodeFetch(`${WINBOAT_API_URL}/desktop/launch`, {
+            method: "POST",
+            headers: { ...guestAuthHeaders(), "Content-Type": "application/json" },
+            // Seamless: the window tracker reports its windows, which the viewer shows as windows of their own
+            body: JSON.stringify({ path: app.Path, args: app.Args ?? "", seamless: true, taskbar: "hide" }),
+            signal: AbortSignal.timeout(30_000),
+        });
+        if (!res.ok) {
+            const error: Error & { status?: number } = new Error(
+                (await res.text()).trim() || `Guest Server returned ${res.status} for /desktop/launch`,
+            );
+            error.status = res.status;
+            throw error;
+        }
+        return ((await res.json()) as { pid: number }).pid;
+    }
+
+    /** Shows or hides Windows' taskbar on the desktop the SPICE display route shows */
+    async setDesktopTaskbar(visible: boolean) {
+        const res = await nodeFetch(`${WINBOAT_API_URL}/desktop/taskbar`, {
+            method: "POST",
+            headers: { ...guestAuthHeaders(), "Content-Type": "application/json" },
+            body: JSON.stringify({ visible }),
+            signal: AbortSignal.timeout(30_000),
+        });
+        if (!res.ok) {
+            throw new Error((await res.text()).trim() || `Guest Server returned ${res.status} for /desktop/taskbar`);
+        }
+    }
+
+    /**
+     * Sets Windows' refresh rate to the one of the monitor the SPICE window is on (the fastest Windows offers up to
+     * it), so Windows composes as many frames as that monitor shows. A Guest Server without it, or Windows not
+     * signed in yet, leaves the rate as it is.
+     */
+    #appliedTheme: "light" | "dark" | null = null;
+    #themeTriedAt = 0;
+
+    /** Windows' light or dark mode as the setting asks: the Linux desktop's, or a fixed one */
+    wantedWindowsTheme(): "light" | "dark" {
+        const setting = this.#wbConfig?.config.windowsTheme ?? "follow";
+        if (setting !== "follow") return setting;
+        const remote: typeof import("@electron/remote") = require("@electron/remote");
+        return remote.nativeTheme.shouldUseDarkColors ? "dark" : "light";
+    }
+
+    /**
+     * Keeps Windows in the wanted light or dark mode (the health check calls it): when Windows starts, when the
+     * setting or the Linux desktop's mode changes. Until somebody is signed in to Windows it can't be set: tried again
+     * every 15 seconds.
+     */
+    #keepWindowsTheme() {
+        const mode = this.wantedWindowsTheme();
+        if (mode === this.#appliedTheme || Date.now() - this.#themeTriedAt < 15_000) return;
+        this.#themeTriedAt = Date.now();
+        void this.setWindowsTheme(mode);
+    }
+
+    async setWindowsTheme(mode: "light" | "dark") {
+        try {
+            const res = await nodeFetch(`${WINBOAT_API_URL}/desktop/theme`, {
+                method: "POST",
+                headers: { ...guestAuthHeaders(), "Content-Type": "application/json" },
+                body: JSON.stringify({ mode }),
+                signal: AbortSignal.timeout(30_000),
+            });
+            if (!res.ok) throw new Error((await res.text()).trim() || `Guest Server returned ${res.status}`);
+            this.#appliedTheme = mode;
+            this.#themeTriedAt = 0;
+            logger.info(`Windows is in ${mode} mode`);
+        } catch (e) {
+            logger.warn(`Setting Windows to ${mode} mode failed (tried again later): ${e}`);
+        }
+    }
+
+    /** The refresh rate of the monitor the SPICE viewer is on, as it last reported */
+    #monitorRate = 0;
+
+    /**
+     * Sets Windows' refresh rate for the SPICE route: the one the setting fixes, else the rate of the monitor the
+     * viewer is on (it reports it when it starts). Windows composes that many frames a second, and the virtual GPU's
+     * work runs on QEMU's main loop, which also feeds the sound card: high rates at large resolutions make the sound
+     * crackle.
+     */
+    async matchRefreshRate(monitorRate: number) {
+        this.#monitorRate = monitorRate;
+        await this.applyRefreshRate();
+    }
+
+    /** Applies the refresh rate setting now (Windows has to be running) */
+    async applyRefreshRate() {
+        const fixed = this.#wbConfig?.config.vmRefreshRate ?? 0;
+        const maxRate = fixed > 0 ? fixed : this.#monitorRate;
+        if (maxRate <= 0) return;
+        try {
+            const res = await nodeFetch(`${WINBOAT_API_URL}/desktop/refresh-rate`, {
+                method: "POST",
+                headers: { ...guestAuthHeaders(), "Content-Type": "application/json" },
+                body: JSON.stringify({ maxRate }),
+                signal: AbortSignal.timeout(30_000),
+            });
+            if (!res.ok) throw new Error((await res.text()).trim() || `Guest Server returned ${res.status}`);
+            const { rate } = (await res.json()) as { rate: number };
+            logger.info(
+                `SPICE display route: host monitor at ${this.#monitorRate || "?"} Hz, ` +
+                    `${fixed > 0 ? `set to ${fixed} Hz` : "matching it"}, Windows at ${rate} Hz`,
+            );
+        } catch (e) {
+            logger.error(`SPICE display route: setting Windows' refresh rate to ${maxRate} Hz failed`);
+            logger.error(e);
+        }
+    }
+
+    /**
+     * Starts an app on the SPICE desktop and shows its windows as windows of their own. The app list shows it as
+     * starting until its window shows (a minute at most): apps can take a while, and nothing showed meanwhile.
+     */
+    async startSeamless(app: WinApp) {
+        const isApp = (other: WinApp) => other.Path === app.Path && other.Args === app.Args;
+        const waiting = waitForAppWindow(60_000);
+        this.startingApps.value = [...this.startingApps.value, app];
+        void waiting.shown.then(() => (this.startingApps.value = this.startingApps.value.filter(a => !isApp(a))));
+        try {
+            await this.showSeamless(await this.launchOnDesktop(app));
+        } catch (e) {
+            waiting.cancel();
+            throw e;
+        }
+    }
+
+    /**
+     * Measures the VM's use of the host GPU into gpuMetrics until the returned function is called (the Home view
+     * shows it): measuring runs helper processes, only while it shows. Without the virtual GPU it's "off".
+     */
+    watchGpu(): () => void {
+        if (this.#gpuWatchers++ === 0) {
+            const compose = Winboat.readCompose(this.containerMgr!.composeFilePath);
+            if (!isVirtualGpuEnabled(compose)) {
+                this.gpuMetrics.value = { ...this.gpuMetrics.value, state: "off", usage: 0 };
+            } else {
+                this.gpuMetrics.value = { ...this.gpuMetrics.value, state: "measuring", usage: 0 };
+                this.#gpuMonitor = new GpuMonitor(
+                    this.containerMgr!.executableAlias,
+                    this.containerMgr!.containerName,
+                    virtualGpuRenderNode(compose),
+                    metrics => (this.gpuMetrics.value = metrics),
+                );
+            }
+        }
+        let watching = true;
+        return () => {
+            if (!watching) return;
+            watching = false;
+            if (--this.#gpuWatchers === 0) {
+                this.#gpuMonitor?.stop();
+                this.#gpuMonitor = null;
+            }
+        };
+    }
+
+    /** The driver's bytes per second, from its totals in two metrics samples */
+    #updateGpuTraffic() {
+        const counters = this.metrics.value.gpu;
+        if (!counters) {
+            this.#lastGpuCounters = null;
+            this.gpuTraffic.value = { ...this.gpuTraffic.value, bytesPerSecond: null };
+            return;
+        }
+        const sample = {
+            bytes: counters.commandBytes + counters.uploadBytes + counters.downloadBytes,
+            at: Date.now(),
+        };
+        const last = this.#lastGpuCounters;
+        // A driver that started again counts from 0
+        if (last && sample.at > last.at && sample.bytes >= last.bytes) {
+            const bytesPerSecond = ((sample.bytes - last.bytes) * 1000) / (sample.at - last.at);
+            this.gpuTraffic.value = { ...this.gpuTraffic.value, bytesPerSecond };
+        }
+        this.#lastGpuCounters = sample;
+    }
+
+    /** Whether an app is starting on the SPICE desktop (its window hasn't shown yet) */
+    isStarting(app: WinApp) {
+        return this.startingApps.value.some(other => other.Path === app.Path && other.Args === app.Args);
+    }
+
+    /** Shows the windows of an app started on the SPICE desktop as windows of their own */
+    async showSeamless(pid: number) {
+        await showSeamlessApp(
+            this.containerMgr!.executableAlias,
+            this.containerMgr!.containerName,
+            pid,
+            this.#wbConfig?.config.seamlessBackground ?? "black",
+            rate => void this.matchRefreshRate(rate),
+        );
+    }
+
+    /**
+     * Starts the app once someone signs in to the Windows desktop (in the SPICE window), trying for a few minutes.
+     * Auto logon signs in by itself from Windows' next start.
+     */
+    async launchWhenSignedIn(app: WinApp) {
+        const deadline = Date.now() + 5 * 60_000;
+        while (Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            try {
+                await this.showSeamless(await this.launchOnDesktop(app));
+                logger.info(`SPICE display route: started '${app.Name}' after signing in`);
+                return;
+            } catch (e) {
+                if ((e as { status?: number }).status !== 409) {
+                    logger.error(e);
+                    return;
+                }
+            }
+        }
+        logger.warn(`SPICE display route: nobody signed in, '${app.Name}' wasn't started`);
+    }
+
+    /** Windows' auto logon, which the SPICE display route needs (WinBoat's installer turns it off for RDP) */
+    async setDesktopAutoLogon(enable: boolean) {
+        logger.info(`SPICE display route: auto logon ${enable ? "on" : "off"}`);
+        const { username, password } = this.getCredentials();
+        const res = await nodeFetch(`${WINBOAT_API_URL}/desktop/autologon`, {
+            method: "POST",
+            headers: { ...guestAuthHeaders(), "Content-Type": "application/json" },
+            body: JSON.stringify({ enable, username, password }),
+            signal: AbortSignal.timeout(30_000),
+        });
+        if (!res.ok) {
+            throw new Error((await res.text()).trim() || `Guest Server returned ${res.status} for /desktop/autologon`);
+        }
+    }
+
+    async setVirtualGpuDriver(action: "install" | "uninstall", reboot: boolean): Promise<GuestGpuStatus> {
+        logger.info(`Virtual GPU: ${action} the driver in Windows${reboot ? " and restart it" : ""}`);
+        const res = await nodeFetch(`${WINBOAT_API_URL}/gpu/driver`, {
+            method: "POST",
+            headers: { ...guestAuthHeaders(), "Content-Type": "application/json" },
+            body: JSON.stringify({ action, reboot }),
+            signal: AbortSignal.timeout(VIRTUAL_GPU_SCRIPT_TIMEOUT_MS),
+        });
+        const body = (await res.json()) as GuestGpuStatus & { error?: string };
+        if (!res.ok || body.error) {
+            throw new Error(body.error ?? `Guest Server returned ${res.status} for /gpu/driver`);
+        }
+        return body;
+    }
+
+    /** Waits for Windows to go down (a restart the guest scheduled) and for the Guest Server to answer again */
+    async waitForGuestRestart(timeoutMs = 10 * 60_000): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        const offlineDeadline = Date.now() + 90_000;
+        while ((await this.getHealth()) && Date.now() < offlineDeadline) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        while (Date.now() < deadline) {
+            if (await this.getHealth()) return true;
+            await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+        return false;
     }
 
     static readCompose(composePath: string): ComposeConfig {
@@ -694,6 +1020,53 @@ export class Winboat {
     async launchApp(app: WinApp) {
         if (!this.isOnline.value) throw new Error("Cannot launch app, Winboat is offline");
 
+        // The SPICE display route shows the whole desktop, and an RDP connection would take over the Windows session
+        // it shows: open the desktop instead
+        if (displayRoute(Winboat.readCompose(this.containerMgr!.composeFilePath)) === DisplayRoute.SPICE) {
+            const internal = app.Path === InternalApps.WINDOWS_DESKTOP || !!customAppCallbacks[app.Path];
+            logger.info(`SPICE display route: opening the desktop${internal ? "" : ` with '${app.Name}'`}`);
+            const openDesktop = () =>
+                openSpiceViewer(
+                    this.containerMgr!.executableAlias,
+                    this.containerMgr!.containerName,
+                    "WinBoat",
+                    "winboat-desktop",
+                    rate => void this.matchRefreshRate(rate),
+                );
+            try {
+                if (internal) {
+                    await openDesktop();
+                    await this.setDesktopTaskbar(true).catch(error => logger.error(error));
+                } else {
+                    if (this.isStarting(app)) {
+                        // Clicked again while it starts: one is enough
+                        logger.info(`SPICE display route: '${app.Name}' is starting already`);
+                        return;
+                    }
+                    try {
+                        // Seamless app windows: each of the app's windows in a Linux window of its own
+                        await this.startSeamless(app);
+                    } catch (e) {
+                        if ((e as { status?: number }).status !== 409) throw e;
+                        // Nobody is signed in to the desktop (auto logon was off at Windows' start): sign-in is
+                        // automatic from the next start, and the app opens once someone signs in now (the desktop
+                        // shows meanwhile)
+                        logger.info("SPICE display route: Windows isn't signed in, waiting to start the app");
+                        await openDesktop();
+                        await this.setDesktopAutoLogon(true).catch(error => logger.error(error));
+                        void this.launchWhenSignedIn(app);
+                    }
+                }
+            } catch (e) {
+                logger.error("SPICE display route: opening the desktop failed");
+                logger.error(e);
+                throw e;
+            }
+            this.appMgr?.incrementAppUsage(app);
+            this.appMgr?.writeToDisk();
+            return;
+        }
+
         if (customAppCallbacks[app.Path]) {
             logger.info(`Found custom app command for '${app.Name}'`);
             customAppCallbacks[app.Path]!(this);
@@ -734,7 +1107,8 @@ export class Winboat {
                 this.#wbConfig?.config.multiMonitor === MultiMonitorMode.MultiMon ? "/multimon" : "",
                 `/scale-desktop:${this.#wbConfig?.config.scaleDesktop ?? 100}`,
                 `/wm-class:winboat-${cleanAppName}`,
-                `/app:program:${app.Path},name:${cleanAppName},cmd:"${app.Args}"`,
+                // hidef goes before cmd: FreeRDP stops reading sub-options after the quoted cmd value
+                `/app:program:${app.Path},name:${cleanAppName}${this.#wbConfig?.config.legacyRemoteApp ? ",hidef:off" : ""},cmd:"${app.Args}"`,
             ]);
         }
 

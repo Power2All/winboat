@@ -1,0 +1,244 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd, d3d9umd, virgl: VC-1 decoding
+
+DXVA VC-1 (VC1_D2010 and VC1_D: simple, main and advanced profile, WMV9 too) in the Direct3D 11 and 9 drivers,
+through virgl to the host's VA-API (nvidia-vaapi-driver 0005, virglrenderer 0014 on NVDEC). DxvaDecode's VC1Picture
+unpacks DXVA's MPEG-2-era picture parameters as ffmpeg's dxva2_vc1.c packs them (sequence and entry point flags in
+bPicSpatialResid8/bPicOverflowBlocks/bPicDeblocked/bPicDeblockConfined/bPicOBMC, the frame coding mode from
+bPicStructure and bPicExtrapolation, a BI picture as intra in a B picture's place), VA-API's picture type codes
+(PTYPE for frames, FPTYPE for fields). The advanced profile's slices each get their real start code back (0x0D
+frame, 0x0C second field, 0x0B slice; ffmpeg puts a frame's before every one), which the host splits them at.
+Gallium's and virgl's VC-1 picture descriptions gain what decoders that parse the picture layer themselves need
+besides (the first field's parity, which field, RANGEREDFRM, the stream's profile: one decoder decodes every VC-1
+profile), appended (virgl's union stays H.264's/HEVC's size); virgl now also sends the frame coding mode and
+POSTPROCFLAG, which it never did. ffmpeg -hwaccel d3d11va/dxva2: the FATE suite's VC-1 clips (simple/main,
+advanced progressive and interlaced with field pairs, 1080i) bit-exact against libavcodec.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_video.c b/src/gallium/drivers/virgl/virgl_video.c
+index 29af663..db61809 100644
+--- a/src/gallium/drivers/virgl/virgl_video.c
++++ b/src/gallium/drivers/virgl/virgl_video.c
+@@ -611,6 +611,12 @@ static int fill_vc1_picture_desc(const struct pipe_picture_desc *desc,
+         vvc1->ref[i] = vbuf ? vbuf->handle : 0;
+     }
+     ITEM_SET(vvc1, vc1, picture_type);
++    ITEM_SET(vvc1, vc1, frame_coding_mode);
++    ITEM_SET(vvc1, vc1, postprocflag);
++    ITEM_SET(vvc1, vc1, top_field_first);
++    ITEM_SET(vvc1, vc1, is_first_field);
++    ITEM_SET(vvc1, vc1, rangeredfrm);
++    ITEM_SET(vvc1, vc1, vc1_profile);
+     ITEM_SET(vvc1, vc1, pulldown);
+     ITEM_SET(vvc1, vc1, interlace);
+     ITEM_SET(vvc1, vc1, tfcntrflag);
+diff --git a/src/gallium/frontends/d3d10umd/DxvaDecode.cpp b/src/gallium/frontends/d3d10umd/DxvaDecode.cpp
+index 4b86b12..5da429d 100644
+--- a/src/gallium/frontends/d3d10umd/DxvaDecode.cpp
++++ b/src/gallium/frontends/d3d10umd/DxvaDecode.cpp
+@@ -6,7 +6,7 @@
+ /*
+  * DxvaDecode.cpp --
+  *    DXVA decoding shared by the Direct3D 10/11 and 9 drivers (DxvaDecode.h): the frame's buffers to a gallium
+- *    picture description, and the decoding. H.264, HEVC, VP9, AV1 and MPEG-2, short slice formats only.
++ *    picture description, and the decoding. H.264, HEVC, VP9, AV1, MPEG-2 and VC-1, short slice formats only.
+  */
+ 
+ #include "DxvaDecode.h"
+@@ -72,6 +72,7 @@ DxvaBeginFrame(DxvaDecoder *dec)
+    dec->stream.clear();
+    dec->slices = 0;
+    dec->tiles.clear();
++   dec->slice_starts.clear();
+ }
+ 
+ /* A bitstream buffer and its slice control: the slices where the slice control says they are. False when one
+@@ -98,8 +99,9 @@ DxvaAddSlices(DxvaDecoder *dec, const uint8_t *slice_control, unsigned slice_con
+       }
+       dec->stream.insert(dec->stream.end(), bitstream, bitstream + bitstream_size);
+       dec->slices = (unsigned)dec->tiles.size();
+-   } else if (slice_control && bitstream && dec->profile->codec == CODEC_MPEG2) {
+-      /* MPEG-2: the slices with their start codes, as they are */
++   } else if (slice_control && bitstream && (dec->profile->codec == CODEC_MPEG2 || dec->profile->codec == CODEC_VC1)) {
++      /* MPEG-2: the slices with their start codes, as they are; VC-1 the same (VC1Picture puts the advanced
++       * profile's start codes right) */
+       for (unsigned i = 0; i < slice_control_size / sizeof(DxvaSliceInfo); i++) {
+          DxvaSliceInfo si;
+          memcpy(&si, slice_control + i * sizeof si, sizeof si);
+@@ -109,6 +111,7 @@ DxvaAddSlices(DxvaDecoder *dec, const uint8_t *slice_control, unsigned slice_con
+                      si.dwSliceDataLocation, bitstream_size);
+             return false;
+          }
++         dec->slice_starts.push_back((uint32_t)dec->stream.size());
+          dec->stream.insert(dec->stream.end(), bitstream + si.dwSliceDataLocation,
+                             bitstream + si.dwSliceDataLocation + bytes);
+          dec->slices++;
+@@ -732,6 +735,84 @@ MPEG2Picture(DxvaDecoder *dec)
+    return true;
+ }
+ 
++/* VC-1 as ffmpeg's dxva2_vc1.c packs it into DXVA's (MPEG-2-era) picture parameters, in gallium's (VA-API's) terms */
++static bool
++VC1Picture(DxvaDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DxvaPictureParameters)) {
++      return false;
++   }
++   const DxvaPictureParameters *pp = (const DxvaPictureParameters *)dec->pic_params.data();
++   struct pipe_vc1_picture_desc *d = &dec->desc.vc1;
++   memset(d, 0, sizeof *d);
++
++   bool advanced = pp->bBidirectionalAveragingMode & 0x08;
++   bool field = pp->bPicStructure != 3;
++   d->vc1_profile = advanced ? 3 : 1;   /* simple and main aren't told apart: main's syntax is a superset */
++   d->frame_coding_mode = field ? 2 : pp->bPicExtrapolation == 2 ? 1 : 0;
++   d->top_field_first = field ? (pp->bPicStructure == 1) != (pp->bSecondField != 0) : 1;
++   d->is_first_field = !pp->bSecondField;
++   /* PTYPE for frames (I 0, P 1, B 2, BI 3), FPTYPE for fields (I 0, P 3, B 4, BI 7); a BI picture is intra in a
++    * B one's place (bPicDeblockConfined bit 2: not a B picture) */
++   bool b_picture = !(pp->bPicDeblockConfined & 0x04);
++   if (pp->bPicIntra) {
++      d->picture_type = !b_picture ? 0 : field ? 7 : 3;
++   } else if (pp->bPicBackwardPrediction) {
++      d->picture_type = field ? 4 : 2;
++   } else {
++      d->picture_type = field ? 3 : 1;
++   }
++
++   d->postprocflag = (pp->bPicDeblockConfined >> 7) & 1;
++   d->pulldown = (pp->bPicDeblockConfined >> 6) & 1;
++   d->interlace = (pp->bPicDeblockConfined >> 5) & 1;
++   d->tfcntrflag = (pp->bPicDeblockConfined >> 4) & 1;
++   d->finterpflag = (pp->bPicDeblockConfined >> 3) & 1;
++   d->psf = (pp->bPicDeblockConfined >> 1) & 1;
++   d->extended_dmv = pp->bPicDeblockConfined & 1;
++   d->panscan_flag = (pp->bPicSpatialResid8 >> 7) & 1;
++   d->refdist_flag = (pp->bPicSpatialResid8 >> 6) & 1;
++   d->loopfilter = (pp->bPicSpatialResid8 >> 5) & 1;
++   d->fastuvmc = (pp->bPicSpatialResid8 >> 4) & 1;
++   d->extended_mv = (pp->bPicSpatialResid8 >> 3) & 1;
++   d->dquant = (pp->bPicSpatialResid8 >> 1) & 3;
++   d->vstransform = pp->bPicSpatialResid8 & 1;
++   d->quantizer = (pp->bPicOverflowBlocks >> 6) & 3;
++   d->multires = (pp->bPicOverflowBlocks >> 5) & 1;
++   d->syncmarker = (pp->bPicOverflowBlocks >> 4) & 1;
++   d->rangered = (pp->bPicOverflowBlocks >> 3) & 1;
++   d->maxbframes = pp->bPicOverflowBlocks & 7;
++   d->overlap = (pp->bPicDeblocked >> 6) & 1;
++   d->rangeredfrm = (pp->bPicDeblocked >> 5) & 1;
++   if (advanced) {
++      d->range_mapy_flag = (pp->bPicOBMC >> 7) & 1;
++      d->range_mapy = (pp->bPicOBMC >> 4) & 7;
++      d->range_mapuv_flag = (pp->bPicOBMC >> 3) & 1;
++      d->range_mapuv = pp->bPicOBMC & 7;
++   }
++   d->pquant = pp->bReservedBits;
++   d->slice_count = dec->slices;
++   d->ref[0] = pp->wForwardRefPictureIndex == 0xffff ? NULL : Surface(dec, pp->wForwardRefPictureIndex);
++   d->ref[1] = pp->wBackwardRefPictureIndex == 0xffff ? NULL : Surface(dec, pp->wBackwardRefPictureIndex);
++
++   /* The advanced profile's slices each after a start code (ffmpeg puts a frame's, 0x0D, before every one): the
++    * picture's first a frame's or a second field's, the others a slice's, as the host splits them */
++   if (advanced) {
++      static const uint8_t start_code[3] = {0, 0, 1};
++      for (size_t i = dec->slice_starts.size(); i-- > 0;) {
++         uint32_t at = dec->slice_starts[i];
++         uint8_t code = i ? 0x0b : pp->bSecondField ? 0x0c : 0x0d;
++         if (dec->stream.size() - at >= 4 && !memcmp(&dec->stream[at], start_code, 3)) {
++            dec->stream[at + 3] = code;
++         } else {
++            const uint8_t marker[4] = {0, 0, 1, code};
++            dec->stream.insert(dec->stream.begin() + at, marker, marker + 4);
++         }
++      }
++   }
++   return true;
++}
++
+ bool
+ DxvaPicture(DxvaDecoder *dec)
+ {
+@@ -739,6 +820,7 @@ DxvaPicture(DxvaDecoder *dec)
+         : dec->profile->codec == CODEC_HEVC ? HEVCPicture(dec)
+         : dec->profile->codec == CODEC_VP9  ? VP9Picture(dec)
+         : dec->profile->codec == CODEC_AV1  ? AV1Picture(dec)
++        : dec->profile->codec == CODEC_VC1  ? VC1Picture(dec)
+                                             : MPEG2Picture(dec);
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/DxvaDecode.h b/src/gallium/frontends/d3d10umd/DxvaDecode.h
+index 0400950..9c8adb4 100644
+--- a/src/gallium/frontends/d3d10umd/DxvaDecode.h
++++ b/src/gallium/frontends/d3d10umd/DxvaDecode.h
+@@ -565,7 +565,7 @@ static const uint8_t DxvaInvalidEntry = 0xff;
+  * The decoder profiles (D3D11_DECODER_PROFILE_*), as gallium's
+  */
+ 
+-enum VideoCodec { CODEC_H264, CODEC_HEVC, CODEC_VP9, CODEC_AV1, CODEC_MPEG2 };
++enum VideoCodec { CODEC_H264, CODEC_HEVC, CODEC_VP9, CODEC_AV1, CODEC_MPEG2, CODEC_VC1 };
+ 
+ struct VideoProfileInfo {
+    GUID guid;
+@@ -592,6 +592,11 @@ static const VideoProfileInfo PROFILES[] = {
+     PIPE_VIDEO_PROFILE_AV1_MAIN, DXGI_FORMAT_NV12, CODEC_AV1, DXGI_FORMAT_P010},
+    {{0xee27417f, 0x5e28, 0x4e65, {0xbe, 0xea, 0x1d, 0x26, 0xb5, 0x08, 0xad, 0xc9}}, /* MPEG2_VLD */
+     PIPE_VIDEO_PROFILE_MPEG2_MAIN, DXGI_FORMAT_NV12, CODEC_MPEG2},
++   /* VC-1 (and WMV9: simple/main), every profile: the advanced one's decoder decodes them all */
++   {{0x1b81bea4, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}}, /* VC1_D2010 */
++    PIPE_VIDEO_PROFILE_VC1_ADVANCED, DXGI_FORMAT_NV12, CODEC_VC1},
++   {{0x1b81bea3, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}}, /* VC1_D */
++    PIPE_VIDEO_PROFILE_VC1_ADVANCED, DXGI_FORMAT_NV12, CODEC_VC1},
+ };
+ 
+ /* DXVA_NoEncrypt */
+@@ -610,6 +615,7 @@ struct DxvaDecoder {
+    std::vector<uint8_t> stream;     /* the slices' data, each H.264/HEVC slice after a start code */
+    unsigned slices;
+    std::vector<DxvaTile_AV1> tiles; /* AV1: where each tile is in stream */
++   std::vector<uint32_t> slice_starts; /* VC-1: where each slice is in stream */
+    uint8_t intra_matrix[64], non_intra_matrix[64];   /* MPEG-2's, for its picture description */
+ 
+    union {
+@@ -618,6 +624,7 @@ struct DxvaDecoder {
+       struct pipe_vp9_picture_desc vp9;
+       struct pipe_av1_picture_desc av1;
+       struct pipe_mpeg12_picture_desc mpeg2;
++      struct pipe_vc1_picture_desc vc1;
+    } desc;
+    struct pipe_h264_pps h264_pps;
+    struct pipe_h264_sps h264_sps;
+diff --git a/src/gallium/include/pipe/p_video_state.h b/src/gallium/include/pipe/p_video_state.h
+index b70332e..0b04393 100644
+--- a/src/gallium/include/pipe/p_video_state.h
++++ b/src/gallium/include/pipe/p_video_state.h
+@@ -331,6 +331,14 @@ struct pipe_vc1_picture_desc
+    uint8_t pquant;
+ 
+    struct pipe_video_buffer *ref[2];
++
++   /* what decoders that parse the picture layer themselves (NVDEC) need besides (WinBoat): the first field's
++    * parity, which field this is, RANGEREDFRM, and the stream's profile (VA-API's: 0 simple, 1 main, 3 advanced;
++    * one decoder decodes them all) */
++   uint8_t top_field_first;
++   uint8_t is_first_field;
++   uint8_t rangeredfrm;
++   uint8_t vc1_profile;
+ };
+ 
+ struct pipe_h264_sps
+diff --git a/src/virtio/virtio-gpu/virgl_video_hw.h b/src/virtio/virtio-gpu/virgl_video_hw.h
+index 02d39fb..242ebed 100644
+--- a/src/virtio/virtio-gpu/virgl_video_hw.h
++++ b/src/virtio/virtio-gpu/virgl_video_hw.h
+@@ -617,6 +617,12 @@ struct virgl_vc1_picture_desc
+    uint8_t pquant;
+ 
+    uint32_t ref[2];
++
++   /* (WinBoat) appended: the union's size is H.264's/HEVC's */
++   uint8_t top_field_first;
++   uint8_t is_first_field;
++   uint8_t rangeredfrm;
++   uint8_t vc1_profile;
+ };
+ 
+ struct virgl_mjpeg_picture_desc

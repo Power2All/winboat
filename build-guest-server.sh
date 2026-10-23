@@ -54,7 +54,25 @@ echo "Building guest server updater..."
 go build -ldflags="${LDFLAGS[*]}" -o "$DIST/oem/updater/winboat_guest_server_updater.exe" ./cmd/updater
 
 # Runtime assets that ship inside server\ (these get updated alongside the exe)
-cp scripts/apps.ps1 scripts/get-icon.ps1 scripts/time-sync.bat "$DIST/oem/server/scripts/"
+cp scripts/apps.ps1 scripts/get-icon.ps1 scripts/gpu-driver.ps1 scripts/time-sync.bat "$DIST/oem/server/scripts/"
+
+# The virtual GPU driver (experimental, see docs/hardware-acceleration.md), when a built package has been exported
+# into drivers/viogpu3d (tools/gpu-spike/export-driver-package.sh). It is not in git: ~50 MB of built binaries.
+if [ -f drivers/viogpu3d/viogpu3d.inf ]; then
+    mkdir -p "$DIST/oem/server/drivers"
+    cp -r drivers/viogpu3d "$DIST/oem/server/drivers/"
+    echo "Bundled the virtual GPU driver ($(du -sh drivers/viogpu3d | cut -f1))"
+    # The SPICE display route's helpers (SPICE agent, viogpuap.exe), exported alongside
+    if [ -d drivers/spice ]; then
+        cp -r drivers/spice "$DIST/oem/server/drivers/"
+    fi
+    # The GPU check (tools/dx-test), installed with the driver
+    if [ -d drivers/gpucheck ]; then
+        cp -r drivers/gpucheck "$DIST/oem/server/drivers/"
+    fi
+else
+    echo "No virtual GPU driver package in guest_server/drivers/viogpu3d, building without it"
+fi
 
 # Install-time assets that live at the OEM/install root
 cp install.bat nssm.exe RDPApps.reg "$DIST/oem/"

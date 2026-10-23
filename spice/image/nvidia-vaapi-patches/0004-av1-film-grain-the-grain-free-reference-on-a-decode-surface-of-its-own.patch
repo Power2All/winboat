@@ -1,0 +1,190 @@
+av1: film grain, the grain-free reference on a decode surface of its own (WinBoat)
+
+NVDEC writes a picture with film grain applied to CurrPicIdx and the picture
+without it, which later frames reference, to decodePicIdx. Both were the
+render target's index, and the output came out without grain. VA-API's
+current_display_picture would name the surface for the grained picture, but
+virglrenderer (WinBoat's guests decode through it) has one surface per
+picture. So a picture that applies grain keeps its grain-free version on a
+decode surface of its own while a reference slot holds it, taken from the
+indices the surfaces didn't (an AV1 decoder now has NVDEC's maximum of 32),
+and references map to it.
+
+diff --git a/src/av1.c b/src/av1.c
+index 0957165..5eacf07 100644
+--- a/src/av1.c
++++ b/src/av1.c
+@@ -11,6 +11,64 @@ static int get_relative_dist(CUVIDAV1PICPARAMS *pps, int ref_hint, int order_hin
+     return (diff & (m - 1)) - (diff & m);
+ }
+ 
++//Film grain: NVDEC writes the picture with grain to CurrPicIdx and the one without, which later frames reference, to
++//decodePicIdx. VA-API's current_display_picture would be the surface for the former, but virglrenderer (WinBoat's
++//client) has one surface per picture and doesn't pass a surface there, so the grain-free picture gets a decode surface
++//of its own while it's referenced (the 8 reference slots and the current picture at most), from those the surfaces'
++//pictureIdx didn't take. ponytail: a client with a separate current_display_picture gets the upstream behavior (no grain)
++static int av1RefIdx(NVDriver *drv, VASurfaceID id) {
++    NVSurface *surf = nvSurfaceFromSurfaceId(drv, id);
++    if (surf == NULL) {
++        return -1;
++    }
++    return surf->refPictureIdx >= 0 ? surf->refPictureIdx : surf->pictureIdx;
++}
++
++static void av1ReleaseGrainIdx(NVContext *ctx, int idx) {
++    NVSurface *owner = nvSurfaceFromSurfaceId(ctx->drv, ctx->grainIdxOwner[idx]);
++    if (owner != NULL && owner->refPictureIdx == idx) {
++        owner->refPictureIdx = -1;
++    }
++    ctx->grainIdxUsed &= ~(1u << idx);
++}
++
++static void av1GrainFreePicture(NVContext *ctx, VADecPictureParameterBufferAV1 *buf, CUVIDAV1PICPARAMS *pps) {
++    //the grain-free pictures no longer referenced (the current surface's own is reused)
++    for (int i = 0; i < ctx->decodeSurfaceCount; i++) {
++        if (!(ctx->grainIdxUsed & (1u << i)) || ctx->grainIdxOwner[i] == ctx->renderTargetId) {
++            continue;
++        }
++        bool referenced = false;
++        for (int j = 0; j < 8; j++) {
++            referenced |= buf->ref_frame_map[j] == ctx->grainIdxOwner[i];
++        }
++        if (!referenced) {
++            av1ReleaseGrainIdx(ctx, i);
++        }
++    }
++    NVSurface *target = ctx->renderTarget;
++    if (!pps->apply_grain) {
++        if (target->refPictureIdx >= 0) {
++            av1ReleaseGrainIdx(ctx, target->refPictureIdx);
++        }
++        return;
++    }
++    int idx = target->refPictureIdx;
++    for (int i = ctx->decodeSurfaceCount - 1; idx < 0 && i >= 0; i--) {
++        if (!((ctx->pictureIdxUsed | ctx->grainIdxUsed) & (1u << i))) {
++            idx = i;
++        }
++    }
++    if (idx < 0) {
++        LOG("No decode surface left for the picture without film grain, not applying it");
++        return;
++    }
++    ctx->grainIdxUsed |= 1u << idx;
++    ctx->grainIdxOwner[idx] = ctx->renderTargetId;
++    target->refPictureIdx = idx;
++    pps->decodePicIdx = idx;
++}
++
+ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams) {
+     static const int bit_depth_map[] = {0, 2, 4}; //8-bpc, 10-bpc, 12-bpc
+ 
+@@ -152,7 +210,7 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
+ 
+     for (int i = 0; i < 8; i++) { //MAX_REF_FRAMES
+         pps->loop_filter_ref_deltas[i] = buf->ref_deltas[i];
+-        pps->ref_frame_map[i] = pictureIdxFromSurfaceId(ctx->drv, buf->ref_frame_map[i]);
++        pps->ref_frame_map[i] = av1RefIdx(ctx->drv, buf->ref_frame_map[i]);
+     }
+ 
+     pps->base_qindex = buf->base_qindex;
+@@ -298,6 +356,7 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
+             pps->ar_coeffs_cr[i] = buf->film_grain_info.ar_coeffs_cr[i];
+         }
+     }
++    av1GrainFreePicture(ctx, buf, pps);
+ 
+     //printCUVIDPICPARAMS(picParams);
+ }
+diff --git a/src/vabackend.c b/src/vabackend.c
+index f464ce5..52a4803 100644
+--- a/src/vabackend.c
++++ b/src/vabackend.c
+@@ -979,6 +979,7 @@ static VAStatus nvCreateSurfaces2(
+         suf->height = height;
+         suf->format = nvFormat;
+         suf->pictureIdx = -1;
++        suf->refPictureIdx = -1;
+         suf->bitDepth = bitdepth;
+         suf->context = NULL;
+         suf->chromaFormat = chromaFormat;
+@@ -1119,7 +1120,8 @@ static VAStatus nvCreateContext(
+         //it isn't particually efficient to do this, but it is simple
+         .ulNumOutputSurfaces = 1,
+         //just allocate as many surfaces as have been created since we can never have as much information as the decode to guess correctly
+-        .ulNumDecodeSurfaces = surfaceCount,
++        //(AV1: NVDEC's maximum, the ones the surfaces don't take hold grain-free pictures, av1.c)
++        .ulNumDecodeSurfaces = cfg->cudaCodec == cudaVideoCodec_AV1 ? 32 : surfaceCount,
+         //.vidLock             = drv->vidLock
+     };
+ 
+@@ -1142,6 +1144,7 @@ static VAStatus nvCreateContext(
+     nvCtx->height = picture_height;
+     nvCtx->codec = selectedCodec;
+     nvCtx->surfaceCount = surfaceCount;
++    nvCtx->decodeSurfaceCount = vdci.ulNumDecodeSurfaces;
+ 
+     pthread_mutexattr_t attrib;
+     pthread_mutexattr_init(&attrib);
+@@ -1319,14 +1322,19 @@ static VAStatus nvBeginPicture(
+         }
+         //...and reset the pictureIdx
+         surface->pictureIdx = -1;
++        surface->refPictureIdx = -1;
+     }
+ 
+-    //if this surface hasn't been used before, give it a new picture index
++    //if this surface hasn't been used before, give it a new picture index (not one an AV1 grain-free picture holds)
+     if (surface->pictureIdx == -1) {
++        while (nvCtx->currentPictureId < nvCtx->surfaceCount && (nvCtx->grainIdxUsed & (1u << nvCtx->currentPictureId))) {
++            nvCtx->currentPictureId++;
++        }
+         if (nvCtx->currentPictureId == nvCtx->surfaceCount) {
+             return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+         }
+         surface->pictureIdx = nvCtx->currentPictureId++;
++        nvCtx->pictureIdxUsed |= 1u << surface->pictureIdx;
+     }
+ 
+     //I don't know if we actually need to lock here, nothing should be waiting
+@@ -1337,6 +1345,7 @@ static VAStatus nvBeginPicture(
+ 
+     memset(&nvCtx->pPicParams, 0, sizeof(CUVIDPICPARAMS));
+     nvCtx->renderTarget = surface;
++    nvCtx->renderTargetId = render_target;
+     nvCtx->renderTarget->progressiveFrame = true; //assume we're producing progressive frame unless the codec says otherwise
+     nvCtx->pPicParams.CurrPicIdx = nvCtx->renderTarget->pictureIdx;
+ 
+diff --git a/src/vabackend.h b/src/vabackend.h
+index 50ebd0b..7e3dd35 100644
+--- a/src/vabackend.h
++++ b/src/vabackend.h
+@@ -59,6 +59,7 @@ typedef struct
+     cudaVideoChromaFormat   chromaFormat;
+     int                     bitDepth;
+     int                     pictureIdx;
++    int                     refPictureIdx; //AV1 with film grain: the decode surface of the grain-free picture (-1: pictureIdx)
+     struct _NVContext       *context;
+     int                     progressiveFrame;
+     int                     topFieldFirst;
+@@ -168,6 +169,7 @@ typedef struct _NVContext
+     uint32_t            height;
+     CUvideodecoder      decoder;
+     NVSurface           *renderTarget;
++    VASurfaceID         renderTargetId;
+     void                *lastSliceParams;
+     unsigned int        lastSliceParamsCount;
+     AppendableBuffer    bitstreamBuffer;
+@@ -184,6 +186,12 @@ typedef struct _NVContext
+     volatile bool       exiting;
+     pthread_mutex_t     surfaceCreationMutex;
+     int                 surfaceCount;
++    //the decoder's surfaces (AV1: all 32, for the grain-free pictures), those the surfaces' pictureIdx took, and the
++    //grain-free pictures' (av1.c) with the surface each belongs to
++    int                 decodeSurfaceCount;
++    uint32_t            pictureIdxUsed;
++    uint32_t            grainIdxUsed;
++    VASurfaceID         grainIdxOwner[32];
+ } NVContext;
+ 
+ typedef struct

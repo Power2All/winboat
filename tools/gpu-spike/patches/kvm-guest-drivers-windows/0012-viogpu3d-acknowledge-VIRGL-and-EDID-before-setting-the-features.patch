@@ -1,0 +1,35 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: acknowledge VIRGL and EDID before setting the features
+
+StartDevice acknowledged VIRTIO_GPU_F_VIRGL after HWInit had already written
+the guest's features to the device, so the device never saw it (EDID wasn't
+acknowledged at all). QEMU's own virtio-gpu runs 3D commands regardless; a
+device that goes by the negotiated features, such as vhost-user-gpu (the GPU
+in a process of its own), treated every 3D command as an unknown 2D one.
+Acknowledge both with the other features, and check VIRGL in what was
+negotiated.
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -205,7 +205,7 @@
+         return Status;
+     }
+ 
+-    if (!AckFeature(VIRTIO_GPU_F_VIRGL))
++    if (!virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_VIRGL))
+     {
+         DbgPrint(TRACE_LEVEL_ERROR, ("VioGpu3D cannot start because virgl is not enabled\n"));
+         return STATUS_UNSUCCESSFUL;
+@@ -1154,6 +1154,11 @@
+             break;
+         }
+ 
++        // Before the features go to the device: a device that runs the 3D commands only when the guest acknowledged
++        // VIRGL (vhost-user-gpu, the GPU in a process of its own) otherwise treats them as unknown 2D commands
++        AckFeature(VIRTIO_GPU_F_VIRGL);
++        AckFeature(VIRTIO_GPU_F_EDID);
++
+         status = virtio_set_features(&m_VioDev, m_u64GuestFeatures);
+         if (!NT_SUCCESS(status))
+         {

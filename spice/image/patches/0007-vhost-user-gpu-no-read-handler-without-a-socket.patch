@@ -1,0 +1,26 @@
+vhost-user-gpu: no read handler without a socket
+
+gl_flushed re-arms the GPU socket's read handler whenever the display
+reports a flush, also before the device started (or after it stopped), when
+there is no socket (fd -1). With a SPICE client connected while the firmware
+runs, QEMU then logged "failed to read msg header: 0, ..." on every flush until
+the guest's driver started the device. Only arm it with a socket. Applies on
+top of patch 0006.
+
+--- a/hw/display/vhost-user-gpu.c
++++ b/hw/display/vhost-user-gpu.c
+@@ -463,6 +463,14 @@
+ static void
+ vhost_user_gpu_update_blocked(VhostUserGPU *g, bool blocked)
+ {
++    /*
++     * No socket before the device starts (or after it stopped): a GL display
++     * that reports a flush then (a SPICE client connected while the firmware
++     * runs) would have the handler read fd -1 ("failed to read msg header")
++     */
++    if (g->vhost_gpu_fd == -1) {
++        return;
++    }
+     qemu_set_fd_handler(g->vhost_gpu_fd,
+                         blocked ? NULL : vhost_user_gpu_chr_read, NULL, g);
+ }

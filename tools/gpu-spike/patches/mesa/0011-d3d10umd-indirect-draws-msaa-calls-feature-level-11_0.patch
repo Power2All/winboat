@@ -1,0 +1,1181 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: indirect draws, MSAA, subroutine inlining; report feature level 11_0 (stage 4)
+
+- Feature level 11_0 (and 10_1) is reported when the host can do it: compute and tessellation shaders, 4x MSAA
+  and 8 images and shader buffers in pixel and compute shaders. The runtime asks before any device exists, so the
+  adapter reads the virgl caps itself (D3DKMTEnumAdapters2, the VioGPU adapter's GET_CAPS escape).
+  WINBOAT_D3D_FL11=0 reports 10_0 anyway, =1 11_0 anyway.
+- DrawInstancedIndirect / DrawIndexedInstancedIndirect: D3D's argument layouts are GL's. virglrenderer ignores
+  the index buffer offset in indirect draws: with one, the indices from it on are copied to a temporary buffer
+  (on the GPU). Without host indirect draws (or without an index buffer) the arguments are read back.
+- MSAA: quality levels, MULTISAMPLE_RENDERTARGET/LOAD, ResolveSubresource and DXGI Blt/Blt1 (resolves,
+  conversions and stretches for multisampled swap chains; Blt was a stub), multisampled rasterization. The
+  runtime checks the answers against each other at device creation (a typeless format and the formats it casts
+  to that have MULTISAMPLE_RENDERTARGET report the same quality levels) and refused every device when they
+  disagreed: sample counts are offered per format family.
+- The 11.1 DDI's format caps: vertex and typed buffers, UAV writes, gather.
+- call/callc: virglrenderer has no TGSI subroutines (a shader with them failed and stopped the context's
+  rendering). Calls are inlined, each body in a run-once loop that ret leaves; loops and switches are looked up
+  by token offset (an inlined body is translated once per call).
+- Fixes found on the way:
+  - D24S8 depth buffers were never created: virgl hosts only have GL's packed format (PIPE_FORMAT_S8_UINT_Z24_UNORM).
+  - The pixel shader coverage input (SV_Coverage) was declared as a compute thread ID (its operand type is
+    numbered among them).
+---
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -39,6 +39,10 @@
+ 
+ #include "util/u_memory.h"
+ 
++#include <d3dkmthk.h>
++#include "virtio/wddm/viogpu_wddm_driver.h"
++#include "virtio/virtio-gpu/virgl_hw.h"
++
+ 
+ static HRESULT APIENTRY CloseAdapter(D3D10DDI_HADAPTER hAdapter);
+ 
+@@ -192,6 +196,97 @@
+ 
+ 
+ /*
++ * Whether the host renders what feature level 11_0 needs: compute and tessellation shaders, 4x MSAA and 8 UAVs
++ * (images and shader buffers) in compute and pixel shaders. The runtime asks before any device exists, so the
++ * virgl caps are read here, through the first VioGPU adapter with 3D. WINBOAT_D3D_FL11=0 reports 10_0 anyway,
++ * =1 reports 11_0 anyway.
++ */
++static bool
++HostSupportsFL11(void)
++{
++   static int supported = -1;
++   if (supported >= 0) {
++      return supported;
++   }
++
++   char env[4] = "";
++   if (GetEnvironmentVariableA("WINBOAT_D3D_FL11", env, sizeof env) && (env[0] == '0' || env[0] == '1')) {
++      supported = env[0] == '1';
++      return supported;
++   }
++
++   HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
++   if (!gdi32) {
++      gdi32 = LoadLibraryA("gdi32.dll");
++   }
++   PFND3DKMT_ENUMADAPTERS2 enumAdapters =
++      gdi32 ? (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(gdi32, "D3DKMTEnumAdapters2") : NULL;
++   PFND3DKMT_QUERYADAPTERINFO queryAdapterInfo =
++      gdi32 ? (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(gdi32, "D3DKMTQueryAdapterInfo") : NULL;
++   PFND3DKMT_ESCAPE escape = gdi32 ? (PFND3DKMT_ESCAPE)GetProcAddress(gdi32, "D3DKMTEscape") : NULL;
++   PFND3DKMT_CLOSEADAPTER closeAdapter =
++      gdi32 ? (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32, "D3DKMTCloseAdapter") : NULL;
++   if (!enumAdapters || !queryAdapterInfo || !escape || !closeAdapter) {
++      supported = 0;
++      return false;
++   }
++
++   D3DKMT_ENUMADAPTERS2 adapters = {};
++   if (!NT_SUCCESS(enumAdapters(&adapters)) || !adapters.NumAdapters) {
++      supported = 0;
++      return false;
++   }
++   adapters.pAdapters = (D3DKMT_ADAPTERINFO *)CALLOC(adapters.NumAdapters, sizeof(D3DKMT_ADAPTERINFO));
++   if (!adapters.pAdapters || !NT_SUCCESS(enumAdapters(&adapters))) {
++      FREE(adapters.pAdapters);
++      supported = 0;
++      return false;
++   }
++
++   bool found = false, fl11 = false;
++   for (ULONG i = 0; i < adapters.NumAdapters; i++) {
++      D3DKMT_HANDLE hAdapter = adapters.pAdapters[i].hAdapter;
++      VIOGPU_ADAPTERINFO info = {};
++      D3DKMT_QUERYADAPTERINFO query = {};
++      query.hAdapter = hAdapter;
++      query.Type = KMTQAITYPE_UMDRIVERPRIVATE;
++      query.pPrivateDriverData = &info;
++      query.PrivateDriverDataSize = sizeof info;
++      if (!found && NT_SUCCESS(queryAdapterInfo(&query)) && info.IamVioGPU == VIOGPU_IAM &&
++          info.Flags.Supports3d && (info.SupportedCapsetIDs & (1ull << 2))) {
++         union virgl_caps caps = {};
++         VIOGPU_ESCAPE args = {};
++         args.Type = VIOGPU_GET_CAPS;
++         args.DataLength = sizeof(VIOGPU_CAPSET_REQ);
++         args.Capset.CapsetId = 2;
++         args.Capset.Size = sizeof caps;
++         args.Capset.Capset = (UINT64)(uintptr_t)&caps;
++         D3DKMT_ESCAPE esc = {};
++         esc.hAdapter = hAdapter;
++         esc.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
++         esc.pPrivateDriverData = &args;
++         esc.PrivateDriverDataSize = sizeof args;
++         found = true;
++         if (NT_SUCCESS(escape(&esc))) {
++            fl11 = caps.v1.bset.has_tessellation_shaders &&
++                   (caps.v2.capability_bits & VIRGL_CAP_COMPUTE_SHADER) &&
++                   caps.v1.bset.texture_multisample && caps.v1.max_samples >= 4 &&
++                   caps.v2.max_shader_image_frag_compute >= 8 &&
++                   caps.v2.max_shader_buffer_frag_compute >= 8;
++         }
++      }
++      D3DKMT_CLOSEADAPTER close = {};
++      close.hAdapter = hAdapter;
++      closeAdapter(&close);
++   }
++   FREE(adapters.pAdapters);
++
++   supported = fl11;
++   return fl11;
++}
++
++
++/*
+  * ----------------------------------------------------------------------
+  *
+  * GetCaps --
+@@ -211,27 +306,22 @@
+    }
+    memset(pData->pData, 0, pData->DataSize);
+    switch (pData->Type) {
+-   case D3D11DDICAPS_SHADER: {
+-      /* The runtime refuses feature level 11_0 without compute (and raw/structured buffers) in shader model 4.x
+-       * too. Reported with feature level 11_0, so for now only with the development switch below. */
+-      char fl11[4] = "";
+-      if (pData->DataSize >= sizeof(D3D11DDI_SHADER_CAPS) &&
+-          GetEnvironmentVariableA("WINBOAT_D3D_FL11", fl11, sizeof fl11) && fl11[0] == '1') {
++   case D3D11DDICAPS_SHADER:
++      /* Compute (with raw and structured buffers) also in shader model 4.x, which the runtime requires for feature
++       * level 11_0 too. No doubles (not translated). */
++      if (pData->DataSize >= sizeof(D3D11DDI_SHADER_CAPS) && HostSupportsFL11()) {
+          static_cast<D3D11DDI_SHADER_CAPS *>(pData->pData)->Caps =
+             D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X;
+       }
+       break;
+-   }
+    case D3D11DDICAPS_3DPIPELINESUPPORT:
+-      /* The 11.x DDI runtime asks which feature levels the device has: 10_0. Development: 11_0 for programs
+-       * started with WINBOAT_D3D_FL11=1, while shader model 5 is being completed (test programs only). */
++      /* The 11.x DDI runtime asks which feature levels the device has: 10_0, and 10_1 and 11_0 when the host has
++       * what they need */
+       if (pData->DataSize >= sizeof(D3D11DDI_3DPIPELINESUPPORT_CAPS)) {
+-         char fl11[4] = "";
+-         bool dev_fl11 = GetEnvironmentVariableA("WINBOAT_D3D_FL11", fl11, sizeof fl11) && fl11[0] == '1';
+          static_cast<D3D11DDI_3DPIPELINESUPPORT_CAPS *>(pData->pData)->Caps =
+             D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0) |
+-            (dev_fl11 ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1) |
+-                        D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0) : 0);
++            (HostSupportsFL11() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1) |
++                                  D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0) : 0);
+       }
+       break;
+    default:
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -45,6 +45,8 @@
+ 
+ #include "Debug.h"
+ 
++#include "util/format/u_format.h"
++#include "util/u_math.h"
+ #include "util/u_sampler.h"
+ 
+ #include "gdikmt/gdikmt.h"
+@@ -473,6 +475,113 @@
+ 
+ 
+ /*
++ * MSAA. Creating a device, the runtime checks the answers against each other and refuses the device (for every
++ * application) when they disagree: a typeless format and each format it casts to that has
++ * MULTISAMPLE_RENDERTARGET report the same quality levels for every sample count, the others none. So sample counts
++ * are offered per format family: when every member that renders (a render target or depth format) renders with
++ * that count on the host. Members that render get MULTISAMPLE_RENDERTARGET when 4x is offered. One quality level
++ * (the sample positions are the host's).
++ */
++#define F(x) DXGI_FORMAT_##x
++static const DXGI_FORMAT FormatFamilies[][7] = {
++   {F(R32G32B32A32_TYPELESS), F(R32G32B32A32_FLOAT), F(R32G32B32A32_UINT), F(R32G32B32A32_SINT)},
++   {F(R32G32B32_TYPELESS), F(R32G32B32_FLOAT), F(R32G32B32_UINT), F(R32G32B32_SINT)},
++   {F(R16G16B16A16_TYPELESS), F(R16G16B16A16_FLOAT), F(R16G16B16A16_UNORM), F(R16G16B16A16_UINT),
++    F(R16G16B16A16_SNORM), F(R16G16B16A16_SINT)},
++   {F(R32G32_TYPELESS), F(R32G32_FLOAT), F(R32G32_UINT), F(R32G32_SINT)},
++   {F(R32G8X24_TYPELESS), F(D32_FLOAT_S8X24_UINT), F(R32_FLOAT_X8X24_TYPELESS), F(X32_TYPELESS_G8X24_UINT)},
++   {F(R10G10B10A2_TYPELESS), F(R10G10B10A2_UNORM), F(R10G10B10A2_UINT)},
++   {F(R8G8B8A8_TYPELESS), F(R8G8B8A8_UNORM), F(R8G8B8A8_UNORM_SRGB), F(R8G8B8A8_UINT), F(R8G8B8A8_SNORM),
++    F(R8G8B8A8_SINT)},
++   {F(R16G16_TYPELESS), F(R16G16_FLOAT), F(R16G16_UNORM), F(R16G16_UINT), F(R16G16_SNORM), F(R16G16_SINT)},
++   {F(R32_TYPELESS), F(D32_FLOAT), F(R32_FLOAT), F(R32_UINT), F(R32_SINT)},
++   {F(R24G8_TYPELESS), F(D24_UNORM_S8_UINT), F(R24_UNORM_X8_TYPELESS), F(X24_TYPELESS_G8_UINT)},
++   {F(R8G8_TYPELESS), F(R8G8_UNORM), F(R8G8_UINT), F(R8G8_SNORM), F(R8G8_SINT)},
++   {F(R16_TYPELESS), F(R16_FLOAT), F(D16_UNORM), F(R16_UNORM), F(R16_UINT), F(R16_SNORM), F(R16_SINT)},
++   {F(R8_TYPELESS), F(R8_UNORM), F(R8_UINT), F(R8_SNORM), F(R8_SINT)},
++   {F(B8G8R8A8_TYPELESS), F(B8G8R8A8_UNORM), F(B8G8R8A8_UNORM_SRGB)},
++   {F(B8G8R8X8_TYPELESS), F(B8G8R8X8_UNORM), F(B8G8R8X8_UNORM_SRGB)},
++};
++#undef F
++
++/* The family of a format (the typeless parent first), or just the format */
++static unsigned
++FormatFamily(DXGI_FORMAT Format, DXGI_FORMAT members[7])
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(FormatFamilies); i++) {
++      for (unsigned j = 0; j < 7 && FormatFamilies[i][j]; j++) {
++         if (FormatFamilies[i][j] == Format) {
++            unsigned n = 0;
++            while (n < 7 && FormatFamilies[i][n]) {
++               members[n] = FormatFamilies[i][n];
++               n++;
++            }
++            return n;
++         }
++      }
++   }
++   members[0] = Format;
++   return 1;
++}
++
++static bool
++IsDepthFormat(DXGI_FORMAT Format)
++{
++   return Format == DXGI_FORMAT_D16_UNORM || Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
++          Format == DXGI_FORMAT_D32_FLOAT || Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
++}
++
++/* Whether a format renders (as a render target or depth buffer), with SampleCount samples (0: single-sampled) */
++static bool
++FormatRenders(struct pipe_screen *screen, DXGI_FORMAT Format, UINT SampleCount)
++{
++   bool depth = IsDepthFormat(Format);
++   enum pipe_format format = FormatTranslate(Format, depth);
++   if (format == PIPE_FORMAT_NONE || Format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM) {
++      return false;
++   }
++   return screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, SampleCount, SampleCount,
++                                      depth ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET);
++}
++
++/* Whether a format's family offers a sample count (2 and up) */
++static bool
++FamilyMultisample(struct pipe_screen *screen, DXGI_FORMAT Format, UINT SampleCount)
++{
++   DXGI_FORMAT members[7];
++   unsigned count = FormatFamily(Format, members);
++   bool renders = false;
++
++   if (SampleCount < 2 || SampleCount > 32 || !util_is_power_of_two_nonzero(SampleCount)) {
++      return false;
++   }
++   for (unsigned i = 0; i < count; i++) {
++      if (FormatRenders(screen, members[i], 0)) {
++         if (!FormatRenders(screen, members[i], SampleCount)) {
++            return false;
++         }
++         renders = true;
++      }
++   }
++   return renders;
++}
++
++static bool
++IsFamilyParent(DXGI_FORMAT Format)
++{
++   DXGI_FORMAT members[7];
++   return FormatFamily(Format, members) > 1 && members[0] == Format;
++}
++
++/* MULTISAMPLE_RENDERTARGET */
++static bool
++MultisampleRenderTarget(struct pipe_screen *screen, DXGI_FORMAT Format)
++{
++   return !IsFamilyParent(Format) && FormatRenders(screen, Format, 0) && FamilyMultisample(screen, Format, 4);
++}
++
++
++/*
+  * ----------------------------------------------------------------------
+  *
+  * CheckFormatSupport --
+@@ -513,25 +622,20 @@
+                                    PIPE_BIND_RENDER_TARGET)) {
+       *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_RENDERTARGET;
+       *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_BLENDABLE;
+-
+-#if SUPPORT_MSAA
+-      if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 4, 4,
+-                                      PIPE_BIND_RENDER_TARGET)) {
+-         *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
+-      }
+-#endif
++   }
++   if (MultisampleRenderTarget(screen, Format)) {
++      *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
+    }
+ 
+    if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 0, 0,
+                                    PIPE_BIND_SAMPLER_VIEW)) {
+       *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE;
+ 
+-#if SUPPORT_MSAA
+-      if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 4, 4,
+-                                      PIPE_BIND_RENDER_TARGET)) {
++      /* also the formats that read multisampled depth buffers */
++      if (!IsFamilyParent(Format) && FamilyMultisample(screen, Format, 4) &&
++          screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 4, 4, PIPE_BIND_SAMPLER_VIEW)) {
+          *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
+       }
+-#endif
+    }
+ 
+ }
+@@ -557,8 +661,17 @@
+ {
+    //LOG_ENTRYPOINT();
+ 
+-   /* XXX: Disable MSAA */
+-   *pNumQualityLevels = 0;
++   struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
++
++   if (SampleCount == 1) {
++      *pNumQualityLevels = FormatTranslate(Format, false) != PIPE_FORMAT_NONE ||
++                           FormatTranslate(Format, true) != PIPE_FORMAT_NONE;
++      return;
++   }
++   /* as the family: a typeless format when it offers 4x, the others with MULTISAMPLE_RENDERTARGET */
++   bool offered = IsFamilyParent(Format) ? FamilyMultisample(screen, Format, 4) :
++                                           MultisampleRenderTarget(screen, Format);
++   *pNumQualityLevels = offered && FamilyMultisample(screen, Format, SampleCount) ? 1 : 0;
+ }
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/Draw.cpp
+@@ -342,6 +342,103 @@
+ 
+ 
+ /*
++ * Indirect draws: the argument layouts of D3D and GL are the same (count, instances, first vertex or index, [base
++ * vertex,] first instance). The host ignores the index buffer's offset in indirect draws, so with an offset the
++ * indices from it on are copied to a temporary buffer first (on the GPU). Without host indirect draws, or for an
++ * indexed draw without an index buffer, the arguments are read back.
++ */
++static void
++DrawIndirect(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hBufferForArgs, UINT AlignedByteOffsetForArgs,
++             bool indexed)
++{
++   Device *pDevice = CastDevice(hDevice);
++   struct pipe_context *pipe = pDevice->pipe;
++   struct pipe_resource *args = CastPipeResource(hBufferForArgs);
++   const unsigned args_size = indexed ? 20 : 16;
++
++   if (!args || AlignedByteOffsetForArgs + args_size > args->width0) {
++      return;
++   }
++
++   if (!pipe->screen->get_param(pipe->screen, PIPE_CAP_DRAW_INDIRECT) || (indexed && !pDevice->index_buffer)) {
++      UINT a[5];
++      pipe_buffer_read(pipe, args, AlignedByteOffsetForArgs, args_size, a);
++      if (indexed) {
++         DrawIndexedInstanced(hDevice, a[0], a[1], a[2], (INT)a[3], a[4]);
++      } else {
++         DrawInstanced(hDevice, a[0], a[1], a[2], a[3]);
++      }
++      return;
++   }
++
++   struct pipe_draw_info info;
++   struct pipe_draw_indirect_info indirect;
++   struct pipe_draw_start_count_bias draw;
++   struct pipe_resource *ib = NULL;
++
++   assert(pDevice->primitive < MESA_PRIM_COUNT);
++
++   if (indexed) {
++      ib = pDevice->index_buffer;
++      if (pDevice->ib_offset) {
++         unsigned size = pDevice->ib_offset < ib->width0 ? ib->width0 - pDevice->ib_offset : 0;
++         ib = pipe_buffer_create(pipe->screen, PIPE_BIND_INDEX_BUFFER, PIPE_USAGE_STREAM, MAX2(size, 4));
++         if (!ib) {
++            return;
++         }
++         if (size) {
++            struct pipe_box box;
++            u_box_1d(pDevice->ib_offset, size, &box);
++            pipe->resource_copy_region(pipe, ib, 0, 0, 0, 0, pDevice->index_buffer, 0, &box);
++         }
++      }
++   }
++
++   ResolveState(pDevice);
++
++   util_draw_init_info(&info);
++   info.mode = pDevice->primitive;
++   memset(&draw, 0, sizeof draw);
++   if (indexed) {
++      info.index_size = pDevice->index_size;
++      info.index.resource = ib;
++      info.primitive_restart = true;
++      info.restart_index = pDevice->restart_index;
++   }
++   memset(&indirect, 0, sizeof indirect);
++   indirect.buffer = args;
++   indirect.offset = AlignedByteOffsetForArgs;
++   indirect.draw_count = 1;
++
++   pipe->draw_vbo(pipe, &info, 0, &indirect, &draw, 1);
++   PostDraw(pDevice);
++
++   if (ib && ib != pDevice->index_buffer) {
++      pipe_resource_reference(&ib, NULL);
++   }
++}
++
++
++void APIENTRY
++DrawInstancedIndirect(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hBufferForArgs, UINT AlignedByteOffsetForArgs)
++{
++   LOG_ENTRYPOINT();
++
++   DrawIndirect(hDevice, hBufferForArgs, AlignedByteOffsetForArgs, false);
++}
++
++
++void APIENTRY
++DrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hBufferForArgs,
++                             UINT AlignedByteOffsetForArgs)
++{
++   LOG_ENTRYPOINT();
++
++   DrawIndirect(hDevice, hBufferForArgs, AlignedByteOffsetForArgs, true);
++}
++
++
++/*
+  * ----------------------------------------------------------------------
+  *
+  * DrawAuto --
+diff --git a/src/gallium/frontends/d3d10umd/Draw.h b/src/gallium/frontends/d3d10umd/Draw.h
+--- a/src/gallium/frontends/d3d10umd/Draw.h
++++ b/src/gallium/frontends/d3d10umd/Draw.h
+@@ -49,4 +49,10 @@
+ 
+ void APIENTRY DrawAuto(D3D10DDI_HDEVICE hDevice);
+ 
++void APIENTRY DrawInstancedIndirect(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hBufferForArgs,
++                                    UINT AlignedByteOffsetForArgs);
++
++void APIENTRY DrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hBufferForArgs,
++                                           UINT AlignedByteOffsetForArgs);
++
+ #endif
+diff --git a/src/gallium/frontends/d3d10umd/DxgiFns.cpp b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
+--- a/src/gallium/frontends/d3d10umd/DxgiFns.cpp
++++ b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
+@@ -46,6 +46,8 @@
+ #include "pipe/p_defines.h"
+ #include "pipe/p_state.h"
+ #include "util/format/u_format.h"
++#include "util/u_inlines.h"
++#include "util/u_math.h"
+ 
+ /*
+  * ----------------------------------------------------------------------
+@@ -228,10 +230,67 @@
+  * ----------------------------------------------------------------------
+  */
+ 
++/* A subresource's level, layer and rectangle (whole when the rectangle is empty) */
++static void
++BltSurface(struct pipe_resource *res, UINT Subresource, UINT Left, UINT Top, UINT Right, UINT Bottom,
++           unsigned *level, struct pipe_box *box)
++{
++   unsigned levels = res->last_level + 1;
++   *level = Subresource % levels;
++   unsigned layer = Subresource / levels;
++   if (Right <= Left || Bottom <= Top) {
++      Left = Top = 0;
++      Right = u_minify(res->width0, *level);
++      Bottom = u_minify(res->height0, *level);
++   }
++   u_box_3d(Left, Top, layer, Right - Left, Bottom - Top, 1, box);
++}
++
++/* Blits for presents: MSAA resolves (multisampled swap chains), format conversions and stretches. Rotations are
++ * not done (no rotated modes are offered). */
++static HRESULT
++BltCommon(DXGI_DDI_HDEVICE hDevice, DXGI_DDI_HRESOURCE hDst, UINT DstSubresource, UINT DstLeft, UINT DstTop,
++          UINT DstRight, UINT DstBottom, DXGI_DDI_HRESOURCE hSrc, UINT SrcSubresource, UINT SrcLeft, UINT SrcTop,
++          UINT SrcRight, UINT SrcBottom)
++{
++   Device *device = CastDevice(hDevice);
++   struct pipe_context *pipe = device->pipe;
++   struct pipe_resource *dst = CastPipeResource(hDst);
++   struct pipe_resource *src = CastPipeResource(hSrc);
++   struct pipe_blit_info info;
++
++   if (!dst || !src) {
++      return S_OK;
++   }
++   memset(&info, 0, sizeof info);
++   BltSurface(dst, DstSubresource, DstLeft, DstTop, DstRight, DstBottom, &info.dst.level, &info.dst.box);
++   BltSurface(src, SrcSubresource, SrcLeft, SrcTop, SrcRight, SrcBottom, &info.src.level, &info.src.box);
++   info.dst.resource = dst;
++   info.dst.format = dst->format;
++   info.src.resource = src;
++   info.src.format = src->format;
++   info.mask = util_format_get_mask(dst->format);
++   info.filter = info.dst.box.width == info.src.box.width && info.dst.box.height == info.src.box.height ?
++                 PIPE_TEX_FILTER_NEAREST : PIPE_TEX_FILTER_LINEAR;
++   pipe->blit(pipe, &info);
++   return S_OK;
++}
++
+ HRESULT APIENTRY
+ _Blt(DXGI_DDI_ARG_BLT *Blt)
+ {
+-   LOG_UNSUPPORTED_ENTRYPOINT();
++   LOG_ENTRYPOINT();
+ 
+-   return S_OK;
++   return BltCommon(Blt->hDevice, Blt->hDstResource, Blt->DstSubresource, Blt->DstLeft, Blt->DstTop,
++                    Blt->DstRight, Blt->DstBottom, Blt->hSrcResource, Blt->SrcSubresource, 0, 0, 0, 0);
++}
++
++HRESULT APIENTRY
++_Blt1(DXGI_DDI_ARG_BLT1 *Blt)
++{
++   LOG_ENTRYPOINT();
++
++   return BltCommon(Blt->hDevice, Blt->hDstResource, Blt->DstSubresource, Blt->DstLeft, Blt->DstTop,
++                    Blt->DstRight, Blt->DstBottom, Blt->hSrcResource, Blt->SrcSubresource, Blt->SrcLeft,
++                    Blt->SrcTop, Blt->SrcRight, Blt->SrcBottom);
+ }
+diff --git a/src/gallium/frontends/d3d10umd/DxgiFns.h b/src/gallium/frontends/d3d10umd/DxgiFns.h
+--- a/src/gallium/frontends/d3d10umd/DxgiFns.h
++++ b/src/gallium/frontends/d3d10umd/DxgiFns.h
+@@ -42,5 +42,6 @@
+ HRESULT APIENTRY _QueryResourceResidency( DXGI_DDI_ARG_QUERYRESOURCERESIDENCY * );
+ HRESULT APIENTRY _RotateResourceIdentities( DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES * );
+ HRESULT APIENTRY _Blt( DXGI_DDI_ARG_BLT * );
++HRESULT APIENTRY _Blt1( DXGI_DDI_ARG_BLT1 * );
+ 
+ #endif
+diff --git a/src/gallium/frontends/d3d10umd/Format.cpp b/src/gallium/frontends/d3d10umd/Format.cpp
+--- a/src/gallium/frontends/d3d10umd/Format.cpp
++++ b/src/gallium/frontends/d3d10umd/Format.cpp
+@@ -102,7 +102,9 @@
+    case DXGI_FORMAT_R32_SINT:
+       return PIPE_FORMAT_R32_SINT;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+-      return PIPE_FORMAT_Z24_UNORM_S8_UINT;
++      /* virgl hosts have GL's packed depth-stencil format (stencil in the low byte) only: creating the D3D layout
++       * failed, and with it every D24S8 depth buffer */
++      return PIPE_FORMAT_S8_UINT_Z24_UNORM;
+    case DXGI_FORMAT_R8G8_UNORM:
+       return PIPE_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_R8G8_UINT:
+@@ -192,11 +194,11 @@
+    case DXGI_FORMAT_R32_TYPELESS:
+       return depth ? PIPE_FORMAT_Z32_FLOAT : PIPE_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+-      return PIPE_FORMAT_Z24_UNORM_S8_UINT;
++      return PIPE_FORMAT_S8_UINT_Z24_UNORM;
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+       return PIPE_FORMAT_Z24X8_UNORM;
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+-      return PIPE_FORMAT_Z24_UNORM_S8_UINT;
++      return PIPE_FORMAT_S8_UINT_Z24_UNORM;
+ 
+    case DXGI_FORMAT_R8G8_B8G8_UNORM:
+       return PIPE_FORMAT_R8G8_B8G8_UNORM;
+@@ -346,6 +348,7 @@
+    case PIPE_FORMAT_R32_SINT:
+       return DXGI_FORMAT_R32_SINT;
+    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
++   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+       return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case PIPE_FORMAT_R8G8_UNORM:
+       return DXGI_FORMAT_R8G8_UNORM;
+diff --git a/src/gallium/frontends/d3d10umd/Rasterizer.cpp b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+--- a/src/gallium/frontends/d3d10umd/Rasterizer.cpp
++++ b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+@@ -220,7 +220,9 @@
+    state.offset_units = (float)pRasterizerDesc->DepthBias;
+    state.offset_scale = pRasterizerDesc->SlopeScaledDepthBias;
+    state.offset_clamp = pRasterizerDesc->DepthBiasClamp;
+-   state.multisample = /* pRasterizerDesc->MultisampleEnable */ 0;
++   /* As feature level 10_1 and up: MultisampleEnable only picks the line algorithm, triangles on multisampled
++    * targets are always multisampled (10_0 left them aliased without it). No effect on single-sampled targets. */
++   state.multisample = 1;
+    state.half_pixel_center = 1;
+    state.bottom_edge_rule = 0;
+    state.clip_halfz = 1;
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -932,7 +932,28 @@
+                            UINT SrcSubResource,             // IN
+                            DXGI_FORMAT ResolveFormat)       // IN
+ {
+-   LOG_UNSUPPORTED_ENTRYPOINT();
++   LOG_ENTRYPOINT();
++
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   struct pipe_resource *dst = CastPipeResource(hDstResource);
++   struct pipe_resource *src = CastPipeResource(hSrcResource);
++   enum pipe_format format = FormatTranslate(ResolveFormat, false);
++   struct pipe_blit_info info;
++
++   if (!dst || !src || format == PIPE_FORMAT_NONE) {
++      return;
++   }
++   memset(&info, 0, sizeof info);
++   subResourceBox(dst, DstSubResource, &info.dst.level, &info.dst.box);
++   subResourceBox(src, SrcSubResource, &info.src.level, &info.src.box);
++   info.dst.box.depth = info.src.box.depth = 1;
++   info.dst.resource = dst;
++   info.dst.format = format;
++   info.src.resource = src;
++   info.src.format = format;
++   info.mask = util_format_get_mask(format);
++   info.filter = PIPE_TEX_FILTER_NEAREST;
++   pipe->blit(pipe, &info);
+ }
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -315,14 +315,21 @@
+ #define SHADER_MAX_SAMPLERS PIPE_MAX_SAMPLERS
+ #define SHADER_MAX_INDEXABLE_TEMPS 4096
+ 
+-struct Shader_call {
+-   unsigned d3d_label;
+-   unsigned tgsi_label_token;
+-};
++/* Subroutines (call, callc): virglrenderer has no TGSI CAL/BGNSUB/ENDSUB (a shader with them failed to translate,
++ * an error that stopped all later rendering of the context). They are inlined: a call translates the label's body,
++ * up to the next label or the end, in a loop that runs once so ret leaves it (as in hull shader phases). The main
++ * program ends at the first label. D3D has no recursion; the nesting is limited as D3D's (32). */
++#define SHADER_MAX_INLINE_DEPTH 32
+ 
+ struct Shader_label {
+    unsigned d3d_label;
+-   unsigned tgsi_insn_no;
++   unsigned offset;      /* of the body's first opcode, in dwords from the start of the code */
++};
++
++struct Shader_inline {
++   unsigned return_offset;
++   unsigned cf_base;     /* cf_depth at the call */
++   bool endif;           /* callc: the if around it */
+ };
+ 
+ struct Shader_resource {
+@@ -413,12 +420,12 @@
+    uint num_clip_distances_declared;
+    uint num_cull_distances_declared;
+ 
+-   struct Shader_call *calls;
+-   uint num_calls;
+-   uint max_calls;
+-   struct Shader_label *labels;
++   struct Shader_label *labels;            /* (Shader_scan_control_flow) */
+    uint num_labels;
+-   uint max_labels;
++   bool has_calls;
++   struct Shader_inline inlines[SHADER_MAX_INLINE_DEPTH];
++   uint inline_depth;
++   unsigned cur_offset;                    /* the opcode being translated, in dwords from the start */
+ 
+    struct Shader_bindings bindings;
+ 
+@@ -438,7 +445,7 @@
+    unsigned hs_phase_index;                /* fork and join phases, in order */
+    unsigned hs_instance_counts[64];        /* their instance counts (Shader_scan_control_flow) */
+    unsigned hs_num_counted;
+-   struct ureg_dst hs_counter;             /* .x the phase instance, .y ret in a loop */
++   struct ureg_dst hs_counter;             /* .x the phase instance, .y ret in a loop (also in inlined calls) */
+    bool ds_body;                           /* the domain shader's main code, in a run-once loop */
+    unsigned *icb_data;                     /* the immediate constant buffer, for bindings.icb */
+    unsigned icb_dwords;
+@@ -469,9 +476,11 @@
+    struct Shader_cf cf[SHADER_MAX_CF_DEPTH];
+    uint cf_depth;
+    bool *loop_has_continue;               /* by loop, in program order (Shader_scan_control_flow) */
+-   uint num_loops, loops_seen;
++   unsigned *loop_offsets;                /* their opcodes' offsets (inlined code is translated out of order) */
++   uint num_loops;
+    struct Shader_switch_cases *switches;  /* by switch, in program order */
+-   uint num_switches, switches_seen;
++   unsigned *switch_offsets;
++   uint num_switches;
+ };
+ 
+ static uint
+@@ -1490,31 +1499,6 @@
+ }
+ 
+ static void
+-Shader_add_call(struct Shader_xlate *sx,
+-                unsigned d3d_label,
+-                unsigned tgsi_label_token)
+-{
+-   ASSERT(sx->num_calls < sx->max_calls);
+-
+-   sx->calls[sx->num_calls].d3d_label = d3d_label;
+-   sx->calls[sx->num_calls].tgsi_label_token = tgsi_label_token;
+-   sx->num_calls++;
+-}
+-
+-static void
+-Shader_add_label(struct Shader_xlate *sx,
+-                 unsigned d3d_label,
+-                 unsigned tgsi_insn_no)
+-{
+-   ASSERT(sx->num_labels < sx->max_labels);
+-
+-   sx->labels[sx->num_labels].d3d_label = d3d_label;
+-   sx->labels[sx->num_labels].tgsi_insn_no = tgsi_insn_no;
+-   sx->num_labels++;
+-}
+-
+-
+-static void
+ sample_ureg_emit(struct ureg_program *ureg,
+                  unsigned tgsi_opcode,
+                  unsigned num_src,
+@@ -2926,12 +2910,13 @@
+    }
+ }
+ 
+-/* Code in a run-once loop, where ret leaves the loop: hull shader phases, and the domain shader (virglrenderer
+- * turns RET into a plain return there, skipping its epilogue: the y flip, clip distances) */
++/* Code in a run-once loop, where ret leaves the loop: hull shader phases, the domain shader (virglrenderer
++ * turns RET into a plain return there, skipping its epilogue: the y flip, clip distances), and inlined calls */
+ static bool
+ ret_is_break(const struct Shader_xlate *sx)
+ {
+-   return sx->hs_phase == HS_CONTROL_POINT || sx->hs_phase == HS_FORK || sx->hs_phase == HS_JOIN || sx->ds_body;
++   return sx->hs_phase == HS_CONTROL_POINT || sx->hs_phase == HS_FORK || sx->hs_phase == HS_JOIN || sx->ds_body ||
++          sx->inline_depth;
+ }
+ 
+ /* ret: out of the run-once loop, through D3D loops inside it */
+@@ -2944,9 +2929,11 @@
+       ureg_RET(ureg);
+       return;
+    }
+-   if (sx->cf_depth) {
++   /* the loops and switches of the inlined call (or the phase) */
++   unsigned base = sx->inline_depth ? sx->inlines[sx->inline_depth - 1].cf_base : 0;
++   if (sx->cf_depth > base) {
+       ureg_MOV(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, ~0u));
+-      for (unsigned i = 0; i < sx->cf_depth; i++) {
++      for (unsigned i = base; i < sx->cf_depth; i++) {
+          if (!sx->cf[i].is_switch && sx->cf[i].lowered) {
+             ureg_MOV(ureg, ureg_writemask(sx->cf[i].flags, TGSI_WRITEMASK_X), ureg_imm1u(ureg, ~0u));
+          }
+@@ -2968,6 +2955,49 @@
+    }
+ }
+ 
++/* call: the label's body follows, in a run-once loop; false without such a label (or too deep) */
++static bool
++inline_begin(struct Shader_xlate *sx, struct Shader_parser *parser, unsigned d3d_label, bool endif)
++{
++   unsigned label;
++
++   if (sx->inline_depth >= SHADER_MAX_INLINE_DEPTH) {
++      assert(0);
++      return false;
++   }
++   for (uint i = 0; i < sx->num_labels; i++) {
++      if (sx->labels[i].d3d_label == d3d_label) {
++         struct Shader_inline *in = &sx->inlines[sx->inline_depth++];
++         in->return_offset = parser->curr - parser->code;
++         in->cf_base = sx->cf_depth;
++         in->endif = endif;
++         ureg_BGNLOOP(sx->ureg, &label);
++         parser->curr = parser->code + sx->labels[i].offset;
++         return true;
++      }
++   }
++   assert(0);
++   return false;
++}
++
++/* The end of an inlined body (the next label or the end of the code): back after the call */
++static void
++inline_end(struct Shader_xlate *sx, struct Shader_parser *parser)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct Shader_inline *in = &sx->inlines[--sx->inline_depth];
++   unsigned label;
++
++   ureg_BRK(ureg);
++   ureg_ENDLOOP(ureg, &label);
++   /* a ret in a loop of the body: done with it */
++   ureg_MOV(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, 0));
++   if (in->endif) {
++      ureg_ENDIF(ureg);
++   }
++   parser->curr = parser->code + in->return_offset;
++}
++
+ static void
+ hs_close_phase(struct Shader_xlate *sx)
+ {
+@@ -3120,12 +3150,31 @@
+    uint depth = 0;
+ 
+    Shader_parse_init(&parser, code);
+-   while (Shader_parse_opcode(&parser, &opcode)) {
++   for (;;) {
++      unsigned offset = parser.curr - parser.code;
++      if (!Shader_parse_opcode(&parser, &opcode)) {
++         break;
++      }
+       switch (opcode.type) {
++      case D3D10_SB_OPCODE_LABEL:
++         sx->labels = REALLOC(sx->labels, sx->num_labels * sizeof(*sx->labels),
++                              (sx->num_labels + 1) * sizeof(*sx->labels));
++         sx->labels[sx->num_labels].d3d_label = opcode.src[0].base.index[0].imm;
++         sx->labels[sx->num_labels].offset = parser.curr - parser.code;
++         sx->num_labels++;
++         depth = 0;
++         break;
++      case D3D10_SB_OPCODE_CALL:
++      case D3D10_SB_OPCODE_CALLC:
++         sx->has_calls = true;
++         break;
+       case D3D10_SB_OPCODE_LOOP:
+          sx->loop_has_continue = REALLOC(sx->loop_has_continue, sx->num_loops * sizeof(bool),
+                                          (sx->num_loops + 1) * sizeof(bool));
+          sx->loop_has_continue[sx->num_loops] = false;
++         sx->loop_offsets = REALLOC(sx->loop_offsets, sx->num_loops * sizeof(unsigned),
++                                    (sx->num_loops + 1) * sizeof(unsigned));
++         sx->loop_offsets[sx->num_loops] = offset;
+          if (depth < SHADER_MAX_CF_DEPTH) {
+             stack[depth].is_switch = false;
+             stack[depth].index = sx->num_loops;
+@@ -3137,6 +3186,9 @@
+          sx->switches = REALLOC(sx->switches, sx->num_switches * sizeof(*sx->switches),
+                                 (sx->num_switches + 1) * sizeof(*sx->switches));
+          memset(&sx->switches[sx->num_switches], 0, sizeof(*sx->switches));
++         sx->switch_offsets = REALLOC(sx->switch_offsets, sx->num_switches * sizeof(unsigned),
++                                      (sx->num_switches + 1) * sizeof(unsigned));
++         sx->switch_offsets[sx->num_switches] = offset;
+          if (depth < SHADER_MAX_CF_DEPTH) {
+             stack[depth].is_switch = true;
+             stack[depth].index = sx->num_switches;
+@@ -3264,8 +3316,12 @@
+    assert(sx->cf_depth < SHADER_MAX_CF_DEPTH);
+    cf = &sx->cf[sx->cf_depth++];
+    memset(cf, 0, sizeof *cf);
+-   cf->lowered = sx->loops_seen < sx->num_loops && sx->loop_has_continue[sx->loops_seen];
+-   sx->loops_seen++;
++   for (uint i = 0; i < sx->num_loops; i++) {
++      if (sx->loop_offsets[i] == sx->cur_offset) {
++         cf->lowered = sx->loop_has_continue[i];
++         break;
++      }
++   }
+ 
+    if (cf->lowered) {
+       cf->flags = ureg_DECL_temporary(ureg);
+@@ -3335,12 +3391,16 @@
+ cf_switch(struct Shader_xlate *sx, struct ureg_src selector)
+ {
+    struct ureg_program *ureg = sx->ureg;
+-   const struct Shader_switch_cases *cases =
+-      sx->switches_seen < sx->num_switches ? &sx->switches[sx->switches_seen] : NULL;
++   const struct Shader_switch_cases *cases = NULL;
+    struct Shader_cf *cf;
+    unsigned label;
+ 
+-   sx->switches_seen++;
++   for (uint i = 0; i < sx->num_switches; i++) {
++      if (sx->switch_offsets[i] == sx->cur_offset) {
++         cases = &sx->switches[i];
++         break;
++      }
++   }
+    assert(sx->cf_depth < SHADER_MAX_CF_DEPTH);
+    cf = &sx->cf[sx->cf_depth++];
+    memset(cf, 0, sizeof *cf);
+@@ -3440,8 +3500,7 @@
+    const struct tgsi_token *tokens = NULL;
+    uint nr_tokens;
+    bool shader_dumped = false;
+-   bool inside_sub = false;
+-   uint i, j;
++   uint i;
+ 
+    sx = CALLOC_STRUCT(Shader_xlate);
+    if (!sx) {
+@@ -3457,16 +3516,6 @@
+ 
+    sx->options = options;
+    sx->image_formats = options ? options->image_formats : NULL;
+-   sx->max_calls = 64;
+-   sx->calls = (struct Shader_call *)MALLOC(sx->max_calls *
+-                                           sizeof(struct Shader_call));
+-   sx->num_calls = 0;
+-
+-   sx->max_labels = 64;
+-   sx->labels = (struct Shader_label *)MALLOC(sx->max_labels *
+-                                             sizeof(struct Shader_call));
+-   sx->num_labels = 0;
+-
+    Shader_scan_control_flow(sx, code);
+ 
+    /* Header. */
+@@ -3505,6 +3554,11 @@
+       ureg_BGNLOOP(ureg, &label);
+       sx->ds_body = true;
+    }
++   if (sx->has_calls && parser.header.type != D3D11_SB_HULL_SHADER &&
++       parser.header.type != D3D11_SB_DOMAIN_SHADER) {
++      sx->hs_counter = ureg_DECL_temporary(ureg);
++      ureg_MOV(ureg, ureg_writemask(sx->hs_counter, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, 0));
++   }
+ 
+    for(uint i = 0; i < SHADER_MAX_ADDRS; i++) {
+       sx->addrs[i] = ureg_DECL_address(sx->ureg);
+@@ -3514,8 +3568,23 @@
+    }
+    sx->addr_cur = 1;
+ 
+-   while (Shader_parse_opcode(&parser, &opcode)) {
++   for (;;) {
+       const struct dx10_opcode_xlate *ox;
++      unsigned offset = parser.curr - parser.code;
++      bool more = Shader_parse_opcode(&parser, &opcode);
++
++      /* the end of the main program or of an inlined body */
++      if (!more || opcode.type == D3D10_SB_OPCODE_LABEL) {
++         if (more) {
++            Shader_opcode_free(&opcode);
++         }
++         if (!sx->inline_depth) {
++            break;
++         }
++         inline_end(sx, &parser);
++         continue;
++      }
++      sx->cur_offset = offset;
+ 
+       assert(opcode.type < D3D10_SB_NUM_OPCODES);
+       ox = &opcode_xlate[opcode.type];
+@@ -4197,8 +4266,10 @@
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT:
++         /* (the pixel shader's coverage input is numbered among them) */
+          if (opcode.dst[0].base.type >= D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID &&
+-             opcode.dst[0].base.type <= D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED) {
++             opcode.dst[0].base.type <= D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED &&
++             opcode.dst[0].base.type != D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK) {
+             sx->cs_input_wanted[opcode.dst[0].base.type - D3D11_SB_OPERAND_TYPE_INPUT_THREAD_ID] = true;
+             cs_inputs(sx);
+          } else if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_CONTROL_POINT ||
+@@ -4465,12 +4536,12 @@
+          case D3D10_SB_OPCODE_CONTINUEC:
+             cf_continue(sx);
+             break;
+-         case D3D10_SB_OPCODE_CALLC: {
+-            unsigned label = opcode.src[1].base.index[0].imm;
+-            unsigned tgsi_token_label = 0;
+-            ureg_CAL(ureg, &tgsi_token_label);
+-            Shader_add_call(sx, label, tgsi_token_label);
+-         }
++         case D3D10_SB_OPCODE_CALLC:
++            /* the endif after the inlined body */
++            if (inline_begin(sx, &parser, opcode.src[1].base.index[0].imm, true)) {
++               Shader_opcode_free(&opcode);
++               continue;
++            }
+             break;
+          case D3D10_SB_OPCODE_DISCARD:
+             ureg_KILL(ureg);
+@@ -4485,25 +4556,8 @@
+          ureg_ENDIF(ureg);
+       }
+          break;
+-      case D3D10_SB_OPCODE_LABEL: {
+-         unsigned label = opcode.src[0].base.index[0].imm;
+-         unsigned tgsi_inst_no = 0;
+-         if (inside_sub) {
+-            ureg_ENDSUB(ureg);
+-         }
+-         ds_close_body(sx);
+-         tgsi_inst_no = ureg_get_instruction_number(ureg);
+-         ureg_BGNSUB(ureg);
+-         inside_sub = true;
+-         Shader_add_label(sx, label, tgsi_inst_no);
+-      }
+-         break;
+-      case D3D10_SB_OPCODE_CALL: {
+-         unsigned label = opcode.src[0].base.index[0].imm;
+-         unsigned tgsi_token_label = 0;
+-         ureg_CAL(ureg, &tgsi_token_label);
+-         Shader_add_call(sx, label, tgsi_token_label);
+-      }
++      case D3D10_SB_OPCODE_CALL:
++         inline_begin(sx, &parser, opcode.src[0].base.index[0].imm, false);
+          break;
+       case D3D10_SB_OPCODE_LOOP:
+          cf_loop(sx);
+@@ -4594,9 +4648,6 @@
+       Shader_opcode_free(&opcode);
+    }
+ 
+-   if (inside_sub) {
+-      ureg_ENDSUB(ureg);
+-   }
+    ds_close_body(sx);
+ 
+    if (parser.header.type == D3D11_SB_HULL_SHADER) {
+@@ -4618,24 +4669,14 @@
+ 
+    ureg_END(ureg);
+ 
+-   for (i = 0; i < sx->num_calls; ++i) {
+-      for (j = 0; j < sx->num_labels; ++j) {
+-         if (sx->calls[i].d3d_label == sx->labels[j].d3d_label) {
+-            ureg_fixup_label(sx->ureg,
+-                             sx->calls[i].tgsi_label_token,
+-                             sx->labels[j].tgsi_insn_no);
+-            break;
+-         }
+-      }
+-      ASSERT(j < sx->num_labels);
+-   }
+    FREE(sx->labels);
+-   FREE(sx->calls);
+    for (i = 0; i < sx->num_switches; i++) {
+       FREE(sx->switches[i].values);
+    }
+    FREE(sx->switches);
++   FREE(sx->switch_offsets);
+    FREE(sx->loop_has_continue);
++   FREE(sx->loop_offsets);
+ 
+    FREE(sx->icb_data);
+    if (bindings) {
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -45,7 +45,6 @@
+ #define D3D11_1_UAV_SLOT_COUNT 64
+ #endif
+ 
+-#define SUPPORT_MSAA 0
+ #define SUPPORT_D3D10_1 0
+ #define SUPPORT_D3D11 0
+ 
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -20,6 +20,8 @@
+ 
+ #include "D3D11_1.h"
+ #include "Compute.h"
++#include "Draw.h"
++#include "Format.h"
+ 
+ #include "DxgiFns.h"
+ #include "OutputMerger.h"
+@@ -498,6 +500,33 @@
+ }
+ 
+ 
++/* The 11.1 DDI's format caps: the 10.0 ones and vertex and typed buffers, UAV writes and gathers */
++static void APIENTRY
++CheckFormatSupport11_1(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps)
++{
++   funcs10.pfnCheckFormatSupport(hDevice, Format, pFormatCaps);
++
++   struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
++   enum pipe_format format = FormatTranslate(Format, false);
++   if ((*pFormatCaps & D3D10_DDI_FORMAT_SUPPORT_NOT_SUPPORTED) || format == PIPE_FORMAT_NONE) {
++      return;
++   }
++   if (screen->is_format_supported(screen, format, PIPE_BUFFER, 0, 0, PIPE_BIND_VERTEX_BUFFER)) {
++      *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_VERTEX_BUFFER;
++   }
++   if (screen->is_format_supported(screen, format, PIPE_BUFFER, 0, 0, PIPE_BIND_SAMPLER_VIEW)) {
++      *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_BUFFER;
++   }
++   if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_SHADER_IMAGE)) {
++      *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_UAV_WRITES;
++   }
++   if ((*pFormatCaps & D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE) &&
++       screen->get_param(screen, PIPE_CAP_MAX_TEXTURE_GATHER_COMPONENTS)) {
++      *pFormatCaps |= D3D11_1DDI_FORMAT_SUPPORT_SHADER_GATHER;
++   }
++}
++
++
+ void
+ FillDeviceFuncs11_1(D3D11_1DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10)
+ {
+@@ -574,7 +603,7 @@
+    pFuncs->pfnCalcPrivateQuerySize = funcs10.pfnCalcPrivateQuerySize;
+    pFuncs->pfnCreateQuery = funcs10.pfnCreateQuery;
+    pFuncs->pfnDestroyQuery = funcs10.pfnDestroyQuery;
+-   pFuncs->pfnCheckFormatSupport = funcs10.pfnCheckFormatSupport;
++   pFuncs->pfnCheckFormatSupport = CheckFormatSupport11_1;
+    pFuncs->pfnCheckMultisampleQualityLevels = funcs10.pfnCheckMultisampleQualityLevels;
+    pFuncs->pfnCheckCounterInfo = funcs10.pfnCheckCounterInfo;
+    pFuncs->pfnCheckCounter = funcs10.pfnCheckCounter;
+@@ -617,9 +646,10 @@
+    pFuncs->pfnCheckDeferredContextHandleSizes = CheckDeferredContextHandleSizes;
+    pFuncs->pfnCheckDirectFlipSupport = CheckDirectFlipSupport;
+ 
+-   /* Feature level 11 and hints: refused or ignored */
+-   STUB(pfnDrawIndexedInstancedIndirect);
+-   STUB(pfnDrawInstancedIndirect);
++   /* Indirect draws (Draw.cpp) */
++   pFuncs->pfnDrawIndexedInstancedIndirect = DrawIndexedInstancedIndirect;
++   pFuncs->pfnDrawInstancedIndirect = DrawInstancedIndirect;
++   /* Deferred contexts and hints: refused or ignored */
+    STUB(pfnCommandListExecute);
+    /* Tessellation (Shader.cpp) */
+    pFuncs->pfnHsSetShaderResources = HsSetShaderResources;
+@@ -704,13 +734,7 @@
+ }
+ 
+ 
+-/* DXGI 1.2: blits with rectangles (as the 1.0 Blt: not offered), offering memory back (nothing to give) */
+-static HRESULT APIENTRY
+-Blt1(DXGI_DDI_ARG_BLT1 *pBlt)
+-{
+-   return S_OK;
+-}
+-
++/* DXGI 1.2: blits with rectangles (DxgiFns.cpp), offering memory back (nothing to give) */
+ static HRESULT APIENTRY
+ OfferResources(DXGI_DDI_ARG_OFFERRESOURCES *pOffer)
+ {
+@@ -738,7 +762,7 @@
+ FillDXGIFuncs1_2(DXGI1_2_DDI_BASE_FUNCTIONS *pFuncs)
+ {
+    pFuncs->pfnResolveSharedResource = ResolveSharedResource;
+-   pFuncs->pfnBlt1 = Blt1;
++   pFuncs->pfnBlt1 = _Blt1;
+    pFuncs->pfnOfferResources = OfferResources;
+    pFuncs->pfnReclaimResources = ReclaimResources;
+ }
+@@ -781,7 +805,7 @@
+ FillDXGIFuncs1_3(DXGI1_3_DDI_BASE_FUNCTIONS *pFuncs)
+ {
+    pFuncs->pfnResolveSharedResource = ResolveSharedResource;
+-   pFuncs->pfnBlt1 = Blt1;
++   pFuncs->pfnBlt1 = _Blt1;
+    pFuncs->pfnOfferResources = OfferResources;
+    pFuncs->pfnReclaimResources = ReclaimResources;
+    /* No multiplane overlays (the kernel driver has no overlay planes) */

@@ -1,0 +1,70 @@
+av1: references at their decoded size, and every frame a reference (WinBoat)
+
+- The references' sizes came from their surfaces, which can be larger than the
+  pictures (ffmpeg's d3d11va pads AV1 surfaces to 128 rows: 1280x768 for 720p,
+  which WinBoat's guests decode into): NVDEC took them for references of
+  another size and scaled them, and inter frames came out garbled. Keep the
+  size each picture was decoded at on its surface and pass that. Also look the
+  reference up in its own slot (ref_frame_map[ref_frame_idx[i]], not
+  ref_frame_map[i]).
+- ref_pic_flag was set for key frames and shown switch frames only, but any
+  frame can refresh reference slots: inter frames weren't kept as references,
+  and the frames predicted from them decoded from nothing. Set it always, as
+  later versions of this driver do.
+
+diff --git a/src/av1.c b/src/av1.c
+index 75ce73c..0957165 100644
+--- a/src/av1.c
++++ b/src/av1.c
+@@ -23,9 +23,9 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
+     picParams->intra_pic_flag    = buf->pic_info_fields.bits.frame_type == 0 || //Key
+                                    buf->pic_info_fields.bits.frame_type == 2; //Intra-Only
+ 
+-    //TODO if it's not a key or switch frame type, it still *might* be a ref_pic
+-    picParams->ref_pic_flag      = buf->pic_info_fields.bits.frame_type == 0 ||
+-                                  (buf->pic_info_fields.bits.frame_type == 3 && buf->pic_info_fields.bits.show_frame);
++    //any frame can refresh reference slots (refresh_frame_flags): inter frames weren't references, and the frames
++    //predicted from them decoded from nothing (as in later versions of this driver)
++    picParams->ref_pic_flag      = true;
+ 
+     pps->width = ctx->width;
+     pps->height = ctx->height;
+@@ -91,6 +91,9 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
+ 
+     //we'll need this value in a future frame
+     ctx->renderTarget->order_hint = pps->frame_offset;
++    //and the size it's decoded at, for the frames that reference it
++    ctx->renderTarget->frameWidth = buf->frame_width_minus1 + 1;
++    ctx->renderTarget->frameHeight = buf->frame_height_minus1 + 1;
+ 
+     if (pps->skip_mode) {
+         int forwardIdx = -1;
+@@ -258,11 +261,12 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
+     for (int i = 0; i < 7; i++) { //REFS_PER_FRAME
+         int ref_idx = buf->ref_frame_idx[i];
+         pps->ref_frame[i].index = pps->ref_frame_map[ref_idx];
+-        //pull these from the surface itself
+-        NVSurface *surf = nvSurfaceFromSurfaceId(ctx->drv, buf->ref_frame_map[i]);
++        //the size the reference was decoded at: its surface can be larger (d3d11va pads AV1 surfaces to 128 rows),
++        //which NVDEC takes for a reference of another size and scales (inter frames came out garbled)
++        NVSurface *surf = nvSurfaceFromSurfaceId(ctx->drv, buf->ref_frame_map[ref_idx]);
+         if (surf != NULL) {
+-            pps->ref_frame[i].width = surf->width;
+-            pps->ref_frame[i].height = surf->height;
++            pps->ref_frame[i].width = surf->frameWidth ? surf->frameWidth : surf->width;
++            pps->ref_frame[i].height = surf->frameHeight ? surf->frameHeight : surf->height;
+         }
+ 
+         //TODO not sure on this one
+diff --git a/src/vabackend.h b/src/vabackend.h
+index 70df804..50ebd0b 100644
+--- a/src/vabackend.h
++++ b/src/vabackend.h
+@@ -64,6 +64,7 @@ typedef struct
+     int                     topFieldFirst;
+     int                     secondField;
+     int                     order_hint; //needed for AV1
++    int                     frameWidth, frameHeight; //AV1: the size the picture was decoded at (surfaces can be larger)
+     struct _BackingImage    *backingImage;
+     int                     resolving;
+     pthread_mutex_t         mutex;

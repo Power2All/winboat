@@ -1,0 +1,20 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: a failed resource creation reports out-of-memory
+
+CreateResource checked the wrapper (pResource, never NULL) instead of the gallium resource after resource_create,
+so a resource the winsys couldn't allocate (the kernel driver's GPU memory limit, for one) went on as NULL and the
+program crashed. Now the runtime gets E_OUTOFMEMORY, and CreateTexture2D and friends fail as on a full graphics card.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index 03b2579..aa00670 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -343,7 +343,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+    }
+ 
+    pResource->resource = screen->resource_create(screen, &templat);
+-   if (!pResource) {
++   if (!pResource->resource) {
+       DebugPrintf("%s: failed to create resource\n", __func__);
+       SetError(hDevice, E_OUTOFMEMORY);
+       goto unlock;

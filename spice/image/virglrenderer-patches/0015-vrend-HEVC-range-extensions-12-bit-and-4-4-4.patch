@@ -1,0 +1,334 @@
+From: WinBoat
+Subject: [PATCH] vrend: HEVC range extensions, 12-bit and 4:4:4 decoding
+
+HEVC Main 12 and Main 4:4:4 (8, 10, 12 bits) through VA-API, for D3D's
+DXVA profiles HEVC_VLD_Main12 and Main_444/Main10_444/Main12_444:
+- profiles: VAProfileHEVCMain12 and Main444 in the caps (one gallium
+  profile for the 4:4:4 depths); the deferred configuration takes the
+  depth from the first target's format: P016 (12-bit 4:2:0), and 4:4:4 as
+  an RGBA buffer the way D3D's AYUV, Y410 and Y416 are packed
+  (R8G8B8A8 -> Main444, R10G10B10A2 -> Main444_10, R16G16B16A16 ->
+  Main444_12), surfaces of the matching RT format
+- the range extension parameters (appended to virgl_h265_picture_desc, in
+  VAPictureParameterBufferHEVCRext's flag order) go after the base ones
+  in a VAPictureParameterBufferHEVCExtension for these profiles
+- read_images: P016 read like P010; 4:4:4 read as NVIDIA's three planes
+  (444P, Q416) and packed into the guest's one RGBA plane (AYUV: V, U, Y,
+  A bytes; Y410: U, Y, V, A 10:10:10:2 from bit 0; Y416: U, Y, V, A 16-bit)
+ponytail: the dma-buf export path (other VA drivers) still knows NV12/P010
+only; 4:4:4 there would need the packing as a GPU pass.
+
+--- a/src/virgl_video_hw.h
++++ b/src/virgl_video_hw.h
+@@ -394,6 +394,17 @@
+ 
+    uint8_t RefPicList[2][15];
+    uint8_t reserved[2];
++
++   /* Range extensions (4:4:4, 12 bits; WinBoat): the flags in VAPictureParameterBufferHEVCRext's bit order */
++   uint32_t rext_flags;
++   uint8_t diff_cu_chroma_qp_offset_depth;
++   uint8_t chroma_qp_offset_list_len_minus1;
++   uint8_t log2_sao_offset_scale_luma;
++   uint8_t log2_sao_offset_scale_chroma;
++   uint8_t log2_max_transform_skip_block_size_minus2;
++   int8_t cb_qp_offset_list[6];
++   int8_t cr_qp_offset_list[6];
++   uint8_t reserved_rext[3];
+ };
+ 
+ struct virgl_h265_enc_seq_param
+--- a/src/vrend/virgl_video.c
++++ b/src/vrend/virgl_video.c
+@@ -96,6 +96,7 @@
+     VASurfaceID va_sfc;
+     struct virgl_video_dma_buf *dmabuf;
+     VAImage image;                              /* read_images: the picture read with vaGetImage */
++    void *packed;                               /* read_images, 4:4:4: the picture packed (decode_completed) */
+     void *opaque;                               /* User opaque data */
+ };
+ 
+@@ -160,6 +161,12 @@
+       return PIPE_VIDEO_PROFILE_HEVC_MAIN;
+    case VAProfileHEVCMain10:
+       return PIPE_VIDEO_PROFILE_HEVC_MAIN_10;
++   /* range extensions: 12-bit 4:2:0, and 4:4:4 (one gallium profile for its 8, 10 and 12 bits: the guest's buffer
++    * format names the depth, begin_frame picks VA's profile; WinBoat) */
++   case VAProfileHEVCMain12:
++      return PIPE_VIDEO_PROFILE_HEVC_MAIN_12;
++   case VAProfileHEVCMain444:
++      return PIPE_VIDEO_PROFILE_HEVC_MAIN_444;
+    case VAProfileJPEGBaseline:
+       return PIPE_VIDEO_PROFILE_JPEG_BASELINE;
+    case VAProfileVP9Profile0:
+@@ -253,6 +260,10 @@
+       return VAProfileHEVCMain;
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_10:
+       return VAProfileHEVCMain10;
++   case PIPE_VIDEO_PROFILE_HEVC_MAIN_12:
++      return VAProfileHEVCMain12;
++   case PIPE_VIDEO_PROFILE_HEVC_MAIN_444:
++      return VAProfileHEVCMain444;
+    case PIPE_VIDEO_PROFILE_JPEG_BASELINE:
+       return VAProfileJPEGBaseline;
+    case PIPE_VIDEO_PROFILE_VP9_PROFILE0:
+@@ -266,9 +277,7 @@
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH422:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH444:
+    case PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE:
+-   case PIPE_VIDEO_PROFILE_HEVC_MAIN_12:
+    case PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL:
+-   case PIPE_VIDEO_PROFILE_HEVC_MAIN_444:
+    case PIPE_VIDEO_PROFILE_UNKNOWN:
+       return VAProfileNone;
+    default:
+@@ -305,6 +314,20 @@
+     case PIPE_FORMAT_P010:
+         va_format = VA_RT_FORMAT_YUV420_10;
+         break;
++    /* 12-bit 4:2:0, and 4:4:4 packed into an RGBA buffer the way D3D's AYUV, Y410 and Y416 are (see
++     * decode_completed; WinBoat) */
++    case PIPE_FORMAT_P016:
++        va_format = VA_RT_FORMAT_YUV420_12;
++        break;
++    case PIPE_FORMAT_R8G8B8A8_UNORM:
++        va_format = VA_RT_FORMAT_YUV444;
++        break;
++    case PIPE_FORMAT_R10G10B10A2_UNORM:
++        va_format = VA_RT_FORMAT_YUV444_10;
++        break;
++    case PIPE_FORMAT_R16G16B16A16_UNORM:
++        va_format = VA_RT_FORMAT_YUV444_12;
++        break;
+     default:
+         va_format = VA_RT_FORMAT_YUV420;
+     }
+@@ -510,6 +533,69 @@
+     free(coded_sizes);
+ }
+ 
++/*
++ * read_images: how a picture is read (vaGetImage in a format the driver has) and handed to the guest's planes
++ * (WinBoat). 4:2:0 in two planes as NV12/P010/P016; 4:4:4 packed into one RGBA plane the way D3D's AYUV (V, U, Y, A
++ * bytes), Y410 (U, Y, V, A in 10:10:10:2 from bit 0) and Y416 (U, Y, V, A in 16 bits, the samples at the top) are:
++ * NVIDIA's driver reads 4:4:4 only as three planes (444P, Q416), packed here.
++ */
++struct read_layout {
++    enum pipe_format format;
++    uint32_t fourcc, bits_per_pixel, drm_format;
++    unsigned packed_bytes;              /* 4:4:4: bytes per packed pixel; 0: planes as read */
++};
++
++static const struct read_layout *read_layout(enum pipe_format format)
++{
++    static const struct read_layout layouts[] = {
++        {PIPE_FORMAT_NV12, VA_FOURCC_NV12, 12, DRM_FORMAT_NV12, 0},
++        {PIPE_FORMAT_P010, VA_FOURCC_P010, 24, DRM_FORMAT_P010, 0},
++        {PIPE_FORMAT_P016, VA_FOURCC_P016, 24, DRM_FORMAT_P016, 0},
++        {PIPE_FORMAT_R8G8B8A8_UNORM, VA_FOURCC_444P, 24, DRM_FORMAT_AYUV, 4},
++        {PIPE_FORMAT_R10G10B10A2_UNORM, VA_FOURCC_Q416, 48, DRM_FORMAT_Y410, 4},
++        {PIPE_FORMAT_R16G16B16A16_UNORM, VA_FOURCC_Q416, 48, DRM_FORMAT_Y416, 8},
++    };
++    for (unsigned i = 1; i < ARRAY_SIZE(layouts); i++) {
++        if (layouts[i].format == format)
++            return &layouts[i];
++    }
++    return &layouts[0];
++}
++
++/* The three planes read (444P, Q416: 16-bit samples at the top) packed into buffer->packed */
++static void pack_444(struct virgl_video_buffer *buffer, const uint8_t *data)
++{
++    const VAImage *img = &buffer->image;
++    for (unsigned y = 0; y < buffer->height; y++) {
++        const uint8_t *py = data + img->offsets[0] + (size_t)y * img->pitches[0];
++        const uint8_t *pu = data + img->offsets[1] + (size_t)y * img->pitches[1];
++        const uint8_t *pv = data + img->offsets[2] + (size_t)y * img->pitches[2];
++        if (buffer->format == PIPE_FORMAT_R8G8B8A8_UNORM) {
++            uint8_t *o = (uint8_t *)buffer->packed + (size_t)y * buffer->width * 4;
++            for (unsigned x = 0; x < buffer->width; x++, o += 4) {
++                o[0] = pv[x];
++                o[1] = pu[x];
++                o[2] = py[x];
++                o[3] = 0xff;
++            }
++        } else if (buffer->format == PIPE_FORMAT_R10G10B10A2_UNORM) {
++            const uint16_t *y16 = (const uint16_t *)py, *u16 = (const uint16_t *)pu, *v16 = (const uint16_t *)pv;
++            uint32_t *o = (uint32_t *)buffer->packed + (size_t)y * buffer->width;
++            for (unsigned x = 0; x < buffer->width; x++)
++                o[x] = (uint32_t)(u16[x] >> 6) | (uint32_t)(y16[x] >> 6) << 10 | (uint32_t)(v16[x] >> 6) << 20 | 3u << 30;
++        } else {
++            const uint16_t *y16 = (const uint16_t *)py, *u16 = (const uint16_t *)pu, *v16 = (const uint16_t *)pv;
++            uint16_t *o = (uint16_t *)buffer->packed + (size_t)y * buffer->width * 4;
++            for (unsigned x = 0; x < buffer->width; x++, o += 4) {
++                o[0] = u16[x];
++                o[1] = y16[x];
++                o[2] = v16[x];
++                o[3] = 0xffff;
++            }
++        }
++    }
++}
++
+ static void decode_completed(struct virgl_video_codec *codec,
+                              struct virgl_video_buffer *buffer)
+ {
+@@ -519,13 +605,13 @@
+     if (read_images) {
+         struct virgl_video_dma_buf picture = {0};
+         void *data = NULL;
+-        bool ten = buffer->format == PIPE_FORMAT_P010;
++        const struct read_layout *l = read_layout(buffer->format);
+ 
+         if (buffer->image.image_id == VA_INVALID_ID) {
+             VAImageFormat format = {
+-                .fourcc = ten ? VA_FOURCC_P010 : VA_FOURCC_NV12,
++                .fourcc = l->fourcc,
+                 .byte_order = VA_LSB_FIRST,
+-                .bits_per_pixel = ten ? 24 : 12,
++                .bits_per_pixel = l->bits_per_pixel,
+             };
+             if (VA_STATUS_SUCCESS != vaCreateImage(va_dpy, &format, buffer->width, buffer->height, &buffer->image)) {
+                 buffer->image.image_id = VA_INVALID_ID;
+@@ -540,17 +626,29 @@
+             return;
+         }
+         picture.buf = buffer;
+-        picture.drm_format = ten ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
++        picture.drm_format = l->drm_format;
+         picture.width = buffer->width;
+         picture.height = buffer->height;
+         picture.flags = VIRGL_VIDEO_DMABUF_READ_ONLY;
+-        picture.num_planes = 2;
+-        for (unsigned i = 0; i < 2; i++) {
++        picture.num_planes = l->packed_bytes ? 1 : 2;
++        for (unsigned i = 0; i < picture.num_planes; i++) {
+             picture.planes[i].fd = -1;
+             picture.planes[i].offset = buffer->image.offsets[i];
+             picture.planes[i].pitch = buffer->image.pitches[i];
+         }
+         picture.data = data;
++        if (l->packed_bytes) {
++            if (!buffer->packed)
++                buffer->packed = malloc((size_t)buffer->width * buffer->height * l->packed_bytes);
++            if (!buffer->packed) {
++                vaUnmapBuffer(va_dpy, buffer->image.buf);
++                return;
++            }
++            pack_444(buffer, data);
++            picture.planes[0].offset = 0;
++            picture.planes[0].pitch = buffer->width * l->packed_bytes;
++            picture.data = buffer->packed;
++        }
+         callbacks->decode_completed(codec, &picture);
+         vaUnmapBuffer(va_dpy, buffer->image.buf);
+         return;
+@@ -659,6 +757,8 @@
+         {VAProfileH264High,     {VAEntrypointVLD, VAEntrypointEncSlice, 0}},
+         {VAProfileHEVCMain,     {VAEntrypointVLD, VAEntrypointEncSlice, 0}},
+         {VAProfileHEVCMain10,   {VAEntrypointVLD, VAEntrypointEncSlice, 0}},
++        {VAProfileHEVCMain12,   {VAEntrypointVLD, 0}},
++        {VAProfileHEVCMain444,  {VAEntrypointVLD, 0}},
+         {VAProfileJPEGBaseline, {VAEntrypointVLD, 0}},
+         {VAProfileVC1Simple,    {VAEntrypointVLD, 0}},
+         {VAProfileVC1Main,      {VAEntrypointVLD, 0}},
+@@ -942,6 +1042,7 @@
+     if (buffer->va_sfc)
+         vaDestroySurfaces(va_dpy, &buffer->va_sfc, 1);
+ 
++    free(buffer->packed);
+     free(buffer);
+ }
+ 
+@@ -980,9 +1081,18 @@
+     /* Decoding: the configuration and context for the first picture's surfaces (WinBoat) */
+     if (!codec->va_ctx) {
+         VAConfigAttrib attr = { .type = VAConfigAttribRTFormat };
++        VAProfile profile = va_profile_from_pipe(codec->profile);
+         attr.value = target->format == PIPE_FORMAT_P010 && (codec->rt_formats & VA_RT_FORMAT_YUV420_10)
+                    ? VA_RT_FORMAT_YUV420_10 : va_format_from_pipe_chroma(codec->chroma_format);
+-        va_stat = vaCreateConfig(va_dpy, va_profile_from_pipe(codec->profile),
++        /* HEVC range extensions: the target's format (P016, packed 4:4:4) is the depth; VA has a profile per 4:4:4
++         * depth (WinBoat) */
++        if (codec->profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_12 || codec->profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_444)
++            attr.value = va_format_from_pipe(target->format);
++        if (attr.value == VA_RT_FORMAT_YUV444_10)
++            profile = VAProfileHEVCMain444_10;
++        else if (attr.value == VA_RT_FORMAT_YUV444_12)
++            profile = VAProfileHEVCMain444_12;
++        va_stat = vaCreateConfig(va_dpy, profile,
+                                  va_entrypoint_from_pipe(codec->entrypoint), &attr, 1, &codec->va_cfg);
+         if (VA_STATUS_SUCCESS == va_stat)
+             va_stat = vaCreateContext(va_dpy, codec->va_cfg, codec->width, codec->height, VA_PROGRESSIVE, NULL, 0,
+@@ -2214,12 +2324,25 @@
+     VAStatus va_stat;
+     VABufferID bufs[2];
+     unsigned num_bufs = 1;
+-    VAPictureParameterBufferHEVC pic_param = {0};
++    VAPictureParameterBufferHEVCExtension pic_param = {0};
+     VASliceParameterBufferHEVC slice_param = {0};
+-
+-    h265_fill_picture_param(codec, target, desc, &pic_param);
++    /* Range extension profiles: their parameters follow the base ones in the same buffer (WinBoat). The slices'
++     * stay base (NVDEC parses slice headers itself) */
++    bool rext = codec->profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_12 || codec->profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_444;
++
++    h265_fill_picture_param(codec, target, desc, &pic_param.base);
++    if (rext) {
++        pic_param.rext.range_extension_pic_fields.value = desc->rext_flags;
++        ITEM_SET(&pic_param.rext, desc, diff_cu_chroma_qp_offset_depth);
++        ITEM_SET(&pic_param.rext, desc, chroma_qp_offset_list_len_minus1);
++        ITEM_SET(&pic_param.rext, desc, log2_sao_offset_scale_luma);
++        ITEM_SET(&pic_param.rext, desc, log2_sao_offset_scale_chroma);
++        ITEM_SET(&pic_param.rext, desc, log2_max_transform_skip_block_size_minus2);
++        memcpy(pic_param.rext.cb_qp_offset_list, desc->cb_qp_offset_list, sizeof(pic_param.rext.cb_qp_offset_list));
++        memcpy(pic_param.rext.cr_qp_offset_list, desc->cr_qp_offset_list, sizeof(pic_param.rext.cr_qp_offset_list));
++    }
+     vaCreateBuffer(va_dpy, codec->va_ctx, VAPictureParameterBufferType,
+-                   sizeof(pic_param), 1, &pic_param, &bufs[0]);
++                   rext ? sizeof(pic_param) : sizeof(pic_param.base), 1, &pic_param, &bufs[0]);
+ 
+     /* The scaling lists, which virgl never sent: NVIDIA's driver decoded streams that have them with zeros (WinBoat) */
+     if (desc->pps.sps.scaling_list_enabled_flag) {
+--- a/src/vrend/vrend_video.c
++++ b/src/vrend/vrend_video.c
+@@ -166,19 +166,33 @@
+             continue;
+         }
+ 
+-        /* the picture in memory (NVIDIA's VA-API driver): uploaded into the plane (WinBoat) */
++        /* the picture in memory (NVIDIA's VA-API driver): uploaded into the plane (WinBoat). 4:2:0 in two planes
++         * (8 or 16 bits), 4:4:4 packed into one (AYUV, Y410, Y416: RGBA textures in the guest) */
+         if (dmabuf->data) {
+-            bool sixteen = dmabuf->drm_format == DRM_FORMAT_P010;
+-            unsigned texel = (sixteen ? 2 : 1) * (i ? 2 : 1);
++            bool sixteen = dmabuf->drm_format == DRM_FORMAT_P010 || dmabuf->drm_format == DRM_FORMAT_P016;
++            unsigned texel = (sixteen ? 2 : 1) * (i ? 2 : 1), sub = i + 1;
++            GLenum format = i ? GL_RG : GL_RED, type = sixteen ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE;
++
++            switch (dmabuf->drm_format) {
++            case DRM_FORMAT_AYUV:
++                format = GL_RGBA, type = GL_UNSIGNED_BYTE, texel = 4, sub = 1;
++                break;
++            case DRM_FORMAT_Y410:
++                format = GL_RGBA, type = GL_UNSIGNED_INT_2_10_10_10_REV, texel = 4, sub = 1;
++                break;
++            case DRM_FORMAT_Y416:
++                format = GL_RGBA, type = GL_UNSIGNED_SHORT, texel = 8, sub = 1;
++                break;
++            }
+ 
+             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+             glBindTexture(GL_TEXTURE_2D, res->gl_id);
+             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+             glPixelStorei(GL_UNPACK_ROW_LENGTH, dmabuf->planes[i].pitch / texel);
+             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+-                            MIN2(res->base.width0, dmabuf->width / (i + 1)),
+-                            MIN2(res->base.height0, dmabuf->height / (i + 1)),
+-                            i ? GL_RG : GL_RED, sixteen ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
++                            MIN2(res->base.width0, dmabuf->width / sub),
++                            MIN2(res->base.height0, dmabuf->height / sub),
++                            format, type,
+                             (const uint8_t *)dmabuf->data + dmabuf->planes[i].offset);
+             glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);

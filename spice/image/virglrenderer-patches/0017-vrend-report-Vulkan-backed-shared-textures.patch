@@ -1,0 +1,36 @@
+From: WinBoat
+Subject: [PATCH] vrend: report Vulkan-backed shared textures (VIRGL_CAP_V2_VK_SHARED)
+
+Patch 0012 gives textures with VIRGL_BIND_VK_SHARED storage from Vulkan memory that a Venus context imports
+(the guest's D3D12 swap chain buffers). A stock virglrenderer ignores that bind flag and makes an ordinary texture;
+importing that into Venus ends the Venus context, which the guest only finds out from the failed import. The new
+WinBoat cap bit 29 in capability_bits_v2 says the host does it, so the guest only tries where it works (and copies
+elsewhere).
+---
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -633,6 +633,9 @@
+ /* WinBoat: gl_Layer and gl_ViewportIndex written by tessellation evaluation shaders too
+  * (GL_ARB_shader_viewport_layer_array) */
+ #define VIRGL_CAP_V2_TES_LAYER_VIEWPORT   (1u << 30)
++/* WinBoat: textures with VIRGL_BIND_VK_SHARED get Vulkan storage a Venus context can import (stock hosts make an
++ * ordinary texture, and Venus' import of it ends the context) */
++#define VIRGL_CAP_V2_VK_SHARED            (1u << 29)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -12948,8 +12948,11 @@
+    }
+ #ifdef ENABLE_VENUS
+    /* persistent buffers on Vulkan memory, which the GPU process can map into the guest (vrend_create_buffer) */
+-   if (has_feature(feat_memory_object) && has_feature(feat_memory_object_fd) && vrend_vk_buffers_init())
++   if (has_feature(feat_memory_object) && has_feature(feat_memory_object_fd) && vrend_vk_buffers_init()) {
+       caps->v2.capability_bits |= VIRGL_CAP_ARB_BUFFER_STORAGE;
++      /* and textures on Vulkan memory (vrend_texture_vk_storage) */
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_VK_SHARED;
++   }
+ #endif
+ 
+ #if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)

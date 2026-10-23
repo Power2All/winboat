@@ -1,0 +1,24 @@
+spice-widget-egl: swap without waiting for the vblank
+
+On X11 the display widget draws with its own EGL surface, and eglSwapBuffers
+waited for the vblank. The widget redraws on every new scanout as well as on
+every gl-draw (a guest flipping between buffers sends both each frame), so a
+frame's gl-draw-done, which the server waits for, came up to a frame or more
+late. The window is composited, so swapping right away doesn't tear.
+
+--- a/src/spice-widget-egl.c
++++ b/src/spice-widget-egl.c
+@@ -412,6 +412,13 @@
+     if (!gl_make_current(display, err))
+         return FALSE;
+ 
++    /*
++     * Don't wait for the vblank in eglSwapBuffers: the window is composited
++     * (no tearing), and a blocking swap delays the gl-draw-done that the
++     * server waits for, and each new scanout's redraws, by up to a frame each
++     */
++    eglSwapInterval(d->egl.display, 0);
++
+     return TRUE;
+ }
+ 

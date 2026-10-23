@@ -1,0 +1,63 @@
+From: WinBoat
+Subject: [PATCH] venus: host image copies for single-plane formats only
+
+ffmpeg's Vulkan filters hung on uploaded frames: its hwupload fills
+images with VK_EXT_host_image_copy, and a 3-plane yuv420p image filled
+that way hung the host GPU at its first use on a queue (NVIDIA: Xid 109,
+context switch timeout), while frames the GPU decoded, 2-plane NV12
+uploads and single-plane images (disable_multiplane=1) all work. The
+2-plane formats already lose VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT
+to the 32-bit YCbCr feature mask; now every multi-planar format does, so
+applications upload those through a buffer on the GPU. The fault in the
+multi-planar host copy path itself isn't found.
+
+Also: a host copy region of one plane is sized with the plane's format
+(vk_format_get_aspect_format), not the image's.
+---
+diff --git a/src/virtio/vulkan/vn_host_copy.c b/src/virtio/vulkan/vn_host_copy.c
+index 7a294a3..6714103 100644
+--- a/src/virtio/vulkan/vn_host_copy.c
++++ b/src/virtio/vulkan/vn_host_copy.c
+@@ -128,6 +128,13 @@ vn_get_copy_size(VkImage img_handle,
+    else if (!copy_depth && copy_stencil)
+       format = vk_format_stencil_only(format);
+ 
++   /* A plane of a multi-planar image: the plane's own format (its texel size; the region's extent is in the plane's
++    * texels). The image's format gave chroma planes the wrong size, and the host copied from past the data sent */
++   const VkImageAspectFlags plane_aspects =
++      VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_PLANE_2_BIT;
++   if (subres_layers->aspectMask & plane_aspects)
++      format = vk_format_get_aspect_format(format, subres_layers->aspectMask & plane_aspects);
++
+    const uint32_t width = mem_row_length ?: img_extent.width;
+    const uint32_t height = mem_img_height ?: img_extent.height;
+    const uint32_t bw = vk_format_get_blockwidth(format);
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 0bc2177..7a6b543 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -18,6 +18,7 @@
+ #include "venus-protocol/vn_protocol_driver_device.h"
+ #include "vk_android.h"
+ #include "vk_common_entrypoints.h"
++#include "vk_format.h"
+ 
+ #include "vn_android.h"
+ #include "vn_instance.h"
+@@ -2200,6 +2201,16 @@ vn_sanitize_format_properties(VkFormat format,
+    default:
+       break;
+    }
++
++   /* Host image copies (VK_EXT_host_image_copy) only for single-plane formats: a 3-plane image filled by host copies
++    * hung the host GPU at its first use on a queue (NVIDIA: Xid 109; ffmpeg's yuv420p uploads before any Vulkan
++    * filter), the 2-plane formats above already lose the bit to the 32-bit mask, and single-plane images (ffmpeg with
++    * disable_multiplane=1) work. Without the bit applications upload through a buffer on the GPU. ponytail: the fault
++    * in the multi-planar host copy path isn't found */
++   if (props3 && vk_format_get_plane_count(format) > 1) {
++      props3->linearTilingFeatures &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
++      props3->optimalTilingFeatures &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
++   }
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL

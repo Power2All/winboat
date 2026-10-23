@@ -1,0 +1,469 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: swap chain buffers DWM composes without a copy
+
+A present copied the buffer to a readback buffer on the GPU, waited, copied it on the CPU into the kernel
+allocation, and the kernel driver uploaded it again for every composition: at 2560x1440 5.3 ms a present (184 fps
+for a clear and present; 1080p 290, 720p 526; D3D11 ~0.4 ms).
+
+Swap chain buffers (committed on a primary heap) in RGBA8, BGRA8, RGB10A2 or RGBA16F, one level, layer and sample,
+no UAVs, are now shared: their kernel allocation asks the host for a texture made from Vulkan memory
+(VIOGPU_UMD_VIRGL_BIND_VK_SHARED, virglrenderer image patch 0012; no GDI-surface uploads), its host resource id
+(VIOGPU_RES_INFO) names that memory to Venus (VkImportMemoryResourceInfoMESA; Venus' renderer has the kernel driver
+attach it, kvm-guest-drivers-windows 0022, mesa-venus 0007), and the buffer is a Venus image of the host's
+parameters on it, wrapped by vkd3d-proton (CreateResourceFromBorrowedHandle; the driver frees image and memory).
+Present waits for the queue as before and copies nothing: 0.3 ms at every size (~2300-3000 fps). GL keeps BGRA as
+RGBA, so a BGRA buffer stays vkd3d-proton's own and Present blits it into its shared RGBA image (the blit swaps the
+channels; recorded through vkd3d-proton's Vulkan interop on the present queue): 0.7 ms (1100-1400 fps). Anything
+missing (format, flags, host or driver support, an import the host refuses) leaves nothing behind and makes a copied
+buffer as before. The runtime refused a swap chain allocation of size 0, so the shared one keeps its (unused) guest
+pages.
+---
+diff --git a/libs/viogpu_umd/umd_bridge.c b/libs/viogpu_umd/umd_bridge.c
+index 486aa6d4..f3e58e4c 100644
+--- a/libs/viogpu_umd/umd_bridge.c
++++ b/libs/viogpu_umd/umd_bridge.c
+@@ -93,6 +93,21 @@ static ID3D12DXVKInteropDevice1 *bridge_interop(void *device)
+     return interop;
+ }
+ 
++long viogpu_bridge_create_borrowed_resource(void *device, const void *desc, unsigned long long vk_image,
++        void **resource)
++{
++    ID3D12DeviceExt1 *ext = NULL;
++    ID3D12Device *d = device;
++    HRESULT hr;
++
++    *resource = NULL;
++    if (FAILED(hr = d->lpVtbl->QueryInterface(d, &IID_ID3D12DeviceExt1, (void **)&ext)))
++        return hr;
++    hr = ext->lpVtbl->CreateResourceFromBorrowedHandle(ext, desc, vk_image, (ID3D12Resource **)resource);
++    ext->lpVtbl->Release(ext);
++    return hr;
++}
++
+ long viogpu_bridge_vk_handles(void *device, void **instance, void **physical_device, void **vk_device)
+ {
+     ID3D12DXVKInteropDevice1 *interop = bridge_interop(device);
+diff --git a/libs/viogpu_umd/umd_bridge.h b/libs/viogpu_umd/umd_bridge.h
+index 987edd74..6e12a4d3 100644
+--- a/libs/viogpu_umd/umd_bridge.h
++++ b/libs/viogpu_umd/umd_bridge.h
+@@ -32,6 +32,10 @@ long viogpu_bridge_vk_handles(void *device, void **instance, void **physical_dev
+ /* An ID3D12Resource's VkImage (and its VkFormat), or VkBuffer and the resource's offset in it */
+ long viogpu_bridge_resource_info(void *device, void *resource, unsigned long long *vk_handle,
+                                  unsigned long long *buffer_offset, int *vk_format);
++/* An ID3D12Resource on an existing VkImage (desc: a D3D12_RESOURCE_DESC1), which it doesn't own (the swap chain
++ * buffers the host's DWM side shares, umd_resource.cpp) */
++long viogpu_bridge_create_borrowed_resource(void *device, const void *desc, unsigned long long vk_image,
++                                            void **resource);
+ /* The VkImageLayout an image resource has in a D3D12_RESOURCE_STATES */
+ int viogpu_bridge_image_layout(void *device, void *resource, unsigned int state);
+ /* An ID3D12CommandQueue (desc: a D3D12_COMMAND_QUEUE_DESC) or ID3D12CommandAllocator (type: a
+diff --git a/libs/viogpu_umd/umd_command.cpp b/libs/viogpu_umd/umd_command.cpp
+index b62d9ee4..73dbf3ab 100644
+--- a/libs/viogpu_umd/umd_command.cpp
++++ b/libs/viogpu_umd/umd_command.cpp
+@@ -936,6 +936,30 @@ present_copy(viogpu_device *device, viogpu_resource *res)
+    LeaveCriticalSection(&device->presentLock);
+ }
+ 
++/* A BGRA buffer into its shared image (the host keeps BGRA textures as RGBA): one blit on the GPU, waited for */
++static void
++present_convert(viogpu_device *device, viogpu_resource *res)
++{
++   EnterCriticalSection(&device->presentLock);
++   HRESULT hr = present_init(device) ? device->presentAllocator->Reset() : E_FAIL;
++   if (SUCCEEDED(hr))
++      hr = device->presentList->Reset(device->presentAllocator, NULL);
++   if (SUCCEEDED(hr) && !viogpu_shared_blit(device, res, device->presentList))
++      hr = E_FAIL;
++   if (SUCCEEDED(hr))
++      hr = device->presentList->Close();
++   if (SUCCEEDED(hr)) {
++      ID3D12CommandList *list = device->presentList;
++      device->presentQueue->ExecuteCommandLists(1, &list);
++      hr = device->presentQueue->Signal(device->presentFence, ++device->presentFenceValue);
++   }
++   if (SUCCEEDED(hr))
++      hr = device->presentFence->SetEventOnCompletion(device->presentFenceValue, NULL);
++   if (FAILED(hr))
++      viogpu_log("present conversion: 0x%08lx", (unsigned long)hr);
++   LeaveCriticalSection(&device->presentLock);
++}
++
+ static VOID APIENTRY
+ present(D3D12DDI_HCOMMANDLIST, D3D12DDI_HCOMMANDQUEUE hQueue, const D3D12DDIARG_PRESENT_0001 *args,
+         D3D12DDI_PRESENT_0051 *out, D3D12DDI_PRESENT_CONTEXTS_0051 *contexts, D3D12DDI_PRESENT_HWQUEUES_0051 *hwQueues)
+@@ -948,7 +972,11 @@ present(D3D12DDI_HCOMMANDLIST, D3D12DDI_HCOMMANDQUEUE hQueue, const D3D12DDIARG_
+    viogpu_resource *dst = (viogpu_resource *)args->hDstResource.pDrvPrivate;
+    if (src && src->kmAllocation) {
+       queue_wait_idle(queue);
+-      present_copy(device, src);
++      /* a shared buffer: DWM's texture is the image itself (a BGRA one's is converted into) */
++      if (src->vkConvert)
++         present_convert(device, src);
++      else if (!src->vkImage)
++         present_copy(device, src);
+    }
+    static LONG logged;
+    if (InterlockedIncrement(&logged) <= 4)
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+index 4d355fd2..6a776248 100644
+--- a/libs/viogpu_umd/umd_ddi.cpp
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -745,6 +745,7 @@ adapter_create_device(D3D12DDI_HADAPTER hAdapter, const D3D12DDIARG_CREATEDEVICE
+    device->vkd3d11 = vkd3d11;
+    InitializeCriticalSection(&device->presentLock);
+    device->hRTDevice = args->hRTDevice;
++   device->hRTAdapter = adapter->hRTAdapter.handle;
+    device->interfaceVersion = args->Interface;
+    device->version = args->Version;
+    device->ktCallbacks = args->pKTCallbacks;
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+index cb71f5f5..c98c5c6e 100644
+--- a/libs/viogpu_umd/umd_private.h
++++ b/libs/viogpu_umd/umd_private.h
+@@ -46,6 +46,8 @@ struct viogpu_device {
+    ID3D12Fence *presentFence;
+    UINT64 presentFenceValue;
+    D3D12DDI_HRTDEVICE hRTDevice;
++   /* the runtime's adapter (kernel driver escapes) */
++   HANDLE hRTAdapter;
+    UINT interfaceVersion;
+    UINT version;
+    const D3DDDI_DEVICECALLBACKS *ktCallbacks;
+@@ -88,6 +90,9 @@ barrier_layout(D3D12DDI_BARRIER_LAYOUT layout)
+    }
+ }
+ 
++/* Present's conversion of a BGRA swap chain buffer into its shared image (umd_resource.cpp), recorded into list */
++bool viogpu_shared_blit(viogpu_device *device, struct viogpu_resource *res, ID3D12GraphicsCommandList *list);
++
+ /* Device-level errors from DDIs without a return value */
+ void viogpu_device_error(viogpu_device *device, HRESULT hr);
+ 
+@@ -114,6 +119,12 @@ struct viogpu_resource {
+    D3DKMT_HANDLE kmAllocation;
+    UINT kmPitch;
+    ID3D12Resource *readback;
++   /* a swap chain buffer DWM composes as it is (umd_resource.cpp's shared_swap_chain_buffer): its Venus image and
++    * memory (VkImage, VkDeviceMemory), 0 otherwise */
++   UINT64 vkImage, vkMemory;
++   /* the buffer is vkd3d-proton's own and Present converts it into vkImage (a BGRA swap chain: the host keeps the
++    * texture as RGBA) */
++   bool vkConvert;
+    /* a sampler feedback map's (zero otherwise) */
+    D3D12_MIP_REGION mipRegion;
+ };
+diff --git a/libs/viogpu_umd/umd_resource.cpp b/libs/viogpu_umd/umd_resource.cpp
+index 46bfab17..dd01fe80 100644
+--- a/libs/viogpu_umd/umd_resource.cpp
++++ b/libs/viogpu_umd/umd_resource.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include "umd_private.h"
+ #include "umd_viogpu.h"
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
+ #include <stdlib.h>
+ 
+ /* ---------------------------------------------------------------------------------------------------------------- */
+@@ -173,8 +175,12 @@ virgl_format(DXGI_FORMAT format, UINT *bytes)
+    }
+ }
+ 
++/* shared: the host makes the texture from Vulkan memory a Venus image shares (VIOGPU_UMD_VIRGL_BIND_VK_SHARED), and
++ * the kernel driver uploads nothing (no GDI surface).
++ * ponytail: still sized like a copied buffer, its guest pages unused (the runtime refused a swap chain allocation of
++ * size 0: E_INVALIDARG); a smaller size if the guest memory of large swap chains matters */
+ static HRESULT
+-create_km_allocation(viogpu_device *device, viogpu_resource *res)
++create_km_allocation(viogpu_device *device, viogpu_resource *res, bool shared = false)
+ {
+    UINT bytes;
+    ULONG format = virgl_format(res->desc.Format, &bytes);
+@@ -185,12 +191,14 @@ create_km_allocation(viogpu_device *device, viogpu_resource *res)
+    VIOGPU_UMD_CREATE_ALLOCATION_EXCHANGE allocation = {};
+    allocation.ResourceOptions.target = VIOGPU_UMD_PIPE_TEXTURE_2D;
+    allocation.ResourceOptions.format = format;
+-   allocation.ResourceOptions.bind = VIOGPU_UMD_VIRGL_BIND_RENDER_TARGET | VIOGPU_UMD_VIRGL_BIND_SAMPLER_VIEW;
++   allocation.ResourceOptions.bind = VIOGPU_UMD_VIRGL_BIND_RENDER_TARGET | VIOGPU_UMD_VIRGL_BIND_SAMPLER_VIEW |
++                                     (shared ? VIOGPU_UMD_VIRGL_BIND_VK_SHARED : 0);
+    allocation.ResourceOptions.width = (ULONG)res->desc.Width;
+    allocation.ResourceOptions.height = res->desc.Height;
+    allocation.ResourceOptions.depth = 1;
+    allocation.ResourceOptions.array_size = 1;
+-   allocation.ResourceOptions.flags = VIOGPU_UMD_VIRGL_RESOURCE_FLAG_MAP_COHERENT | VIOGPU_UMD_RESOURCE_FLAG_GDI_SURFACE;
++   allocation.ResourceOptions.flags =
++      shared ? 0 : VIOGPU_UMD_VIRGL_RESOURCE_FLAG_MAP_COHERENT | VIOGPU_UMD_RESOURCE_FLAG_GDI_SURFACE;
+    allocation.Size = res->desc.Width * res->desc.Height * bytes;
+    VIOGPU_UMD_CREATE_RESOURCE_EXCHANGE resource = {};
+ 
+@@ -214,6 +222,208 @@ create_km_allocation(viogpu_device *device, viogpu_resource *res)
+    return S_OK;
+ }
+ 
++/* The Venus functions a shared swap chain buffer needs, from the device vkd3d-proton made */
++struct shared_vk {
++   VkDevice device;
++   VkPhysicalDeviceMemoryProperties memory;
++   PFN_vkCreateImage CreateImage;
++   PFN_vkDestroyImage DestroyImage;
++   PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
++   PFN_vkAllocateMemory AllocateMemory;
++   PFN_vkFreeMemory FreeMemory;
++   PFN_vkBindImageMemory BindImageMemory;
++   PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
++   PFN_vkCmdBlitImage CmdBlitImage;
++};
++
++static bool
++shared_vk_load(viogpu_device *device, shared_vk *vk)
++{
++   PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)viogpu_bridge_get_instance_proc_addr();
++   VkInstance instance;
++   VkPhysicalDevice physical;
++   if (!gipa || FAILED(viogpu_bridge_vk_handles(device->vkd3d, (void **)&instance, (void **)&physical,
++                                                (void **)&vk->device)))
++      return false;
++   PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)gipa(instance, "vkGetDeviceProcAddr");
++   PFN_vkGetPhysicalDeviceMemoryProperties memoryProperties =
++      (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(instance, "vkGetPhysicalDeviceMemoryProperties");
++   if (!gdpa || !memoryProperties)
++      return false;
++   memoryProperties(physical, &vk->memory);
++#define X(f) (vk->f = (PFN_vk##f)gdpa(vk->device, "vk" #f))
++   return X(CreateImage) && X(DestroyImage) && X(GetImageMemoryRequirements) && X(AllocateMemory) && X(FreeMemory) &&
++          X(BindImageMemory) && X(CmdPipelineBarrier) && X(CmdBlitImage);
++#undef X
++}
++
++static void
++shared_image_free(viogpu_device *device, viogpu_resource *res)
++{
++   shared_vk vk;
++   if (!res->vkImage || !shared_vk_load(device, &vk))
++      return;
++   vk.DestroyImage(vk.device, (VkImage)res->vkImage, NULL);
++   if (res->vkMemory)
++      vk.FreeMemory(vk.device, (VkDeviceMemory)res->vkMemory, NULL);
++   res->vkImage = res->vkMemory = 0;
++}
++
++/* Venus' VkImportMemoryResourceInfoMESA: memory of a host resource the context has (the kernel driver's
++ * VIOGPU_RES_ATTACH, which Venus' renderer asks for) */
++#define VIOGPU_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA ((VkStructureType)1000384002)
++struct import_memory_resource_info_mesa {
++   VkStructureType sType;
++   const void *pNext;
++   uint32_t resourceId;
++};
++
++/* A swap chain buffer DWM composes as it is: the kernel allocation's host texture is made from Vulkan memory
++ * (virglrenderer image patch 0012) and the buffer is a Venus image on that same memory, so Present has nothing to
++ * copy. The image's parameters are the host's (VREND_VK_IMAGE_USAGE: color attachment, sampled, transfers; mutable
++ * format, optimal tiling, dedicated). GL keeps BGRA as RGBA, so a BGRA buffer stays vkd3d-proton's own and its shared
++ * image is RGBA, which Present blits it into (vkConvert, viogpu_shared_blit: the blit swaps the channels). False when
++ * anything is missing (format, flags, host or driver support): nothing is left behind and the caller makes a copied
++ * buffer */
++static bool
++shared_swap_chain_buffer(viogpu_device *device, viogpu_resource *res, const D3D12_RESOURCE_DESC &desc)
++{
++   VkFormat format;
++   bool convert = false;
++   switch (desc.Format) {
++   case DXGI_FORMAT_B8G8R8A8_UNORM: convert = true; /* fall through: an RGBA image */
++   case DXGI_FORMAT_R8G8B8A8_UNORM: format = VK_FORMAT_R8G8B8A8_UNORM; break;
++   case DXGI_FORMAT_R10G10B10A2_UNORM: format = VK_FORMAT_A2B10G10R10_UNORM_PACK32; break;
++   case DXGI_FORMAT_R16G16B16A16_FLOAT: format = VK_FORMAT_R16G16B16A16_SFLOAT; break;
++   default: return false;
++   }
++   if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 || desc.DepthOrArraySize != 1 ||
++       desc.SampleDesc.Count != 1 || desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
++       (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
++      return false;
++   shared_vk vk;
++   if (!shared_vk_load(device, &vk))
++      return false;
++
++   res->desc = desc;
++   if (FAILED(create_km_allocation(device, res, true)) || !res->kmAllocation)
++      return false;
++   VIOGPU_UMD_ESCAPE_RES_INFO_DATA info = {};
++   info.Type = VIOGPU_UMD_ESCAPE_RES_INFO;
++   info.DataLength = sizeof(info.ResHandle) + sizeof(info.Id);
++   info.ResHandle = res->kmAllocation;
++   D3DDDICB_ESCAPE escape = {};
++   escape.hDevice = device->hRTDevice.handle;
++   escape.pPrivateDriverData = &info;
++   escape.PrivateDriverDataSize = sizeof(info);
++   bool ok = SUCCEEDED(device->ktCallbacks->pfnEscapeCb(device->hRTAdapter, &escape)) && info.Id;
++
++   VkImage image = VK_NULL_HANDLE;
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   if (ok) {
++      VkExternalMemoryImageCreateInfo external = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
++      external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &external};
++      ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++      ici.imageType = VK_IMAGE_TYPE_2D;
++      ici.format = format;
++      ici.extent = {(uint32_t)desc.Width, desc.Height, 1};
++      ici.mipLevels = 1;
++      ici.arrayLayers = 1;
++      ici.samples = VK_SAMPLE_COUNT_1_BIT;
++      ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++      ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++                  VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++      ok = vk.CreateImage(vk.device, &ici, NULL, &image) == VK_SUCCESS;
++   }
++   if (ok) {
++      VkMemoryRequirements requirements;
++      vk.GetImageMemoryRequirements(vk.device, image, &requirements);
++      int type = -1;
++      for (uint32_t t = 0; t < vk.memory.memoryTypeCount && type < 0; t++) {
++         if ((requirements.memoryTypeBits & (1u << t)) &&
++             (vk.memory.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++            type = (int)t;
++      }
++      import_memory_resource_info_mesa import = {VIOGPU_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA, NULL, info.Id};
++      VkMemoryDedicatedAllocateInfo dedicated = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &import};
++      dedicated.image = image;
++      VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated};
++      mai.allocationSize = requirements.size;
++      mai.memoryTypeIndex = (uint32_t)type;
++      VkResult r = type < 0 ? VK_ERROR_FEATURE_NOT_PRESENT : vk.AllocateMemory(vk.device, &mai, NULL, &memory);
++      ok = r == VK_SUCCESS && vk.BindImageMemory(vk.device, image, memory, 0) == VK_SUCCESS;
++      if (!ok)
++         viogpu_log("shared swap chain buffer: resource %u, memory type %d: %d", info.Id, type, (int)r);
++   }
++   if (ok && !convert) {
++      D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
++      ok = SUCCEEDED(viogpu_bridge_create_borrowed_resource(device->vkd3d, &d, (unsigned long long)image,
++                                                            (void **)&res->resource));
++   }
++   if (ok) {
++      res->vkImage = (UINT64)image;
++      res->vkMemory = (UINT64)memory;
++      res->vkConvert = convert;
++      return true;
++   }
++   if (image)
++      vk.DestroyImage(vk.device, image, NULL);
++   if (memory)
++      vk.FreeMemory(vk.device, memory, NULL);
++   D3D12DDICB_DEALLOCATE_0022 deallocate = {};
++   deallocate.NumAllocations = 1;
++   deallocate.HandleList = &res->kmAllocation;
++   device->umCallbacks->pfnDeallocateCb(device->hRTDevice, &deallocate);
++   res->kmAllocation = 0;
++   return false;
++}
++
++/* Present's conversion of a BGRA buffer into its shared RGBA image (vkConvert): a blit, recorded into list (open)
++ * through vkd3d-proton's Vulkan interop; the buffer is in the PRESENT (common) state, and the app's queue is done
++ * with it. False: nothing recorded */
++bool
++viogpu_shared_blit(viogpu_device *device, viogpu_resource *res, ID3D12GraphicsCommandList *list)
++{
++   static shared_vk vk;
++   static bool loaded;
++   if (!loaded)
++      loaded = shared_vk_load(device, &vk);
++   unsigned long long handle = 0, offset = 0;
++   int vkFormat = 0;
++   VkCommandBuffer cmd = VK_NULL_HANDLE;
++   if (!loaded || FAILED(viogpu_bridge_resource_info(device->vkd3d, res->resource, &handle, &offset, &vkFormat)) ||
++       FAILED(viogpu_bridge_begin_vk_commands(device->vkd3d, list, (void **)&cmd)))
++      return false;
++   VkImage src = (VkImage)handle, dst = (VkImage)res->vkImage;
++   VkImageLayout common = (VkImageLayout)viogpu_bridge_image_layout(device->vkd3d, res->resource,
++                                                                    D3D12_RESOURCE_STATE_COMMON);
++   const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++   VkImageMemoryBarrier before[2] = {}, after[2] = {};
++   before[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++                common, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, src, range};
++   /* its old contents go: the blit covers it all */
++   before[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
++                VK_QUEUE_FAMILY_IGNORED, dst, range};
++   after[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, common, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, src, range};
++   after[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
++               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
++               VK_QUEUE_FAMILY_IGNORED, dst, range};
++   vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
++                         2, before);
++   VkImageBlit blit = {};
++   blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++   blit.srcOffsets[1] = blit.dstOffsets[1] = {(int32_t)res->desc.Width, (int32_t)res->desc.Height, 1};
++   vk.CmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
++                   VK_FILTER_NEAREST);
++   vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL,
++                         2, after);
++   viogpu_bridge_end_vk_commands(device->vkd3d, list);
++   return true;
++}
++
+ static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY
+ calc_heap_and_resource_sizes(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATEHEAP_0001 *, const D3D12DDIARG_CREATERESOURCE_0109 *,
+                              D3D12DDI_HPROTECTEDRESOURCESESSION_0030)
+@@ -277,7 +487,10 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+    if (heapDesc && resDesc) {
+       viogpu_heap *heap = new (hHeap.pDrvPrivate) viogpu_heap();
+       D3D12_HEAP_PROPERTIES props = heap_properties(heapDesc);
+-      if (device10) {
++      bool shared = (heapDesc->Flags & D3D12DDI_HEAP_FLAG_PRIMARY) && shared_swap_chain_buffer(device, res, desc);
++      if (res->resource) {
++         /* made above */
++      } else if (device10) {
+          D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
+          hr = device10->CreateCommittedResource3(&props, D3D12_HEAP_FLAG_NONE, &d, layout, clearValue, NULL, castCount,
+                                                  castFormats, IID_PPV_ARGS(&res->resource));
+@@ -291,7 +504,7 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+       }
+       heap->committed = res->resource;
+       heap->committedResource = res;
+-      if (SUCCEEDED(hr) && (heapDesc->Flags & D3D12DDI_HEAP_FLAG_PRIMARY)) {
++      if (SUCCEEDED(hr) && (heapDesc->Flags & D3D12DDI_HEAP_FLAG_PRIMARY) && !shared) {
+          res->desc = res->resource->GetDesc();
+          hr = create_km_allocation(device, res);
+       }
+@@ -382,6 +595,8 @@ destroy_heap_and_resource(D3D12DDI_HDEVICE hDevice, D3D12DDI_HHEAP hHeap, D3D12D
+          res->readback->Release();
+       if (res->resource)
+          res->resource->Release();
++      /* vkd3d-proton only borrowed it */
++      shared_image_free(device_from(hDevice), res);
+       res->~viogpu_resource();
+    }
+    if (hHeap.pDrvPrivate) {
+diff --git a/libs/viogpu_umd/umd_viogpu.h b/libs/viogpu_umd/umd_viogpu.h
+index 1ec7fb6a..76cc6d52 100644
+--- a/libs/viogpu_umd/umd_viogpu.h
++++ b/libs/viogpu_umd/umd_viogpu.h
+@@ -41,6 +41,8 @@ typedef struct VIOGPU_UMD_CREATE_ALLOCATION_EXCHANGE {
+ #define VIOGPU_UMD_PIPE_TEXTURE_2D 2
+ #define VIOGPU_UMD_VIRGL_BIND_RENDER_TARGET (1u << 1)
+ #define VIOGPU_UMD_VIRGL_BIND_SAMPLER_VIEW (1u << 3)
++/* a texture the guest renders to through Venus too (virglrenderer image patch 0012) */
++#define VIOGPU_UMD_VIRGL_BIND_VK_SHARED (1u << 13)
+ #define VIOGPU_UMD_VIRGL_RESOURCE_FLAG_MAP_COHERENT (1u << 2)
+ 
+ #define VIOGPU_UMD_VIRGL_FORMAT_B8G8R8A8_UNORM 1
+@@ -51,4 +53,15 @@ typedef struct VIOGPU_UMD_CREATE_ALLOCATION_EXCHANGE {
+ #define VIOGPU_UMD_VIRGL_FORMAT_B8G8R8A8_SRGB 100
+ #define VIOGPU_UMD_VIRGL_FORMAT_R8G8B8A8_SRGB 104
+ 
++/* The kernel driver's VIOGPU_RES_INFO escape: an allocation's host resource id */
++#define VIOGPU_UMD_ESCAPE_RES_INFO 0x100
++#pragma pack(push, 1)
++typedef struct VIOGPU_UMD_ESCAPE_RES_INFO_DATA {
++   USHORT Type;
++   USHORT DataLength;
++   D3DKMT_HANDLE ResHandle;
++   ULONG Id;
++} VIOGPU_UMD_ESCAPE_RES_INFO_DATA;
++#pragma pack(pop)
++
+ #endif

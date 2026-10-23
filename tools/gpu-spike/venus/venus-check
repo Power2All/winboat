@@ -1,0 +1,18 @@
+#!/bin/sh
+# Proves the host side of Venus without a VM: the host's Vulkan driver, then Mesa's Venus driver through
+# virgl_test_server (the same virglrenderer and render server QEMU uses).
+set -e
+
+echo "== Host Vulkan devices (NVIDIA driver through the loader)"
+VK_ICD_FILENAMES=$(ls /etc/vulkan/icd.d/*.json /usr/share/vulkan/icd.d/nvidia*.json 2>/dev/null | head -1) \
+    vulkaninfo --summary 2>&1 | grep -E "deviceName|driverName|apiVersion" || true
+
+echo "== Venus through virgl_test_server"
+virgl_test_server --venus &
+server=$!
+sleep 1
+# VN_DEBUG=vtest makes Mesa's Venus driver use vtest instead of a virtio-gpu device
+VN_DEBUG=vtest \
+    VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json \
+    vulkaninfo --summary 2>&1 | grep -E "deviceName|driverName|apiVersion|ERROR|error" || true
+kill "$server" 2>/dev/null || true

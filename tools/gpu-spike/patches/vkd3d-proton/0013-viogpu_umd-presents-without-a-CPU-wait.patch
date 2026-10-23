@@ -1,0 +1,197 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: presents without a CPU wait
+
+Present waited on the CPU for the queue's work before returning, so a game's CPU and GPU took turns: a frame of
+5 ms CPU and ~5 ms GPU work took their sum (102 fps) instead of the longer of the two.
+
+The kernel context already orders the present: every submission makes it wait until vkd3d-proton finished the
+submission's lists (kmOut, viogpu_command_queue), so the present runs - and DWM composes the buffer - once the frame
+is drawn. A shared swap chain buffer (DWM composes it as it is) now presents without waiting: 168 fps for that frame,
+Present ~0.1 ms. A BGRA buffer's conversion into its shared image is a submission of the queue's own after the
+frame's (queue_submit, the runtime's ExecuteCommandLists' path; an allocator each for the last three), ordered the
+same way. Only a copied buffer, whose pixels the CPU reads, still waits.
+---
+diff --git a/libs/viogpu_umd/umd_command.cpp b/libs/viogpu_umd/umd_command.cpp
+index 73dbf3ab..b881d734 100644
+--- a/libs/viogpu_umd/umd_command.cpp
++++ b/libs/viogpu_umd/umd_command.cpp
+@@ -811,6 +811,12 @@ struct viogpu_command_queue {
+     * viogpu_video_queue_submitted) */
+    struct viogpu_video_queue *video;
+    ID3D12Fence *gpuDone;
++   /* Present's conversions of BGRA buffers (present_convert): submissions of the queue's own, an allocator each for
++    * the last three (blitDone: their submissions) */
++   ID3D12CommandAllocator *blitAllocator[3];
++   ID3D12GraphicsCommandList *blitList;
++   UINT64 blitDone[3];
++   UINT blitNext;
+ };
+ 
+ 
+@@ -936,28 +942,45 @@ present_copy(viogpu_device *device, viogpu_resource *res)
+    LeaveCriticalSection(&device->presentLock);
+ }
+ 
+-/* A BGRA buffer into its shared image (the host keeps BGRA textures as RGBA): one blit on the GPU, waited for */
++static HRESULT queue_submit(viogpu_command_queue *queue, UINT count, ID3D12CommandList *const *lists,
++                            const D3D12DDI_HCOMMANDLIST *ddiLists);
++
++/* A BGRA buffer into its shared image (the host keeps BGRA textures as RGBA): a blit, submitted on the queue after
++ * the frame's lists, so the present waits for it as for them */
+ static void
+-present_convert(viogpu_device *device, viogpu_resource *res)
++present_convert(viogpu_command_queue *queue, viogpu_resource *res)
+ {
+-   EnterCriticalSection(&device->presentLock);
+-   HRESULT hr = present_init(device) ? device->presentAllocator->Reset() : E_FAIL;
++   viogpu_device *device = queue->device;
++   UINT i = queue->blitNext;
++   HRESULT hr = S_OK;
++   if (!queue->blitAllocator[i])
++      hr = device->vkd3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
++                                                 IID_PPV_ARGS(&queue->blitAllocator[i]));
++   /* the allocator's last blit ran long ago (three presents back) */
++   if (SUCCEEDED(hr) && queue->blitDone[i] && queue->done->GetCompletedValue() < queue->blitDone[i])
++      hr = queue->done->SetEventOnCompletion(queue->blitDone[i], NULL);
+    if (SUCCEEDED(hr))
+-      hr = device->presentList->Reset(device->presentAllocator, NULL);
+-   if (SUCCEEDED(hr) && !viogpu_shared_blit(device, res, device->presentList))
++      hr = queue->blitAllocator[i]->Reset();
++   if (SUCCEEDED(hr) && !queue->blitList)
++      hr = device->vkd3d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, queue->blitAllocator[i], NULL,
++                                            IID_PPV_ARGS(&queue->blitList));
++   else if (SUCCEEDED(hr))
++      hr = queue->blitList->Reset(queue->blitAllocator[i], NULL);
++   if (SUCCEEDED(hr) && !viogpu_shared_blit(device, res, queue->blitList))
+       hr = E_FAIL;
+    if (SUCCEEDED(hr))
+-      hr = device->presentList->Close();
+-   if (SUCCEEDED(hr)) {
+-      ID3D12CommandList *list = device->presentList;
+-      device->presentQueue->ExecuteCommandLists(1, &list);
+-      hr = device->presentQueue->Signal(device->presentFence, ++device->presentFenceValue);
+-   }
++      hr = queue->blitList->Close();
++   ID3D12CommandList *list = queue->blitList;
+    if (SUCCEEDED(hr))
+-      hr = device->presentFence->SetEventOnCompletion(device->presentFenceValue, NULL);
+-   if (FAILED(hr))
++      hr = queue_submit(queue, 1, &list, NULL);
++   if (SUCCEEDED(hr)) {
++      EnterCriticalSection(&queue->lock);
++      queue->blitDone[i] = queue->submitted;
++      LeaveCriticalSection(&queue->lock);
++      queue->blitNext = (i + 1) % 3;
++   } else {
+       viogpu_log("present conversion: 0x%08lx", (unsigned long)hr);
+-   LeaveCriticalSection(&device->presentLock);
++   }
+ }
+ 
+ static VOID APIENTRY
+@@ -971,12 +994,15 @@ present(D3D12DDI_HCOMMANDLIST, D3D12DDI_HCOMMANDQUEUE hQueue, const D3D12DDIARG_
+       args->SurfacesToPresent ? (viogpu_resource *)args->phSurfacesToPresent[0].hSurface.pDrvPrivate : NULL;
+    viogpu_resource *dst = (viogpu_resource *)args->hDstResource.pDrvPrivate;
+    if (src && src->kmAllocation) {
+-      queue_wait_idle(queue);
+-      /* a shared buffer: DWM's texture is the image itself (a BGRA one's is converted into) */
+-      if (src->vkConvert)
+-         present_convert(device, src);
+-      else if (!src->vkImage)
++      /* a shared buffer: DWM's texture is the image itself (a BGRA one's is converted into). The kernel context
++       * runs the present after the waits of the frame's submissions (see viogpu_command_queue): the CPU goes on.
++       * A copied buffer's pixels are read on the CPU: those wait */
++      if (src->vkConvert) {
++         present_convert(queue, src);
++      } else if (!src->vkImage) {
++         queue_wait_idle(queue);
+          present_copy(device, src);
++      }
+    }
+    static LONG logged;
+    if (InterlockedIncrement(&logged) <= 4)
+@@ -1268,6 +1294,12 @@ destroy_command_queue(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDQUEUE h)
+    }
+    if (queue->video)
+       viogpu_video_queue_destroy(queue->video);
++   if (queue->blitList)
++      queue->blitList->Release();
++   for (ID3D12CommandAllocator *a : queue->blitAllocator) {
++      if (a)
++         a->Release();
++   }
+    if (queue->gpuDone)
+       queue->gpuDone->Release();
+    km_fence_destroy(device, queue->kmIn);
+@@ -1287,17 +1319,13 @@ destroy_command_queue(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDQUEUE h)
+    queue->~viogpu_command_queue();
+ }
+ 
+-/* temporary timing */
+-
+-static VOID APIENTRY
+-execute_command_lists(D3D12DDI_HCOMMANDQUEUE h, UINT count, const D3D12DDI_HCOMMANDLIST *lists)
++/* Lists (the runtime's: ddiLists too; the driver's own: NULL) as the queue's next submission, in its place on the
++ * kernel context */
++static HRESULT
++queue_submit(viogpu_command_queue *queue, UINT count, ID3D12CommandList *const *api,
++             const D3D12DDI_HCOMMANDLIST *ddiLists)
+ {
+-   viogpu_command_queue *queue = (viogpu_command_queue *)h.pDrvPrivate;
+    viogpu_device *device = queue->device;
+-   std::vector<ID3D12CommandList *> api(count);
+-   for (UINT i = 0; i < count; i++)
+-      api[i] = list_from(lists[i])->list;
+-
+    EnterCriticalSection(&queue->lock);
+    UINT64 n = queue->submitted + 1;
+    /* its place on the kernel context (see viogpu_command_queue) */
+@@ -1312,10 +1340,10 @@ execute_command_lists(D3D12DDI_HCOMMANDQUEUE h, UINT count, const D3D12DDI_HCOMM
+    if (SUCCEEDED(hr))
+       hr = queue->queue->Wait(queue->gate, n);
+    if (SUCCEEDED(hr)) {
+-      queue->queue->ExecuteCommandLists(count, api.data());
++      queue->queue->ExecuteCommandLists(count, api);
+       if (queue->video) {
+          hr = queue->queue->Signal(queue->gpuDone, n);
+-         viogpu_video_queue_submitted(queue->video, n, count, lists);
++         viogpu_video_queue_submitted(queue->video, n, count, ddiLists);
+       } else {
+          hr = queue->queue->Signal(queue->done, n);
+       }
+@@ -1331,8 +1359,19 @@ execute_command_lists(D3D12DDI_HCOMMANDQUEUE h, UINT count, const D3D12DDI_HCOMM
+    }
+    LeaveCriticalSection(&queue->lock);
+    WakeAllConditionVariable(&queue->wake);
++   return hr;
++}
++
++static VOID APIENTRY
++execute_command_lists(D3D12DDI_HCOMMANDQUEUE h, UINT count, const D3D12DDI_HCOMMANDLIST *lists)
++{
++   viogpu_command_queue *queue = (viogpu_command_queue *)h.pDrvPrivate;
++   std::vector<ID3D12CommandList *> api(count);
++   for (UINT i = 0; i < count; i++)
++      api[i] = list_from(lists[i])->list;
++   HRESULT hr = queue_submit(queue, count, api.data(), lists);
+    if (FAILED(hr))
+-      viogpu_device_error(device, hr);
++      viogpu_device_error(queue->device, hr);
+ }
+ 
+ static VOID APIENTRY
+diff --git a/libs/viogpu_umd/umd_resource.cpp b/libs/viogpu_umd/umd_resource.cpp
+index dd01fe80..1d003e17 100644
+--- a/libs/viogpu_umd/umd_resource.cpp
++++ b/libs/viogpu_umd/umd_resource.cpp
+@@ -380,8 +380,8 @@ shared_swap_chain_buffer(viogpu_device *device, viogpu_resource *res, const D3D1
+ }
+ 
+ /* Present's conversion of a BGRA buffer into its shared RGBA image (vkConvert): a blit, recorded into list (open)
+- * through vkd3d-proton's Vulkan interop; the buffer is in the PRESENT (common) state, and the app's queue is done
+- * with it. False: nothing recorded */
++ * through vkd3d-proton's Vulkan interop; the buffer is in the PRESENT (common) state, written by the queue's earlier
++ * lists (the barrier makes those writes visible). False: nothing recorded */
+ bool
+ viogpu_shared_blit(viogpu_device *device, viogpu_resource *res, ID3D12GraphicsCommandList *list)
+ {

@@ -1,0 +1,83 @@
+From: WinBoat
+Subject: [PATCH] util, venus: shorter waits on Windows
+
+- os_time_sleep slept with Sleep(), which lasts at least one tick of the
+  system timer (15.6 ms by default): sleep on a high-resolution waitable timer
+  instead (Windows 10 1803 and later; older Windows keep Sleep()). It still
+  lasts at least the finest timer interrupt period, 0.5 ms.
+- Venus waits by polling (vn_relax): a few yields, then sleeps of 160 us and
+  more. A round trip through the host takes ~70 us, so every wait that didn't
+  finish within the yields cost a whole sleep. On Windows vn_relax yields for
+  up to 0.5 ms before its first sleep; the iterations, which pace the sleeps
+  and the watchdog, only count from then on.
+
+Measured in a Windows 11 guest (RTX 3080 host): an empty vkQueueSubmit +
+vkWaitSemaphores 537 -> 70 us.
+---
+diff --git a/src/util/os_time.c b/src/util/os_time.c
+--- a/src/util/os_time.c
++++ b/src/util/os_time.c
+@@ -90,6 +90,27 @@ os_time_sleep(int64_t usecs)
+    usleep(usecs);
+ 
+ #elif DETECT_OS_WINDOWS
++   if (usecs <= 0)
++      return;
++   /* Sleep() lasts at least one tick of the system timer, 15.6 ms unless some process raised its resolution: a
++    * wait that polls with short sleeps (Venus' vn_relax starts at 160 us) then waits a whole tick each time. A
++    * high-resolution waitable timer (Windows 10 1803 and later) sleeps for the time asked, rounded up to the
++    * finest timer interrupt period (0.5 ms).
++    */
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++   HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                         TIMER_ALL_ACCESS);
++   if (timer) {
++      LARGE_INTEGER due;
++      due.QuadPart = -usecs * 10; /* relative, in 100 ns units */
++      if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
++         WaitForSingleObject(timer, INFINITE);
++      CloseHandle(timer);
++      return;
++   }
++
+    DWORD dwMilliseconds = (DWORD) ((usecs + 999) / 1000);
+    /* Avoid Sleep(O) as that would cause to sleep for an undetermined duration */
+    if (dwMilliseconds) {
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -250,6 +250,20 @@ vn_relax(struct vn_relax_state *state)
+    const uint32_t warn_order = state->profile.warn_order;
+    const uint32_t abort_order = state->profile.abort_order;
+ 
++#if DETECT_OS_WINDOWS
++   /* WinBoat: a sleep lasts at least a tick of the timer interrupt, 0.5 ms at best (high-resolution timers too),
++    * where a GPU round trip through the host takes ~70 us. Yield for up to a tick before the first sleep; the
++    * iterations, which pace the sleeps and the watchdog, only count from then on.
++    */
++   const int64_t now_ns = os_time_get_nano();
++   if (!state->spin_end_ns)
++      state->spin_end_ns = now_ns + 500000;
++   if (now_ns < state->spin_end_ns) {
++      thrd_yield();
++      return;
++   }
++#endif
++
+    uint32_t *iter = &state->iter;
+    (*iter)++;
+    if (*iter < (1 << busy_wait_order)) {
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -275,6 +287,8 @@ struct vn_relax_state {
+    const struct vn_relax_profile profile;
+    const char *reason_str;
+    bool warn;
++   /* WinBoat: when the Windows spin of vn_relax ends (0 before the first call) */
++   int64_t spin_end_ns;
+ };
+ 
+ /* TLS ring

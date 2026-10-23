@@ -1,0 +1,29 @@
+virgl/gdi: pass the capset buffer address as a 64-bit value
+
+Applies on top of 0001. Matches kvm-guest-drivers-windows patch 0001: VIOGPU_CAPSET_REQ.Capset is a UINT64 so a
+32-bit (WOW64) build of the user-mode drivers sends the same escape layout as a 64-bit one.
+
+diff --git a/src/virtio/wddm/viogpu_wddm_driver.h b/src/virtio/wddm/viogpu_wddm_driver.h
+--- a/src/virtio/wddm/viogpu_wddm_driver.h
++++ b/src/virtio/wddm/viogpu_wddm_driver.h
+@@ -87,7 +87,7 @@
+     ULONG CapsetId;
+     ULONG Version;
+     ULONG Size;
+-    UCHAR *Capset;
++    UINT64 Capset; // buffer address; 64 bits wide so 32-bit (WOW64) callers use the same layout as the driver
+ }VIOGPU_CAPSET_REQ;
+ #pragma pack()
+ 
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+@@ -906,7 +906,7 @@
+ 
+    args.Capset.CapsetId = 2;
+    args.Capset.Size = sizeof(union virgl_caps);
+-   args.Capset.Capset = (UCHAR *)&caps->caps;
++   args.Capset.Capset = (UINT64)(uintptr_t)&caps->caps;
+ 
+    ret = vdws->device->escape(vdws->device, &args, sizeof(args));
+    if (!NT_SUCCESS(ret)) {

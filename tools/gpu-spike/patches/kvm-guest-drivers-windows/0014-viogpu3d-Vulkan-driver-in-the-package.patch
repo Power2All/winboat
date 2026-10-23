@@ -1,0 +1,103 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: Vulkan driver in the package
+
+Mesa's Venus Vulkan driver (viogpu_vk.dll and viogpu_vk_x86.dll, each with
+its ICD manifest) goes into the package next to the other user-mode drivers,
+and the INF names the manifests in VulkanDriverName and VulkanDriverNameWow,
+where the Vulkan loader looks for the drivers of a display adapter.
+
+Windows has no Vulkan loader of its own (GPU vendors' drivers install it), so
+the package installs the Khronos loader (vulkan-1.dll, 64- and 32-bit, from
+the Vulkan runtime; Apache-2.0/MIT, its license goes along) into System32 and
+SysWOW64, never over a newer copy.
+---
+---
+diff --git a/viogpu/viogpu3d/viogpu3d.inx b/viogpu/viogpu3d/viogpu3d.inx
+--- a/viogpu/viogpu3d/viogpu3d.inx
++++ b/viogpu/viogpu3d/viogpu3d.inx
+@@ -18,6 +18,8 @@
+ [DestinationDirs]
+ VioGpu3D_Files.Driver = 13   ; drivers
+ VioGpu3D_Files.Usermode = 13 ; DriverStore
++VioGpu3D_Files.VulkanLoader = 11      ; System32: the Khronos Vulkan loader (Windows has none of its own)
++VioGpu3D_Files.VulkanLoaderWow = 10,SysWOW64
+ 
+ 
+ 
+@@ -32,6 +34,13 @@
+ viogpu_d3d9_x86.dll = 1,,
+ viogpu_d3d10_x86.dll = 1,,
+ viogpu_wgl_x86.dll = 1,,
++viogpu_vk.dll = 1,,
++viogpu_vk.json = 1,,
++viogpu_vk_x86.dll = 1,,
++viogpu_vk_x86.json = 1,,
++vulkan-1.dll = 1,,
++vulkan-1_x86.dll = 1,,
++vulkan-1-license.txt = 1,,
+ 
+ [Manufacturer]
+ %RHEL%=RHEL,NT$ARCH$
+@@ -49,11 +58,23 @@
+ viogpu_d3d9_x86.dll,,,0
+ viogpu_d3d10_x86.dll,,,0
+ viogpu_wgl_x86.dll,,,0
++viogpu_vk.dll,,,0
++viogpu_vk.json,,,0
++viogpu_vk_x86.dll,,,0
++viogpu_vk_x86.json,,,0
++vulkan-1-license.txt,,,0
++
++; 0x20: never over a newer loader another driver or the Vulkan runtime installed
++[VioGpu3D_Files.VulkanLoader]
++vulkan-1.dll,,,0x20
++
++[VioGpu3D_Files.VulkanLoaderWow]
++vulkan-1.dll,vulkan-1_x86.dll,,0x20
+ 
+ [VioGpu3D_Inst]
+ Include=msdv.inf
+ FeatureScore=F9
+-CopyFiles=VioGpu3D_Files.Driver, VioGpu3D_Files.Usermode
++CopyFiles=VioGpu3D_Files.Driver, VioGpu3D_Files.Usermode, VioGpu3D_Files.VulkanLoader, VioGpu3D_Files.VulkanLoaderWow
+ AddReg=VioGpu3D_DeviceSettings
+ 
+ 
+@@ -86,11 +107,14 @@
+ HKR,, OpenGLDriverName,            %REG_MULTI_SZ%, %13%\viogpu_wgl.dll
+ HKR,, OpenGLFlags,                 %REG_DWORD%, 3
+ HKR,, OpenGLVersion,               %REG_DWORD%, 4096
++; Vulkan (Mesa's Venus): the ICD manifests, which name their DLLs next to them
++HKR,, VulkanDriverName,            %REG_MULTI_SZ%, %13%\viogpu_vk.json
+ ; 32-bit (WOW64) apps
+ HKR,, UserModeDriverNameWow,       %REG_MULTI_SZ%, %13%\viogpu_d3d9_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll
+ HKR,, OpenGLDriverNameWow,         %REG_MULTI_SZ%, %13%\viogpu_wgl_x86.dll
+ HKR,, OpenGLFlagsWow,              %REG_DWORD%, 3
+ HKR,, OpenGLVersionWow,            %REG_DWORD%, 4096
++HKR,, VulkanDriverNameWow,         %REG_MULTI_SZ%, %13%\viogpu_vk_x86.json
+ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,%REG_DWORD%,0
+ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,1
+ 
+diff --git a/viogpu/viogpu3d/viogpu3d.vcxproj b/viogpu/viogpu3d/viogpu3d.vcxproj
+--- a/viogpu/viogpu3d/viogpu3d.vcxproj
++++ b/viogpu/viogpu3d/viogpu3d.vcxproj
+@@ -212,6 +212,11 @@
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
++    <!-- Vulkan: Mesa's Venus driver (clang-cl builds into the same prefixes) and the Khronos loader -->
++    <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll">
++      <PackageRelativeDirectory>
++      </PackageRelativeDirectory>
++    </FilesToPackage>
+   </ItemGroup>
+   <ItemGroup Condition="Exists('$(MESA_PREFIX)\bin\viogpu_d3d10.dll')">
+     <Inf Include="viogpu3d.inx" />
+@@ -228,6 +233,7 @@
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d9_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_wgl_x86.dll" />
++    <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll" />
+   </ItemGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <Import Condition="Exists('$(MESA_PREFIX)\bin\viogpu_d3d10.dll')" Project="$(MSBuildProjectDirectory)\..\..\build\Driver.Common.targets" />

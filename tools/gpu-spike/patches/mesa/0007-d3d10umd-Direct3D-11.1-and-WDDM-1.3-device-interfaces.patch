@@ -1,0 +1,905 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: Direct3D 11.1 and WDDM 1.3 device interfaces
+
+The driver offered only the D3D10.0 DDI, so the D3D11 runtime ran it as a 10.x driver: no extended resource sharing
+(NT handles, the A8 and BC formats DirectComposition uses for composition surfaces), so packaged apps' caption
+buttons, drawn through DirectComposition, were white or missing. Offer the D3D11.1 and WDDM 1.3 DDIs as well,
+still at feature level 10_0 (D3D11DDICAPS_3DPIPELINESUPPORT):
+
+- D3D11_1.cpp builds the 11.1 device table from the 10.0 one: wrappers for the 11.x argument structures (resources,
+  views, blend/rasterizer state, shaders without signatures, stream output), constant buffer ranges
+  (SetConstantBuffers1), ClearView, the *1 copy/update functions, and stubs (E_NOTIMPL or no-ops) for what feature
+  level 10_0 doesn't reach (UAVs, tessellation, compute, deferred contexts). The WDDM 1.3 table extends it (tiled
+  resources refused, markers ignored).
+- DXGI 1.2/1.3: Present1 presents every surface of a batch (DirectComposition presents several at once), plus
+  Blt1, Offer/ReclaimResources, ResolveSharedResource and CheckPresentDurationSupport.
+- OutputMerger exports RenderTargetViewSurface for ClearView.
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.h b/src/gallium/frontends/d3d10umd/D3D11_1.h
+new file mode 100644
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.h
+@@ -0,0 +1,21 @@
++/*
++ * D3D11_1.h --
++ *    The Direct3D 11.1 DDI on top of the D3D10 entry points (see D3D11_1.cpp).
++ */
++
++#pragma once
++
++#include "DriverIncludes.h"
++
++/* Fills the 11.1 device function table from a filled 10.0 one (kept for the wrappers to call) */
++void FillDeviceFuncs11_1(D3D11_1DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
++
++/* The WDDM 1.3 table: the 11.1 one and tiled resources (refused) and markers */
++void FillDeviceFuncsWDDM1_3(D3DWDDM1_3DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
++
++/* The DXGI 1.2 and 1.3 entry points the 1.0 table doesn't have */
++void FillDXGIFuncs1_2(DXGI1_2_DDI_BASE_FUNCTIONS *pFuncs);
++void FillDXGIFuncs1_3(DXGI1_3_DDI_BASE_FUNCTIONS *pFuncs);
++
++HRESULT APIENTRY RetrieveSubObject11_1(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T ParamSize,
++                                       void *pParams, SIZE_T OutputParamSize, void *pOutputParamsBuffer);
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -0,0 +1,712 @@
++/*
++ * D3D11_1.cpp --
++ *    The Direct3D 11.1 and WDDM 1.3 DDIs, at feature level 10_0, on top of the D3D10 entry points.
++ *
++ *    The D3D11 runtime talks to a 10.x driver through the 10.x DDI, and then keeps some Direct3D 11.1 features
++ *    from it: ExtendedResourceSharing above all, which lets formats beyond the basic ones be shared with NT
++ *    handles. Windows' composition needs that (alpha-only surfaces of the frame of packaged apps: their caption
++ *    buttons came out as white blocks or not at all). With this interface the runtime grants it.
++ *
++ *    Most entry points keep their 10.x form: they are the 10.0 functions. The changed ones are wrappers that
++ *    convert their arguments. Constant buffer offsets, ClearView and the 11.1 Flush are implemented; the stages
++ *    and features of feature level 11 (tessellation, compute, unordered access views, command lists) are refused
++ *    or ignored: the runtime doesn't use them at feature level 10_0 (GetCaps says so), and emulates deferred
++ *    contexts itself (no threading caps).
++ *
++ *    The WDDM 1.3 DDI adds tiled resources (not offered: refused) and markers to the 11.1 one, and DXGI 1.3's
++ *    Present1. The runtime lets drivers with it (and no others) have composition buffers in more formats than
++ *    BGRA/RGBA: alpha-only (A8) ones, which DirectComposition makes masks of (the caption buttons again).
++ */
++
++#include "D3D11_1.h"
++
++#include "DxgiFns.h"
++#include "OutputMerger.h"
++#include "Shader.h"
++#include "State.h"
++
++#include "util/format/u_format.h"
++
++#include <type_traits>
++#include <vector>
++
++/* The 10.0 functions (the same for every device) */
++static D3D10DDI_DEVICEFUNCS funcs10;
++
++/* Stubs for the entry points of feature level 11: nothing to do, sizes of a minimal private object, or E_NOTIMPL */
++template <typename F> struct Stub;
++template <typename R, typename... A> struct Stub<R(APIENTRY *)(A...)> {
++   static R APIENTRY Call(A...)
++   {
++      if constexpr (std::is_void_v<R>) {
++         return;
++      } else if constexpr (std::is_same_v<R, HRESULT>) {
++         return E_NOTIMPL;
++      } else {
++         return R(16);
++      }
++   }
++};
++#define STUB(member) (pFuncs->member = Stub<decltype(pFuncs->member)>::Call)
++
++/* The shader stages' IO signatures: the 10.x shader functions don't read them */
++static const D3D10DDIARG_STAGE_IO_SIGNATURES noSignatures = {};
++
++
++/* Constant buffers, with 11.1's offsets: pFirstConstant/pNumConstants in 16-byte constants (a multiple of 16
++ * constants, 256 bytes); without them the whole buffer. Slot 0 is the driver's own, as in SetConstantBuffers. */
++static void
++SetConstantBuffers1(enum pipe_shader_type shader, D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers,
++                    const D3D10DDI_HRESOURCE *phBuffers, const UINT *pFirstConstant, const UINT *pNumConstants)
++{
++   struct pipe_context *pipe = CastDevice(hDevice)->pipe;
++
++   for (UINT i = 0; i < NumBuffers; i++) {
++      struct pipe_constant_buffer cb = {};
++      cb.buffer = CastPipeResource(phBuffers[i]);
++      if (cb.buffer) {
++         unsigned size = cb.buffer->width0;
++         if (pFirstConstant && pNumConstants) {
++            cb.buffer_offset = MIN2(pFirstConstant[i] * 16, size);
++            cb.buffer_size = MIN2(pNumConstants[i] * 16, size - cb.buffer_offset);
++         } else {
++            cb.buffer_size = size;
++         }
++      }
++      pipe->set_constant_buffer(pipe, shader, StartSlot + i + 1, false, &cb);
++   }
++}
++
++static void APIENTRY
++VsSetConstantBuffers1(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers,
++                      const UINT *pFirstConstant, const UINT *pNumConstants)
++{
++   SetConstantBuffers1(PIPE_SHADER_VERTEX, hDevice, StartSlot, NumBuffers, phBuffers, pFirstConstant, pNumConstants);
++}
++
++static void APIENTRY
++GsSetConstantBuffers1(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers,
++                      const UINT *pFirstConstant, const UINT *pNumConstants)
++{
++   SetConstantBuffers1(PIPE_SHADER_GEOMETRY, hDevice, StartSlot, NumBuffers, phBuffers, pFirstConstant,
++                       pNumConstants);
++}
++
++static void APIENTRY
++PsSetConstantBuffers1(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers,
++                      const UINT *pFirstConstant, const UINT *pNumConstants)
++{
++   SetConstantBuffers1(PIPE_SHADER_FRAGMENT, hDevice, StartSlot, NumBuffers, phBuffers, pFirstConstant,
++                       pNumConstants);
++}
++
++
++/* Copies and updates: 11.1's CopyFlags (discard, no overwrite) are hints */
++static void APIENTRY
++ResourceUpdateSubresourceUP1(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDstResource, UINT DstSubresource,
++                             const D3D10_DDI_BOX *pDstBox, const VOID *pSysMemUP, UINT RowPitch, UINT DepthPitch,
++                             UINT CopyFlags)
++{
++   funcs10.pfnResourceUpdateSubresourceUP(hDevice, hDstResource, DstSubresource, pDstBox, pSysMemUP, RowPitch,
++                                          DepthPitch);
++}
++
++static void APIENTRY
++DefaultConstantBufferUpdateSubresourceUP1(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDstResource,
++                                          UINT DstSubresource, const D3D10_DDI_BOX *pDstBox, const VOID *pSysMemUP,
++                                          UINT RowPitch, UINT DepthPitch, UINT CopyFlags)
++{
++   funcs10.pfnDefaultConstantBufferUpdateSubresourceUP(hDevice, hDstResource, DstSubresource, pDstBox, pSysMemUP,
++                                                       RowPitch, DepthPitch);
++}
++
++static void APIENTRY
++ResourceCopyRegion1(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDstResource, UINT DstSubresource, UINT DstX,
++                    UINT DstY, UINT DstZ, D3D10DDI_HRESOURCE hSrcResource, UINT SrcSubresource,
++                    const D3D10_DDI_BOX *pSrcBox, UINT CopyFlags)
++{
++   funcs10.pfnResourceCopyRegion(hDevice, hDstResource, DstSubresource, DstX, DstY, DstZ, hSrcResource,
++                                 SrcSubresource, pSrcBox);
++}
++
++
++static BOOL APIENTRY
++Flush1(D3D10DDI_HDEVICE hDevice, UINT FlushFlags)
++{
++   funcs10.pfnFlush(hDevice);
++   return TRUE;
++}
++
++static void APIENTRY
++RelocateDeviceFuncs1(D3D10DDI_HDEVICE hDevice, struct D3D11_1DDI_DEVICEFUNCS *pDeviceFunctions)
++{
++   /* Nothing to do: no pointer to the table is kept */
++}
++
++
++/* Resources: the 11 arguments extend the 10 ones (ByteStride and later come after the 10 fields) */
++static SIZE_T APIENTRY
++CalcPrivateResourceSize11(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATERESOURCE *pCreateResource)
++{
++   return funcs10.pfnCalcPrivateResourceSize(hDevice,
++                                             reinterpret_cast<const D3D10DDIARG_CREATERESOURCE *>(pCreateResource));
++}
++
++static void APIENTRY
++CreateResource11(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATERESOURCE *pCreateResource,
++                 D3D10DDI_HRESOURCE hResource, D3D10DDI_HRTRESOURCE hRTResource)
++{
++   funcs10.pfnCreateResource(hDevice, reinterpret_cast<const D3D10DDIARG_CREATERESOURCE *>(pCreateResource),
++                             hResource, hRTResource);
++}
++
++
++/* Views: shader resource views as in 10.1 (11 adds BufferEx, raw buffers of feature level 11); depth stencil
++ * views have read-only Flags (feature level 11) before the view's union */
++static SIZE_T APIENTRY
++CalcPrivateShaderResourceViewSize11(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *pView)
++{
++   return CalcPrivateShaderResourceViewSize1(
++      hDevice, reinterpret_cast<const D3D10_1DDIARG_CREATESHADERRESOURCEVIEW *>(pView));
++}
++
++static void APIENTRY
++CreateShaderResourceView11(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *pView,
++                           D3D10DDI_HSHADERRESOURCEVIEW hView, D3D10DDI_HRTSHADERRESOURCEVIEW hRTView)
++{
++   CreateShaderResourceView1(hDevice, reinterpret_cast<const D3D10_1DDIARG_CREATESHADERRESOURCEVIEW *>(pView), hView,
++                             hRTView);
++}
++
++static D3D10DDIARG_CREATEDEPTHSTENCILVIEW
++DepthStencilView10(const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *pView)
++{
++   D3D10DDIARG_CREATEDEPTHSTENCILVIEW view = {};
++   view.hDrvResource = pView->hDrvResource;
++   view.Format = pView->Format;
++   view.ResourceDimension = pView->ResourceDimension;
++   memcpy(&view.Tex1D, &pView->Tex1D, sizeof view - offsetof(D3D10DDIARG_CREATEDEPTHSTENCILVIEW, Tex1D));
++   return view;
++}
++
++static SIZE_T APIENTRY
++CalcPrivateDepthStencilViewSize11(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *pView)
++{
++   D3D10DDIARG_CREATEDEPTHSTENCILVIEW view = DepthStencilView10(pView);
++   return funcs10.pfnCalcPrivateDepthStencilViewSize(hDevice, &view);
++}
++
++static void APIENTRY
++CreateDepthStencilView11(D3D10DDI_HDEVICE hDevice, const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *pView,
++                         D3D10DDI_HDEPTHSTENCILVIEW hView, D3D10DDI_HRTDEPTHSTENCILVIEW hRTView)
++{
++   D3D10DDIARG_CREATEDEPTHSTENCILVIEW view = DepthStencilView10(pView);
++   funcs10.pfnCreateDepthStencilView(hDevice, &view, hView, hRTView);
++}
++
++/* Render targets: unordered access views come with them in 11 (feature level 11) */
++static void APIENTRY
++SetRenderTargets11(D3D10DDI_HDEVICE hDevice, const D3D10DDI_HRENDERTARGETVIEW *phRenderTargetView, UINT NumRTVs,
++                   UINT ClearSlots, D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView,
++                   const D3D11DDI_HUNORDEREDACCESSVIEW *phUnorderedAccessView, const UINT *pUAVInitialCounts,
++                   UINT UAVStartSlot, UINT NumUAVs, UINT UAVRangeStart, UINT UAVRangeSize)
++{
++   funcs10.pfnSetRenderTargets(hDevice, phRenderTargetView, NumRTVs, ClearSlots, hDepthStencilView);
++}
++
++
++/* Blend states: 11.1 adds logic ops (not offered: OutputMergerLogicOp is FALSE) */
++static D3D10_1_DDI_BLEND_DESC
++BlendDesc10_1(const D3D11_1_DDI_BLEND_DESC *pDesc)
++{
++   D3D10_1_DDI_BLEND_DESC desc = {};
++   desc.AlphaToCoverageEnable = pDesc->AlphaToCoverageEnable;
++   desc.IndependentBlendEnable = pDesc->IndependentBlendEnable;
++   for (UINT i = 0; i < D3D10_DDI_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
++      const D3D11_1_DDI_RENDER_TARGET_BLEND_DESC &from = pDesc->RenderTarget[i];
++      D3D10_DDI_RENDER_TARGET_BLEND_DESC1 &to = desc.RenderTarget[i];
++      to.BlendEnable = from.BlendEnable;
++      to.SrcBlend = from.SrcBlend;
++      to.DestBlend = from.DestBlend;
++      to.BlendOp = from.BlendOp;
++      to.SrcBlendAlpha = from.SrcBlendAlpha;
++      to.DestBlendAlpha = from.DestBlendAlpha;
++      to.BlendOpAlpha = from.BlendOpAlpha;
++      to.RenderTargetWriteMask = from.RenderTargetWriteMask;
++   }
++   return desc;
++}
++
++static SIZE_T APIENTRY
++CalcPrivateBlendStateSize11_1(D3D10DDI_HDEVICE hDevice, const D3D11_1_DDI_BLEND_DESC *pDesc)
++{
++   D3D10_1_DDI_BLEND_DESC desc = BlendDesc10_1(pDesc);
++   return CalcPrivateBlendStateSize1(hDevice, &desc);
++}
++
++static void APIENTRY
++CreateBlendState11_1(D3D10DDI_HDEVICE hDevice, const D3D11_1_DDI_BLEND_DESC *pDesc, D3D10DDI_HBLENDSTATE hState,
++                     D3D10DDI_HRTBLENDSTATE hRTState)
++{
++   D3D10_1_DDI_BLEND_DESC desc = BlendDesc10_1(pDesc);
++   CreateBlendState1(hDevice, &desc, hState, hRTState);
++}
++
++/* Rasterizer states: 11.1 adds ForcedSampleCount after the 10 fields (0 unless target independent rasterization) */
++static SIZE_T APIENTRY
++CalcPrivateRasterizerStateSize11_1(D3D10DDI_HDEVICE hDevice, const D3D11_1_DDI_RASTERIZER_DESC *pDesc)
++{
++   return funcs10.pfnCalcPrivateRasterizerStateSize(hDevice,
++                                                    reinterpret_cast<const D3D10_DDI_RASTERIZER_DESC *>(pDesc));
++}
++
++static void APIENTRY
++CreateRasterizerState11_1(D3D10DDI_HDEVICE hDevice, const D3D11_1_DDI_RASTERIZER_DESC *pDesc,
++                          D3D10DDI_HRASTERIZERSTATE hState, D3D10DDI_HRTRASTERIZERSTATE hRTState)
++{
++   funcs10.pfnCreateRasterizerState(hDevice, reinterpret_cast<const D3D10_DDI_RASTERIZER_DESC *>(pDesc), hState,
++                                    hRTState);
++}
++
++
++/* Shaders: 11.1's signatures have precision information (unused) */
++static SIZE_T APIENTRY
++CalcPrivateShaderSize11_1(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode,
++                          const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
++{
++   return funcs10.pfnCalcPrivateShaderSize(hDevice, pShaderCode, &noSignatures);
++}
++
++static void APIENTRY
++CreateVertexShader11_1(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                       D3D10DDI_HRTSHADER hRTShader, const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
++{
++   funcs10.pfnCreateVertexShader(hDevice, pShaderCode, hShader, hRTShader, &noSignatures);
++}
++
++static void APIENTRY
++CreateGeometryShader11_1(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                         D3D10DDI_HRTSHADER hRTShader, const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
++{
++   funcs10.pfnCreateGeometryShader(hDevice, pShaderCode, hShader, hRTShader, &noSignatures);
++}
++
++static void APIENTRY
++CreatePixelShader11_1(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                      D3D10DDI_HRTSHADER hRTShader, const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
++{
++   funcs10.pfnCreatePixelShader(hDevice, pShaderCode, hShader, hRTShader, &noSignatures);
++}
++
++/* Geometry shaders with stream output: 11 has a stream per entry and a stride per buffer (feature level 10: one
++ * stream, the first buffer's stride) */
++struct StreamOutput10 {
++   std::vector<D3D10DDIARG_STREAM_OUTPUT_DECLARATION_ENTRY> entries;
++   D3D10DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT args;
++
++   StreamOutput10(const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT *p) : entries(p->NumEntries), args()
++   {
++      for (UINT i = 0; i < p->NumEntries; i++) {
++         entries[i].OutputSlot = p->pOutputStreamDecl[i].OutputSlot;
++         entries[i].RegisterIndex = p->pOutputStreamDecl[i].RegisterIndex;
++         entries[i].RegisterMask = p->pOutputStreamDecl[i].RegisterMask;
++      }
++      args.pShaderCode = p->pShaderCode;
++      args.pOutputStreamDecl = entries.data();
++      args.NumEntries = p->NumEntries;
++      args.StreamOutputStrideInBytes = p->NumStrides ? p->BufferStridesInBytes[0] : 0;
++   }
++};
++
++static SIZE_T APIENTRY
++CalcPrivateGeometryShaderWithStreamOutput11_1(D3D10DDI_HDEVICE hDevice,
++                                              const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT *pCreate,
++                                              const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
++{
++   StreamOutput10 so(pCreate);
++   return funcs10.pfnCalcPrivateGeometryShaderWithStreamOutput(hDevice, &so.args, &noSignatures);
++}
++
++static void APIENTRY
++CreateGeometryShaderWithStreamOutput11_1(D3D10DDI_HDEVICE hDevice,
++                                         const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT *pCreate,
++                                         D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRTShader,
++                                         const D3D11_1DDIARG_STAGE_IO_SIGNATURES *pSignatures)
++{
++   StreamOutput10 so(pCreate);
++   funcs10.pfnCreateGeometryShaderWithStreamOutput(hDevice, &so.args, hShader, hRTShader, &noSignatures);
++}
++
++/* Shaders with class instances (feature level 11): without them, as before */
++static void APIENTRY
++VsSetShaderWithIfaces(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader, UINT NumClassInstances,
++                      const UINT *pPointerData, const D3D11DDIARG_POINTERDATA *pIfaces)
++{
++   funcs10.pfnVsSetShader(hDevice, hShader);
++}
++
++static void APIENTRY
++GsSetShaderWithIfaces(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader, UINT NumClassInstances,
++                      const UINT *pPointerData, const D3D11DDIARG_POINTERDATA *pIfaces)
++{
++   funcs10.pfnGsSetShader(hDevice, hShader);
++}
++
++static void APIENTRY
++PsSetShaderWithIfaces(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader, UINT NumClassInstances,
++                      const UINT *pPointerData, const D3D11DDIARG_POINTERDATA *pIfaces)
++{
++   funcs10.pfnPsSetShader(hDevice, hShader);
++}
++
++
++/* ClearView: a render target view, all of it or some rectangles (other views: feature level 11 or video) */
++static void APIENTRY
++ClearView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE viewType, VOID *hView, const FLOAT Color[4],
++          const D3D10_DDI_RECT *pRect, UINT NumRects)
++{
++   if (viewType != D3D10DDI_HT_RENDERTARGETVIEW || !hView) {
++      return;
++   }
++   D3D10DDI_HRENDERTARGETVIEW hRenderTargetView;
++   hRenderTargetView.pDrvPrivate = hView;
++   FLOAT color[4] = {Color[0], Color[1], Color[2], Color[3]};
++   if (!pRect || !NumRects) {
++      funcs10.pfnClearRenderTargetView(hDevice, hRenderTargetView, color);
++      return;
++   }
++
++   struct pipe_context *pipe = CastDevice(hDevice)->pipe;
++   struct pipe_surface *surface = RenderTargetViewSurface(hRenderTargetView);
++   if (!surface) {
++      return;
++   }
++   union pipe_color_union clear = {};
++   for (unsigned i = 0; i < 4; i++) {
++      if (util_format_is_pure_sint(surface->format)) {
++         clear.i[i] = (int)color[i];
++      } else if (util_format_is_pure_uint(surface->format)) {
++         clear.ui[i] = color[i] > 0.0f ? (unsigned)color[i] : 0;
++      } else {
++         clear.f[i] = color[i];
++      }
++   }
++   for (UINT r = 0; r < NumRects; r++) {
++      LONG left = MAX2(pRect[r].left, 0), top = MAX2(pRect[r].top, 0);
++      LONG right = MIN2(pRect[r].right, (LONG)surface->width), bottom = MIN2(pRect[r].bottom, (LONG)surface->height);
++      if (right > left && bottom > top) {
++         pipe->clear_render_target(pipe, surface, &clear, left, top, right - left, bottom - top, true);
++      }
++   }
++}
++
++static void APIENTRY
++CheckDeferredContextHandleSizes(D3D10DDI_HDEVICE hDevice, UINT *pHSizes, D3D11DDI_HANDLESIZE *pHandleSize)
++{
++   *pHSizes = 0;
++}
++
++static void APIENTRY
++CheckDirectFlipSupport(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource1, D3D10DDI_HRESOURCE hResource2,
++                       UINT CheckDirectFlipFlags, BOOL *pSupported)
++{
++   *pSupported = FALSE;
++}
++
++HRESULT APIENTRY
++RetrieveSubObject11_1(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T ParamSize, void *pParams,
++                      SIZE_T OutputParamSize, void *pOutputParamsBuffer)
++{
++   /* Video decoding and processing: none */
++   return E_NOTIMPL;
++}
++
++
++void
++FillDeviceFuncs11_1(D3D11_1DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10)
++{
++   funcs10 = *pFuncs10;
++
++   /* The same as in 10.0 */
++   pFuncs->pfnPsSetShaderResources = funcs10.pfnPsSetShaderResources;
++   pFuncs->pfnPsSetShader = funcs10.pfnPsSetShader;
++   pFuncs->pfnPsSetSamplers = funcs10.pfnPsSetSamplers;
++   pFuncs->pfnVsSetShader = funcs10.pfnVsSetShader;
++   pFuncs->pfnDrawIndexed = funcs10.pfnDrawIndexed;
++   pFuncs->pfnDraw = funcs10.pfnDraw;
++   pFuncs->pfnDynamicIABufferMapNoOverwrite = funcs10.pfnDynamicIABufferMapNoOverwrite;
++   pFuncs->pfnDynamicIABufferUnmap = funcs10.pfnDynamicIABufferUnmap;
++   pFuncs->pfnDynamicConstantBufferMapDiscard = funcs10.pfnDynamicConstantBufferMapDiscard;
++   pFuncs->pfnDynamicIABufferMapDiscard = funcs10.pfnDynamicIABufferMapDiscard;
++   pFuncs->pfnDynamicConstantBufferUnmap = funcs10.pfnDynamicConstantBufferUnmap;
++   pFuncs->pfnIaSetInputLayout = funcs10.pfnIaSetInputLayout;
++   pFuncs->pfnIaSetVertexBuffers = funcs10.pfnIaSetVertexBuffers;
++   pFuncs->pfnIaSetIndexBuffer = funcs10.pfnIaSetIndexBuffer;
++   pFuncs->pfnDrawIndexedInstanced = funcs10.pfnDrawIndexedInstanced;
++   pFuncs->pfnDrawInstanced = funcs10.pfnDrawInstanced;
++   pFuncs->pfnDynamicResourceMapDiscard = funcs10.pfnDynamicResourceMapDiscard;
++   pFuncs->pfnDynamicResourceUnmap = funcs10.pfnDynamicResourceUnmap;
++   pFuncs->pfnGsSetShader = funcs10.pfnGsSetShader;
++   pFuncs->pfnIaSetTopology = funcs10.pfnIaSetTopology;
++   pFuncs->pfnStagingResourceMap = funcs10.pfnStagingResourceMap;
++   pFuncs->pfnStagingResourceUnmap = funcs10.pfnStagingResourceUnmap;
++   pFuncs->pfnVsSetShaderResources = funcs10.pfnVsSetShaderResources;
++   pFuncs->pfnVsSetSamplers = funcs10.pfnVsSetSamplers;
++   pFuncs->pfnGsSetShaderResources = funcs10.pfnGsSetShaderResources;
++   pFuncs->pfnGsSetSamplers = funcs10.pfnGsSetSamplers;
++   pFuncs->pfnShaderResourceViewReadAfterWriteHazard = funcs10.pfnShaderResourceViewReadAfterWriteHazard;
++   pFuncs->pfnResourceReadAfterWriteHazard = funcs10.pfnResourceReadAfterWriteHazard;
++   pFuncs->pfnSetBlendState = funcs10.pfnSetBlendState;
++   pFuncs->pfnSetDepthStencilState = funcs10.pfnSetDepthStencilState;
++   pFuncs->pfnSetRasterizerState = funcs10.pfnSetRasterizerState;
++   pFuncs->pfnQueryEnd = funcs10.pfnQueryEnd;
++   pFuncs->pfnQueryBegin = funcs10.pfnQueryBegin;
++   pFuncs->pfnSoSetTargets = funcs10.pfnSoSetTargets;
++   pFuncs->pfnDrawAuto = funcs10.pfnDrawAuto;
++   pFuncs->pfnSetViewports = funcs10.pfnSetViewports;
++   pFuncs->pfnSetScissorRects = funcs10.pfnSetScissorRects;
++   pFuncs->pfnClearRenderTargetView = funcs10.pfnClearRenderTargetView;
++   pFuncs->pfnClearDepthStencilView = funcs10.pfnClearDepthStencilView;
++   pFuncs->pfnSetPredication = funcs10.pfnSetPredication;
++   pFuncs->pfnQueryGetData = funcs10.pfnQueryGetData;
++   pFuncs->pfnGenMips = funcs10.pfnGenMips;
++   pFuncs->pfnResourceCopy = funcs10.pfnResourceCopy;
++   pFuncs->pfnResourceResolveSubresource = funcs10.pfnResourceResolveSubresource;
++   pFuncs->pfnResourceMap = funcs10.pfnResourceMap;
++   pFuncs->pfnResourceUnmap = funcs10.pfnResourceUnmap;
++   pFuncs->pfnResourceIsStagingBusy = funcs10.pfnResourceIsStagingBusy;
++   pFuncs->pfnCalcPrivateOpenedResourceSize = funcs10.pfnCalcPrivateOpenedResourceSize;
++   pFuncs->pfnOpenResource = funcs10.pfnOpenResource;
++   pFuncs->pfnDestroyResource = funcs10.pfnDestroyResource;
++   pFuncs->pfnDestroyShaderResourceView = funcs10.pfnDestroyShaderResourceView;
++   pFuncs->pfnCalcPrivateRenderTargetViewSize = funcs10.pfnCalcPrivateRenderTargetViewSize;
++   pFuncs->pfnCreateRenderTargetView = funcs10.pfnCreateRenderTargetView;
++   pFuncs->pfnDestroyRenderTargetView = funcs10.pfnDestroyRenderTargetView;
++   pFuncs->pfnDestroyDepthStencilView = funcs10.pfnDestroyDepthStencilView;
++   pFuncs->pfnCalcPrivateElementLayoutSize = funcs10.pfnCalcPrivateElementLayoutSize;
++   pFuncs->pfnCreateElementLayout = funcs10.pfnCreateElementLayout;
++   pFuncs->pfnDestroyElementLayout = funcs10.pfnDestroyElementLayout;
++   pFuncs->pfnDestroyBlendState = funcs10.pfnDestroyBlendState;
++   pFuncs->pfnCalcPrivateDepthStencilStateSize = funcs10.pfnCalcPrivateDepthStencilStateSize;
++   pFuncs->pfnCreateDepthStencilState = funcs10.pfnCreateDepthStencilState;
++   pFuncs->pfnDestroyDepthStencilState = funcs10.pfnDestroyDepthStencilState;
++   pFuncs->pfnDestroyRasterizerState = funcs10.pfnDestroyRasterizerState;
++   pFuncs->pfnDestroyShader = funcs10.pfnDestroyShader;
++   pFuncs->pfnCalcPrivateSamplerSize = funcs10.pfnCalcPrivateSamplerSize;
++   pFuncs->pfnCreateSampler = funcs10.pfnCreateSampler;
++   pFuncs->pfnDestroySampler = funcs10.pfnDestroySampler;
++   pFuncs->pfnCalcPrivateQuerySize = funcs10.pfnCalcPrivateQuerySize;
++   pFuncs->pfnCreateQuery = funcs10.pfnCreateQuery;
++   pFuncs->pfnDestroyQuery = funcs10.pfnDestroyQuery;
++   pFuncs->pfnCheckFormatSupport = funcs10.pfnCheckFormatSupport;
++   pFuncs->pfnCheckMultisampleQualityLevels = funcs10.pfnCheckMultisampleQualityLevels;
++   pFuncs->pfnCheckCounterInfo = funcs10.pfnCheckCounterInfo;
++   pFuncs->pfnCheckCounter = funcs10.pfnCheckCounter;
++   pFuncs->pfnDestroyDevice = funcs10.pfnDestroyDevice;
++   pFuncs->pfnSetTextFilterSize = funcs10.pfnSetTextFilterSize;
++   pFuncs->pfnResourceConvert = funcs10.pfnResourceCopy;
++   pFuncs->pfnDynamicConstantBufferMapNoOverwrite = funcs10.pfnResourceMap;
++
++   /* Changed in 11 or 11.1 */
++   pFuncs->pfnDefaultConstantBufferUpdateSubresourceUP = DefaultConstantBufferUpdateSubresourceUP1;
++   pFuncs->pfnVsSetConstantBuffers = VsSetConstantBuffers1;
++   pFuncs->pfnPsSetConstantBuffers = PsSetConstantBuffers1;
++   pFuncs->pfnGsSetConstantBuffers = GsSetConstantBuffers1;
++   pFuncs->pfnSetRenderTargets = SetRenderTargets11;
++   pFuncs->pfnResourceCopyRegion = ResourceCopyRegion1;
++   pFuncs->pfnResourceConvertRegion = ResourceCopyRegion1;
++   pFuncs->pfnResourceUpdateSubresourceUP = ResourceUpdateSubresourceUP1;
++   pFuncs->pfnFlush = Flush1;
++   pFuncs->pfnRelocateDeviceFuncs = RelocateDeviceFuncs1;
++   pFuncs->pfnCalcPrivateResourceSize = CalcPrivateResourceSize11;
++   pFuncs->pfnCreateResource = CreateResource11;
++   pFuncs->pfnCalcPrivateShaderResourceViewSize = CalcPrivateShaderResourceViewSize11;
++   pFuncs->pfnCreateShaderResourceView = CreateShaderResourceView11;
++   pFuncs->pfnCalcPrivateDepthStencilViewSize = CalcPrivateDepthStencilViewSize11;
++   pFuncs->pfnCreateDepthStencilView = CreateDepthStencilView11;
++   pFuncs->pfnCalcPrivateBlendStateSize = CalcPrivateBlendStateSize11_1;
++   pFuncs->pfnCreateBlendState = CreateBlendState11_1;
++   pFuncs->pfnCalcPrivateRasterizerStateSize = CalcPrivateRasterizerStateSize11_1;
++   pFuncs->pfnCreateRasterizerState = CreateRasterizerState11_1;
++   pFuncs->pfnCalcPrivateShaderSize = CalcPrivateShaderSize11_1;
++   pFuncs->pfnCreateVertexShader = CreateVertexShader11_1;
++   pFuncs->pfnCreateGeometryShader = CreateGeometryShader11_1;
++   pFuncs->pfnCreatePixelShader = CreatePixelShader11_1;
++   pFuncs->pfnCalcPrivateGeometryShaderWithStreamOutput = CalcPrivateGeometryShaderWithStreamOutput11_1;
++   pFuncs->pfnCreateGeometryShaderWithStreamOutput = CreateGeometryShaderWithStreamOutput11_1;
++   pFuncs->pfnVsSetShaderWithIfaces = VsSetShaderWithIfaces;
++   pFuncs->pfnGsSetShaderWithIfaces = GsSetShaderWithIfaces;
++   pFuncs->pfnPsSetShaderWithIfaces = PsSetShaderWithIfaces;
++   pFuncs->pfnClearView = ClearView;
++   pFuncs->pfnCheckDeferredContextHandleSizes = CheckDeferredContextHandleSizes;
++   pFuncs->pfnCheckDirectFlipSupport = CheckDirectFlipSupport;
++
++   /* Feature level 11 and hints: refused or ignored */
++   STUB(pfnDrawIndexedInstancedIndirect);
++   STUB(pfnDrawInstancedIndirect);
++   STUB(pfnCommandListExecute);
++   STUB(pfnHsSetShaderResources);
++   STUB(pfnHsSetShader);
++   STUB(pfnHsSetSamplers);
++   STUB(pfnHsSetConstantBuffers);
++   STUB(pfnDsSetShaderResources);
++   STUB(pfnDsSetShader);
++   STUB(pfnDsSetSamplers);
++   STUB(pfnDsSetConstantBuffers);
++   STUB(pfnCreateHullShader);
++   STUB(pfnCreateDomainShader);
++   STUB(pfnCalcDeferredContextHandleSize);
++   STUB(pfnCalcPrivateDeferredContextSize);
++   STUB(pfnCreateDeferredContext);
++   STUB(pfnAbandonCommandList);
++   STUB(pfnCalcPrivateCommandListSize);
++   STUB(pfnCreateCommandList);
++   STUB(pfnDestroyCommandList);
++   STUB(pfnCalcPrivateTessellationShaderSize);
++   STUB(pfnHsSetShaderWithIfaces);
++   STUB(pfnDsSetShaderWithIfaces);
++   STUB(pfnCsSetShaderWithIfaces);
++   STUB(pfnCreateComputeShader);
++   STUB(pfnCsSetShader);
++   STUB(pfnCsSetShaderResources);
++   STUB(pfnCsSetSamplers);
++   STUB(pfnCsSetConstantBuffers);
++   STUB(pfnCalcPrivateUnorderedAccessViewSize);
++   STUB(pfnCreateUnorderedAccessView);
++   STUB(pfnDestroyUnorderedAccessView);
++   STUB(pfnClearUnorderedAccessViewUint);
++   STUB(pfnClearUnorderedAccessViewFloat);
++   STUB(pfnCsSetUnorderedAccessViews);
++   STUB(pfnDispatch);
++   STUB(pfnDispatchIndirect);
++   STUB(pfnSetResourceMinLOD);
++   STUB(pfnCopyStructureCount);
++   STUB(pfnRecycleCommandList);
++   STUB(pfnRecycleCreateCommandList);
++   STUB(pfnRecycleCreateDeferredContext);
++   STUB(pfnRecycleDestroyCommandList);
++   STUB(pfnDiscard);
++   STUB(pfnAssignDebugBinary);
++}
++
++
++/* WDDM 1.3 */
++static void APIENTRY
++RelocateDeviceFuncsWDDM1_3(D3D10DDI_HDEVICE hDevice, struct D3DWDDM1_3DDI_DEVICEFUNCS *pDeviceFunctions)
++{
++}
++
++static void APIENTRY
++CheckMultisampleQualityLevelsWDDM1_3(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT SampleCount, UINT Flags,
++                                     UINT *pNumQualityLevels)
++{
++   if (Flags & D3DWDDM1_3DDI_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE) {
++      *pNumQualityLevels = 0; /* no tiled resources */
++      return;
++   }
++   funcs10.pfnCheckMultisampleQualityLevels(hDevice, Format, SampleCount, pNumQualityLevels);
++}
++
++void
++FillDeviceFuncsWDDM1_3(D3DWDDM1_3DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10)
++{
++   /* The 11.1 table is its beginning */
++   FillDeviceFuncs11_1(reinterpret_cast<D3D11_1DDI_DEVICEFUNCS *>(pFuncs), pFuncs10);
++   pFuncs->pfnRelocateDeviceFuncs = RelocateDeviceFuncsWDDM1_3;
++   pFuncs->pfnCheckMultisampleQualityLevels = CheckMultisampleQualityLevelsWDDM1_3;
++   STUB(pfnUpdateTileMappings);
++   STUB(pfnCopyTileMappings);
++   STUB(pfnCopyTiles);
++   STUB(pfnUpdateTiles);
++   STUB(pfnTiledResourceBarrier);
++   STUB(pfnGetMipPacking);
++   STUB(pfnResizeTilePool);
++   STUB(pfnSetMarker);
++   STUB(pfnSetMarkerMode);
++}
++
++
++/* DXGI 1.2: blits with rectangles (as the 1.0 Blt: not offered), offering memory back (nothing to give) */
++static HRESULT APIENTRY
++Blt1(DXGI_DDI_ARG_BLT1 *pBlt)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++OfferResources(DXGI_DDI_ARG_OFFERRESOURCES *pOffer)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++ReclaimResources(DXGI_DDI_ARG_RECLAIMRESOURCES *pReclaim)
++{
++   if (pReclaim->pDiscarded) {
++      for (UINT i = 0; i < pReclaim->Resources; i++) {
++         pReclaim->pDiscarded[i] = FALSE;
++      }
++   }
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++ResolveSharedResource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *pResolve)
++{
++   return S_OK;
++}
++
++void
++FillDXGIFuncs1_2(DXGI1_2_DDI_BASE_FUNCTIONS *pFuncs)
++{
++   pFuncs->pfnResolveSharedResource = ResolveSharedResource;
++   pFuncs->pfnBlt1 = Blt1;
++   pFuncs->pfnOfferResources = OfferResources;
++   pFuncs->pfnReclaimResources = ReclaimResources;
++}
++
++/* DXGI 1.3: Present1 presents a list of surfaces with dirty rectangles. DirectComposition presents its composition
++ * buffers together (a call with two, say): each one is presented as Present presents one, whole (the kernel's
++ * present takes one allocation). */
++static HRESULT APIENTRY
++Present1(DXGI_DDI_ARG_PRESENT1 *pPresent)
++{
++   HRESULT result = S_OK;
++   for (UINT i = 0; pPresent->phSurfacesToPresent && i < pPresent->SurfacesToPresent; i++) {
++      DXGI_DDI_ARG_PRESENT present = {};
++      present.hDevice = pPresent->hDevice;
++      present.hSurfaceToPresent = pPresent->phSurfacesToPresent[i].hSurface;
++      present.SrcSubResourceIndex = pPresent->phSurfacesToPresent[i].SubResourceIndex;
++      present.hDstResource = pPresent->hDstResource;
++      present.DstSubResourceIndex = pPresent->DstSubResourceIndex;
++      present.pDXGIContext = pPresent->pDXGIContext;
++      present.Flags = pPresent->Flags;
++      present.FlipInterval = pPresent->FlipInterval;
++      HRESULT hr = _Present(&present);
++      if (FAILED(hr)) {
++         result = hr;
++      }
++   }
++   return result;
++}
++
++/* Custom present durations (for video): none */
++static HRESULT APIENTRY
++CheckPresentDurationSupport(DXGI_DDI_ARG_CHECKPRESENTDURATIONSUPPORT *pCheck)
++{
++   pCheck->ClosestSmallerDuration = 0;
++   pCheck->ClosestLargerDuration = 0;
++   return S_OK;
++}
++
++void
++FillDXGIFuncs1_3(DXGI1_3_DDI_BASE_FUNCTIONS *pFuncs)
++{
++   pFuncs->pfnResolveSharedResource = ResolveSharedResource;
++   pFuncs->pfnBlt1 = Blt1;
++   pFuncs->pfnOfferResources = OfferResources;
++   pFuncs->pfnReclaimResources = ReclaimResources;
++   /* No multiplane overlays (the kernel driver has no overlay planes) */
++   pFuncs->pfnPresent1 = Present1;
++   pFuncs->pfnCheckPresentDurationSupport = CheckPresentDurationSupport;
++}
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -148,6 +148,11 @@
+    D3D11_0_DDI_SUPPORTED,
+    D3D11_0_7_DDI_SUPPORTED,
+ #endif
++   /* Feature level 10_0 through the 11.1 DDI (D3D11_1.cpp): the D3D11 runtime grants 11.1 features to it, like
++    * sharing more formats with NT handles (ExtendedResourceSharing) */
++   D3D11_1_DDI_SUPPORTED,
++   /* And the WDDM 1.3 DDI: composition buffers in more formats (A8 masks) */
++   D3DWDDM1_3_DDI_SUPPORTED,
+ };
+ 
+ 
+@@ -201,7 +206,22 @@
+         const D3D10_2DDIARG_GETCAPS *pData)
+ {
+    LOG_ENTRYPOINT();
++   if (!pData->pData) {
++      return E_INVALIDARG;
++   }
+    memset(pData->pData, 0, pData->DataSize);
++   switch (pData->Type) {
++   case D3D11DDICAPS_3DPIPELINESUPPORT:
++      /* The 11.x DDI runtime asks which feature levels the device has: 10_0 */
++      if (pData->DataSize >= sizeof(D3D11DDI_3DPIPELINESUPPORT_CAPS)) {
++         static_cast<D3D11DDI_3DPIPELINESUPPORT_CAPS *>(pData->pData)->Caps =
++            D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0);
++      }
++      break;
++   default:
++      /* No threading, shader or 11.1 option caps: none of them (logic ops, debug binaries) is offered */
++      break;
++   }
+    return S_OK;
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -31,6 +31,7 @@
+  */
+ 
+ 
++#include "D3D11_1.h"
+ #include "Draw.h"
+ #include "DxgiFns.h"
+ #include "InputAssembly.h"
+@@ -122,6 +123,8 @@
+    case D3D10_1_x_DDI_INTERFACE_VERSION:
+    case D3D10_1_7_DDI_INTERFACE_VERSION:
+ #endif
++   case D3D11_1_DDI_INTERFACE_VERSION:
++   case D3DWDDM1_3_DDI_INTERFACE_VERSION:
+       break;
+    default:
+       DebugPrintf("%s: unsupported interface version 0x%08x\n",
+@@ -177,9 +180,12 @@
+    }
+ 
+    /*
+-    * Fill in the D3D10 DDI functions
++    * Fill in the D3D10 DDI functions (for the 11.1 DDI a copy, which D3D11_1.cpp builds its table from)
+     */
+-   D3D10DDI_DEVICEFUNCS *pDeviceFuncs = pCreateData->pDeviceFuncs;
++   const bool isWDDM1_3 = pCreateData->Interface == D3DWDDM1_3_DDI_INTERFACE_VERSION;
++   const bool is11_1 = pCreateData->Interface == D3D11_1_DDI_INTERFACE_VERSION || isWDDM1_3;
++   D3D10DDI_DEVICEFUNCS funcs10 = {};
++   D3D10DDI_DEVICEFUNCS *pDeviceFuncs = is11_1 ? &funcs10 : pCreateData->pDeviceFuncs;
+    pDeviceFuncs->pfnDefaultConstantBufferUpdateSubresourceUP = ResourceUpdateSubResourceUP;
+    pDeviceFuncs->pfnVsSetConstantBuffers = VsSetConstantBuffers;
+    pDeviceFuncs->pfnPsSetShaderResources = PsSetShaderResources;
+@@ -293,6 +299,16 @@
+       p10_1DeviceFuncs->pfnResourceConvert = ResourceCopy;
+       p10_1DeviceFuncs->pfnResourceConvertRegion = ResourceCopyRegion;
+    }
++   if (isWDDM1_3) {
++      FillDeviceFuncsWDDM1_3(pCreateData->pWDDM1_3DeviceFuncs, &funcs10);
++   } else if (is11_1) {
++      FillDeviceFuncs11_1(pCreateData->p11_1DeviceFuncs, &funcs10);
++   }
++   if (is11_1) {
++      if (pCreateData->ppfnRetrieveSubObject) {
++         *pCreateData->ppfnRetrieveSubObject = RetrieveSubObject11_1;
++      }
++   }
+ 
+    /*
+     * Fill in DXGI DDI functions
+@@ -311,6 +327,13 @@
+       _RotateResourceIdentities;
+    pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions->pfnBlt =
+       _Blt;
++   if (isWDDM1_3) {
++      /* The WDDM 1.3 DDI comes with DXGI 1.3's table, the 11.1 one with DXGI 1.2's (the 1.0 entries above are
++       * their first ones) */
++      FillDXGIFuncs1_3(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions4);
++   } else if (is11_1) {
++      FillDXGIFuncs1_2(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions3);
++   }
+ 
+    return S_OK;
+ }
+diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+--- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
++++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+@@ -61,6 +61,14 @@
+    return pRenderTargetView->surface;
+ }
+ 
++
++/* A render target view's surface, up to date (D3D11_1.cpp's ClearView) */
++struct pipe_surface *
++RenderTargetViewSurface(D3D10DDI_HRENDERTARGETVIEW hRenderTargetView)
++{
++   return GetPipeRenderTargetView(hRenderTargetView);
++}
++
+ /*
+  * ----------------------------------------------------------------------
+  *
+diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.h b/src/gallium/frontends/d3d10umd/OutputMerger.h
+--- a/src/gallium/frontends/d3d10umd/OutputMerger.h
++++ b/src/gallium/frontends/d3d10umd/OutputMerger.h
+@@ -72,6 +72,8 @@
+ SIZE_T APIENTRY CalcPrivateBlendStateSize(D3D10DDI_HDEVICE hDevice,
+                                  __in const D3D10_DDI_BLEND_DESC *pBlendDesc);
+ 
++struct pipe_surface *RenderTargetViewSurface(D3D10DDI_HRENDERTARGETVIEW hRenderTargetView);
++
+ SIZE_T APIENTRY CalcPrivateBlendStateSize1(D3D10DDI_HDEVICE hDevice,
+                                  __in const D3D10_1_DDI_BLEND_DESC *pBlendDesc);
+ 
+diff --git a/src/gallium/frontends/d3d10umd/meson.build b/src/gallium/frontends/d3d10umd/meson.build
+--- a/src/gallium/frontends/d3d10umd/meson.build
++++ b/src/gallium/frontends/d3d10umd/meson.build
+@@ -9,6 +9,7 @@
+   'd3d10umd',
+   files(
+     'Adapter.cpp',
++    'D3D11_1.cpp',
+     'Debug.cpp',
+     'Device.cpp',
+     'Draw.cpp',

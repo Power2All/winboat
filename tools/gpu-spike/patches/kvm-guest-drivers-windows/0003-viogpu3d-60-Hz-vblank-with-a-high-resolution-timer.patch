@@ -1,0 +1,76 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: 60 Hz vblank with a high-resolution timer
+
+The flip thread slept 16.67 ms with KeDelayExecutionThread, which is rounded up to the system timer tick (15.6 ms by
+default): two ticks, so vblank and DWM's composition ran at 32 Hz. Wake the thread from a high-resolution periodic
+timer instead (falls back to the delay if the timer can't be allocated).
+---
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index f4c5aca..903d8a9 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -1990,11 +1990,31 @@ void VioGpuVidPN::FlipThread(void *ctx)
+     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
+     LARGE_INTEGER interval;
+     interval.QuadPart = -166666LL;
++
++    // A vblank every 1/60 s. A plain delay is rounded up to the system timer tick (15.6 ms by default), so it lasted
++    // two ticks: 32 Hz, and DWM composed at that rate. A high-resolution periodic timer keeps 60 Hz.
++    KeInitializeEvent(&vidpn->m_flipEvent, SynchronizationEvent, FALSE);
++    PEX_TIMER timer = ExAllocateTimer(VioGpuVidPN::FlipTimerCallback, vidpn, EX_TIMER_HIGH_RESOLUTION);
++    if (timer != NULL)
++    {
++        ExSetTimer(timer, interval.QuadPart, -interval.QuadPart, NULL);
++    }
+     while (true)
+     {
+-        KeDelayExecutionThread(KernelMode, false, &interval);
++        if (timer != NULL)
++        {
++            KeWaitForSingleObject(&vidpn->m_flipEvent, Executive, KernelMode, FALSE, NULL);
++        }
++        else
++        {
++            KeDelayExecutionThread(KernelMode, false, &interval);
++        }
+         if (vidpn->m_shouldFlipStop)
+         {
++            if (timer != NULL)
++            {
++                ExDeleteTimer(timer, TRUE, TRUE, NULL);
++            }
+             return;
+         }
+         vidpn->Flip();
+@@ -2009,6 +2029,13 @@ PAGED_CODE_SEG_END
+ #pragma code_seg(push)
+ #pragma code_seg()
+ 
++// Runs at DISPATCH_LEVEL: wakes the flip thread
++void VioGpuVidPN::FlipTimerCallback(PEX_TIMER Timer, PVOID ctx)
++{
++    UNREFERENCED_PARAMETER(Timer);
++    KeSetEvent(&reinterpret_cast<VioGpuVidPN *>(ctx)->m_flipEvent, IO_NO_INCREMENT, FALSE);
++}
++
+ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
+ {
+     m_sourceAddress = pSetVidPnSourceAddress->PrimaryAddress;
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index 8246328..33e44bf 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -100,6 +100,7 @@ class VioGpuVidPN
+ 
+     void Flip();
+     static void FlipThread(void *ctx);
++    static EXT_CALLBACK FlipTimerCallback;
+ 
+     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
+ 
+@@ -141,4 +142,5 @@ class VioGpuVidPN
+ 
+     PETHREAD m_pFlipThread;
+     BOOL m_shouldFlipStop = false;
++    KEVENT m_flipEvent;
+ };

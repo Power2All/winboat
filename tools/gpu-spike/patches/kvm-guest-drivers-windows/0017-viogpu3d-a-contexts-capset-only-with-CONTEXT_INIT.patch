@@ -1,0 +1,66 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: a context's capset only with CONTEXT_INIT
+
+A user-mode driver asks for a context of a capset (VIOGPU_CTX_INIT: virgl's
+for D3D9/D3D11/OpenGL, Venus' for Vulkan), and the kernel driver put the
+capset into the CTX_CREATE command whatever the device offered. A device
+without VIRTIO_GPU_F_CONTEXT_INIT (vhost-user-gpu without Venus, an older
+QEMU) refuses such a context (ERR_UNSPEC), and every 3D context failed: the
+desktop and all Direct3D rendered black.
+
+The capset now goes to the host only when CONTEXT_INIT was negotiated.
+Without it the host's contexts are virgl's: virgl's capsets (1, 2) get a
+plain context, others (Venus) are refused (STATUS_NOT_SUPPORTED, which the
+escape now returns), so Vulkan finds no device and Direct3D 12 reports
+DXGI_ERROR_UNSUPPORTED, as on a GPU without them.
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -213,6 +213,11 @@
+         return m_PciResources.IsMSIEnabled();
+     }
+ 
++    // Contexts of a given capset (Venus' next to virgl's): without CONTEXT_INIT the host has virgl contexts only
++    bool SupportsContextInit()
++    {
++        return virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_CONTEXT_INIT);
++    }
+     // Blob resources (Venus): the guest acknowledged them and the device has a host-visible memory window
+     bool SupportsBlob()
+     {
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -57,9 +57,17 @@
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s", __FUNCTION__));
+ 
++    // The capset goes to the host with CONTEXT_INIT only: a host without it (QEMU without Venus, older QEMU) refuses
++    // the context. Its contexts are virgl's, so virgl's capsets (1, 2) still get one; others (Venus) can't
+     UINT context_init = 0;
+-
+-    context_init |= pOptions->CapsetID;
++    if (m_pAdapter->SupportsContextInit())
++    {
++        context_init = pOptions->CapsetID;
++    }
++    else if (pOptions->CapsetID > 2)
++    {
++        return STATUS_NOT_SUPPORTED;
++    }
+ 
+     m_pAdapter->ctrlQueue.DestroyCtx(m_id); // Destroy old viogpu context
+     m_pAdapter->ctrlQueue.CreateCtx(m_id, context_init);
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1015,7 +1015,7 @@
+                     DbgPrint(TRACE_LEVEL_ERROR, ("%s no hDdevice(context) supplied\n", __FUNCTION__));
+                     return STATUS_INVALID_PARAMETER;
+                 }
+-                context->Init(&pVioGpuEscape->CtxInit);
++                status = context->Init(&pVioGpuEscape->CtxInit);
+                 break;
+             }
+         case VIOGPU_BLOB_CREATE:

@@ -39,6 +39,7 @@ type Metrics struct {
 		Total      uint64  `json:"total"`      // MB
 		Percentage float64 `json:"percentage"` // %
 	} `json:"disk"`
+	GPU *GPUStats `json:"gpu,omitempty"` // the virtual GPU driver's counters (without it: none)
 }
 
 type RDPStatusResponse struct {
@@ -107,6 +108,7 @@ func getMetrics(w http.ResponseWriter, r *http.Request) {
 	metrics.Disk.Used = diskInfo.Used / 1024 / 1024
 	metrics.Disk.Total = diskInfo.Total / 1024 / 1024
 	metrics.Disk.Percentage = diskInfo.UsedPercent
+	metrics.GPU = virtioGPUStats()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -162,6 +164,12 @@ func getIcon(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Run in the user's session by setConsoleTaskbar, not as the service
+	handleTaskbarArgs()
+	handleRefreshRateArgs()
+	handleThemeArgs()
+	handleWindowTrackerArgs()
+
 	token, err := guestauth.LoadToken()
 	if err != nil {
 		log.Fatalf("Failed to load guest token: %v", err)
@@ -182,6 +190,14 @@ func main() {
 	r.Handle("/metrics", protected(getMetrics)).Methods("GET")
 	r.Handle("/rdp/status", protected(getRdpConnectedStatus)).Methods("GET")
 	r.Handle("/get-icon", protected(getIcon)).Methods("POST")
+	r.Handle("/gpu", protected(getGPUStatus)).Methods("GET")
+	r.Handle("/gpu/driver", protected(setGPUDriver)).Methods("POST")
+	r.Handle("/desktop/launch", protected(launchOnDesktop)).Methods("POST")
+	r.Handle("/desktop/autologon", protected(setDesktopAutoLogon)).Methods("POST")
+	r.Handle("/desktop/taskbar", protected(setDesktopTaskbar)).Methods("POST")
+	r.Handle("/desktop/refresh-rate", protected(setDesktopRefreshRate)).Methods("POST")
+	r.Handle("/desktop/theme", protected(setDesktopTheme)).Methods("POST")
+	r.Handle("/desktop/process/{pid}", protected(getDesktopProcess)).Methods("GET")
 
 	srv := &http.Server{
 		Addr:              ":7148",

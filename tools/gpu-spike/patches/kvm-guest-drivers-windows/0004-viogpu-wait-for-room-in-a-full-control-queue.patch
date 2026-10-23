@@ -1,0 +1,140 @@
+From: WinBoat
+Subject: [PATCH] viogpu: wait for room in a full control queue, split SG elements at page boundaries
+
+CtrlQueue::QueueBuffer ignored AddBuf failing with -ENOSPC (the ring has no indirect descriptors, so a burst of
+commands can fill its 256 entries while the host is busy) and dropped the command. Its completion callback never ran:
+a 3D submission then never completed and the GPU scheduler waited for it forever, hanging DWM's mode change (seen
+when SPICE paused the device while the guest was resized). Wait for the host to free entries where the caller may
+wait (IRQL <= APC_LEVEL), which covers the 3D submissions and transfers.
+
+BuildSGElement also gave every element up to a page from its start address, so a buffer not starting on a page
+boundary ran into the next virtual page, which isn't physically contiguous. Split elements at page boundaries.
+---
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index efc029d..ce52a2a 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -786,14 +786,37 @@ void CtrlQueue::SetScanout(UINT scan_id, UINT res_id, UINT width, UINT height, U
+ }
+ 
+ #define SGLIST_SIZE 256
++#ifndef ENOSPC
++#define ENOSPC 28 // virtqueue_add_buf's "ring full" (VirtIO/osdep.h)
++#endif
++
++// Adds a buffer's scatter-gather elements, split at page boundaries: an element that starts inside a page and runs
++// into the next would give the host the wrong physical page for the rest
++static BOOLEAN AddSGElements(VirtIOBufferDescriptor *sg, UINT *count, UINT max, PVOID buf, ULONG size)
++{
++    while (size)
++    {
++        if (*count >= max || !MmIsAddressValid(buf))
++        {
++            return FALSE;
++        }
++        ULONG length = min(size, PAGE_SIZE - BYTE_OFFSET(buf));
++        sg[*count].length = length;
++        sg[*count].physAddr = MmGetPhysicalAddress(buf);
++        (*count)++;
++        buf = (PVOID)((ULONG_PTR)buf + length);
++        size -= length;
++    }
++    return TRUE;
++}
++
+ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
+ {
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+ 
+     VirtIOBufferDescriptor sg[SGLIST_SIZE];
+-    UINT sgleft = SGLIST_SIZE;
+-    UINT outcnt = 0, incnt = 0;
+-    UINT ret = 0;
++    UINT outcnt = 0, total = 0;
++    int ret = 0;
+     KIRQL SavedIrql;
+ 
+     if (buf->size > PAGE_SIZE)
+@@ -802,54 +825,47 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
+         return 0;
+     }
+ 
+-    if (BuildSGElement(&sg[outcnt + incnt], (PVOID)buf->buf, buf->size))
++    if (buf->resp_size > PAGE_SIZE)
+     {
+-        outcnt++;
+-        sgleft--;
++        DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s resp_size is too big %d\n", __FUNCTION__, buf->resp_size));
++        return 0;
+     }
+ 
+-    if (buf->data_size)
++    if (!AddSGElements(sg, &outcnt, SGLIST_SIZE, (PVOID)buf->buf, buf->size) ||
++        !AddSGElements(sg, &outcnt, SGLIST_SIZE, (PVOID)buf->data_buf, buf->data_size))
+     {
+-        ULONG data_size = buf->data_size;
+-        PVOID data_buf = (PVOID)buf->data_buf;
+-        while (data_size)
+-        {
+-            if (BuildSGElement(&sg[outcnt + incnt], data_buf, data_size))
+-            {
+-                data_buf = (PVOID)((LONG_PTR)(data_buf) + PAGE_SIZE);
+-                data_size -= min(data_size, PAGE_SIZE);
+-                outcnt++;
+-                sgleft--;
+-                if (sgleft == 0)
+-                {
+-                    DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s no more sgelenamt spots left %d\n", __FUNCTION__, outcnt));
+-                    return 0;
+-                }
+-            }
+-        }
++        DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s no more sg element spots left %d\n", __FUNCTION__, outcnt));
++        return 0;
+     }
+-
+-    if (buf->resp_size > PAGE_SIZE)
++    total = outcnt;
++    if (!AddSGElements(sg, &total, SGLIST_SIZE, (PVOID)buf->resp_buf, buf->resp_size))
+     {
+-        DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s resp_size is too big %d\n", __FUNCTION__, buf->resp_size));
++        DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s no sg element spot left for the response\n", __FUNCTION__));
+         return 0;
+     }
+ 
+-    if (buf->resp_size && (sgleft > 0))
++    for (;;)
+     {
+-        if (BuildSGElement(&sg[outcnt + incnt], (PVOID)buf->resp_buf, buf->resp_size))
++        Lock(&SavedIrql);
++        ret = AddBuf(&sg[0], outcnt, total - outcnt, buf, NULL, 0);
++        Kick();
++        Unlock(SavedIrql);
++
++        // A full ring frees up as the host completes commands. Dropping the command would lose its completion
++        // callback, and the GPU scheduler then waits for it forever (seen while SPICE paused the device during a
++        // resize), so wait for room where waiting is allowed
++        if (ret != -ENOSPC || KeGetCurrentIrql() > APC_LEVEL)
+         {
+-            incnt++;
+-            sgleft--;
++            break;
+         }
++        LARGE_INTEGER delay;
++        delay.QuadPart = -10000; // 1 ms
++        KeDelayExecutionThread(KernelMode, FALSE, &delay);
++    }
++    if (ret < 0)
++    {
++        DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s failed to queue the command: %d\n", __FUNCTION__, ret));
+     }
+-
+-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s sgleft %d\n", __FUNCTION__, sgleft));
+-
+-    Lock(&SavedIrql);
+-    ret = AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0);
+-    Kick();
+-    Unlock(SavedIrql);
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s ret = %d\n", __FUNCTION__, ret));
+ 

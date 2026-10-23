@@ -1,0 +1,3254 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: D3D12 video decoding on Vulkan Video
+
+D3D12 video decoding (the video DDI's decode tables) for H.264, HEVC Main/Main
+10, VP9 profiles 0/2 and AV1 Main 8/10-bit, on the Vulkan device's video
+decode queue (NVDEC on NVIDIA hosts, through Venus). ffmpeg's d3d12va decodes
+bit-exact against libavcodec on every test clip but one (below); decoding and
+encoding chain on the GPU (h264 d3d12va -> hevc_d3d12va, 720p at ~10x).
+
+vkd3d-proton:
+- the video decode queue family and VK_KHR_video_decode_queue, decode_h264,
+  _h265, _av1, _vp9 (and VP9's feature) when the device has them;
+- buffers get VIDEO_DECODE_SRC (upload heaps included), profile-independent,
+  their Vulkan buffer padded to 4 KiB: decoders read bitstreams in aligned
+  sizes, applications size buffers to the byte;
+- NV12/P010 textures (P010 is G16 here) are concurrent with the video
+  families, so the decoder can copy its output into them on the decode queue;
+- vkd3d_command_list_track_interop_resource(): a texture that Vulkan commands
+  recorded through the DXVK interop use still gets the initial layout
+  transition before the list (a decoder output's first use otherwise lost its
+  luma to the transition).
+
+viogpu_umd:
+- umd_video.h: what encoding and decoding share (the device's Vulkan side;
+  encoding and decoding each where the device has them); lists, allocators and
+  queues per video family;
+- umd_video_decode.cpp: caps (profiles and formats as far as the host decodes
+  them, tier 2), decoders and heaps (the heap owns the session and the DPB: an
+  image per slot, decoded into, DPB and output coinciding), DecodeFrame:
+  - parameter sets rebuilt from DXVA's picture parameters (H.264 SPS/PPS,
+    HEVC VPS/SPS/PPS, the AV1 sequence header; scaling lists in the PPS), new
+    session parameters when they change;
+  - references by the application's textures -> DPB slots; AV1's order hints,
+    sign biases, saved order hints and skip mode frames derived as the spec
+    does from what each slot keeps;
+  - the picture copied into the application's output texture (both planes);
+- umd_dxva.h: DXVA's structures (the D3D10/11 decoder's definitions);
+- NV12/P010 report decoder output support (the runtime checks it).
+
+Known limits: progressive H.264 only; no AV1 film grain (it needs an output
+picture apart from the DPB); DXVA has no AV1 refresh_frame_flags, which
+NVIDIA's decoder uses: with 0xff, a multi-tile 8-bit AV1 test clip decodes
+with off-by-one U samples here and there (~75 dB), everything else exact.
+diff --git a/libs/viogpu_umd/meson.build b/libs/viogpu_umd/meson.build
+index e9d713cc..b6e8a2d9 100644
+--- a/libs/viogpu_umd/meson.build
++++ b/libs/viogpu_umd/meson.build
+@@ -8,7 +8,8 @@ viogpu_umd_bridge = static_library('viogpu_umd_bridge', ['umd_bridge.c'] + vkd3d
+   dependencies        : [ vkd3d_dep ],
+   include_directories : vkd3d_private_includes)
+ 
+-viogpu_umd_lib = shared_library(get_option('viogpu_umd_name'), ['umd_ddi.cpp', 'umd_state.cpp', 'umd_resource.cpp', 'umd_command.cpp', 'umd_video.cpp'],
++viogpu_umd_lib = shared_library(get_option('viogpu_umd_name'), ['umd_ddi.cpp', 'umd_state.cpp', 'umd_resource.cpp', 'umd_command.cpp', 'umd_video.cpp',
++    'umd_video_decode.cpp'],
+   name_prefix         : '',
+   link_with           : [ viogpu_umd_bridge ],
+   dependencies        : [ vkd3d_dep ],
+diff --git a/libs/viogpu_umd/umd_bridge.c b/libs/viogpu_umd/umd_bridge.c
+index f352f0f6..486aa6d4 100644
+--- a/libs/viogpu_umd/umd_bridge.c
++++ b/libs/viogpu_umd/umd_bridge.c
+@@ -167,6 +167,13 @@ long viogpu_bridge_end_vk_commands(void *device, void *list)
+     return interop->lpVtbl->EndVkCommandBufferInterop(interop, list);
+ }
+ 
++void vkd3d_command_list_track_interop_resource(ID3D12GraphicsCommandList *list, ID3D12Resource *resource);
++
++void viogpu_bridge_track_resource(void *list, void *resource)
++{
++    vkd3d_command_list_track_interop_resource(list, resource);
++}
++
+ /* d3d12core.dll implements vkd3d-proton's test-suite and debug-layer controls; this driver has neither */
+ bool vkd3d_debug_control_is_test_suite(void)
+ {
+diff --git a/libs/viogpu_umd/umd_bridge.h b/libs/viogpu_umd/umd_bridge.h
+index 6b9d522a..987edd74 100644
+--- a/libs/viogpu_umd/umd_bridge.h
++++ b/libs/viogpu_umd/umd_bridge.h
+@@ -41,6 +41,8 @@ long viogpu_bridge_create_interop_allocator(void *device, int type, unsigned int
+ /* The VkCommandBuffer an open ID3D12GraphicsCommandList records into, for commands of the caller's own */
+ long viogpu_bridge_begin_vk_commands(void *device, void *list, void **command_buffer);
+ long viogpu_bridge_end_vk_commands(void *device, void *list);
++/* a texture the list's Vulkan commands use: vkd3d-proton's first-use transition then happens before the list */
++void viogpu_bridge_track_resource(void *list, void *resource);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libs/viogpu_umd/umd_command.cpp b/libs/viogpu_umd/umd_command.cpp
+index 711dc38d..9a7758e7 100644
+--- a/libs/viogpu_umd/umd_command.cpp
++++ b/libs/viogpu_umd/umd_command.cpp
+@@ -23,11 +23,12 @@ D3D12DDI_HRTTABLE viogpu_command_list_rt_tables[2];
+ 
+ struct viogpu_command_pool {
+    viogpu_device *device;
+-   /* by D3D12_COMMAND_LIST_TYPE: direct, bundle, compute, copy; then video encoding's */
+-   ID3D12CommandAllocator *allocators[5];
++   /* by D3D12_COMMAND_LIST_TYPE: direct, bundle, compute, copy; then video encoding's and decoding's */
++   ID3D12CommandAllocator *allocators[6];
+ };
+ 
+ #define VIDEO_ENCODE_ALLOCATOR 4
++#define VIDEO_DECODE_ALLOCATOR 5
+ 
+ struct viogpu_command_recorder {
+    D3D12DDI_COMMAND_QUEUE_FLAGS queueFlags;
+@@ -35,12 +36,14 @@ struct viogpu_command_recorder {
+ };
+ 
+ static ID3D12CommandAllocator *
+-pool_allocator(viogpu_command_pool *pool, D3D12_COMMAND_LIST_TYPE type, bool video)
++pool_allocator(viogpu_command_pool *pool, D3D12_COMMAND_LIST_TYPE type, const viogpu_video_list *video)
+ {
+    if (video) {
+-      if (!pool->allocators[VIDEO_ENCODE_ALLOCATOR])
+-         viogpu_video_create_allocator(pool->device, &pool->allocators[VIDEO_ENCODE_ALLOCATOR]);
+-      return pool->allocators[VIDEO_ENCODE_ALLOCATOR];
++      bool decode = viogpu_video_list_decodes(video);
++      int index = decode ? VIDEO_DECODE_ALLOCATOR : VIDEO_ENCODE_ALLOCATOR;
++      if (!pool->allocators[index])
++         viogpu_video_create_allocator(pool->device, decode, &pool->allocators[index]);
++      return pool->allocators[index];
+    }
+    if (!pool->allocators[type]) {
+       HRESULT hr = pool->device->vkd3d->CreateCommandAllocator(type, IID_PPV_ARGS(&pool->allocators[type]));
+@@ -156,8 +159,8 @@ create_command_list(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_COMMAND_L
+    list->device = device;
+    list->hRT = hRT;
+    list->type = list_type(args->Type, args->QueueFlags);
+-   if (args->QueueFlags & D3D12DDI_COMMAND_QUEUE_FLAG_0053_VIDEO_ENCODE)
+-      list->video = viogpu_video_list_create();
++   if (args->QueueFlags & (D3D12DDI_COMMAND_QUEUE_FLAG_0053_VIDEO_ENCODE | D3D12DDI_COMMAND_QUEUE_FLAG_0022_VIDEO_DECODE))
++      list->video = viogpu_video_list_create(args->QueueFlags & D3D12DDI_COMMAND_QUEUE_FLAG_0022_VIDEO_DECODE);
+ 
+    /* created closed, without an allocator: the first reset gives it one */
+    ID3D12Device4 *device4 = NULL;
+@@ -176,8 +179,10 @@ create_command_list(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_COMMAND_L
+    list->list->QueryInterface(IID_PPV_ARGS(&list->list4));
+ 
+    bool compute = list->type == D3D12_COMMAND_LIST_TYPE_COMPUTE || list->type == D3D12_COMMAND_LIST_TYPE_COPY;
+-   device->umCallbacks->pfnSetCommandListDDITableCb(hRT, list->video ? viogpu_video_encode_rt_table
+-                                                                     : viogpu_command_list_rt_tables[compute ? 0 : 1]);
++   device->umCallbacks->pfnSetCommandListDDITableCb(
++      hRT, !list->video                             ? viogpu_command_list_rt_tables[compute ? 0 : 1]
++           : viogpu_video_list_decodes(list->video) ? viogpu_video_decode_rt_table
++                                                    : viogpu_video_encode_rt_table);
+    return S_OK;
+ }
+ 
+@@ -212,7 +217,7 @@ reset_command_list(D3D12DDI_HCOMMANDLIST h, const D3D12DDIARG_RESETCOMMANDLIST_0
+    viogpu_command_list *list = list_from(h);
+    viogpu_command_recorder *recorder = (viogpu_command_recorder *)args->hDrvCommandRecorder.pDrvPrivate;
+    ID3D12CommandAllocator *allocator =
+-      recorder && recorder->pool ? pool_allocator(recorder->pool, list->type, list->video != NULL) : NULL;
++      recorder && recorder->pool ? pool_allocator(recorder->pool, list->type, list->video) : NULL;
+    HRESULT hr = allocator ? list->list->Reset(allocator, NULL) : E_INVALIDARG;
+    if (list->video)
+       viogpu_video_list_reset(list->video);
+@@ -1040,8 +1045,9 @@ create_command_queue(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATECOMMANDQU
+                       ? D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME
+                       : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    desc.NodeMask = args->NodeMask;
+-   bool video = args->QueueFlags & D3D12DDI_COMMAND_QUEUE_FLAG_0053_VIDEO_ENCODE;
+-   HRESULT hr = video ? viogpu_video_create_queue(device, &desc, &queue->queue)
++   bool decode = args->QueueFlags & D3D12DDI_COMMAND_QUEUE_FLAG_0022_VIDEO_DECODE;
++   bool video = decode || (args->QueueFlags & D3D12DDI_COMMAND_QUEUE_FLAG_0053_VIDEO_ENCODE);
++   HRESULT hr = video ? viogpu_video_create_queue(device, decode, &desc, &queue->queue)
+                       : device->vkd3d->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue->queue));
+    if (SUCCEEDED(hr))
+       hr = device->vkd3d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue->gate));
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+index 6e9cae99..c5a740e3 100644
+--- a/libs/viogpu_umd/umd_ddi.cpp
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -136,11 +136,17 @@ struct stub<Table, Entry, R (APIENTRY *)(A...)> {
+ 
+ 
+ static void APIENTRY
+-device_check_format_support(D3D12DDI_HDEVICE, DXGI_FORMAT format, UINT *support)
++device_check_format_support(D3D12DDI_HDEVICE hDevice, DXGI_FORMAT format, UINT *support)
+ {
+-   /* What the feature level requires, the runtime knows; these bits are the optional extras. None yet, besides
+-    * the formats DXGI swap chains show */
++   /* What the feature level requires, the runtime knows; these bits are the optional extras: the formats DXGI swap
++    * chains show, and the video decoder's outputs (the runtime checks its decode formats have them) */
+    switch (format) {
++   case DXGI_FORMAT_NV12:
++   case DXGI_FORMAT_P010:
++      *support = viogpu_video_decodes(device_from(hDevice))
++                    ? D3D12DDI_FORMAT_SUPPORT_DECODER_OUTPUT | D3D12DDI_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT
++                    : 0;
++      break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+@@ -179,8 +185,8 @@ device_query_node_map(D3D12DDI_HDEVICE, UINT numPhysicalAdapters, UINT *map)
+ }
+ 
+ /* ---------------------------------------------------------------------------------------------------------------- */
+-/* Extended features (video, shader cache, render passes, meta commands...): video (encoding only, umd_video.cpp) when
+- * the GPU has a video encode queue. The runtime asks for the count first (null array), then the list. */
++/* Extended features (video, shader cache, render passes, meta commands...): video (encoding and decoding,
++ * umd_video.cpp and umd_video_decode.cpp) when the GPU has a video encode or decode queue. The runtime asks for the count first (null array), then the list. */
+ 
+ static HRESULT APIENTRY
+ device_get_supported_extended_features(D3D12DDI_HDEVICE hDevice, UINT32 *count, D3D12DDI_FEATURE_0020 *features)
+@@ -605,7 +611,7 @@ adapter_fill_ddi_table(D3D12DDI_HADAPTER, D3D12DDI_TABLE_TYPE type, VOID *table,
+       funcs->pfnEnableExtendedFeature = device_enable_extended_feature;
+       return S_OK;
+    }
+-   /* video: stubs in every entry (the runtime wants them all), then the encoder's */
++   /* video: stubs in every entry (the runtime wants them all), then the encoder's and decoder's */
+    case D3D12DDI_TABLE_TYPE_0020_DEVICE_VIDEO:
+       FILL_STUBS(VIDEO_DEVICE, D3D12DDI_DEVICE_FUNCS_VIDEO_0082_0, table, size);
+       return viogpu_fill_video_table(type, table, size, hRTTable);
+@@ -616,7 +622,7 @@ adapter_fill_ddi_table(D3D12DDI_HADAPTER, D3D12DDI_TABLE_TYPE type, VOID *table,
+       return viogpu_fill_video_table(type, table, size, hRTTable);
+    case D3D12DDI_TABLE_TYPE_0022_COMMAND_LIST_VIDEO_DECODE:
+       FILL_STUBS(VIDEO_DECODE_LIST, D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_DECODE_0063, table, size);
+-      return S_OK;
++      return viogpu_fill_video_table(type, table, size, hRTTable);
+    case D3D12DDI_TABLE_TYPE_0022_COMMAND_LIST_VIDEO_PROCESS:
+       FILL_STUBS(VIDEO_PROCESS_LIST, D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_PROCESS_0063, table, size);
+       return S_OK;
+diff --git a/libs/viogpu_umd/umd_dxva.h b/libs/viogpu_umd/umd_dxva.h
+new file mode 100644
+index 00000000..6612b187
+--- /dev/null
++++ b/libs/viogpu_umd/umd_dxva.h
+@@ -0,0 +1,484 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* DXVA's picture parameters, quantization matrices and slice controls (the DXVA specs; the same definitions as
++ * the D3D10/11 driver's video decoder, Mesa's d3d10umd Video.cpp) */
++
++#pragma once
++#include <stdint.h>
++
++#pragma pack(push, 1)
++struct DXVA_PicEntry {
++   union {
++      struct {
++         uint8_t Index7Bits : 7;
++         uint8_t AssociatedFlag : 1;
++      };
++      uint8_t bPicEntry;
++   };
++};
++
++struct DXVA_PicParams_H264 {
++   uint16_t wFrameWidthInMbsMinus1;
++   uint16_t wFrameHeightInMbsMinus1;
++   DXVA_PicEntry CurrPic; /* flag: bottom field */
++   uint8_t num_ref_frames;
++   union {
++      struct {
++         uint16_t field_pic_flag : 1;
++         uint16_t MbaffFrameFlag : 1;
++         uint16_t residual_colour_transform_flag : 1;
++         uint16_t sp_for_switch_flag : 1;
++         uint16_t chroma_format_idc : 2;
++         uint16_t RefPicFlag : 1;
++         uint16_t constrained_intra_pred_flag : 1;
++         uint16_t weighted_pred_flag : 1;
++         uint16_t weighted_bipred_idc : 2;
++         uint16_t MbsConsecutiveFlag : 1;
++         uint16_t frame_mbs_only_flag : 1;
++         uint16_t transform_8x8_mode_flag : 1;
++         uint16_t MinLumaBipredSize8x8Flag : 1;
++         uint16_t IntraPicFlag : 1;
++      };
++      uint16_t wBitFields;
++   };
++   uint8_t bit_depth_luma_minus8;
++   uint8_t bit_depth_chroma_minus8;
++   uint16_t Reserved16Bits;
++   uint32_t StatusReportFeedbackNumber;
++   DXVA_PicEntry RefFrameList[16]; /* flag: long term */
++   int32_t CurrFieldOrderCnt[2];
++   int32_t FieldOrderCntList[16][2];
++   int8_t pic_init_qs_minus26;
++   int8_t chroma_qp_index_offset;
++   int8_t second_chroma_qp_index_offset;
++   uint8_t ContinuationFlag;
++   int8_t pic_init_qp_minus26;
++   uint8_t num_ref_idx_l0_active_minus1;
++   uint8_t num_ref_idx_l1_active_minus1;
++   uint8_t Reserved8BitsA;
++   uint16_t FrameNumList[16];
++   uint32_t UsedForReferenceFlags;
++   uint16_t NonExistingFrameFlags;
++   uint16_t frame_num;
++   uint8_t log2_max_frame_num_minus4;
++   uint8_t pic_order_cnt_type;
++   uint8_t log2_max_pic_order_cnt_lsb_minus4;
++   uint8_t delta_pic_order_always_zero_flag;
++   uint8_t direct_8x8_inference_flag;
++   uint8_t entropy_coding_mode_flag;
++   uint8_t pic_order_present_flag;
++   uint8_t num_slice_groups_minus1;
++   uint8_t slice_group_map_type;
++   uint8_t deblocking_filter_control_present_flag;
++   uint8_t redundant_pic_cnt_present_flag;
++   uint8_t Reserved8BitsB;
++   uint16_t slice_group_change_rate_minus1;
++   uint8_t SliceGroupMap[810];
++};
++
++struct DXVA_Qmatrix_H264 {
++   uint8_t bScalingLists4x4[6][16];
++   uint8_t bScalingLists8x8[2][64];
++};
++
++/* The short slice control of H.264, HEVC and VPx: where each slice's data is in the bitstream buffer */
++struct DXVA_Slice_Short {
++   uint32_t BSNALunitDataLocation;
++   uint32_t SliceBytesInBuffer;
++   uint16_t wBadSliceChopping;
++};
++
++struct DXVA_PicParams_HEVC {
++   uint16_t PicWidthInMinCbsY;
++   uint16_t PicHeightInMinCbsY;
++   union {
++      struct {
++         uint16_t chroma_format_idc : 2;
++         uint16_t separate_colour_plane_flag : 1;
++         uint16_t bit_depth_luma_minus8 : 3;
++         uint16_t bit_depth_chroma_minus8 : 3;
++         uint16_t log2_max_pic_order_cnt_lsb_minus4 : 4;
++         uint16_t NoPicReorderingFlag : 1;
++         uint16_t NoBiPredFlag : 1;
++         uint16_t ReservedBits1 : 1;
++      };
++      uint16_t wFormatAndSequenceInfoFlags;
++   };
++   DXVA_PicEntry CurrPic;
++   uint8_t sps_max_dec_pic_buffering_minus1;
++   uint8_t log2_min_luma_coding_block_size_minus3;
++   uint8_t log2_diff_max_min_luma_coding_block_size;
++   uint8_t log2_min_transform_block_size_minus2;
++   uint8_t log2_diff_max_min_transform_block_size;
++   uint8_t max_transform_hierarchy_depth_inter;
++   uint8_t max_transform_hierarchy_depth_intra;
++   uint8_t num_short_term_ref_pic_sets;
++   uint8_t num_long_term_ref_pics_sps;
++   uint8_t num_ref_idx_l0_default_active_minus1;
++   uint8_t num_ref_idx_l1_default_active_minus1;
++   int8_t init_qp_minus26;
++   uint8_t ucNumDeltaPocsOfRefRpsIdx;
++   uint16_t wNumBitsForShortTermRPSInSlice;
++   uint16_t ReservedBits2;
++   union {
++      struct {
++         uint32_t scaling_list_enabled_flag : 1;
++         uint32_t amp_enabled_flag : 1;
++         uint32_t sample_adaptive_offset_enabled_flag : 1;
++         uint32_t pcm_enabled_flag : 1;
++         uint32_t pcm_sample_bit_depth_luma_minus1 : 4;
++         uint32_t pcm_sample_bit_depth_chroma_minus1 : 4;
++         uint32_t log2_min_pcm_luma_coding_block_size_minus3 : 2;
++         uint32_t log2_diff_max_min_pcm_luma_coding_block_size : 2;
++         uint32_t pcm_loop_filter_disabled_flag : 1;
++         uint32_t long_term_ref_pics_present_flag : 1;
++         uint32_t sps_temporal_mvp_enabled_flag : 1;
++         uint32_t strong_intra_smoothing_enabled_flag : 1;
++         uint32_t dependent_slice_segments_enabled_flag : 1;
++         uint32_t output_flag_present_flag : 1;
++         uint32_t num_extra_slice_header_bits : 3;
++         uint32_t sign_data_hiding_enabled_flag : 1;
++         uint32_t cabac_init_present_flag : 1;
++         uint32_t ReservedBits3 : 5;
++      };
++      uint32_t dwCodingParamToolFlags;
++   };
++   union {
++      struct {
++         uint32_t constrained_intra_pred_flag : 1;
++         uint32_t transform_skip_enabled_flag : 1;
++         uint32_t cu_qp_delta_enabled_flag : 1;
++         uint32_t pps_slice_chroma_qp_offsets_present_flag : 1;
++         uint32_t weighted_pred_flag : 1;
++         uint32_t weighted_bipred_flag : 1;
++         uint32_t transquant_bypass_enabled_flag : 1;
++         uint32_t tiles_enabled_flag : 1;
++         uint32_t entropy_coding_sync_enabled_flag : 1;
++         uint32_t uniform_spacing_flag : 1;
++         uint32_t loop_filter_across_tiles_enabled_flag : 1;
++         uint32_t pps_loop_filter_across_slices_enabled_flag : 1;
++         uint32_t deblocking_filter_override_enabled_flag : 1;
++         uint32_t pps_deblocking_filter_disabled_flag : 1;
++         uint32_t lists_modification_present_flag : 1;
++         uint32_t slice_segment_header_extension_present_flag : 1;
++         uint32_t IrapPicFlag : 1;
++         uint32_t IdrPicFlag : 1;
++         uint32_t IntraPicFlag : 1;
++         uint32_t ReservedBits4 : 13;
++      };
++      uint32_t dwCodingSettingPicturePropertyFlags;
++   };
++   int8_t pps_cb_qp_offset;
++   int8_t pps_cr_qp_offset;
++   uint8_t num_tile_columns_minus1;
++   uint8_t num_tile_rows_minus1;
++   uint16_t column_width_minus1[19];
++   uint16_t row_height_minus1[21];
++   uint8_t diff_cu_qp_delta_depth;
++   int8_t pps_beta_offset_div2;
++   int8_t pps_tc_offset_div2;
++   uint8_t log2_parallel_merge_level_minus2;
++   int32_t CurrPicOrderCntVal;
++   DXVA_PicEntry RefPicList[15];
++   uint8_t ReservedBits5;
++   int32_t PicOrderCntValList[15];
++   uint8_t RefPicSetStCurrBefore[8];
++   uint8_t RefPicSetStCurrAfter[8];
++   uint8_t RefPicSetLtCurr[8];
++   uint16_t ReservedBits6;
++   uint16_t ReservedBits7;
++   uint32_t StatusReportFeedbackNumber;
++};
++
++struct DXVA_Qmatrix_HEVC {
++   uint8_t ucScalingLists0[6][16];
++   uint8_t ucScalingLists1[6][64];
++   uint8_t ucScalingLists2[6][64];
++   uint8_t ucScalingLists3[2][64];
++   uint8_t ucScalingListDCCoefSizeID2[6];
++   uint8_t ucScalingListDCCoefSizeID3[2];
++};
++
++struct DXVA_PicParams_VP9 {
++   DXVA_PicEntry CurrPic;
++   uint8_t profile;
++   union {
++      struct {
++         uint16_t frame_type : 1;
++         uint16_t show_frame : 1;
++         uint16_t error_resilient_mode : 1;
++         uint16_t subsampling_x : 1;
++         uint16_t subsampling_y : 1;
++         uint16_t extra_plane : 1;
++         uint16_t refresh_frame_context : 1;
++         uint16_t frame_parallel_decoding_mode : 1;
++         uint16_t intra_only : 1;
++         uint16_t frame_context_idx : 2;
++         uint16_t reset_frame_context : 2;
++         uint16_t allow_high_precision_mv : 1;
++         uint16_t ReservedFormatInfo2Bits : 2;
++      };
++      uint16_t wFormatAndPictureInfoFlags;
++   };
++   uint32_t width;
++   uint32_t height;
++   uint8_t BitDepthMinus8Luma;
++   uint8_t BitDepthMinus8Chroma;
++   uint8_t interp_filter;
++   uint8_t Reserved8Bits;
++   DXVA_PicEntry ref_frame_map[8];
++   uint32_t ref_frame_coded_width[8];
++   uint32_t ref_frame_coded_height[8];
++   DXVA_PicEntry frame_refs[3];
++   int8_t ref_frame_sign_bias[4];
++   int8_t filter_level;
++   int8_t sharpness_level;
++   union {
++      struct {
++         uint8_t mode_ref_delta_enabled : 1;
++         uint8_t mode_ref_delta_update : 1;
++         uint8_t use_prev_in_find_mv_refs : 1;
++         uint8_t ReservedControlInfo5Bits : 5;
++      };
++      uint8_t wControlInfoFlags;
++   };
++   int8_t ref_deltas[4];
++   int8_t mode_deltas[2];
++   int16_t base_qindex;
++   int8_t y_dc_delta_q;
++   int8_t uv_dc_delta_q;
++   int8_t uv_ac_delta_q;
++   struct {
++      union {
++         struct {
++            uint8_t enabled : 1;
++            uint8_t update_map : 1;
++            uint8_t temporal_update : 1;
++            uint8_t abs_delta : 1;
++            uint8_t ReservedSegmentFlags4Bits : 4;
++         };
++         uint8_t wSegmentInfoFlags;
++      };
++      uint8_t tree_probs[7];
++      uint8_t pred_probs[3];
++      int16_t feature_data[8][4];
++      uint8_t feature_mask[8];
++   } stVP9Segments;
++   uint8_t log2_tile_cols;
++   uint8_t log2_tile_rows;
++   uint16_t uncompressed_header_size_byte_aligned;
++   uint16_t first_partition_size;
++   uint16_t Reserved16Bits;
++   uint32_t Reserved32Bits;
++   uint32_t StatusReportFeedbackNumber;
++};
++struct DXVA_PicEntry_AV1 {
++   uint32_t width;
++   uint32_t height;
++   int32_t wmmat[6];
++   union {
++      struct {
++         uint8_t wminvalid : 1;
++         uint8_t wmtype : 2;
++         uint8_t Reserved : 5;
++      };
++      uint8_t GlobalMotionFlags;
++   };
++   uint8_t Index;
++   uint16_t Reserved16Bits;
++};
++
++struct DXVA_PicParams_AV1 {
++   uint32_t width;
++   uint32_t height;
++   uint32_t max_width;
++   uint32_t max_height;
++   uint8_t CurrPicTextureIndex;
++   uint8_t superres_denom;
++   uint8_t bitdepth;
++   uint8_t seq_profile;
++   struct {
++      uint8_t cols;
++      uint8_t rows;
++      uint16_t context_update_id;
++      uint16_t widths[64];
++      uint16_t heights[64];
++   } tiles;
++   union {
++      struct {
++         uint32_t use_128x128_superblock : 1;
++         uint32_t intra_edge_filter : 1;
++         uint32_t interintra_compound : 1;
++         uint32_t masked_compound : 1;
++         uint32_t warped_motion : 1;
++         uint32_t dual_filter : 1;
++         uint32_t jnt_comp : 1;
++         uint32_t screen_content_tools : 1;
++         uint32_t integer_mv : 1;
++         uint32_t cdef : 1;
++         uint32_t restoration : 1;
++         uint32_t film_grain : 1;
++         uint32_t intrabc : 1;
++         uint32_t high_precision_mv : 1;
++         uint32_t switchable_motion_mode : 1;
++         uint32_t filter_intra : 1;
++         uint32_t disable_frame_end_update_cdf : 1;
++         uint32_t disable_cdf_update : 1;
++         uint32_t reference_mode : 1;
++         uint32_t skip_mode : 1;
++         uint32_t reduced_tx_set : 1;
++         uint32_t superres : 1;
++         uint32_t tx_mode : 2;
++         uint32_t use_ref_frame_mvs : 1;
++         uint32_t enable_ref_frame_mvs : 1;
++         uint32_t reference_frame_update : 1;
++         uint32_t Reserved : 5;
++      };
++      uint32_t CodingParamToolFlags;
++   } coding;
++   union {
++      struct {
++         uint8_t frame_type : 2;
++         uint8_t show_frame : 1;
++         uint8_t showable_frame : 1;
++         uint8_t subsampling_x : 1;
++         uint8_t subsampling_y : 1;
++         uint8_t mono_chrome : 1;
++         uint8_t Reserved : 1;
++      };
++      uint8_t FormatAndPictureInfoFlags;
++   } format;
++   uint8_t primary_ref_frame;
++   uint8_t order_hint;
++   uint8_t order_hint_bits;
++   DXVA_PicEntry_AV1 frame_refs[7];
++   uint8_t RefFrameMapTextureIndex[8];
++   struct {
++      uint8_t filter_level[2];
++      uint8_t filter_level_u;
++      uint8_t filter_level_v;
++      uint8_t sharpness_level;
++      union {
++         struct {
++            uint8_t mode_ref_delta_enabled : 1;
++            uint8_t mode_ref_delta_update : 1;
++            uint8_t delta_lf_multi : 1;
++            uint8_t delta_lf_present : 1;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      int8_t ref_deltas[8];
++      int8_t mode_deltas[2];
++      uint8_t delta_lf_res;
++      uint8_t frame_restoration_type[3];
++      uint16_t log2_restoration_unit_size[3];
++      uint16_t Reserved16Bits;
++   } loop_filter;
++   struct {
++      union {
++         struct {
++            uint8_t delta_q_present : 1;
++            uint8_t delta_q_res : 2;
++            uint8_t Reserved : 5;
++         };
++         uint8_t ControlFlags;
++      };
++      uint8_t base_qindex;
++      int8_t y_dc_delta_q;
++      int8_t u_dc_delta_q;
++      int8_t v_dc_delta_q;
++      int8_t u_ac_delta_q;
++      int8_t v_ac_delta_q;
++      uint8_t qm_y;
++      uint8_t qm_u;
++      uint8_t qm_v;
++      uint16_t Reserved16Bits;
++   } quantization;
++   struct {
++      union {
++         struct {
++            uint8_t damping : 2;
++            uint8_t bits : 2;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      union {
++         struct {
++            uint8_t primary : 6;
++            uint8_t secondary : 2;
++         };
++         uint8_t combined;
++      } y_strengths[8], uv_strengths[8];
++   } cdef;
++   uint8_t interp_filter;
++   struct {
++      union {
++         struct {
++            uint8_t enabled : 1;
++            uint8_t update_map : 1;
++            uint8_t update_data : 1;
++            uint8_t temporal_update : 1;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      uint8_t Reserved24Bits[3];
++      uint8_t feature_mask[8];
++      int16_t feature_data[8][8];
++   } segmentation;
++   struct {
++      union {
++         struct {
++            uint16_t apply_grain : 1;
++            uint16_t scaling_shift_minus8 : 2;
++            uint16_t chroma_scaling_from_luma : 1;
++            uint16_t ar_coeff_lag : 2;
++            uint16_t ar_coeff_shift_minus6 : 2;
++            uint16_t grain_scale_shift : 2;
++            uint16_t overlap_flag : 1;
++            uint16_t clip_to_restricted_range : 1;
++            uint16_t matrix_coeff_is_identity : 1;
++            uint16_t Reserved : 3;
++         };
++         uint16_t ControlFlags;
++      };
++      uint16_t grain_seed;
++      uint8_t scaling_points_y[14][2];
++      uint8_t num_y_points;
++      uint8_t scaling_points_cb[10][2];
++      uint8_t num_cb_points;
++      uint8_t scaling_points_cr[10][2];
++      uint8_t num_cr_points;
++      uint8_t ar_coeffs_y[24];
++      uint8_t ar_coeffs_cb[25];
++      uint8_t ar_coeffs_cr[25];
++      uint8_t cb_mult;
++      uint8_t cb_luma_mult;
++      uint8_t cr_mult;
++      uint8_t cr_luma_mult;
++      uint8_t Reserved8Bits;
++      int16_t cb_offset;
++      int16_t cr_offset;
++   } film_grain;
++   uint32_t Reserved32Bits;
++   uint32_t StatusReportFeedbackNumber;
++};
++
++/* AV1's slice control: the tiles */
++struct DXVA_Tile_AV1 {
++   uint32_t DataOffset;
++   uint32_t DataSize;
++   uint16_t row;
++   uint16_t column;
++   uint16_t Reserved16Bits;
++   uint8_t anchor_frame;
++   uint8_t Reserved8Bits;
++};
++#pragma pack(pop)
++
++static const uint8_t DXVA_INVALID_ENTRY = 0xff;
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+index efc9b532..5e7217d9 100644
+--- a/libs/viogpu_umd/umd_private.h
++++ b/libs/viogpu_umd/umd_private.h
+@@ -146,20 +146,25 @@ HRESULT viogpu_fill_command_queue_table(void *table, SIZE_T size);
+ extern D3D12DDI_HRTTABLE viogpu_command_list_rt_tables[2];
+ void viogpu_command_list_error(viogpu_command_list *list, HRESULT hr);
+ 
+-/* umd_video.cpp: D3D12 video encoding on Vulkan Video (vkd3d-proton's Vulkan device, its encode queue family) */
++/* umd_video.cpp, umd_video_decode.cpp: D3D12 video encoding and decoding on Vulkan Video (vkd3d-proton's Vulkan
++ * device, its encode and decode queue families) */
+ bool viogpu_video_supported(viogpu_device *device);
++bool viogpu_video_decodes(viogpu_device *device);
+ void viogpu_video_destroy(viogpu_device *device);
+ HRESULT viogpu_fill_video_table(D3D12DDI_TABLE_TYPE type, void *table, SIZE_T size, D3D12DDI_HRTTABLE hRTTable);
+-/* the runtime's table for video encoding lists (pfnSetCommandListDDITableCb) */
++/* the runtime's tables for video encoding and decoding lists (pfnSetCommandListDDITableCb) */
+ extern D3D12DDI_HRTTABLE viogpu_video_encode_rt_table;
+-/* an allocator, queue on the encode queue family */
+-HRESULT viogpu_video_create_allocator(viogpu_device *device, ID3D12CommandAllocator **allocator);
+-HRESULT viogpu_video_create_queue(viogpu_device *device, const D3D12_COMMAND_QUEUE_DESC *desc, ID3D12CommandQueue **queue);
+-/* a video encoding list's state: made with the list, cleared when it resets */
+-struct viogpu_video_list *viogpu_video_list_create(void);
++extern D3D12DDI_HRTTABLE viogpu_video_decode_rt_table;
++/* an allocator, queue on the encode (decode: the decode) queue family */
++HRESULT viogpu_video_create_allocator(viogpu_device *device, bool decode, ID3D12CommandAllocator **allocator);
++HRESULT viogpu_video_create_queue(viogpu_device *device, bool decode, const D3D12_COMMAND_QUEUE_DESC *desc,
++                                  ID3D12CommandQueue **queue);
++/* a video encoding or decoding list's state: made with the list, cleared when it resets */
++struct viogpu_video_list *viogpu_video_list_create(bool decode);
++bool viogpu_video_list_decodes(const struct viogpu_video_list *video);
+ void viogpu_video_list_destroy(struct viogpu_video_list *video);
+ void viogpu_video_list_reset(struct viogpu_video_list *video);
+-/* A video encoding queue's completion: the lists' metadata resolves happen on the CPU once the GPU is done with
++/* A video queue's completion: the lists' metadata resolves happen on the CPU once the GPU is done with
+  * submission n (gpuDone reaches n); then done is signaled n */
+ struct viogpu_video_queue *viogpu_video_queue_create(viogpu_device *device, ID3D12Fence *gpuDone, ID3D12Fence *done);
+ void viogpu_video_queue_destroy(struct viogpu_video_queue *queue);
+diff --git a/libs/viogpu_umd/umd_video.cpp b/libs/viogpu_umd/umd_video.cpp
+index 3e09ab39..96cbd7af 100644
+--- a/libs/viogpu_umd/umd_video.cpp
++++ b/libs/viogpu_umd/umd_video.cpp
+@@ -23,110 +23,15 @@
+  * The encoder's objects: the session (with its parameters, DPB and queries) lives in the encoder heap, which D3D12
+  * makes per resolution set; ponytail: one encoder per heap (what applications do). */
+ 
+-#define VK_NO_PROTOTYPES
+-#include "umd_private.h"
+-#include <vulkan/vulkan.h>
+-#include <algorithm>
+-#include <deque>
+-#include <map>
+-
+-/* windows.h's */
+-#undef min
+-#undef max
++#include "umd_video.h"
+ 
+ D3D12DDI_HRTTABLE viogpu_video_encode_rt_table;
+-
+-#define INSTANCE_FUNCS(X)                                                                                              \
+-   X(GetDeviceProcAddr)                                                                                                \
+-   X(GetPhysicalDeviceQueueFamilyProperties)                                                                           \
+-   X(GetPhysicalDeviceMemoryProperties)                                                                                \
+-   X(GetPhysicalDeviceVideoCapabilitiesKHR)
+-
+-#define DEVICE_FUNCS(X)                                                                                                \
+-   X(CreateVideoSessionKHR)                                                                                            \
+-   X(DestroyVideoSessionKHR)                                                                                           \
+-   X(GetVideoSessionMemoryRequirementsKHR)                                                                             \
+-   X(BindVideoSessionMemoryKHR)                                                                                        \
+-   X(CreateVideoSessionParametersKHR)                                                                                  \
+-   X(DestroyVideoSessionParametersKHR)                                                                                 \
+-   X(GetEncodedVideoSessionParametersKHR)                                                                              \
+-   X(AllocateMemory)                                                                                                   \
+-   X(FreeMemory)                                                                                                       \
+-   X(CreateImage)                                                                                                      \
+-   X(DestroyImage)                                                                                                     \
+-   X(GetImageMemoryRequirements)                                                                                       \
+-   X(BindImageMemory)                                                                                                  \
+-   X(CreateImageView)                                                                                                  \
+-   X(DestroyImageView)                                                                                                 \
+-   X(CreateQueryPool)                                                                                                  \
+-   X(DestroyQueryPool)                                                                                                 \
+-   X(GetQueryPoolResults)                                                                                              \
+-   X(CmdBeginVideoCodingKHR)                                                                                           \
+-   X(CmdEndVideoCodingKHR)                                                                                             \
+-   X(CmdControlVideoCodingKHR)                                                                                         \
+-   X(CmdEncodeVideoKHR)                                                                                                \
+-   X(CmdResetQueryPool)                                                                                                \
+-   X(CmdBeginQuery)                                                                                                    \
+-   X(CmdEndQuery)                                                                                                      \
+-   X(CmdPipelineBarrier2)                                                                                              \
+-   X(CmdCopyImage)
+-
+-/* The profiles offered: H.264 Main and High (NV12), HEVC Main (NV12) and Main 10 (P010) */
+-enum { PROFILE_H264_MAIN, PROFILE_H264_HIGH, PROFILE_HEVC_MAIN, PROFILE_HEVC_MAIN10, PROFILE_COUNT };
+-
+-/* A Vulkan video profile; pNext points into the struct itself, so it stays where it was filled */
+-struct video_profile {
+-   VkVideoProfileInfoKHR info;
+-   VkVideoEncodeH264ProfileInfoKHR h264;
+-   VkVideoEncodeH265ProfileInfoKHR h265;
+-   VkVideoProfileListInfoKHR list;
+-   VkFormat format;
+-   DXGI_FORMAT dxgiFormat;
+-   bool hevc;
+-};
+-
+-struct video_caps {
+-   bool queried, ok;
+-   VkVideoCapabilitiesKHR caps;
+-   VkVideoEncodeCapabilitiesKHR encode;
+-   VkVideoEncodeH264CapabilitiesKHR h264;
+-   VkVideoEncodeH265CapabilitiesKHR h265;
+-};
+-
+-struct video_session;
+-
+-struct viogpu_video {
+-   bool tried, ok;
+-   VkInstance instance;
+-   VkPhysicalDevice physical;
+-   VkDevice device;
+-   uint32_t family;
+-   VkPhysicalDeviceMemoryProperties memory;
+-#define X(f) PFN_vk##f f;
+-   INSTANCE_FUNCS(X)
+-   DEVICE_FUNCS(X)
+-#undef X
+-   video_caps caps[PROFILE_COUNT];
+-   /* HEVC: whether the encoder forces asymmetric motion partitions (0: not probed yet, 1: no, 2: yes) */
+-   int ampRequired[PROFILE_COUNT];
+-   /* an encoder's hardware metadata buffer (resource, offset) -> the feedback query of the encode that wrote it */
+-   CRITICAL_SECTION lock;
+-   std::map<std::pair<ID3D12Resource *, UINT64>, std::pair<video_session *, uint32_t>> metadata;
+-};
+-
+-template <typename T>
+-static T
+-vk_handle(UINT64 h)
+-{
+-   T t;
+-   memcpy(&t, &h, sizeof(t));
+-   return t;
+-}
++D3D12DDI_HRTTABLE viogpu_video_decode_rt_table;
+ 
+ /* ---------------------------------------------------------------------------------------------------------------- */
+ /* The device's Vulkan side */
+ 
+-static viogpu_video *
++viogpu_video *
+ video_get(viogpu_device *device)
+ {
+    if (!device->video) {
+@@ -152,26 +57,37 @@ video_get(viogpu_device *device)
+ #undef X
+ #define X(f)                                                                                                           \
+    if (!(video->f = (PFN_vk##f)video->GetDeviceProcAddr(video->device, "vk" #f))) {                                   \
+-      viogpu_log("video: no vk" #f " (the device has no video encoding)");                                            \
++      viogpu_log("video: no vk" #f " (the device has no video)");                                                     \
+       return NULL;                                                                                                     \
+    }
+    DEVICE_FUNCS(X)
+ #undef X
++   bool encode = true, decode = true;
++#define X(f) encode = (video->f = (PFN_vk##f)video->GetDeviceProcAddr(video->device, "vk" #f)) && encode;
++   ENCODE_FUNCS(X)
++#undef X
++#define X(f) decode = (video->f = (PFN_vk##f)video->GetDeviceProcAddr(video->device, "vk" #f)) && decode;
++   DECODE_FUNCS(X)
++#undef X
+ 
+-   /* the family vkd3d-proton made its encode queue on: the first with video encoding */
++   /* the families vkd3d-proton made its video queues on: the first with video encoding, the first with decoding */
+    uint32_t count = 0;
+    video->GetPhysicalDeviceQueueFamilyProperties(video->physical, &count, NULL);
+    std::vector<VkQueueFamilyProperties> families(count);
+    video->GetPhysicalDeviceQueueFamilyProperties(video->physical, &count, families.data());
+-   video->family = VK_QUEUE_FAMILY_IGNORED;
+-   for (uint32_t i = 0; i < count && video->family == VK_QUEUE_FAMILY_IGNORED; i++)
+-      if (families[i].queueFlags & VK_QUEUE_VIDEO_ENCODE_BIT_KHR)
++   video->family = video->decodeFamily = VK_QUEUE_FAMILY_IGNORED;
++   for (uint32_t i = 0; i < count; i++) {
++      if (encode && video->family == VK_QUEUE_FAMILY_IGNORED && (families[i].queueFlags & VK_QUEUE_VIDEO_ENCODE_BIT_KHR))
+          video->family = i;
+-   if (video->family == VK_QUEUE_FAMILY_IGNORED)
++      if (decode && video->decodeFamily == VK_QUEUE_FAMILY_IGNORED &&
++          (families[i].queueFlags & VK_QUEUE_VIDEO_DECODE_BIT_KHR))
++         video->decodeFamily = i;
++   }
++   if (video->family == VK_QUEUE_FAMILY_IGNORED && video->decodeFamily == VK_QUEUE_FAMILY_IGNORED)
+       return NULL;
+    video->GetPhysicalDeviceMemoryProperties(video->physical, &video->memory);
+    video->ok = true;
+-   viogpu_log("video: encoding on queue family %u", video->family);
++   viogpu_log("video: encoding on queue family %d, decoding on %d", (int)video->family, (int)video->decodeFamily);
+    return video;
+ }
+ 
+@@ -181,33 +97,47 @@ viogpu_video_supported(viogpu_device *device)
+    return video_get(device) != NULL;
+ }
+ 
++bool
++viogpu_video_decodes(viogpu_device *device)
++{
++   viogpu_video *video = video_get(device);
++   return video && decode_supported(video);
++}
++
+ void
+ viogpu_video_destroy(viogpu_device *device)
+ {
+    if (!device->video)
+       return;
++   decode_caps_destroy(device->video);
+    DeleteCriticalSection(&device->video->lock);
+    delete device->video;
+    device->video = NULL;
+ }
+ 
+ HRESULT
+-viogpu_video_create_allocator(viogpu_device *device, ID3D12CommandAllocator **allocator)
++viogpu_video_create_allocator(viogpu_device *device, bool decode, ID3D12CommandAllocator **allocator)
+ {
+    viogpu_video *video = video_get(device);
+-   HRESULT hr = video ? viogpu_bridge_create_interop_allocator(device->vkd3d, D3D12_COMMAND_LIST_TYPE_DIRECT,
+-                                                               video->family, (void **)allocator)
+-                      : E_FAIL;
++   uint32_t family = !video ? VK_QUEUE_FAMILY_IGNORED : decode ? video->decodeFamily : video->family;
++   HRESULT hr = family != VK_QUEUE_FAMILY_IGNORED
++                   ? viogpu_bridge_create_interop_allocator(device->vkd3d, D3D12_COMMAND_LIST_TYPE_DIRECT, family,
++                                                            (void **)allocator)
++                   : E_FAIL;
+    if (FAILED(hr))
+       viogpu_log("video: CreateInteropCommandAllocator: 0x%08lx", (unsigned long)hr);
+    return hr;
+ }
+ 
+ HRESULT
+-viogpu_video_create_queue(viogpu_device *device, const D3D12_COMMAND_QUEUE_DESC *desc, ID3D12CommandQueue **queue)
++viogpu_video_create_queue(viogpu_device *device, bool decode, const D3D12_COMMAND_QUEUE_DESC *desc,
++                          ID3D12CommandQueue **queue)
+ {
+    viogpu_video *video = video_get(device);
+-   HRESULT hr = video ? viogpu_bridge_create_interop_queue(device->vkd3d, desc, video->family, (void **)queue) : E_FAIL;
++   uint32_t family = !video ? VK_QUEUE_FAMILY_IGNORED : decode ? video->decodeFamily : video->family;
++   HRESULT hr = family != VK_QUEUE_FAMILY_IGNORED
++                   ? viogpu_bridge_create_interop_queue(device->vkd3d, desc, family, (void **)queue)
++                   : E_FAIL;
+    if (FAILED(hr))
+       viogpu_log("video: CreateInteropCommandQueue: 0x%08lx", (unsigned long)hr);
+    return hr;
+@@ -249,6 +179,8 @@ caps_get(viogpu_video *video, int index)
+    if (index < 0 || index >= PROFILE_COUNT)
+       return NULL;
+    video_caps *c = &video->caps[index];
++   if (video->family == VK_QUEUE_FAMILY_IGNORED)
++      return NULL;
+    if (!c->queried) {
+       c->queried = true;
+       video_profile p;
+@@ -379,10 +311,6 @@ dpb_capacity(const video_caps *c)
+ 
+ #define CAPS(T) (args->DataSize >= sizeof(T) ? (T *)args->pData : NULL)
+ 
+-/* D3D12DDI_VIDEO_DECODE_PROFILE_H264, D3D12DDI_VIDEO_DECODE_BITSTREAM_ENCRYPTION_NONE */
+-static const GUID decode_profile_h264 = {0x1b81be68, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}};
+-static const GUID decode_encryption_none = {0x1b81bed0, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}};
+-
+ static HRESULT video_get_caps_(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_VIDEO_GETCAPS_0020 *args);
+ static bool hevc_amp_required(viogpu_video *v, int index);
+ 
+@@ -404,65 +332,23 @@ video_get_caps_(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_VIDEO_GETCAPS_0020 *
+       auto *d = CAPS(D3D12DDI_VIDEO_FEATURE_AREA_SUPPORT_DATA_0053);
+       if (!d)
+          return E_INVALIDARG;
+-      d->VideoDecodeSupport = FALSE;
++      d->VideoDecodeSupport = video && decode_supported(video);
+       d->VideoProcessSupport = FALSE;
+-      d->VideoEncodeSupport = video != NULL;
+-      return S_OK;
+-   }
+-   /* Decoding: none (D3D11 video has it). The runtime still wants a decode profile on a graphics device (only
+-    * compute-only ones may have none), so H.264 is listed, with its format and no encryption, and DECODE_SUPPORT
+-    * says no to every configuration. */
+-   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_PROFILE_COUNT: {
+-      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_PROFILE_COUNT_DATA_0032);
+-      if (!d)
+-         return E_INVALIDARG;
+-      d->ProfileCount = 1;
+-      return S_OK;
+-   }
+-   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_PROFILES: {
+-      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_PROFILES_DATA_0020);
+-      if (!d || d->ProfileCount < 1 || !d->pProfiles)
+-         return E_INVALIDARG;
+-      d->pProfiles[0] = decode_profile_h264;
+-      return S_OK;
+-   }
+-   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_FORMAT_COUNT: {
+-      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_FORMAT_COUNT_DATA_0032);
+-      if (!d)
+-         return E_INVALIDARG;
+-      d->FormatCount = 1;
+-      return S_OK;
+-   }
+-   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_FORMATS: {
+-      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_FORMATS_DATA_0020);
+-      if (!d || d->FormatCount < 1 || !d->pOutputFormats)
+-         return E_INVALIDARG;
+-      d->pOutputFormats[0] = DXGI_FORMAT_NV12;
+-      return S_OK;
+-   }
+-   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_BITSTREAM_ENCRYPTION_SCHEME_COUNT: {
+-      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_BITSTREAM_ENCRYPTION_SCHEME_COUNT_DATA_0032);
+-      if (!d)
+-         return E_INVALIDARG;
+-      d->BitstreamEncryptionSchemeCount = 1;
+-      return S_OK;
+-   }
+-   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_BITSTREAM_ENCRYPTION_SCHEMES: {
+-      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_BITSTREAM_ENCRYPTION_SCHEMES_DATA_0020);
+-      if (!d || d->EncryptionSchemeCount < 1 || !d->pEncryptionSchemes)
+-         return E_INVALIDARG;
+-      d->pEncryptionSchemes[0] = decode_encryption_none;
+-      return S_OK;
+-   }
+-   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_SUPPORT: {
+-      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_SUPPORT_DATA_0020);
+-      if (!d)
+-         return E_INVALIDARG;
+-      d->SupportFlags = D3D12DDI_VIDEO_DECODE_SUPPORT_FLAG_0020_NONE;
+-      d->ConfigurationFlags = D3D12DDI_VIDEO_DECODE_CONFIGURATION_FLAG_0020_NONE;
+-      d->DecodeTier = D3D12DDI_VIDEO_DECODE_TIER_0020_NOT_SUPPORTED;
++      d->VideoEncodeSupport = video && video->family != VK_QUEUE_FAMILY_IGNORED;
+       return S_OK;
+    }
++   /* decoding's (umd_video_decode.cpp) */
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_SUPPORT:
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_PROFILES:
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_FORMATS:
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_CONVERSION_SUPPORT:
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_BITSTREAM_ENCRYPTION_SCHEMES:
++   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODER_HEAP_SIZE:
++   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_PROFILE_COUNT:
++   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_FORMAT_COUNT:
++   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_BITSTREAM_ENCRYPTION_SCHEME_COUNT:
++   case D3D12DDICAPS_TYPE_VIDEO_0040_DECODE_HISTOGRAM:
++      return decode_get_caps(video, args);
+    case D3D12DDICAPS_TYPE_VIDEO_0020_PROCESS_MAX_INPUT_STREAMS: {
+       auto *d = CAPS(D3D12DDI_VIDEO_PROCESS_MAX_INPUT_STREAMS_DATA_0020);
+       if (!d)
+@@ -914,7 +800,7 @@ destroy_heap(D3D12DDI_HDEVICE, D3D12DDI_HVIDEOENCODERHEAP_0080 h)
+ /* ---------------------------------------------------------------------------------------------------------------- */
+ /* The session */
+ 
+-static VkDeviceMemory
++VkDeviceMemory
+ memory_allocate(viogpu_video *video, VkDeviceSize size, uint32_t typeBits)
+ {
+    /* device-local first */
+@@ -1491,13 +1377,22 @@ struct metadata_resolve {
+ };
+ 
+ struct viogpu_video_list {
++   bool decode;
+    std::vector<metadata_resolve> resolves;
+ };
+ 
+ viogpu_video_list *
+-viogpu_video_list_create(void)
++viogpu_video_list_create(bool decode)
++{
++   viogpu_video_list *video = new viogpu_video_list();
++   video->decode = decode;
++   return video;
++}
++
++bool
++viogpu_video_list_decodes(const viogpu_video_list *video)
+ {
+-   return new viogpu_video_list();
++   return video->decode;
+ }
+ 
+ void
+@@ -1512,7 +1407,7 @@ viogpu_video_list_reset(viogpu_video_list *video)
+    video->resolves.clear();
+ }
+ 
+-static void
++void
+ barrier(viogpu_video *v, VkCommandBuffer cmd, const VkImageMemoryBarrier2 *images, uint32_t imageCount,
+         VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess)
+ {
+@@ -1529,7 +1424,7 @@ barrier(viogpu_video *v, VkCommandBuffer cmd, const VkImageMemoryBarrier2 *image
+    v->CmdPipelineBarrier2(cmd, &dep);
+ }
+ 
+-static VkImageMemoryBarrier2
++VkImageMemoryBarrier2
+ image_barrier(VkImage image, UINT layer, VkImageLayout from, VkImageLayout to)
+ {
+    VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+@@ -1607,7 +1502,7 @@ copy_make(video_session *s)
+ 
+ /* The application's texture (and subresource) -> the image's array layer (one mip, one plane slice per layer: what
+  * video textures have) */
+-static UINT
++UINT
+ texture_layer(const viogpu_resource *res, UINT subresource)
+ {
+    UINT layers = std::max<UINT>(res->desc.DepthOrArraySize, 1);
+@@ -2072,7 +1967,8 @@ encode_frame(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HVIDEOENCODER_0080 hEncoder,
+    rc_key rc = rc_from(seq.RateControl, gop, pPeriod);
+    bool rcChange = !s->rcSet || s->rc != rc;
+ 
+-   /* record */
++   /* record (an input texture's first use: vkd3d-proton's initial transition first) */
++   viogpu_bridge_track_resource(list->list, input->resource);
+    VkCommandBuffer cmd;
+    if (FAILED(viogpu_bridge_begin_vk_commands(device->vkd3d, list->list, (void **)&cmd))) {
+       viogpu_command_list_error(list, E_FAIL);
+@@ -2384,6 +2280,23 @@ viogpu_fill_video_table(D3D12DDI_TABLE_TYPE type, void *table, SIZE_T size, D3D1
+       f->pfnCalcPrivateVideoEncoderHeapSize = calc_heap_size;
+       f->pfnCreateVideoEncoderHeap = create_heap;
+       f->pfnDestroyVideoEncoderHeap = destroy_heap;
++      decode_fill_device_table(f);
++      return S_OK;
++   }
++   case D3D12DDI_TABLE_TYPE_0022_COMMAND_LIST_VIDEO_DECODE: {
++      if (size < sizeof(D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_DECODE_0063))
++         return E_INVALIDARG;
++      viogpu_video_decode_rt_table = hRTTable;
++      auto *f = (D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_DECODE_0063 *)table;
++      viogpu_command_list_funcs common = {};
++      viogpu_fill_command_list_table(&common, sizeof(common), 2, hRTTable);
++      f->pfnCloseCommandList = video_close;
++      f->pfnResetCommandList = common.pfnResetCommandList;
++      f->pfnDiscardResource = video_discard;
++      f->pfnSetMarker = video_set_marker;
++      f->pfnSetPredication = video_set_predication;
++      f->pfnResourceBarrier = video_barrier;
++      decode_fill_list_table(f);
+       return S_OK;
+    }
+    case D3D12DDI_TABLE_TYPE_0053_COMMAND_LIST_VIDEO_ENCODE: {
+diff --git a/libs/viogpu_umd/umd_video.h b/libs/viogpu_umd/umd_video.h
+new file mode 100644
+index 00000000..de20a3f9
+--- /dev/null
++++ b/libs/viogpu_umd/umd_video.h
+@@ -0,0 +1,134 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* What D3D12 video encoding (umd_video.cpp) and decoding (umd_video_decode.cpp) share: the device's Vulkan side */
++
++#pragma once
++#define VK_NO_PROTOTYPES
++#include "umd_private.h"
++#include <vulkan/vulkan.h>
++#include <algorithm>
++#include <deque>
++#include <map>
++
++/* windows.h's */
++#undef min
++#undef max
++
++#define INSTANCE_FUNCS(X)                                                                                              \
++   X(GetDeviceProcAddr)                                                                                                \
++   X(GetPhysicalDeviceQueueFamilyProperties)                                                                           \
++   X(GetPhysicalDeviceMemoryProperties)                                                                                \
++   X(GetPhysicalDeviceVideoCapabilitiesKHR)                                                                            \
++   X(GetPhysicalDeviceVideoFormatPropertiesKHR)
++
++#define DEVICE_FUNCS(X)                                                                                                \
++   X(CreateVideoSessionKHR)                                                                                            \
++   X(DestroyVideoSessionKHR)                                                                                           \
++   X(GetVideoSessionMemoryRequirementsKHR)                                                                             \
++   X(BindVideoSessionMemoryKHR)                                                                                        \
++   X(CreateVideoSessionParametersKHR)                                                                                  \
++   X(DestroyVideoSessionParametersKHR)                                                                                 \
++   X(AllocateMemory)                                                                                                   \
++   X(FreeMemory)                                                                                                       \
++   X(CreateImage)                                                                                                      \
++   X(DestroyImage)                                                                                                     \
++   X(GetImageMemoryRequirements)                                                                                       \
++   X(BindImageMemory)                                                                                                  \
++   X(CreateImageView)                                                                                                  \
++   X(DestroyImageView)                                                                                                 \
++   X(CreateQueryPool)                                                                                                  \
++   X(DestroyQueryPool)                                                                                                 \
++   X(GetQueryPoolResults)                                                                                              \
++   X(CmdBeginVideoCodingKHR)                                                                                           \
++   X(CmdEndVideoCodingKHR)                                                                                             \
++   X(CmdControlVideoCodingKHR)                                                                                         \
++   X(CmdResetQueryPool)                                                                                                \
++   X(CmdBeginQuery)                                                                                                    \
++   X(CmdEndQuery)                                                                                                      \
++   X(CmdPipelineBarrier2)                                                                                              \
++   X(CmdCopyImage)
++
++/* encoding's and decoding's own: each is offered when the device has its functions */
++#define ENCODE_FUNCS(X)                                                                                                \
++   X(GetEncodedVideoSessionParametersKHR)                                                                              \
++   X(CmdEncodeVideoKHR)
++
++#define DECODE_FUNCS(X)                                                                                                \
++   X(CmdDecodeVideoKHR)
++
++/* The profiles offered: H.264 Main and High (NV12), HEVC Main (NV12) and Main 10 (P010) */
++enum { PROFILE_H264_MAIN, PROFILE_H264_HIGH, PROFILE_HEVC_MAIN, PROFILE_HEVC_MAIN10, PROFILE_COUNT };
++
++/* A Vulkan video profile; pNext points into the struct itself, so it stays where it was filled */
++struct video_profile {
++   VkVideoProfileInfoKHR info;
++   VkVideoEncodeH264ProfileInfoKHR h264;
++   VkVideoEncodeH265ProfileInfoKHR h265;
++   VkVideoProfileListInfoKHR list;
++   VkFormat format;
++   DXGI_FORMAT dxgiFormat;
++   bool hevc;
++};
++
++struct video_caps {
++   bool queried, ok;
++   VkVideoCapabilitiesKHR caps;
++   VkVideoEncodeCapabilitiesKHR encode;
++   VkVideoEncodeH264CapabilitiesKHR h264;
++   VkVideoEncodeH265CapabilitiesKHR h265;
++};
++
++struct video_session;
++struct decode_caps;
++
++struct viogpu_video {
++   bool tried, ok;
++   VkInstance instance;
++   VkPhysicalDevice physical;
++   VkDevice device;
++   /* the queue families vkd3d-proton made its encode and decode queues on (VK_QUEUE_FAMILY_IGNORED: none) */
++   uint32_t family;
++   uint32_t decodeFamily;
++   VkPhysicalDeviceMemoryProperties memory;
++#define X(f) PFN_vk##f f;
++   INSTANCE_FUNCS(X)
++   DEVICE_FUNCS(X)
++   ENCODE_FUNCS(X)
++   DECODE_FUNCS(X)
++#undef X
++   video_caps caps[PROFILE_COUNT];
++   /* HEVC: whether the encoder forces asymmetric motion partitions (0: not probed yet, 1: no, 2: yes) */
++   int ampRequired[PROFILE_COUNT];
++   /* an encoder's hardware metadata buffer (resource, offset) -> the feedback query of the encode that wrote it */
++   CRITICAL_SECTION lock;
++   std::map<std::pair<ID3D12Resource *, UINT64>, std::pair<video_session *, uint32_t>> metadata;
++   /* decoding's caps per profile (umd_video_decode.cpp) */
++   decode_caps *decodeCaps;
++};
++
++template <typename T>
++static T
++vk_handle(UINT64 h)
++{
++   T t;
++   memcpy(&t, &h, sizeof(t));
++   return t;
++}
++
++viogpu_video *video_get(viogpu_device *device);
++VkDeviceMemory memory_allocate(viogpu_video *video, VkDeviceSize size, uint32_t typeBits);
++void barrier(viogpu_video *v, VkCommandBuffer cmd, const VkImageMemoryBarrier2 *images, uint32_t imageCount,
++             VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage,
++             VkAccessFlags2 dstAccess);
++VkImageMemoryBarrier2 image_barrier(VkImage image, UINT layer, VkImageLayout from, VkImageLayout to);
++UINT texture_layer(const viogpu_resource *res, UINT subresource);
++
++/* umd_video_decode.cpp */
++HRESULT decode_get_caps(viogpu_video *video, const D3D12DDIARG_VIDEO_GETCAPS_0020 *args);
++void decode_fill_device_table(D3D12DDI_DEVICE_FUNCS_VIDEO_0082_0 *f);
++void decode_fill_list_table(D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_DECODE_0063 *f);
++void decode_caps_destroy(viogpu_video *video);
++bool decode_supported(viogpu_video *video);
+diff --git a/libs/viogpu_umd/umd_video_decode.cpp b/libs/viogpu_umd/umd_video_decode.cpp
+new file mode 100644
+index 00000000..a19f33ff
+--- /dev/null
++++ b/libs/viogpu_umd/umd_video_decode.cpp
+@@ -0,0 +1,1765 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++/* D3D12 video decoding (H.264, HEVC Main/Main 10, VP9 profiles 0/2, AV1 Main 8/10-bit) on Vulkan Video's decode
++ * queue, the same way as the encoder
++ * (umd_video.cpp): video decoding lists are vkd3d-proton direct lists on the decode queue family, into which
++ * DecodeFrame records Vulkan Video.
++ *
++ * What D3D12 and Vulkan Video see differently:
++ * - Parameter sets: D3D12 gets DXVA's picture parameters (the parameter sets' values and the slice headers' that
++ *   matter, per picture); Vulkan wants SPS/PPS (VPS) objects. They are rebuilt from the picture parameters, and
++ *   new session parameters made when they change.
++ * - References: DXVA names reference pictures by their index in the application's reference texture list; Vulkan
++ *   by DPB slot. The decoder keeps its own DPB (images with the session's profile) and decodes into it
++ *   (DPB and output coincide), then copies the picture into the application's output texture: application
++ *   textures need no video usage (vkd3d-proton makes P010 G16; video wants G10X6, the same bytes). The slots
++ *   follow the application's textures (texture and subresource -> slot).
++ * The decoder's objects: the session (parameters, DPB) lives in the decoder heap, which D3D12 makes per resolution
++ * and DPB size; ponytail: one decoder per heap (what applications do). */
++
++#include "umd_video.h"
++#include "umd_dxva.h"
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Profiles and caps */
++
++enum decode_codec { CODEC_H264, CODEC_HEVC, CODEC_VP9, CODEC_AV1 };
++
++/* What is offered: a D3D12 decode profile with an output format (a Vulkan profile each) */
++struct decode_profile_def {
++   GUID guid;
++   decode_codec codec;
++   DXGI_FORMAT format;
++   int stdProfile;
++};
++
++static const decode_profile_def DECODE_PROFILES[] = {
++   /* D3D12_VIDEO_DECODE_PROFILE_H264 (DXVA2_ModeH264_VLD_NoFGT) */
++   {{0x1b81be68, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}}, CODEC_H264, DXGI_FORMAT_NV12,
++    STD_VIDEO_H264_PROFILE_IDC_HIGH},
++   /* D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN, _MAIN10 */
++   {{0x5b11d51b, 0x2f4c, 0x4452, {0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0}}, CODEC_HEVC, DXGI_FORMAT_NV12,
++    STD_VIDEO_H265_PROFILE_IDC_MAIN},
++   {{0x107af0e0, 0xef1a, 0x4d19, {0xab, 0xa8, 0x67, 0xa1, 0x63, 0x07, 0x3d, 0x13}}, CODEC_HEVC, DXGI_FORMAT_P010,
++    STD_VIDEO_H265_PROFILE_IDC_MAIN_10},
++   /* D3D12_VIDEO_DECODE_PROFILE_VP9, _VP9_10BIT_PROFILE2 */
++   {{0x463707f8, 0xa1d0, 0x4585, {0x87, 0x6d, 0x83, 0xaa, 0x6d, 0x60, 0xb8, 0x9e}}, CODEC_VP9, DXGI_FORMAT_NV12,
++    STD_VIDEO_VP9_PROFILE_0},
++   {{0xa4c749ef, 0x6ecf, 0x48aa, {0x84, 0x48, 0x50, 0xa7, 0xa1, 0x16, 0x5f, 0xf7}}, CODEC_VP9, DXGI_FORMAT_P010,
++    STD_VIDEO_VP9_PROFILE_2},
++   /* D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0: 8 and 10 bits */
++   {{0xb8be4ccb, 0xcf53, 0x46ba, {0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a}}, CODEC_AV1, DXGI_FORMAT_NV12,
++    STD_VIDEO_AV1_PROFILE_MAIN},
++   {{0xb8be4ccb, 0xcf53, 0x46ba, {0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a}}, CODEC_AV1, DXGI_FORMAT_P010,
++    STD_VIDEO_AV1_PROFILE_MAIN},
++};
++#define DECODE_PROFILE_COUNT (sizeof(DECODE_PROFILES) / sizeof(DECODE_PROFILES[0]))
++
++/* DXVA_NoEncrypt */
++static const GUID decode_encryption_none = {0x1b81bed0, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}};
++
++struct decode_profile {
++   VkVideoProfileInfoKHR info;
++   VkVideoDecodeH264ProfileInfoKHR h264;
++   VkVideoDecodeH265ProfileInfoKHR h265;
++   VkVideoDecodeVP9ProfileInfoKHR vp9;
++   VkVideoDecodeAV1ProfileInfoKHR av1;
++   VkVideoProfileListInfoKHR list;
++   VkFormat format;
++   decode_codec codec;
++};
++
++struct decode_caps {
++   bool queried, ok;
++   VkVideoCapabilitiesKHR caps;
++   VkVideoDecodeCapabilitiesKHR decode;
++   VkVideoDecodeH264CapabilitiesKHR h264;
++   VkVideoDecodeH265CapabilitiesKHR h265;
++   VkVideoDecodeVP9CapabilitiesKHR vp9;
++   VkVideoDecodeAV1CapabilitiesKHR av1;
++};
++
++static void
++decode_profile_fill(decode_profile *p, int index)
++{
++   const decode_profile_def &d = DECODE_PROFILES[index];
++   memset(p, 0, sizeof(*p));
++   p->codec = d.codec;
++   bool ten = d.format == DXGI_FORMAT_P010;
++   p->info.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR;
++   p->info.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
++   p->info.lumaBitDepth = p->info.chromaBitDepth =
++      ten ? VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR : VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
++   switch (d.codec) {
++   case CODEC_H264:
++      p->info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR;
++      p->h264.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PROFILE_INFO_KHR;
++      p->h264.stdProfileIdc = (StdVideoH264ProfileIdc)d.stdProfile;
++      /* ponytail: progressive only; interlaced H.264 (field pictures, MBAFF) would need the interleaved layout */
++      p->h264.pictureLayout = VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR;
++      p->info.pNext = &p->h264;
++      break;
++   case CODEC_HEVC:
++      p->info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
++      p->h265.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PROFILE_INFO_KHR;
++      p->h265.stdProfileIdc = (StdVideoH265ProfileIdc)d.stdProfile;
++      p->info.pNext = &p->h265;
++      break;
++   case CODEC_VP9:
++      p->info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
++      p->vp9.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_PROFILE_INFO_KHR;
++      p->vp9.stdProfile = (StdVideoVP9Profile)d.stdProfile;
++      p->info.pNext = &p->vp9;
++      break;
++   case CODEC_AV1:
++      p->info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
++      p->av1.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_PROFILE_INFO_KHR;
++      p->av1.stdProfile = (StdVideoAV1Profile)d.stdProfile;
++      /* film grain needs an output picture apart from the DPB (see decode_av1) */
++      p->av1.filmGrainSupport = VK_FALSE;
++      p->info.pNext = &p->av1;
++      break;
++   }
++   p->list.sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR;
++   p->list.profileCount = 1;
++   p->list.pProfiles = &p->info;
++   p->format = ten ? VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 : VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
++}
++
++/* The DPB usage the decoder needs of a profile's pictures: decoded into (coinciding with the output), copied out */
++static const VkImageUsageFlags DPB_USAGE =
++   VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR | VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++
++static bool
++decode_format_ok(viogpu_video *v, decode_profile *p)
++{
++   VkPhysicalDeviceVideoFormatInfoKHR info = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_FORMAT_INFO_KHR};
++   info.pNext = &p->list;
++   info.imageUsage = DPB_USAGE;
++   uint32_t count = 0;
++   if (v->GetPhysicalDeviceVideoFormatPropertiesKHR(v->physical, &info, &count, NULL) != VK_SUCCESS || !count)
++      return false;
++   std::vector<VkVideoFormatPropertiesKHR> props(count, {VK_STRUCTURE_TYPE_VIDEO_FORMAT_PROPERTIES_KHR});
++   if (v->GetPhysicalDeviceVideoFormatPropertiesKHR(v->physical, &info, &count, props.data()) != VK_SUCCESS)
++      return false;
++   for (const auto &f : props)
++      if (f.format == p->format && f.imageTiling == VK_IMAGE_TILING_OPTIMAL)
++         return true;
++   return false;
++}
++
++static const decode_caps *
++decode_caps_get(viogpu_video *v, int index)
++{
++   if (!v || index < 0 || index >= (int)DECODE_PROFILE_COUNT || v->decodeFamily == VK_QUEUE_FAMILY_IGNORED)
++      return NULL;
++   if (!v->decodeCaps)
++      v->decodeCaps = new decode_caps[DECODE_PROFILE_COUNT]();
++   decode_caps *c = &v->decodeCaps[index];
++   if (!c->queried) {
++      c->queried = true;
++      decode_profile p;
++      decode_profile_fill(&p, index);
++      c->caps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
++      c->caps.pNext = &c->decode;
++      c->decode.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR;
++      switch (p.codec) {
++      case CODEC_H264:
++         c->decode.pNext = &c->h264;
++         c->h264.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR;
++         break;
++      case CODEC_HEVC:
++         c->decode.pNext = &c->h265;
++         c->h265.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_CAPABILITIES_KHR;
++         break;
++      case CODEC_VP9:
++         c->decode.pNext = &c->vp9;
++         c->vp9.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_CAPABILITIES_KHR;
++         break;
++      case CODEC_AV1:
++         c->decode.pNext = &c->av1;
++         c->av1.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_CAPABILITIES_KHR;
++         break;
++      }
++      VkResult r = v->GetPhysicalDeviceVideoCapabilitiesKHR(v->physical, &p.info, &c->caps);
++      /* decoding into the DPB and copying out needs coinciding DPB and output pictures (ponytail: a decoder with
++       * distinct ones only would need an output picture of its own) */
++      c->ok = r == VK_SUCCESS && c->caps.maxDpbSlots >= 2 &&
++              (c->decode.flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR) && decode_format_ok(v, &p);
++      viogpu_log("video: decode profile %d: %s (result %d, flags 0x%x, %ux%u..%ux%u, %u slots, %u active references)",
++                 index, c->ok ? "supported" : "not supported", (int)r, (unsigned)c->decode.flags,
++                 c->caps.minCodedExtent.width, c->caps.minCodedExtent.height, c->caps.maxCodedExtent.width,
++                 c->caps.maxCodedExtent.height, c->caps.maxDpbSlots, c->caps.maxActiveReferencePictures);
++   }
++   return c->ok ? c : NULL;
++}
++
++void
++decode_caps_destroy(viogpu_video *v)
++{
++   delete[] v->decodeCaps;
++   v->decodeCaps = NULL;
++}
++
++bool
++decode_supported(viogpu_video *v)
++{
++   for (int i = 0; i < (int)DECODE_PROFILE_COUNT; i++)
++      if (decode_caps_get(v, i))
++         return true;
++   return false;
++}
++
++/* A configuration and format -> the profile index, or -1 */
++static int
++decode_profile_index(const D3D12DDI_VIDEO_DECODE_CONFIGURATION_0020 &config, DXGI_FORMAT format)
++{
++   static const GUID none = {};
++   if (config.BitstreamEncryption != none && config.BitstreamEncryption != decode_encryption_none)
++      return -1;
++   /* ponytail: progressive pictures only (see decode_profile_fill) */
++   if (config.InterlaceType != D3D12DDI_VIDEO_CODED_INTERLACE_TYPE_0020_NONE)
++      return -1;
++   for (int i = 0; i < (int)DECODE_PROFILE_COUNT; i++)
++      if (DECODE_PROFILES[i].guid == config.DecodeProfile && DECODE_PROFILES[i].format == format)
++         return i;
++   return -1;
++}
++
++/* The distinct profile GUIDs offered (H.264 when nothing is: the runtime wants a decode profile on a graphics device,
++ * only compute-only ones may have none, so then it is listed and DECODE_SUPPORT says no) */
++static std::vector<GUID>
++decode_guids(viogpu_video *v)
++{
++   std::vector<GUID> guids;
++   for (int i = 0; i < (int)DECODE_PROFILE_COUNT; i++)
++      if (decode_caps_get(v, i) && std::find(guids.begin(), guids.end(), DECODE_PROFILES[i].guid) == guids.end())
++         guids.push_back(DECODE_PROFILES[i].guid);
++   if (guids.empty())
++      guids.push_back(DECODE_PROFILES[0].guid);
++   return guids;
++}
++
++static std::vector<DXGI_FORMAT>
++decode_formats(viogpu_video *v, const GUID &guid)
++{
++   std::vector<DXGI_FORMAT> formats;
++   for (int i = 0; i < (int)DECODE_PROFILE_COUNT; i++)
++      if (DECODE_PROFILES[i].guid == guid && decode_caps_get(v, i))
++         formats.push_back(DECODE_PROFILES[i].format);
++   if (formats.empty())
++      formats.push_back(DXGI_FORMAT_NV12);
++   return formats;
++}
++
++#define CAPS(T) (args->DataSize >= sizeof(T) ? (T *)args->pData : NULL)
++
++HRESULT
++decode_get_caps(viogpu_video *v, const D3D12DDIARG_VIDEO_GETCAPS_0020 *args)
++{
++   switch (args->Type) {
++   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_PROFILE_COUNT: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_PROFILE_COUNT_DATA_0032);
++      if (!d)
++         return E_INVALIDARG;
++      d->ProfileCount = (UINT)decode_guids(v).size();
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_PROFILES: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_PROFILES_DATA_0020);
++      std::vector<GUID> guids = decode_guids(v);
++      if (!d || d->ProfileCount < guids.size() || !d->pProfiles)
++         return E_INVALIDARG;
++      std::copy(guids.begin(), guids.end(), d->pProfiles);
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_FORMAT_COUNT: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_FORMAT_COUNT_DATA_0032);
++      if (!d)
++         return E_INVALIDARG;
++      d->FormatCount = (UINT)decode_formats(v, d->Configuration.DecodeProfile).size();
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_FORMATS: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_FORMATS_DATA_0020);
++      std::vector<DXGI_FORMAT> formats = d ? decode_formats(v, d->Configuration.DecodeProfile) : std::vector<DXGI_FORMAT>();
++      if (!d || d->FormatCount < formats.size() || !d->pOutputFormats)
++         return E_INVALIDARG;
++      std::copy(formats.begin(), formats.end(), d->pOutputFormats);
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODE_BITSTREAM_ENCRYPTION_SCHEME_COUNT: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_BITSTREAM_ENCRYPTION_SCHEME_COUNT_DATA_0032);
++      if (!d)
++         return E_INVALIDARG;
++      d->BitstreamEncryptionSchemeCount = 1;
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_BITSTREAM_ENCRYPTION_SCHEMES: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_BITSTREAM_ENCRYPTION_SCHEMES_DATA_0020);
++      if (!d || d->EncryptionSchemeCount < 1 || !d->pEncryptionSchemes)
++         return E_INVALIDARG;
++      d->pEncryptionSchemes[0] = decode_encryption_none;
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_SUPPORT: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_SUPPORT_DATA_0020);
++      if (!d)
++         return E_INVALIDARG;
++      const decode_caps *c = decode_caps_get(v, decode_profile_index(d->Configuration, d->DecodeFormat));
++      bool ok = c && d->Width >= c->caps.minCodedExtent.width && d->Height >= c->caps.minCodedExtent.height &&
++                d->Width <= c->caps.maxCodedExtent.width && d->Height <= c->caps.maxCodedExtent.height;
++      d->SupportFlags = ok ? D3D12DDI_VIDEO_DECODE_SUPPORT_FLAG_0020_SUPPORTED : D3D12DDI_VIDEO_DECODE_SUPPORT_FLAG_0020_NONE;
++      d->ConfigurationFlags = D3D12DDI_VIDEO_DECODE_CONFIGURATION_FLAG_0020_NONE;
++      /* tier 2: references in separate textures or texture arrays (the DPB is the decoder's own either way) */
++      d->DecodeTier = ok ? D3D12DDI_VIDEO_DECODE_TIER_0020_2 : D3D12DDI_VIDEO_DECODE_TIER_0020_NOT_SUPPORTED;
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0020_DECODE_CONVERSION_SUPPORT: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_CONVERSION_SUPPORT_DATA_0032);
++      if (!d)
++         return E_INVALIDARG;
++      /* no decode-time conversion or scaling (the video processor's job) */
++      d->SupportFlags = D3D12DDI_VIDEO_DECODE_CONVERSION_SUPPORT_FLAG_0020_NONE;
++      memset(&d->ScaleSupport, 0, sizeof(d->ScaleSupport));
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0032_DECODER_HEAP_SIZE: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODER_HEAP_SIZE_DATA_0072);
++      if (!d)
++         return E_INVALIDARG;
++      d->MemoryPoolL0Size = 0;
++      d->MemoryPoolL1Size = 0;
++      return S_OK;
++   }
++   case D3D12DDICAPS_TYPE_VIDEO_0040_DECODE_HISTOGRAM: {
++      auto *d = CAPS(D3D12DDI_VIDEO_DECODE_HISTOGRAM_DATA_0041);
++      if (!d)
++         return E_INVALIDARG;
++      d->Components = D3D12DDI_VIDEO_DECODE_HISTOGRAM_COMPONENT_FLAG_0041_NONE;
++      d->BinCount = 0;
++      d->CounterBitDepth = 0;
++      return S_OK;
++   }
++   default:
++      return E_INVALIDARG;
++   }
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Decoders, heaps and the session */
++
++struct viogpu_video_decoder {
++   D3D12DDI_VIDEO_DECODE_CONFIGURATION_0020 config;
++};
++
++/* What a DPB slot holds: the application's picture it stands for, its size, and (AV1) what pictures that reference
++ * it need to know of it */
++struct decode_slot {
++   bool used;
++   bool initialized;
++   ID3D12Resource *texture;
++   UINT subresource;
++   VkExtent2D extent;
++   StdVideoDecodeAV1ReferenceInfo av1;
++};
++
++/* The parameter sets as last made (pointers cleared: compared bytewise) */
++struct h264_params {
++   StdVideoH264SequenceParameterSet sps;
++   StdVideoH264PictureParameterSet pps;
++   StdVideoH264ScalingLists lists;
++};
++
++struct h265_params {
++   StdVideoH265VideoParameterSet vps;
++   StdVideoH265SequenceParameterSet sps;
++   StdVideoH265PictureParameterSet pps;
++   StdVideoH265ProfileTierLevel ptl;
++   StdVideoH265DecPicBufMgr dpbm;
++   StdVideoH265ScalingLists lists;
++   StdVideoH265ShortTermRefPicSet rps[STD_VIDEO_H265_MAX_SHORT_TERM_REF_PIC_SETS];
++   StdVideoH265LongTermRefPicsSps ltr;
++};
++
++struct decode_session {
++   viogpu_video *video;
++   decode_profile profile;
++   const decode_caps *caps;
++   VkExtent2D maxExtent;
++   VkVideoSessionKHR session;
++   std::vector<VkDeviceMemory> memory;
++   VkVideoSessionParametersKHR params;
++   std::vector<uint8_t> paramsKey;
++   /* parameters replaced while lists may still use them: freed with the session */
++   std::vector<VkVideoSessionParametersKHR> oldParams;
++   /* one image per slot (as ffmpeg's Vulkan decoder has them) */
++   std::vector<VkImage> dpb;
++   std::vector<VkDeviceMemory> dpbMemory;
++   std::vector<VkImageView> dpbViews;
++   std::vector<decode_slot> slots;
++   bool reset;
++};
++
++struct viogpu_video_decoder_heap {
++   viogpu_device *device;
++   int profile;
++   UINT width, height;
++   UINT dpbCount;
++   decode_session *session;
++};
++
++static SIZE_T APIENTRY
++calc_decoder_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_VIDEO_DECODER_0072 *)
++{
++   return sizeof(viogpu_video_decoder);
++}
++
++static HRESULT APIENTRY
++create_decoder(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_VIDEO_DECODER_0072 *args, D3D12DDI_HVIDEODECODER_0020 h)
++{
++   viogpu_video *v = video_get(device_from(hDevice));
++   bool any = false;
++   for (int i = 0; i < (int)DECODE_PROFILE_COUNT; i++)
++      any |= DECODE_PROFILES[i].guid == args->Configuration.DecodeProfile && decode_caps_get(v, i);
++   if (!any) {
++      viogpu_log("video: CreateVideoDecoder: profile not supported");
++      return E_INVALIDARG;
++   }
++   viogpu_video_decoder *decoder = new (h.pDrvPrivate) viogpu_video_decoder();
++   decoder->config = args->Configuration;
++   return S_OK;
++}
++
++static VOID APIENTRY
++destroy_decoder(D3D12DDI_HDEVICE, D3D12DDI_HVIDEODECODER_0020 h)
++{
++   ((viogpu_video_decoder *)h.pDrvPrivate)->~viogpu_video_decoder();
++}
++
++static SIZE_T APIENTRY
++calc_decoder_heap_size(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATE_VIDEO_DECODER_HEAP_0072 *)
++{
++   return sizeof(viogpu_video_decoder_heap);
++}
++
++static HRESULT APIENTRY
++create_decoder_heap(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATE_VIDEO_DECODER_HEAP_0072 *args,
++                    D3D12DDI_HVIDEODECODERHEAP_0032 h)
++{
++   viogpu_device *device = device_from(hDevice);
++   int index = decode_profile_index(args->Configuration, args->Format);
++   const decode_caps *c = decode_caps_get(video_get(device), index);
++   if (!c || args->DecodeWidth > c->caps.maxCodedExtent.width || args->DecodeHeight > c->caps.maxCodedExtent.height) {
++      viogpu_log("video: CreateVideoDecoderHeap: profile %d, %ux%u not supported", index, args->DecodeWidth,
++                 args->DecodeHeight);
++      return E_INVALIDARG;
++   }
++   viogpu_video_decoder_heap *heap = new (h.pDrvPrivate) viogpu_video_decoder_heap();
++   heap->device = device;
++   heap->profile = index;
++   heap->width = args->DecodeWidth;
++   heap->height = args->DecodeHeight;
++   heap->dpbCount = args->MaxDecodePictureBufferCount;
++   viogpu_log("video: CreateVideoDecoderHeap: profile %d, %ux%u, %u pictures", index, heap->width, heap->height,
++              heap->dpbCount);
++   return S_OK;
++}
++
++static void
++decode_session_destroy(decode_session *s)
++{
++   viogpu_video *v = s->video;
++   for (VkImageView view : s->dpbViews)
++      v->DestroyImageView(v->device, view, NULL);
++   for (VkImage image : s->dpb)
++      v->DestroyImage(v->device, image, NULL);
++   for (VkDeviceMemory m : s->dpbMemory)
++      v->FreeMemory(v->device, m, NULL);
++   for (VkVideoSessionParametersKHR p : s->oldParams)
++      v->DestroyVideoSessionParametersKHR(v->device, p, NULL);
++   if (s->params)
++      v->DestroyVideoSessionParametersKHR(v->device, s->params, NULL);
++   if (s->session)
++      v->DestroyVideoSessionKHR(v->device, s->session, NULL);
++   for (VkDeviceMemory m : s->memory)
++      v->FreeMemory(v->device, m, NULL);
++   delete s;
++}
++
++static VOID APIENTRY
++destroy_decoder_heap(D3D12DDI_HDEVICE, D3D12DDI_HVIDEODECODERHEAP_0032 h)
++{
++   viogpu_video_decoder_heap *heap = (viogpu_video_decoder_heap *)h.pDrvPrivate;
++   if (heap->session)
++      decode_session_destroy(heap->session);
++   heap->~viogpu_video_decoder_heap();
++}
++
++static UINT
++align_up(UINT v, UINT a)
++{
++   return a ? (v + a - 1) / a * a : v;
++}
++
++/* The session and its DPB, made by the heap's first DecodeFrame */
++static decode_session *
++decode_session_get(viogpu_video_decoder_heap *heap)
++{
++   if (heap->session)
++      return heap->session;
++   viogpu_video *v = heap->device->video;
++   decode_session *s = new decode_session();
++   s->video = v;
++   decode_profile_fill(&s->profile, heap->profile);
++   s->caps = decode_caps_get(v, heap->profile);
++   /* the heap's size as the codecs' coded sizes (macroblock, CTB aligned) and the decoder's access granularity round
++    * it */
++   VkExtent2D granularity = s->caps->caps.pictureAccessGranularity;
++   UINT block = s->profile.codec == CODEC_H264 ? 16 : s->profile.codec == CODEC_HEVC ? 64 : 8;
++   s->maxExtent.width = std::min(align_up(align_up(heap->width, block), std::max(granularity.width, 1u)),
++                                 s->caps->caps.maxCodedExtent.width);
++   s->maxExtent.height = std::min(align_up(align_up(heap->height, block), std::max(granularity.height, 1u)),
++                                  s->caps->caps.maxCodedExtent.height);
++   /* the application's references and the current picture */
++   uint32_t slots = std::min(s->caps->caps.maxDpbSlots, std::max(heap->dpbCount, 2u) + 1);
++
++   VkVideoSessionCreateInfoKHR info = {VK_STRUCTURE_TYPE_VIDEO_SESSION_CREATE_INFO_KHR};
++   info.queueFamilyIndex = v->decodeFamily;
++   info.pVideoProfile = &s->profile.info;
++   info.pictureFormat = s->profile.format;
++   info.maxCodedExtent = s->maxExtent;
++   info.referencePictureFormat = s->profile.format;
++   info.maxDpbSlots = slots;
++   info.maxActiveReferencePictures = std::min(s->caps->caps.maxActiveReferencePictures, slots - 1);
++   info.pStdHeaderVersion = &s->caps->caps.stdHeaderVersion;
++   VkResult r = v->CreateVideoSessionKHR(v->device, &info, NULL, &s->session);
++   if (r != VK_SUCCESS) {
++      viogpu_log("video: decode vkCreateVideoSessionKHR: %d", (int)r);
++      decode_session_destroy(s);
++      return NULL;
++   }
++
++   uint32_t count = 0;
++   v->GetVideoSessionMemoryRequirementsKHR(v->device, s->session, &count, NULL);
++   std::vector<VkVideoSessionMemoryRequirementsKHR> reqs(count, {VK_STRUCTURE_TYPE_VIDEO_SESSION_MEMORY_REQUIREMENTS_KHR});
++   v->GetVideoSessionMemoryRequirementsKHR(v->device, s->session, &count, reqs.data());
++   std::vector<VkBindVideoSessionMemoryInfoKHR> binds;
++   for (const auto &req : reqs) {
++      VkDeviceMemory memory = memory_allocate(v, req.memoryRequirements.size, req.memoryRequirements.memoryTypeBits);
++      if (!memory) {
++         decode_session_destroy(s);
++         return NULL;
++      }
++      s->memory.push_back(memory);
++      VkBindVideoSessionMemoryInfoKHR bind = {VK_STRUCTURE_TYPE_BIND_VIDEO_SESSION_MEMORY_INFO_KHR};
++      bind.memoryBindIndex = req.memoryBindIndex;
++      bind.memory = memory;
++      bind.memorySize = req.memoryRequirements.size;
++      binds.push_back(bind);
++   }
++   if (count && (r = v->BindVideoSessionMemoryKHR(v->device, s->session, count, binds.data())) != VK_SUCCESS) {
++      viogpu_log("video: decode vkBindVideoSessionMemoryKHR: %d", (int)r);
++      decode_session_destroy(s);
++      return NULL;
++   }
++
++   /* the DPB: an image per slot */
++   VkImageCreateInfo image = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++   image.pNext = &s->profile.list;
++   image.imageType = VK_IMAGE_TYPE_2D;
++   image.format = s->profile.format;
++   image.extent = {s->maxExtent.width, s->maxExtent.height, 1};
++   image.mipLevels = 1;
++   image.arrayLayers = 1;
++   image.samples = VK_SAMPLE_COUNT_1_BIT;
++   image.tiling = VK_IMAGE_TILING_OPTIMAL;
++   image.usage = DPB_USAGE;
++   image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++   image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++   for (uint32_t i = 0; i < slots; i++) {
++      VkImage handle;
++      if ((r = v->CreateImage(v->device, &image, NULL, &handle)) != VK_SUCCESS) {
++         viogpu_log("video: decode DPB image: %d", (int)r);
++         decode_session_destroy(s);
++         return NULL;
++      }
++      s->dpb.push_back(handle);
++      VkMemoryRequirements req;
++      v->GetImageMemoryRequirements(v->device, handle, &req);
++      VkDeviceMemory memory = memory_allocate(v, req.size, req.memoryTypeBits);
++      if (memory)
++         s->dpbMemory.push_back(memory);
++      if (!memory || v->BindImageMemory(v->device, handle, memory, 0) != VK_SUCCESS) {
++         viogpu_log("video: no memory for the decode DPB (%llu bytes)", (unsigned long long)req.size);
++         decode_session_destroy(s);
++         return NULL;
++      }
++      VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++      view.image = handle;
++      view.viewType = VK_IMAGE_VIEW_TYPE_2D;
++      view.format = s->profile.format;
++      view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++      VkImageView viewHandle;
++      if (v->CreateImageView(v->device, &view, NULL, &viewHandle) != VK_SUCCESS) {
++         decode_session_destroy(s);
++         return NULL;
++      }
++      s->dpbViews.push_back(viewHandle);
++   }
++   s->slots.resize(slots);
++   viogpu_log("video: decode session %ux%u, %u slots", s->maxExtent.width, s->maxExtent.height, slots);
++   heap->session = s;
++   return s;
++}
++
++/* New session parameters when the parameter sets changed (a copy of them, pointers cleared, is the key) */
++template <typename P>
++static bool
++params_changed(decode_session *s, const P &p)
++{
++   if (s->params && s->paramsKey.size() == sizeof(p) && !memcmp(s->paramsKey.data(), &p, sizeof(p)))
++      return false;
++   s->paramsKey.assign((const uint8_t *)&p, (const uint8_t *)&p + sizeof(p));
++   return true;
++}
++
++static bool
++params_create(decode_session *s, const void *codecInfo)
++{
++   viogpu_video *v = s->video;
++   VkVideoSessionParametersCreateInfoKHR info = {VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR};
++   info.pNext = codecInfo;
++   info.videoSession = s->session;
++   VkVideoSessionParametersKHR params;
++   VkResult r = v->CreateVideoSessionParametersKHR(v->device, &info, NULL, &params);
++   if (r != VK_SUCCESS) {
++      viogpu_log("video: decode vkCreateVideoSessionParametersKHR: %d", (int)r);
++      s->paramsKey.clear();
++      return false;
++   }
++   if (s->params)
++      s->oldParams.push_back(s->params);
++   s->params = params;
++   return true;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Slots and pictures */
++
++/* A reference the picture parameters name: the application's texture */
++struct decode_ref {
++   ID3D12Resource *texture;
++   UINT subresource;
++   int slot;
++};
++
++/* A picture as a codec builds it for the recording */
++struct decode_picture {
++   VkExtent2D extent;
++   /* the references the stream still has (their slots stay) */
++   std::vector<decode_ref> keep;
++   /* the ones this picture uses (indices into keep), with their codec DPB slot info (NULL: the codec has none) */
++   std::vector<int> used;
++   std::vector<const void *> usedInfo;
++   int setup;
++   const void *setupInfo;
++   const void *pictureInfo;
++};
++
++/* A DXVA texture index -> the application's texture */
++static bool
++ref_texture(const D3D12DDI_VIDEO_DECODE_REFERENCE_FRAMES_0032 &frames, UINT index, decode_ref *ref)
++{
++   if (index >= frames.NumTexture2Ds || !frames.hDrvTexture2Ds)
++      return false;
++   ref->texture = resource_of(frames.hDrvTexture2Ds[index]);
++   ref->subresource = frames.pSubresources ? frames.pSubresources[index] : 0;
++   ref->slot = -1;
++   return ref->texture != NULL;
++}
++
++/* The kept references' slots (-1: never decoded, as at a stream starting with a non-key picture; pictures that use
++ * one decode without it), the slots of textures no reference names free again, and a slot for the current picture */
++static bool
++decode_slots_assign(decode_session *s, decode_picture *pic, ID3D12Resource *output, UINT outputSub)
++{
++   pic->extent.width = std::min(pic->extent.width, s->maxExtent.width);
++   pic->extent.height = std::min(pic->extent.height, s->maxExtent.height);
++   std::vector<bool> keep(s->slots.size(), false);
++   for (decode_ref &ref : pic->keep) {
++      ref.slot = -1;
++      for (size_t slot = 0; slot < s->slots.size(); slot++) {
++         const decode_slot &d = s->slots[slot];
++         if (d.used && d.texture == ref.texture && d.subresource == ref.subresource) {
++            ref.slot = (int)slot;
++            keep[slot] = true;
++            break;
++         }
++      }
++   }
++   for (size_t slot = 0; slot < s->slots.size(); slot++)
++      if (!keep[slot])
++         s->slots[slot].used = false;
++   pic->setup = -1;
++   for (size_t slot = 0; slot < s->slots.size() && pic->setup < 0; slot++) {
++      decode_slot &d = s->slots[slot];
++      if (!d.used) {
++         d.used = true;
++         d.texture = output;
++         d.subresource = outputSub;
++         d.extent = pic->extent;
++         pic->setup = (int)slot;
++      }
++   }
++   if (pic->setup < 0)
++      viogpu_log("video: no free decode DPB slot");
++   return pic->setup >= 0;
++}
++
++/* The kept reference for a texture index (-1: none) */
++static int
++keep_index(const decode_picture *pic, const D3D12DDI_VIDEO_DECODE_REFERENCE_FRAMES_0032 &frames, UINT index)
++{
++   decode_ref ref;
++   if (!ref_texture(frames, index, &ref))
++      return -1;
++   for (size_t k = 0; k < pic->keep.size(); k++)
++      if (pic->keep[k].texture == ref.texture && pic->keep[k].subresource == ref.subresource)
++         return (int)k;
++   return -1;
++}
++
++static void
++keep_add(decode_picture *pic, const D3D12DDI_VIDEO_DECODE_REFERENCE_FRAMES_0032 &frames, UINT index)
++{
++   decode_ref ref;
++   if (ref_texture(frames, index, &ref) && keep_index(pic, frames, index) < 0)
++      pic->keep.push_back(ref);
++}
++
++/* A reference this picture uses (once each) */
++static void
++use_add(decode_picture *pic, int k, const void *info)
++{
++   if (k < 0 || pic->keep[k].slot < 0 || std::find(pic->used.begin(), pic->used.end(), k) != pic->used.end())
++      return;
++   pic->used.push_back(k);
++   pic->usedInfo.push_back(info);
++}
++
++static const void *
++frame_argument(const D3D12DDI_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS_0032 *in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020 type,
++               UINT minSize, UINT *size = NULL)
++{
++   for (UINT i = 0; i < in->NumFrameArguments && i < D3D12DDI_VIDEO_DECODE_MAX_ARGUMENTS_0020; i++) {
++      const auto &a = in->FrameArguments[i];
++      if (a.Type == type && a.pData && a.Size >= minSize) {
++         if (size)
++            *size = a.Size;
++         return a.pData;
++      }
++   }
++   return NULL;
++}
++
++/* What a codec's picture builder gets */
++struct decode_input {
++   decode_session *s;
++   const D3D12DDI_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS_0032 *in;
++   ID3D12Resource *output;
++   UINT outputSub;
++   const void *slices;
++   UINT sliceBytes;
++};
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* H.264 */
++
++/* DecodeFrame's codec-specific Vulkan structures, kept together while the command is recorded */
++struct h264_picture {
++   VkVideoDecodeH264PictureInfoKHR info;
++   StdVideoDecodeH264PictureInfo std;
++   std::vector<uint32_t> sliceOffsets;
++   StdVideoDecodeH264ReferenceInfo setupInfo;
++   VkVideoDecodeH264DpbSlotInfoKHR setupSlot;
++   StdVideoDecodeH264ReferenceInfo refInfo[16];
++   VkVideoDecodeH264DpbSlotInfoKHR refSlot[16];
++};
++
++static StdVideoH264LevelIdc
++h264_level(const decode_caps *c)
++{
++   return c->h264.maxLevelIdc;
++}
++
++/* The SPS and PPS the picture parameters stand for (ids 0; scaling lists in the PPS, as DXVA has the ones in
++ * effect) */
++static void
++h264_params_fill(const decode_caps *c, const DXVA_PicParams_H264 *pp, const DXVA_Qmatrix_H264 *qm, h264_params *p)
++{
++   memset(p, 0, sizeof(*p));
++   StdVideoH264SequenceParameterSet &sps = p->sps;
++   sps.flags.direct_8x8_inference_flag = pp->direct_8x8_inference_flag;
++   sps.flags.mb_adaptive_frame_field_flag = pp->MbaffFrameFlag;
++   sps.flags.frame_mbs_only_flag = pp->frame_mbs_only_flag;
++   sps.flags.delta_pic_order_always_zero_flag = pp->delta_pic_order_always_zero_flag;
++   sps.flags.gaps_in_frame_num_value_allowed_flag = 1;
++   sps.profile_idc = STD_VIDEO_H264_PROFILE_IDC_HIGH;
++   sps.level_idc = h264_level(c);
++   sps.chroma_format_idc = (StdVideoH264ChromaFormatIdc)pp->chroma_format_idc;
++   sps.bit_depth_luma_minus8 = pp->bit_depth_luma_minus8;
++   sps.bit_depth_chroma_minus8 = pp->bit_depth_chroma_minus8;
++   sps.log2_max_frame_num_minus4 = pp->log2_max_frame_num_minus4;
++   sps.pic_order_cnt_type = (StdVideoH264PocType)pp->pic_order_cnt_type;
++   sps.log2_max_pic_order_cnt_lsb_minus4 = pp->log2_max_pic_order_cnt_lsb_minus4;
++   sps.max_num_ref_frames = pp->num_ref_frames;
++   sps.pic_width_in_mbs_minus1 = pp->wFrameWidthInMbsMinus1;
++   /* map units: frames or field pairs */
++   sps.pic_height_in_map_units_minus1 =
++      pp->frame_mbs_only_flag ? pp->wFrameHeightInMbsMinus1 : (pp->wFrameHeightInMbsMinus1 + 1) / 2 - 1;
++
++   StdVideoH264PictureParameterSet &pps = p->pps;
++   pps.flags.transform_8x8_mode_flag = pp->transform_8x8_mode_flag;
++   pps.flags.redundant_pic_cnt_present_flag = pp->redundant_pic_cnt_present_flag;
++   pps.flags.constrained_intra_pred_flag = pp->constrained_intra_pred_flag;
++   pps.flags.deblocking_filter_control_present_flag = pp->deblocking_filter_control_present_flag;
++   pps.flags.weighted_pred_flag = pp->weighted_pred_flag;
++   pps.flags.bottom_field_pic_order_in_frame_present_flag = pp->pic_order_present_flag;
++   pps.flags.entropy_coding_mode_flag = pp->entropy_coding_mode_flag;
++   pps.flags.pic_scaling_matrix_present_flag = qm != NULL;
++   pps.num_ref_idx_l0_default_active_minus1 = pp->num_ref_idx_l0_active_minus1;
++   pps.num_ref_idx_l1_default_active_minus1 = pp->num_ref_idx_l1_active_minus1;
++   pps.weighted_bipred_idc = (StdVideoH264WeightedBipredIdc)pp->weighted_bipred_idc;
++   pps.pic_init_qp_minus26 = pp->pic_init_qp_minus26;
++   pps.pic_init_qs_minus26 = pp->pic_init_qs_minus26;
++   pps.chroma_qp_index_offset = pp->chroma_qp_index_offset;
++   pps.second_chroma_qp_index_offset = pp->second_chroma_qp_index_offset;
++   if (qm) {
++      /* DXVA's lists are in zigzag order as Vulkan's; its 8x8 ones are intra and inter luma, Vulkan's first two */
++      p->lists.scaling_list_present_mask = 0xff;
++      memcpy(p->lists.ScalingList4x4, qm->bScalingLists4x4, sizeof(qm->bScalingLists4x4));
++      memcpy(p->lists.ScalingList8x8, qm->bScalingLists8x8, sizeof(qm->bScalingLists8x8));
++   }
++}
++
++static bool
++h264_params_get(decode_session *s, const DXVA_PicParams_H264 *pp, const DXVA_Qmatrix_H264 *qm)
++{
++   h264_params p;
++   h264_params_fill(s->caps, pp, qm, &p);
++   if (!params_changed(s, p))
++      return true;
++   if (qm)
++      p.pps.pScalingLists = &p.lists;
++   VkVideoDecodeH264SessionParametersAddInfoKHR add = {VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_SESSION_PARAMETERS_ADD_INFO_KHR};
++   add.stdSPSCount = 1;
++   add.pStdSPSs = &p.sps;
++   add.stdPPSCount = 1;
++   add.pStdPPSs = &p.pps;
++   VkVideoDecodeH264SessionParametersCreateInfoKHR info = {
++      VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_SESSION_PARAMETERS_CREATE_INFO_KHR};
++   info.maxStdSPSCount = 1;
++   info.maxStdPPSCount = 1;
++   info.pParametersAddInfo = &add;
++   return params_create(s, &info);
++}
++
++static bool
++decode_h264(const decode_input &d, decode_picture *pic, h264_picture *h)
++{
++   const auto *pp = (const DXVA_PicParams_H264 *)frame_argument(
++      d.in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020_PICTURE_PARAMETERS, sizeof(DXVA_PicParams_H264));
++   const auto *qm = (const DXVA_Qmatrix_H264 *)frame_argument(
++      d.in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020_INVERSE_QUANTIZATION_MATRIX, sizeof(DXVA_Qmatrix_H264));
++   if (!pp || !h264_params_get(d.s, pp, qm))
++      return false;
++   pic->extent = {(pp->wFrameWidthInMbsMinus1 + 1u) * 16, (pp->wFrameHeightInMbsMinus1 + 1u) * 16};
++   /* the references DXVA lists (the DPB's reference pictures: all of them are Vulkan's references too) */
++   std::vector<UINT> listed;
++   for (UINT i = 0; i < 16; i++) {
++      if (pp->RefFrameList[i].bPicEntry == DXVA_INVALID_ENTRY || (pp->NonExistingFrameFlags & (1u << i)) ||
++          !((pp->UsedForReferenceFlags >> (2 * i)) & 3))
++         continue;
++      keep_add(pic, d.in->ReferenceFrames, pp->RefFrameList[i].Index7Bits);
++      listed.push_back(i);
++   }
++   if (!decode_slots_assign(d.s, pic, d.output, d.outputSub))
++      return false;
++   UINT n = 0;
++   for (UINT i : listed) {
++      UINT used = (pp->UsedForReferenceFlags >> (2 * i)) & 3;
++      StdVideoDecodeH264ReferenceInfo &ri = h->refInfo[n];
++      ri.flags.top_field_flag = used == 1;
++      ri.flags.bottom_field_flag = used == 2;
++      ri.flags.used_for_long_term_reference = pp->RefFrameList[i].AssociatedFlag;
++      ri.FrameNum = pp->FrameNumList[i];
++      ri.PicOrderCnt[0] = pp->FieldOrderCntList[i][0];
++      ri.PicOrderCnt[1] = pp->FieldOrderCntList[i][1];
++      h->refSlot[n].sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_DPB_SLOT_INFO_KHR;
++      h->refSlot[n].pStdReferenceInfo = &ri;
++      use_add(pic, keep_index(pic, d.in->ReferenceFrames, pp->RefFrameList[i].Index7Bits), &h->refSlot[n]);
++      n++;
++   }
++   StdVideoDecodeH264PictureInfo &std = h->std;
++   std.flags.field_pic_flag = pp->field_pic_flag;
++   std.flags.is_intra = pp->IntraPicFlag;
++   /* DXVA has no IDR flag: an intra picture with frame_num 0 and no references is one */
++   std.flags.IdrPicFlag = pp->IntraPicFlag && pp->frame_num == 0 && listed.empty();
++   std.flags.bottom_field_flag = pp->field_pic_flag && pp->CurrPic.AssociatedFlag;
++   std.flags.is_reference = pp->RefPicFlag;
++   std.frame_num = pp->frame_num;
++   std.PicOrderCnt[0] = pp->CurrFieldOrderCnt[0];
++   std.PicOrderCnt[1] = pp->CurrFieldOrderCnt[1];
++   h->setupInfo.FrameNum = pp->frame_num;
++   h->setupInfo.PicOrderCnt[0] = pp->CurrFieldOrderCnt[0];
++   h->setupInfo.PicOrderCnt[1] = pp->CurrFieldOrderCnt[1];
++   h->setupSlot.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_DPB_SLOT_INFO_KHR;
++   h->setupSlot.pStdReferenceInfo = &h->setupInfo;
++   pic->setupInfo = &h->setupSlot;
++   for (UINT i = 0; i < d.sliceBytes / sizeof(DXVA_Slice_Short); i++)
++      h->sliceOffsets.push_back(((const DXVA_Slice_Short *)d.slices)[i].BSNALunitDataLocation);
++   h->info.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PICTURE_INFO_KHR;
++   h->info.pStdPictureInfo = &std;
++   h->info.sliceCount = (uint32_t)h->sliceOffsets.size();
++   h->info.pSliceOffsets = h->sliceOffsets.data();
++   pic->pictureInfo = &h->info;
++   return true;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* HEVC */
++
++struct h265_picture {
++   VkVideoDecodeH265PictureInfoKHR info;
++   StdVideoDecodeH265PictureInfo std;
++   std::vector<uint32_t> sliceOffsets;
++   StdVideoDecodeH265ReferenceInfo setupInfo;
++   VkVideoDecodeH265DpbSlotInfoKHR setupSlot;
++   StdVideoDecodeH265ReferenceInfo refInfo[15];
++   VkVideoDecodeH265DpbSlotInfoKHR refSlot[15];
++};
++
++/* The VPS, SPS and PPS the picture parameters stand for (ids 0; scaling lists in the PPS). The SPS's short-term
++ * reference picture sets aren't in DXVA: slices that use them are parsed by their count, and the references come
++ * from the picture parameters, so they are left empty. */
++static void
++h265_params_fill(const decode_caps *c, const decode_profile &profile, const DXVA_PicParams_HEVC *pp,
++                 const DXVA_Qmatrix_HEVC *qm, h265_params *p)
++{
++   memset(p, 0, sizeof(*p));
++   p->ptl.flags.general_progressive_source_flag = 1;
++   p->ptl.flags.general_frame_only_constraint_flag = 1;
++   p->ptl.general_profile_idc = profile.h265.stdProfileIdc;
++   p->ptl.general_level_idc = c->h265.maxLevelIdc;
++   p->dpbm.max_dec_pic_buffering_minus1[0] = pp->sps_max_dec_pic_buffering_minus1;
++   p->dpbm.max_num_reorder_pics[0] = pp->sps_max_dec_pic_buffering_minus1;
++
++   p->vps.flags.vps_temporal_id_nesting_flag = 1;
++
++   StdVideoH265SequenceParameterSet &sps = p->sps;
++   UINT log2MinCb = pp->log2_min_luma_coding_block_size_minus3 + 3;
++   sps.flags.sps_temporal_id_nesting_flag = 1;
++   sps.flags.separate_colour_plane_flag = pp->separate_colour_plane_flag;
++   sps.flags.scaling_list_enabled_flag = pp->scaling_list_enabled_flag;
++   sps.flags.amp_enabled_flag = pp->amp_enabled_flag;
++   sps.flags.sample_adaptive_offset_enabled_flag = pp->sample_adaptive_offset_enabled_flag;
++   sps.flags.pcm_enabled_flag = pp->pcm_enabled_flag;
++   sps.flags.pcm_loop_filter_disabled_flag = pp->pcm_loop_filter_disabled_flag;
++   sps.flags.long_term_ref_pics_present_flag = pp->long_term_ref_pics_present_flag;
++   sps.flags.sps_temporal_mvp_enabled_flag = pp->sps_temporal_mvp_enabled_flag;
++   sps.flags.strong_intra_smoothing_enabled_flag = pp->strong_intra_smoothing_enabled_flag;
++   sps.chroma_format_idc = (StdVideoH265ChromaFormatIdc)pp->chroma_format_idc;
++   sps.pic_width_in_luma_samples = (uint32_t)pp->PicWidthInMinCbsY << log2MinCb;
++   sps.pic_height_in_luma_samples = (uint32_t)pp->PicHeightInMinCbsY << log2MinCb;
++   sps.bit_depth_luma_minus8 = pp->bit_depth_luma_minus8;
++   sps.bit_depth_chroma_minus8 = pp->bit_depth_chroma_minus8;
++   sps.log2_max_pic_order_cnt_lsb_minus4 = pp->log2_max_pic_order_cnt_lsb_minus4;
++   sps.log2_min_luma_coding_block_size_minus3 = pp->log2_min_luma_coding_block_size_minus3;
++   sps.log2_diff_max_min_luma_coding_block_size = pp->log2_diff_max_min_luma_coding_block_size;
++   sps.log2_min_luma_transform_block_size_minus2 = pp->log2_min_transform_block_size_minus2;
++   sps.log2_diff_max_min_luma_transform_block_size = pp->log2_diff_max_min_transform_block_size;
++   sps.max_transform_hierarchy_depth_inter = pp->max_transform_hierarchy_depth_inter;
++   sps.max_transform_hierarchy_depth_intra = pp->max_transform_hierarchy_depth_intra;
++   sps.num_short_term_ref_pic_sets = pp->num_short_term_ref_pic_sets;
++   sps.num_long_term_ref_pics_sps = pp->num_long_term_ref_pics_sps;
++   sps.pcm_sample_bit_depth_luma_minus1 = pp->pcm_sample_bit_depth_luma_minus1;
++   sps.pcm_sample_bit_depth_chroma_minus1 = pp->pcm_sample_bit_depth_chroma_minus1;
++   sps.log2_min_pcm_luma_coding_block_size_minus3 = pp->log2_min_pcm_luma_coding_block_size_minus3;
++   sps.log2_diff_max_min_pcm_luma_coding_block_size = pp->log2_diff_max_min_pcm_luma_coding_block_size;
++
++   StdVideoH265PictureParameterSet &pps = p->pps;
++   pps.flags.dependent_slice_segments_enabled_flag = pp->dependent_slice_segments_enabled_flag;
++   pps.flags.output_flag_present_flag = pp->output_flag_present_flag;
++   pps.flags.sign_data_hiding_enabled_flag = pp->sign_data_hiding_enabled_flag;
++   pps.flags.cabac_init_present_flag = pp->cabac_init_present_flag;
++   pps.flags.constrained_intra_pred_flag = pp->constrained_intra_pred_flag;
++   pps.flags.transform_skip_enabled_flag = pp->transform_skip_enabled_flag;
++   pps.flags.cu_qp_delta_enabled_flag = pp->cu_qp_delta_enabled_flag;
++   pps.flags.pps_slice_chroma_qp_offsets_present_flag = pp->pps_slice_chroma_qp_offsets_present_flag;
++   pps.flags.weighted_pred_flag = pp->weighted_pred_flag;
++   pps.flags.weighted_bipred_flag = pp->weighted_bipred_flag;
++   pps.flags.transquant_bypass_enabled_flag = pp->transquant_bypass_enabled_flag;
++   pps.flags.tiles_enabled_flag = pp->tiles_enabled_flag;
++   pps.flags.entropy_coding_sync_enabled_flag = pp->entropy_coding_sync_enabled_flag;
++   pps.flags.uniform_spacing_flag = pp->uniform_spacing_flag;
++   pps.flags.loop_filter_across_tiles_enabled_flag = pp->loop_filter_across_tiles_enabled_flag;
++   pps.flags.pps_loop_filter_across_slices_enabled_flag = pp->pps_loop_filter_across_slices_enabled_flag;
++   /* only gates the PPS's own syntax; the slice header's override depends on the override flag */
++   pps.flags.deblocking_filter_control_present_flag = 1;
++   pps.flags.deblocking_filter_override_enabled_flag = pp->deblocking_filter_override_enabled_flag;
++   pps.flags.pps_deblocking_filter_disabled_flag = pp->pps_deblocking_filter_disabled_flag;
++   pps.flags.pps_scaling_list_data_present_flag = pp->scaling_list_enabled_flag && qm;
++   pps.flags.lists_modification_present_flag = pp->lists_modification_present_flag;
++   pps.flags.slice_segment_header_extension_present_flag = pp->slice_segment_header_extension_present_flag;
++   pps.num_extra_slice_header_bits = pp->num_extra_slice_header_bits;
++   pps.num_ref_idx_l0_default_active_minus1 = pp->num_ref_idx_l0_default_active_minus1;
++   pps.num_ref_idx_l1_default_active_minus1 = pp->num_ref_idx_l1_default_active_minus1;
++   pps.init_qp_minus26 = pp->init_qp_minus26;
++   pps.diff_cu_qp_delta_depth = pp->diff_cu_qp_delta_depth;
++   pps.pps_cb_qp_offset = pp->pps_cb_qp_offset;
++   pps.pps_cr_qp_offset = pp->pps_cr_qp_offset;
++   pps.pps_beta_offset_div2 = pp->pps_beta_offset_div2;
++   pps.pps_tc_offset_div2 = pp->pps_tc_offset_div2;
++   pps.log2_parallel_merge_level_minus2 = pp->log2_parallel_merge_level_minus2;
++   pps.num_tile_columns_minus1 = pp->num_tile_columns_minus1;
++   pps.num_tile_rows_minus1 = pp->num_tile_rows_minus1;
++   for (int i = 0; i < 19; i++)
++      pps.column_width_minus1[i] = pp->column_width_minus1[i];
++   for (int i = 0; i < 21; i++)
++      pps.row_height_minus1[i] = pp->row_height_minus1[i];
++   if (pps.flags.pps_scaling_list_data_present_flag) {
++      /* the same layout and order (up-right diagonal) */
++      memcpy(p->lists.ScalingList4x4, qm->ucScalingLists0, sizeof(qm->ucScalingLists0));
++      memcpy(p->lists.ScalingList8x8, qm->ucScalingLists1, sizeof(qm->ucScalingLists1));
++      memcpy(p->lists.ScalingList16x16, qm->ucScalingLists2, sizeof(qm->ucScalingLists2));
++      memcpy(p->lists.ScalingList32x32, qm->ucScalingLists3, sizeof(qm->ucScalingLists3));
++      memcpy(p->lists.ScalingListDCCoef16x16, qm->ucScalingListDCCoefSizeID2, sizeof(qm->ucScalingListDCCoefSizeID2));
++      memcpy(p->lists.ScalingListDCCoef32x32, qm->ucScalingListDCCoefSizeID3, sizeof(qm->ucScalingListDCCoefSizeID3));
++   }
++}
++
++static bool
++h265_params_get(decode_session *s, const DXVA_PicParams_HEVC *pp, const DXVA_Qmatrix_HEVC *qm)
++{
++   h265_params p;
++   h265_params_fill(s->caps, s->profile, pp, qm, &p);
++   if (!params_changed(s, p))
++      return true;
++   p.vps.pDecPicBufMgr = &p.dpbm;
++   p.vps.pProfileTierLevel = &p.ptl;
++   p.sps.pProfileTierLevel = &p.ptl;
++   p.sps.pDecPicBufMgr = &p.dpbm;
++   p.sps.pShortTermRefPicSet = p.sps.num_short_term_ref_pic_sets ? p.rps : NULL;
++   p.sps.pLongTermRefPicsSps = &p.ltr;
++   if (p.pps.flags.pps_scaling_list_data_present_flag)
++      p.pps.pScalingLists = &p.lists;
++   VkVideoDecodeH265SessionParametersAddInfoKHR add = {VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR};
++   add.stdVPSCount = 1;
++   add.pStdVPSs = &p.vps;
++   add.stdSPSCount = 1;
++   add.pStdSPSs = &p.sps;
++   add.stdPPSCount = 1;
++   add.pStdPPSs = &p.pps;
++   VkVideoDecodeH265SessionParametersCreateInfoKHR info = {
++      VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR};
++   info.maxStdVPSCount = 1;
++   info.maxStdSPSCount = 1;
++   info.maxStdPPSCount = 1;
++   info.pParametersAddInfo = &add;
++   return params_create(s, &info);
++}
++
++static bool
++decode_h265(const decode_input &d, decode_picture *pic, h265_picture *h)
++{
++   const auto *pp = (const DXVA_PicParams_HEVC *)frame_argument(
++      d.in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020_PICTURE_PARAMETERS, sizeof(DXVA_PicParams_HEVC));
++   const auto *qm = (const DXVA_Qmatrix_HEVC *)frame_argument(
++      d.in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020_INVERSE_QUANTIZATION_MATRIX, sizeof(DXVA_Qmatrix_HEVC));
++   if (!pp || !h265_params_get(d.s, pp, qm))
++      return false;
++   UINT log2MinCb = pp->log2_min_luma_coding_block_size_minus3 + 3;
++   pic->extent = {(UINT)pp->PicWidthInMinCbsY << log2MinCb, (UINT)pp->PicHeightInMinCbsY << log2MinCb};
++   for (UINT i = 0; i < 15; i++)
++      if (pp->RefPicList[i].bPicEntry != DXVA_INVALID_ENTRY)
++         keep_add(pic, d.in->ReferenceFrames, pp->RefPicList[i].Index7Bits);
++   if (!decode_slots_assign(d.s, pic, d.output, d.outputSub))
++      return false;
++   /* RefPicList index -> DPB slot */
++   int slotOf[15];
++   UINT n = 0;
++   for (UINT i = 0; i < 15; i++) {
++      slotOf[i] = -1;
++      if (pp->RefPicList[i].bPicEntry == DXVA_INVALID_ENTRY)
++         continue;
++      int k = keep_index(pic, d.in->ReferenceFrames, pp->RefPicList[i].Index7Bits);
++      if (k < 0 || pic->keep[k].slot < 0)
++         continue;
++      slotOf[i] = pic->keep[k].slot;
++      StdVideoDecodeH265ReferenceInfo &ri = h->refInfo[n];
++      ri.flags.used_for_long_term_reference = pp->RefPicList[i].AssociatedFlag;
++      ri.PicOrderCntVal = pp->PicOrderCntValList[i];
++      h->refSlot[n].sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_DPB_SLOT_INFO_KHR;
++      h->refSlot[n].pStdReferenceInfo = &ri;
++      use_add(pic, k, &h->refSlot[n]);
++      n++;
++   }
++   StdVideoDecodeH265PictureInfo &std = h->std;
++   std.flags.IrapPicFlag = pp->IrapPicFlag;
++   std.flags.IdrPicFlag = pp->IdrPicFlag;
++   /* DXVA doesn't say: a picture no later one names just leaves its slot */
++   std.flags.IsReference = 1;
++   /* slices that pick an SPS set code no set of their own */
++   std.flags.short_term_ref_pic_set_sps_flag =
++      !pp->IdrPicFlag && pp->num_short_term_ref_pic_sets && !pp->wNumBitsForShortTermRPSInSlice;
++   std.NumDeltaPocsOfRefRpsIdx = pp->ucNumDeltaPocsOfRefRpsIdx;
++   std.PicOrderCntVal = pp->CurrPicOrderCntVal;
++   std.NumBitsForSTRefPicSetInSlice = pp->wNumBitsForShortTermRPSInSlice;
++   /* the RPS lists: DXVA's are RefPicList indices, Vulkan's DPB slots */
++   auto slot_of = [&](UINT8 index) -> uint8_t { return index < 15 && slotOf[index] >= 0 ? (uint8_t)slotOf[index] : 0xff; };
++   for (int i = 0; i < 8; i++) {
++      std.RefPicSetStCurrBefore[i] = slot_of(pp->RefPicSetStCurrBefore[i]);
++      std.RefPicSetStCurrAfter[i] = slot_of(pp->RefPicSetStCurrAfter[i]);
++      std.RefPicSetLtCurr[i] = slot_of(pp->RefPicSetLtCurr[i]);
++   }
++   h->setupInfo.PicOrderCntVal = pp->CurrPicOrderCntVal;
++   h->setupSlot.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_DPB_SLOT_INFO_KHR;
++   h->setupSlot.pStdReferenceInfo = &h->setupInfo;
++   pic->setupInfo = &h->setupSlot;
++   for (UINT i = 0; i < d.sliceBytes / sizeof(DXVA_Slice_Short); i++)
++      h->sliceOffsets.push_back(((const DXVA_Slice_Short *)d.slices)[i].BSNALunitDataLocation);
++   h->info.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PICTURE_INFO_KHR;
++   h->info.pStdPictureInfo = &std;
++   h->info.sliceSegmentCount = (uint32_t)h->sliceOffsets.size();
++   h->info.pSliceSegmentOffsets = h->sliceOffsets.data();
++   pic->pictureInfo = &h->info;
++   return true;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* VP9 */
++
++struct vp9_picture {
++   VkVideoDecodeVP9PictureInfoKHR info;
++   StdVideoDecodeVP9PictureInfo std;
++   StdVideoVP9ColorConfig color;
++   StdVideoVP9LoopFilter loopFilter;
++   StdVideoVP9Segmentation segmentation;
++};
++
++/* DXVA's VP9 parameters are the uncompressed header's, with two kinds of differences: no refresh_frame_flags or color
++ * space (the references come from the DPB slots, and the color space only matters for 4:4:4 RGB), and loop filter
++ * deltas and segmentation data as in effect rather than as updated: they are given as all updated. The bitstream
++ * is the whole frame (headers included). */
++static bool
++decode_vp9(const decode_input &d, decode_picture *pic, vp9_picture *h)
++{
++   const auto *pp = (const DXVA_PicParams_VP9 *)frame_argument(
++      d.in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020_PICTURE_PARAMETERS, sizeof(DXVA_PicParams_VP9));
++   if (!pp)
++      return false;
++   pic->extent = {pp->width, pp->height};
++   for (int i = 0; i < 8; i++)
++      if (pp->ref_frame_map[i].bPicEntry != DXVA_INVALID_ENTRY)
++         keep_add(pic, d.in->ReferenceFrames, pp->ref_frame_map[i].Index7Bits);
++   if (!decode_slots_assign(d.s, pic, d.output, d.outputSub))
++      return false;
++   for (int i = 0; i < 3; i++) {
++      int k = pp->frame_refs[i].bPicEntry != DXVA_INVALID_ENTRY
++                 ? keep_index(pic, d.in->ReferenceFrames, pp->frame_refs[i].Index7Bits)
++                 : -1;
++      h->info.referenceNameSlotIndices[i] = k >= 0 ? pic->keep[k].slot : -1;
++      use_add(pic, k, NULL);
++   }
++
++   h->color.BitDepth = 8 + pp->BitDepthMinus8Luma;
++   h->color.subsampling_x = pp->subsampling_x;
++   h->color.subsampling_y = pp->subsampling_y;
++
++   h->loopFilter.flags.loop_filter_delta_enabled = pp->mode_ref_delta_enabled;
++   h->loopFilter.flags.loop_filter_delta_update = pp->mode_ref_delta_enabled;
++   h->loopFilter.loop_filter_level = pp->filter_level;
++   h->loopFilter.loop_filter_sharpness = pp->sharpness_level;
++   h->loopFilter.update_ref_delta = pp->mode_ref_delta_enabled ? 0xf : 0;
++   h->loopFilter.update_mode_delta = pp->mode_ref_delta_enabled ? 0x3 : 0;
++   for (int i = 0; i < 4; i++)
++      h->loopFilter.loop_filter_ref_deltas[i] = pp->ref_deltas[i];
++   for (int i = 0; i < 2; i++)
++      h->loopFilter.loop_filter_mode_deltas[i] = pp->mode_deltas[i];
++
++   const auto &seg = pp->stVP9Segments;
++   h->segmentation.flags.segmentation_update_map = seg.update_map;
++   h->segmentation.flags.segmentation_temporal_update = seg.temporal_update;
++   h->segmentation.flags.segmentation_update_data = seg.enabled;
++   h->segmentation.flags.segmentation_abs_or_delta_update = seg.abs_delta;
++   memcpy(h->segmentation.segmentation_tree_probs, seg.tree_probs, sizeof(seg.tree_probs));
++   memcpy(h->segmentation.segmentation_pred_prob, seg.pred_probs, sizeof(seg.pred_probs));
++   for (int i = 0; i < 8; i++) {
++      h->segmentation.FeatureEnabled[i] = seg.feature_mask[i];
++      for (int j = 0; j < 4; j++)
++         h->segmentation.FeatureData[i][j] = seg.feature_data[i][j];
++   }
++
++   StdVideoDecodeVP9PictureInfo &std = h->std;
++   std.flags.error_resilient_mode = pp->error_resilient_mode;
++   std.flags.intra_only = pp->intra_only;
++   std.flags.allow_high_precision_mv = pp->allow_high_precision_mv;
++   std.flags.refresh_frame_context = pp->refresh_frame_context;
++   std.flags.frame_parallel_decoding_mode = pp->frame_parallel_decoding_mode;
++   std.flags.segmentation_enabled = seg.enabled;
++   std.flags.show_frame = pp->show_frame;
++   std.flags.UsePrevFrameMvs = pp->use_prev_in_find_mv_refs;
++   std.profile = (StdVideoVP9Profile)pp->profile;
++   std.frame_type = (StdVideoVP9FrameType)pp->frame_type;
++   std.frame_context_idx = pp->frame_context_idx;
++   std.reset_frame_context = pp->reset_frame_context;
++   for (int i = 1; i < 4; i++)
++      std.ref_frame_sign_bias_mask |= (pp->ref_frame_sign_bias[i] ? 1 : 0) << i;
++   /* DXVA's numbering is Vulkan's (EIGHTTAP 0, EIGHTTAP_SMOOTH 1) */
++   std.interpolation_filter = (StdVideoVP9InterpolationFilter)pp->interp_filter;
++   std.base_q_idx = (uint8_t)pp->base_qindex;
++   std.delta_q_y_dc = pp->y_dc_delta_q;
++   std.delta_q_uv_dc = pp->uv_dc_delta_q;
++   std.delta_q_uv_ac = pp->uv_ac_delta_q;
++   std.tile_cols_log2 = pp->log2_tile_cols;
++   std.tile_rows_log2 = pp->log2_tile_rows;
++   std.pColorConfig = &h->color;
++   std.pLoopFilter = &h->loopFilter;
++   std.pSegmentation = &h->segmentation;
++   h->info.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_PICTURE_INFO_KHR;
++   h->info.pStdPictureInfo = &std;
++   h->info.uncompressedHeaderOffset = 0;
++   h->info.compressedHeaderOffset = pp->uncompressed_header_size_byte_aligned;
++   h->info.tilesOffset = pp->uncompressed_header_size_byte_aligned + pp->first_partition_size;
++   pic->setupInfo = NULL;
++   pic->pictureInfo = &h->info;
++   return true;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* AV1 */
++
++struct av1_params {
++   StdVideoAV1SequenceHeader seq;
++   StdVideoAV1ColorConfig color;
++};
++
++struct av1_picture {
++   VkVideoDecodeAV1PictureInfoKHR info;
++   StdVideoDecodeAV1PictureInfo std;
++   StdVideoAV1TileInfo tiles;
++   uint16_t colStarts[64], rowStarts[64], widths[64], heights[64];
++   StdVideoAV1Quantization quantization;
++   StdVideoAV1Segmentation segmentation;
++   StdVideoAV1LoopFilter loopFilter;
++   StdVideoAV1CDEF cdef;
++   StdVideoAV1LoopRestoration restoration;
++   StdVideoAV1GlobalMotion globalMotion;
++   std::vector<uint32_t> tileOffsets, tileSizes;
++   StdVideoDecodeAV1ReferenceInfo setupInfo;
++   VkVideoDecodeAV1DpbSlotInfoKHR setupSlot;
++   StdVideoDecodeAV1ReferenceInfo refInfo[7];
++   VkVideoDecodeAV1DpbSlotInfoKHR refSlot[7];
++};
++
++static UINT
++bit_length(UINT v)
++{
++   UINT n = 0;
++   while (v >> n)
++      n++;
++   return n;
++}
++
++/* The sequence header, from the sequence-level values in DXVA's parameters. What only parsing frame headers needs
++ * (frame size and id bits, warped motion's enable) is set to allow everything: the decoder gets tile data only;
++ * superres is enabled as far as frames use it. */
++static bool
++av1_params_get(decode_session *s, const DXVA_PicParams_AV1 *pp)
++{
++   av1_params p;
++   memset(&p, 0, sizeof(p));
++   StdVideoAV1SequenceHeader &seq = p.seq;
++   seq.flags.use_128x128_superblock = pp->coding.use_128x128_superblock;
++   seq.flags.enable_filter_intra = pp->coding.filter_intra;
++   seq.flags.enable_intra_edge_filter = pp->coding.intra_edge_filter;
++   seq.flags.enable_interintra_compound = pp->coding.interintra_compound;
++   seq.flags.enable_masked_compound = pp->coding.masked_compound;
++   seq.flags.enable_warped_motion = 1;
++   seq.flags.enable_dual_filter = pp->coding.dual_filter;
++   seq.flags.enable_order_hint = pp->order_hint_bits != 0;
++   seq.flags.enable_jnt_comp = pp->coding.jnt_comp;
++   seq.flags.enable_ref_frame_mvs = pp->coding.enable_ref_frame_mvs;
++   seq.flags.enable_superres = pp->coding.superres;
++   seq.flags.enable_cdef = pp->coding.cdef;
++   seq.flags.enable_restoration = pp->coding.restoration;
++   seq.flags.film_grain_params_present = pp->coding.film_grain;
++   seq.seq_profile = (StdVideoAV1Profile)pp->seq_profile;
++   seq.frame_width_bits_minus_1 = (uint8_t)(std::max(bit_length(pp->max_width - 1), 1u) - 1);
++   seq.frame_height_bits_minus_1 = (uint8_t)(std::max(bit_length(pp->max_height - 1), 1u) - 1);
++   seq.max_frame_width_minus_1 = (uint16_t)(pp->max_width - 1);
++   seq.max_frame_height_minus_1 = (uint16_t)(pp->max_height - 1);
++   seq.order_hint_bits_minus_1 = pp->order_hint_bits ? pp->order_hint_bits - 1 : 0;
++   seq.seq_force_integer_mv = 2; /* SELECT_INTEGER_MV */
++   seq.seq_force_screen_content_tools = 2; /* SELECT_SCREEN_CONTENT_TOOLS */
++   p.color.BitDepth = pp->bitdepth;
++   p.color.subsampling_x = pp->format.subsampling_x;
++   p.color.subsampling_y = pp->format.subsampling_y;
++   p.color.flags.mono_chrome = pp->format.mono_chrome;
++   /* not in DXVA: unspecified (0 would be identity matrix coefficients, RGB) */
++   p.color.color_primaries = STD_VIDEO_AV1_COLOR_PRIMARIES_UNSPECIFIED;
++   p.color.transfer_characteristics = STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_UNSPECIFIED;
++   p.color.matrix_coefficients = STD_VIDEO_AV1_MATRIX_COEFFICIENTS_UNSPECIFIED;
++   if (!params_changed(s, p))
++      return true;
++   p.seq.pColorConfig = &p.color;
++   VkVideoDecodeAV1SessionParametersCreateInfoKHR info = {
++      VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_SESSION_PARAMETERS_CREATE_INFO_KHR};
++   info.pStdSequenceHeader = &p.seq;
++   return params_create(s, &info);
++}
++
++/* DXVA's AV1 parameters lack what is about the references: their order hints and frame types, the skip mode frames,
++ * sign biases. Each DPB slot keeps that of its picture (decode_slot::av1); the rest is derived as the AV1 spec does.
++ * Film grain isn't applied (ponytail: it needs an output picture apart from the DPB, VK_KHR_video's distinct mode). */
++static bool
++decode_av1(const decode_input &d, decode_picture *pic, av1_picture *h)
++{
++   UINT tileBytes = d.sliceBytes;
++   const auto *pp = (const DXVA_PicParams_AV1 *)frame_argument(
++      d.in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020_PICTURE_PARAMETERS, sizeof(DXVA_PicParams_AV1));
++   if (!pp || !av1_params_get(d.s, pp))
++      return false;
++   pic->extent = {pp->width, pp->height};
++   for (int i = 0; i < 8; i++)
++      if (pp->RefFrameMapTextureIndex[i] != DXVA_INVALID_ENTRY)
++         keep_add(pic, d.in->ReferenceFrames, pp->RefFrameMapTextureIndex[i]);
++   if (!decode_slots_assign(d.s, pic, d.output, d.outputSub))
++      return false;
++
++   bool intra = pp->format.frame_type == STD_VIDEO_AV1_FRAME_TYPE_KEY ||
++                pp->format.frame_type == STD_VIDEO_AV1_FRAME_TYPE_INTRA_ONLY;
++   int bits = pp->order_hint_bits;
++   auto relative = [bits](int a, int b) {
++      if (!bits)
++         return 0;
++      int diff = a - b, m = 1 << (bits - 1);
++      return (diff & (m - 1)) - (diff & m);
++   };
++   int cur = pp->order_hint;
++   int refHint[7] = {};
++   bool refOk[7] = {};
++   UINT n = 0;
++   for (int i = 0; i < 7; i++) {
++      h->info.referenceNameSlotIndices[i] = -1;
++      UINT map = pp->frame_refs[i].Index;
++      if (intra || map >= 8 || pp->RefFrameMapTextureIndex[map] == DXVA_INVALID_ENTRY)
++         continue;
++      int k = keep_index(pic, d.in->ReferenceFrames, pp->RefFrameMapTextureIndex[map]);
++      if (k < 0 || pic->keep[k].slot < 0)
++         continue;
++      const decode_slot &slot = d.s->slots[pic->keep[k].slot];
++      h->info.referenceNameSlotIndices[i] = pic->keep[k].slot;
++      refHint[i] = slot.av1.OrderHint;
++      refOk[i] = true;
++      if (std::find(pic->used.begin(), pic->used.end(), k) == pic->used.end()) {
++         h->refInfo[n] = slot.av1;
++         h->refSlot[n].sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_DPB_SLOT_INFO_KHR;
++         h->refSlot[n].pStdReferenceInfo = &h->refInfo[n];
++         use_add(pic, k, &h->refSlot[n]);
++         n++;
++      }
++   }
++
++   StdVideoDecodeAV1PictureInfo &std = h->std;
++   /* OrderHints[LAST_FRAME + i], the sign biases (order hints after the current one) */
++   uint8_t signBias = 0;
++   for (int i = 0; i < 7; i++) {
++      std.OrderHints[1 + i] = (uint8_t)refHint[i];
++      if (refOk[i] && relative(refHint[i], cur) > 0)
++         signBias |= 1 << (1 + i);
++   }
++   /* skip mode frames (AV1 spec 5.9.22) */
++   if (pp->coding.skip_mode && !intra) {
++      int forward = -1, backward = -1, second = -1;
++      for (int i = 0; i < 7; i++) {
++         if (!refOk[i])
++            continue;
++         int r = relative(refHint[i], cur);
++         if (r < 0 && (forward < 0 || relative(refHint[i], refHint[forward]) > 0))
++            forward = i;
++         else if (r > 0 && (backward < 0 || relative(refHint[i], refHint[backward]) < 0))
++            backward = i;
++      }
++      if (forward >= 0 && backward < 0) {
++         for (int i = 0; i < 7; i++)
++            if (refOk[i] && relative(refHint[i], refHint[forward]) < 0 &&
++                (second < 0 || relative(refHint[i], refHint[second]) > 0))
++               second = i;
++         backward = second;
++      }
++      if (forward >= 0 && backward >= 0) {
++         std.SkipModeFrame[0] = (uint8_t)(1 + std::min(forward, backward));
++         std.SkipModeFrame[1] = (uint8_t)(1 + std::max(forward, backward));
++      }
++   }
++
++   /* tiles: DXVA's sizes in superblocks; the starts in 4x4 units (MiColStarts) */
++   UINT cols = std::min<UINT>(pp->tiles.cols, 64), rows = std::min<UINT>(pp->tiles.rows, 64);
++   UINT miPerSb = pp->coding.use_128x128_superblock ? 32 : 16;
++   for (UINT i = 0, start = 0; i < cols; start += pp->tiles.widths[i], i++) {
++      h->colStarts[i] = (uint16_t)(start * miPerSb);
++      h->widths[i] = (uint16_t)(pp->tiles.widths[i] - 1);
++   }
++   for (UINT i = 0, start = 0; i < rows; start += pp->tiles.heights[i], i++) {
++      h->rowStarts[i] = (uint16_t)(start * miPerSb);
++      h->heights[i] = (uint16_t)(pp->tiles.heights[i] - 1);
++   }
++   h->tiles.TileCols = (uint8_t)cols;
++   h->tiles.TileRows = (uint8_t)rows;
++   h->tiles.context_update_tile_id = pp->tiles.context_update_id;
++   /* the tile size fields' length: the gap before each tile's data after the first */
++   h->tiles.tile_size_bytes_minus_1 = 3;
++   if (tileBytes >= 2 * sizeof(DXVA_Tile_AV1)) {
++      const auto *t = (const DXVA_Tile_AV1 *)d.slices;
++      UINT gap = t[1].DataOffset - (t[0].DataOffset + t[0].DataSize);
++      if (gap >= 1 && gap <= 4)
++         h->tiles.tile_size_bytes_minus_1 = (uint8_t)(gap - 1);
++   }
++   /* uniform spacing: all tiles but the last the same size, the last no larger */
++   bool uniform = true;
++   for (UINT i = 1; i < cols; i++)
++      uniform &= i + 1 < cols ? pp->tiles.widths[i] == pp->tiles.widths[0] : pp->tiles.widths[i] <= pp->tiles.widths[0];
++   for (UINT i = 1; i < rows; i++)
++      uniform &= i + 1 < rows ? pp->tiles.heights[i] == pp->tiles.heights[0] : pp->tiles.heights[i] <= pp->tiles.heights[0];
++   h->tiles.flags.uniform_tile_spacing_flag = uniform;
++   h->tiles.pMiColStarts = h->colStarts;
++   h->tiles.pMiRowStarts = h->rowStarts;
++   h->tiles.pWidthInSbsMinus1 = h->widths;
++   h->tiles.pHeightInSbsMinus1 = h->heights;
++   for (UINT i = 0; i < tileBytes / sizeof(DXVA_Tile_AV1); i++) {
++      const auto &t = ((const DXVA_Tile_AV1 *)d.slices)[i];
++      h->tileOffsets.push_back(t.DataOffset);
++      h->tileSizes.push_back(t.DataSize);
++   }
++
++   const auto &q = pp->quantization;
++   h->quantization.flags.using_qmatrix = q.qm_y != 0xff;
++   h->quantization.flags.diff_uv_delta = q.u_dc_delta_q != q.v_dc_delta_q || q.u_ac_delta_q != q.v_ac_delta_q;
++   h->quantization.base_q_idx = q.base_qindex;
++   h->quantization.DeltaQYDc = q.y_dc_delta_q;
++   h->quantization.DeltaQUDc = q.u_dc_delta_q;
++   h->quantization.DeltaQUAc = q.u_ac_delta_q;
++   h->quantization.DeltaQVDc = q.v_dc_delta_q;
++   h->quantization.DeltaQVAc = q.v_ac_delta_q;
++   if (h->quantization.flags.using_qmatrix) {
++      h->quantization.qm_y = q.qm_y;
++      h->quantization.qm_u = q.qm_u;
++      h->quantization.qm_v = q.qm_v;
++   }
++
++   for (int i = 0; i < 8; i++) {
++      h->segmentation.FeatureEnabled[i] = pp->segmentation.feature_mask[i];
++      for (int j = 0; j < 8; j++)
++         h->segmentation.FeatureData[i][j] = pp->segmentation.feature_data[i][j];
++   }
++
++   const auto &lf = pp->loop_filter;
++   h->loopFilter.flags.loop_filter_delta_enabled = lf.mode_ref_delta_enabled;
++   h->loopFilter.flags.loop_filter_delta_update = lf.mode_ref_delta_update;
++   h->loopFilter.loop_filter_level[0] = lf.filter_level[0];
++   h->loopFilter.loop_filter_level[1] = lf.filter_level[1];
++   h->loopFilter.loop_filter_level[2] = lf.filter_level_u;
++   h->loopFilter.loop_filter_level[3] = lf.filter_level_v;
++   h->loopFilter.loop_filter_sharpness = lf.sharpness_level;
++   for (int i = 0; i < 8; i++)
++      h->loopFilter.loop_filter_ref_deltas[i] = lf.ref_deltas[i];
++   for (int i = 0; i < 2; i++)
++      h->loopFilter.loop_filter_mode_deltas[i] = lf.mode_deltas[i];
++
++   h->cdef.cdef_damping_minus_3 = pp->cdef.damping;
++   h->cdef.cdef_bits = pp->cdef.bits;
++   for (int i = 0; i < 8; i++) {
++      h->cdef.cdef_y_pri_strength[i] = pp->cdef.y_strengths[i].primary;
++      h->cdef.cdef_y_sec_strength[i] = pp->cdef.y_strengths[i].secondary;
++      h->cdef.cdef_uv_pri_strength[i] = pp->cdef.uv_strengths[i].primary;
++      h->cdef.cdef_uv_sec_strength[i] = pp->cdef.uv_strengths[i].secondary;
++   }
++
++   /* restoration types as the spec numbers them (both); unit sizes: DXVA's log2, Vulkan's log2 - 5 */
++   for (int i = 0; i < 3; i++) {
++      h->restoration.FrameRestorationType[i] = (StdVideoAV1FrameRestorationType)lf.frame_restoration_type[i];
++      h->restoration.LoopRestorationSize[i] =
++         lf.frame_restoration_type[i] && lf.log2_restoration_unit_size[i] >= 5 ? lf.log2_restoration_unit_size[i] - 5 : 1;
++   }
++
++   /* global motion per reference (index 0, the intra frame: unused) */
++   for (int i = 0; i < 7; i++) {
++      h->globalMotion.GmType[1 + i] = pp->frame_refs[i].wmtype;
++      for (int j = 0; j < 6; j++)
++         h->globalMotion.gm_params[1 + i][j] = pp->frame_refs[i].wmmat[j];
++   }
++
++   /* shown key frames are error resilient (the spec infers it) */
++   std.flags.error_resilient_mode = pp->format.frame_type == STD_VIDEO_AV1_FRAME_TYPE_KEY && pp->format.show_frame;
++   std.flags.disable_cdf_update = pp->coding.disable_cdf_update;
++   std.flags.use_superres = pp->coding.superres;
++   std.flags.allow_screen_content_tools = pp->coding.screen_content_tools;
++   std.flags.is_filter_switchable = pp->interp_filter == STD_VIDEO_AV1_INTERPOLATION_FILTER_SWITCHABLE;
++   std.flags.force_integer_mv = pp->coding.integer_mv;
++   std.flags.allow_intrabc = pp->coding.intrabc;
++   std.flags.allow_high_precision_mv = pp->coding.high_precision_mv;
++   std.flags.is_motion_mode_switchable = pp->coding.switchable_motion_mode;
++   std.flags.use_ref_frame_mvs = pp->coding.use_ref_frame_mvs;
++   std.flags.disable_frame_end_update_cdf = pp->coding.disable_frame_end_update_cdf;
++   std.flags.allow_warped_motion = pp->coding.warped_motion;
++   std.flags.reduced_tx_set = pp->coding.reduced_tx_set;
++   std.flags.reference_select = pp->coding.reference_mode;
++   std.flags.skip_mode_present = pp->coding.skip_mode;
++   std.flags.delta_q_present = q.delta_q_present;
++   std.flags.delta_lf_present = lf.delta_lf_present;
++   std.flags.delta_lf_multi = lf.delta_lf_multi;
++   std.flags.segmentation_enabled = pp->segmentation.enabled;
++   std.flags.segmentation_update_map = pp->segmentation.update_map;
++   std.flags.segmentation_temporal_update = pp->segmentation.temporal_update;
++   std.flags.segmentation_update_data = pp->segmentation.update_data;
++   std.flags.UsesLr = lf.frame_restoration_type[0] || lf.frame_restoration_type[1] || lf.frame_restoration_type[2];
++   std.flags.usesChromaLr = lf.frame_restoration_type[1] || lf.frame_restoration_type[2];
++   std.frame_type = (StdVideoAV1FrameType)pp->format.frame_type;
++   std.OrderHint = (uint8_t)cur;
++   std.primary_ref_frame = pp->primary_ref_frame;
++   /* not in DXVA (NVIDIA's decoder does use it, consistently 0xff keeps its reference state consistent); ponytail:
++    * multi-tile 8-bit streams then decode with off-by-one chroma samples here and there (one test clip: U at ~75 dB,
++    * all else bit-exact), the real value would need the frame header, which DXVA doesn't pass */
++   std.refresh_frame_flags = pp->coding.reference_frame_update ? 0xff : 0;
++   std.interpolation_filter = (StdVideoAV1InterpolationFilter)pp->interp_filter;
++   std.TxMode = (StdVideoAV1TxMode)pp->coding.tx_mode;
++   std.delta_q_res = q.delta_q_res;
++   std.delta_lf_res = lf.delta_lf_res;
++   std.coded_denom = pp->coding.superres && pp->superres_denom >= 9 ? pp->superres_denom - 9 : 0;
++   std.pTileInfo = &h->tiles;
++   std.pQuantization = &h->quantization;
++   std.pSegmentation = &h->segmentation;
++   std.pLoopFilter = &h->loopFilter;
++   std.pCDEF = &h->cdef;
++   std.pLoopRestoration = &h->restoration;
++   std.pGlobalMotion = &h->globalMotion;
++
++   /* what later pictures need of this one */
++   StdVideoDecodeAV1ReferenceInfo &self = d.s->slots[pic->setup].av1;
++   memset(&self, 0, sizeof(self));
++   self.flags.disable_frame_end_update_cdf = pp->coding.disable_frame_end_update_cdf;
++   self.flags.segmentation_enabled = pp->segmentation.enabled;
++   self.frame_type = pp->format.frame_type;
++   self.RefFrameSignBias = signBias;
++   self.OrderHint = (uint8_t)cur;
++   memcpy(self.SavedOrderHints, std.OrderHints, sizeof(self.SavedOrderHints));
++   h->setupInfo = self;
++   /* the picture's own saved order hints aren't the setup's (as ffmpeg's decoder, verified on NVIDIA) */
++   memset(h->setupInfo.SavedOrderHints, 0, sizeof(h->setupInfo.SavedOrderHints));
++   h->setupSlot.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_DPB_SLOT_INFO_KHR;
++   h->setupSlot.pStdReferenceInfo = &h->setupInfo;
++   pic->setupInfo = &h->setupSlot;
++
++   h->info.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_PICTURE_INFO_KHR;
++   h->info.pStdPictureInfo = &std;
++   h->info.tileCount = (uint32_t)h->tileOffsets.size();
++   h->info.pTileOffsets = h->tileOffsets.data();
++   h->info.pTileSizes = h->tileSizes.data();
++   pic->pictureInfo = &h->info;
++   return true;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* DecodeFrame */
++
++static void APIENTRY
++decode_frame(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HVIDEODECODER_0020,
++             const D3D12DDI_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS_0041_1 *out,
++             const D3D12DDI_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS_0032 *in)
++{
++   viogpu_command_list *list = list_from(hList);
++   viogpu_device *device = list->device;
++   auto fail = [list](HRESULT hr, const char *why) {
++      viogpu_log("video: DecodeFrame: %s", why);
++      viogpu_command_list_error(list, hr);
++   };
++   viogpu_video *v = device->video;
++   viogpu_video_decoder_heap *heap = (viogpu_video_decoder_heap *)in->hDrvVideoDecoderHeap.pDrvPrivate;
++   decode_session *s = v && heap ? decode_session_get(heap) : NULL;
++   if (!s)
++      return fail(E_FAIL, "no session");
++   if (out->ConversionArguments.Enable)
++      return fail(E_INVALIDARG, "conversion not supported");
++   viogpu_resource *output = (viogpu_resource *)out->hDrvOutputTexture2D.pDrvPrivate;
++   viogpu_resource *bitstream = (viogpu_resource *)in->CompressedBitstream.hDrvBuffer.pDrvPrivate;
++   decode_input d = {s, in, output ? output->resource : NULL, out->OutputSubresource, NULL, 0};
++   d.slices = frame_argument(in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020_SLICE_CONTROL, 1, &d.sliceBytes);
++   if (!output || !bitstream || !d.slices)
++      return fail(E_INVALIDARG, "no output, bitstream or slice control");
++
++   /* the picture: parameters, references, the codec's Vulkan structures */
++   decode_picture pic;
++   pic.setup = -1;
++   pic.setupInfo = pic.pictureInfo = NULL;
++   h264_picture h264 = {};
++   h265_picture h265 = {};
++   vp9_picture vp9 = {};
++   av1_picture av1 = {};
++   bool ok = false;
++   switch (s->profile.codec) {
++   case CODEC_H264: ok = decode_h264(d, &pic, &h264); break;
++   case CODEC_HEVC: ok = decode_h265(d, &pic, &h265); break;
++   case CODEC_VP9: ok = decode_vp9(d, &pic, &vp9); break;
++   case CODEC_AV1: ok = decode_av1(d, &pic, &av1); break;
++   }
++   if (!ok)
++      return fail(E_INVALIDARG, "picture parameters");
++
++   /* the picture resources: the DPB's layers */
++   auto picture_resource = [&](int slot) {
++      VkVideoPictureResourceInfoKHR r = {VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR};
++      r.codedExtent = s->slots[slot].extent;
++      r.imageViewBinding = s->dpbViews[slot];
++      return r;
++   };
++   std::vector<VkVideoPictureResourceInfoKHR> refPictures(pic.used.size());
++   std::vector<VkVideoReferenceSlotInfoKHR> refSlots(pic.used.size());
++   for (size_t u = 0; u < pic.used.size(); u++) {
++      int slot = pic.keep[pic.used[u]].slot;
++      refPictures[u] = picture_resource(slot);
++      refSlots[u] = {VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR};
++      refSlots[u].pNext = pic.usedInfo[u];
++      refSlots[u].slotIndex = slot;
++      refSlots[u].pPictureResource = &refPictures[u];
++   }
++   VkVideoPictureResourceInfoKHR setupPicture = picture_resource(pic.setup);
++   VkVideoReferenceSlotInfoKHR setupSlot = {VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR};
++   setupSlot.pNext = pic.setupInfo;
++   setupSlot.slotIndex = pic.setup;
++   setupSlot.pPictureResource = &setupPicture;
++   VkExtent2D extent = s->slots[pic.setup].extent;
++
++   /* the bitstream: the application's buffer as it is */
++   UINT64 bufferHandle = 0, bufferOffset = 0, outputHandle = 0, unused = 0;
++   int bufferFormat = 0, outputFormat = 0;
++   if (FAILED(viogpu_bridge_resource_info(device->vkd3d, bitstream->resource, &bufferHandle, &bufferOffset, &bufferFormat)) ||
++       FAILED(viogpu_bridge_resource_info(device->vkd3d, output->resource, &outputHandle, &unused, &outputFormat)))
++      return fail(E_INVALIDARG, "resource info");
++   VkDeviceSize offsetAlign = std::max<VkDeviceSize>(s->caps->caps.minBitstreamBufferOffsetAlignment, 1);
++   VkDeviceSize sizeAlign = std::max<VkDeviceSize>(s->caps->caps.minBitstreamBufferSizeAlignment, 1);
++   VkDeviceSize srcOffset = bufferOffset + in->CompressedBitstream.Offset;
++   VkDeviceSize srcRange = (in->CompressedBitstream.Size + sizeAlign - 1) / sizeAlign * sizeAlign;
++   /* the aligned size may reach past the buffer's end, into the 4 KiB vkd3d-proton pads decode buffers' Vulkan
++    * buffers to (ponytail: offsets as applications use them, a buffer's start; a misaligned one would need a copy) */
++   if (srcOffset % offsetAlign || in->CompressedBitstream.Offset + srcRange > align_up((UINT)bitstream->desc.Width, 4096)) {
++      viogpu_log("video: bitstream at %llu (+%llu bytes) in a %llu byte buffer: not aligned for the decoder",
++                 (unsigned long long)srcOffset, (unsigned long long)in->CompressedBitstream.Size,
++                 (unsigned long long)bitstream->desc.Width);
++      return fail(E_INVALIDARG, "bitstream alignment");
++   }
++   VkImage outputImage = vk_handle<VkImage>(outputHandle);
++   UINT outputLayer = texture_layer(output, out->OutputSubresource);
++   VkImageLayout outputLayout =
++      (VkImageLayout)viogpu_bridge_image_layout(device->vkd3d, output->resource, D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE);
++
++   /* record (the output texture's first use: vkd3d-proton's initial transition first, or it discards the picture) */
++   viogpu_bridge_track_resource(list->list, output->resource);
++   VkCommandBuffer cmd;
++   if (FAILED(viogpu_bridge_begin_vk_commands(device->vkd3d, list->list, (void **)&cmd)))
++      return fail(E_FAIL, "BeginVkCommandBufferInterop");
++   std::vector<VkImageMemoryBarrier2> images;
++   for (size_t slot = 0; slot < s->slots.size(); slot++) {
++      if (s->slots[slot].used && !s->slots[slot].initialized) {
++         images.push_back(image_barrier(s->dpb[slot], 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR));
++         s->slots[slot].initialized = true;
++      }
++   }
++   /* earlier decodes' and copies' DPB accesses before this one */
++   barrier(v, cmd, images.data(), (uint32_t)images.size(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++           VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
++
++   std::vector<VkVideoReferenceSlotInfoKHR> beginSlots(refSlots);
++   VkVideoReferenceSlotInfoKHR activate = setupSlot;
++   activate.slotIndex = -1;
++   activate.pNext = NULL;
++   beginSlots.push_back(activate);
++   VkVideoBeginCodingInfoKHR begin = {VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR};
++   begin.videoSession = s->session;
++   begin.videoSessionParameters = s->params;
++   begin.referenceSlotCount = (uint32_t)beginSlots.size();
++   begin.pReferenceSlots = beginSlots.data();
++   v->CmdBeginVideoCodingKHR(cmd, &begin);
++   if (!s->reset) {
++      VkVideoCodingControlInfoKHR control = {VK_STRUCTURE_TYPE_VIDEO_CODING_CONTROL_INFO_KHR};
++      control.flags = VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR;
++      v->CmdControlVideoCodingKHR(cmd, &control);
++      s->reset = true;
++   }
++   VkVideoDecodeInfoKHR decode = {VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR};
++   decode.pNext = pic.pictureInfo;
++   decode.srcBuffer = vk_handle<VkBuffer>(bufferHandle);
++   decode.srcBufferOffset = srcOffset;
++   decode.srcBufferRange = srcRange;
++   decode.dstPictureResource = setupPicture;
++   decode.pSetupReferenceSlot = &setupSlot;
++   decode.referenceSlotCount = (uint32_t)refSlots.size();
++   decode.pReferenceSlots = refSlots.data();
++   v->CmdDecodeVideoKHR(cmd, &decode);
++   VkVideoEndCodingInfoKHR end = {VK_STRUCTURE_TYPE_VIDEO_END_CODING_INFO_KHR};
++   v->CmdEndVideoCodingKHR(cmd, &end);
++
++   /* the picture into the application's texture (both planes) */
++   VkImageLayout dstLayout = outputLayout == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL
++                                                                     : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++   VkImageMemoryBarrier2 toCopy[2] = {
++      image_barrier(s->dpb[pic.setup], 0, VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
++      image_barrier(outputImage, outputLayer, outputLayout, dstLayout),
++   };
++   barrier(v, cmd, toCopy, dstLayout != outputLayout ? 2 : 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++           VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
++   UINT width = std::min<UINT>(extent.width, (UINT)output->desc.Width);
++   UINT height = std::min<UINT>(extent.height, output->desc.Height);
++   VkImageCopy planes[2] = {};
++   for (int plane = 0; plane < 2; plane++) {
++      VkImageAspectFlagBits aspect = plane ? VK_IMAGE_ASPECT_PLANE_1_BIT : VK_IMAGE_ASPECT_PLANE_0_BIT;
++      planes[plane].srcSubresource = {(VkImageAspectFlags)aspect, 0, 0, 1};
++      planes[plane].dstSubresource = {(VkImageAspectFlags)aspect, 0, outputLayer, 1};
++      planes[plane].extent = {plane ? (width + 1) / 2 : width, plane ? (height + 1) / 2 : height, 1};
++   }
++   v->CmdCopyImage(cmd, s->dpb[pic.setup], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, outputImage, dstLayout, 2, planes);
++   images.clear();
++   images.push_back(image_barrier(s->dpb[pic.setup], 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR));
++   if (dstLayout != outputLayout)
++      images.push_back(image_barrier(outputImage, outputLayer, dstLayout, outputLayout));
++   barrier(v, cmd, images.data(), (uint32_t)images.size(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++           VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
++   viogpu_bridge_end_vk_commands(device->vkd3d, list->list);
++}
++
++/* ---------------------------------------------------------------------------------------------------------------- */
++/* Tables */
++
++void
++decode_fill_device_table(D3D12DDI_DEVICE_FUNCS_VIDEO_0082_0 *f)
++{
++   f->pfnCalcPrivateVideoDecoderSize = calc_decoder_size;
++   f->pfnCreateVideoDecoder = create_decoder;
++   f->pfnDestroyVideoDecoder = destroy_decoder;
++   f->pfnCalcPrivateVideoDecoderHeapSize = calc_decoder_heap_size;
++   f->pfnCreateVideoDecoderHeap = create_decoder_heap;
++   f->pfnDestroyVideoDecoderHeap = destroy_decoder_heap;
++}
++
++void
++decode_fill_list_table(D3D12DDI_COMMAND_LIST_FUNCS_VIDEO_DECODE_0063 *f)
++{
++   f->pfnDecodeFrame = decode_frame;
++}
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ed6bbcfb..24aa0c85 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -6511,6 +6511,14 @@ static void d3d12_command_list_track_resource_usage(struct d3d12_command_list *l
+     d3d12_command_list_register_used_resource(list, resource);
+ }
+ 
++/* viogpu's video lists record Vulkan commands into a list (DXVK interop): a texture those use still gets the
++ * initial transition before the list, as with any D3D12 command */
++void vkd3d_command_list_track_interop_resource(ID3D12GraphicsCommandList *iface, ID3D12Resource *resource)
++{
++    d3d12_command_list_track_resource_usage(impl_from_ID3D12GraphicsCommandList((d3d12_command_list_iface *)iface),
++            impl_from_ID3D12Resource(resource), true);
++}
++
+ static void d3d12_command_list_track_query_heap(struct d3d12_command_list *list,
+         struct d3d12_query_heap *heap)
+ {
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 4ea24781..0f399bf0 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -137,6 +137,11 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION(KHR_VIDEO_ENCODE_QUEUE, KHR_video_encode_queue),
+     VK_EXTENSION(KHR_VIDEO_ENCODE_H264, KHR_video_encode_h264),
+     VK_EXTENSION(KHR_VIDEO_ENCODE_H265, KHR_video_encode_h265),
++    VK_EXTENSION(KHR_VIDEO_DECODE_QUEUE, KHR_video_decode_queue),
++    VK_EXTENSION(KHR_VIDEO_DECODE_H264, KHR_video_decode_h264),
++    VK_EXTENSION(KHR_VIDEO_DECODE_H265, KHR_video_decode_h265),
++    VK_EXTENSION(KHR_VIDEO_DECODE_AV1, KHR_video_decode_av1),
++    VK_EXTENSION(KHR_VIDEO_DECODE_VP9, KHR_video_decode_vp9),
+     VK_EXTENSION(KHR_VIDEO_MAINTENANCE_1, KHR_video_maintenance1),
+     /* AMD extensions */
+     VK_EXTENSION(AMD_BUFFER_MARKER, AMD_buffer_marker),
+@@ -2463,6 +2468,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_prepend_struct(&info->features2, &info->video_maintenance1_features);
+     }
+ 
++    if (vulkan_info->KHR_video_decode_vp9)
++    {
++        info->video_decode_vp9_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR;
++        vk_prepend_struct(&info->features2, &info->video_decode_vp9_features);
++    }
++
+     if (vulkan_info->KHR_cooperative_matrix)
+     {
+         info->cooperative_matrix_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+@@ -3713,6 +3724,10 @@ static HRESULT vkd3d_select_queues(const struct d3d12_device *device,
+     if (device->vk_info.KHR_video_encode_queue && device->vk_info.KHR_video_maintenance1)
+         info->family_index[VKD3D_QUEUE_FAMILY_VIDEO_ENCODE] = vkd3d_find_queue(count, queue_properties,
+                 VK_QUEUE_VIDEO_ENCODE_BIT_KHR, VK_QUEUE_VIDEO_ENCODE_BIT_KHR);
++    /* Video decoding (viogpu's D3D12 video decoder): bitstream buffers get the decode usage, profile-independent */
++    if (device->vk_info.KHR_video_decode_queue && device->vk_info.KHR_video_maintenance1)
++        info->family_index[VKD3D_QUEUE_FAMILY_VIDEO_DECODE] = vkd3d_find_queue(count, queue_properties,
++                VK_QUEUE_VIDEO_DECODE_BIT_KHR, VK_QUEUE_VIDEO_DECODE_BIT_KHR);
+ 
+     if (info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE] == VK_QUEUE_FAMILY_IGNORED)
+         info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE] = info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS];
+@@ -4032,6 +4047,8 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
+             device_queue_info.family_index[VKD3D_QUEUE_FAMILY_OPTICAL_FLOW]);
+     TRACE("Using queue family %u for video encoding.\n",
+             device_queue_info.family_index[VKD3D_QUEUE_FAMILY_VIDEO_ENCODE]);
++    TRACE("Using queue family %u for video decoding.\n",
++            device_queue_info.family_index[VKD3D_QUEUE_FAMILY_VIDEO_DECODE]);
+ 
+     if (device_queue_info.family_index[VKD3D_QUEUE_FAMILY_TRANSFER] ==
+         device_queue_info.family_index[VKD3D_QUEUE_FAMILY_COMPUTE] ||
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 2b46ec70..1eaedaf8 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -200,6 +200,18 @@ static bool vkd3d_image_can_be_video_encode_src(struct d3d12_device *device, con
+     return !!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_VIDEO_ENCODE_INPUT_BIT_KHR);
+ }
+ 
++/* Video pictures (NV12/P010; P010 is G16 here): the video queue families use them too (the decoder copies its
++ * output into them on the decode queue), so they are shared with those families */
++static bool vkd3d_image_is_video_picture(const struct d3d12_device *device, const VkImageCreateInfo *image_info)
++{
++    return (device->queue_families[VKD3D_QUEUE_FAMILY_VIDEO_ENCODE] ||
++            device->queue_families[VKD3D_QUEUE_FAMILY_VIDEO_DECODE]) &&
++            (image_info->format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
++            image_info->format == VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 ||
++            image_info->format == VK_FORMAT_G16_B16R16_2PLANE_420_UNORM) &&
++            image_info->imageType == VK_IMAGE_TYPE_2D && !(image_info->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT);
++}
++
+ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
+         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
+         const D3D12_RESOURCE_DESC1 *desc, const char *tag, VkBuffer *vk_buffer)
+@@ -289,6 +301,17 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
+         buffer_info.flags |= VK_BUFFER_CREATE_VIDEO_PROFILE_INDEPENDENT_BIT_KHR;
+     }
+ 
++    /* A video decoder's bitstream input (applications write it in upload heaps). Decoders read bitstreams in
++     * aligned sizes (NVIDIA: 256 bytes) while applications size buffers to the byte: the Vulkan buffer is padded to
++     * 4 KiB so the aligned read stays in it (viogpu_umd's decoder relies on that). */
++    if (device->queue_families[VKD3D_QUEUE_FAMILY_VIDEO_DECODE] &&
++            device->device_info.video_maintenance1_features.videoMaintenance1 && !sparse_resource)
++    {
++        buffer_info.usage |= VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR;
++        buffer_info.flags |= VK_BUFFER_CREATE_VIDEO_PROFILE_INDEPENDENT_BIT_KHR;
++        buffer_info.size = align(buffer_info.size, 4096);
++    }
++
+     if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+         buffer_info.usage |= VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+ 
+@@ -770,7 +793,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+     const bool sparse_resource = !heap_properties;
+     const struct vkd3d_format *format;
+     bool disable_compression;
+-    bool video_encode_src;
++    bool video_encode_src, video_shared;
+     bool use_concurrent;
+     unsigned int i;
+ 
+@@ -1005,6 +1028,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+         image_info->usage |= VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR;
+         image_info->flags |= VK_IMAGE_CREATE_VIDEO_PROFILE_INDEPENDENT_BIT_KHR;
+     }
++    video_shared = video_encode_src || vkd3d_image_is_video_picture(device, image_info);
+ 
+     /* Additional image flags as necessary. Do not add 2D_ARRAY_COMPATIBLE for sparse due
+      * to VUID 09403. */
+@@ -1028,8 +1052,8 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+             (heap_properties && is_cpu_accessible_heap(heap_properties));
+ 
+     /* Simultaneous access implies CONCURRENT since it can concurrently have one writer and many readers.
+-     * maint9 guarantee is technically automatic EXCLUSIVE. Video encoder input: always concurrent (below). */
+-    if (!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && !video_encode_src)
++     * maint9 guarantee is technically automatic EXCLUSIVE. Video pictures: always concurrent (below). */
++    if (!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && !video_shared)
+     {
+         bool linear_guarantee = device->device_info.maintenance_9_features.maintenance9 &&
+                 image_info->tiling == VK_IMAGE_TILING_LINEAR;
+@@ -1053,7 +1077,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+          * Pretend we're buffers.
+          * If we added typically compressed usage types due to fallbacks, force full CONCURRENT. */
+         if (!(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
+-            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) || video_encode_src ||
++            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) || video_shared ||
+             (!device->device_info.maintenance_9_features.maintenance9 &&
+                 vk_image_usage_support_implicit_concurrent(image_info->usage)))
+         {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index d42c1743..0419e4d8 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -204,6 +204,11 @@ struct vkd3d_vulkan_info
+     bool KHR_video_encode_queue;
+     bool KHR_video_encode_h264;
+     bool KHR_video_encode_h265;
++    bool KHR_video_decode_queue;
++    bool KHR_video_decode_h264;
++    bool KHR_video_decode_h265;
++    bool KHR_video_decode_av1;
++    bool KHR_video_decode_vp9;
+     bool KHR_video_maintenance1;
+     bool NV_shader_sm_builtins;
+     bool NVX_binary_import;
+@@ -5107,6 +5112,7 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceDepthBiasControlFeaturesEXT depth_bias_control_features;
+     VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow_nv_features;
+     VkPhysicalDeviceVideoMaintenance1FeaturesKHR video_maintenance1_features;
++    VkPhysicalDeviceVideoDecodeVP9FeaturesKHR video_decode_vp9_features;
+     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix_features;
+     VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT zero_initialize_device_memory_features;
+     VkPhysicalDeviceOpacityMicromapFeaturesEXT opacity_micromap_features;
+@@ -5178,6 +5184,7 @@ enum vkd3d_queue_family
+     VKD3D_QUEUE_FAMILY_TRANSFER,
+     VKD3D_QUEUE_FAMILY_OPTICAL_FLOW,
+     VKD3D_QUEUE_FAMILY_VIDEO_ENCODE,
++    VKD3D_QUEUE_FAMILY_VIDEO_DECODE,
+     /* Keep internal queues at the end */
+     VKD3D_QUEUE_FAMILY_INTERNAL_COMPUTE,
+     /* Keep sparse after all other queues since it does not append concurrent sharing list.

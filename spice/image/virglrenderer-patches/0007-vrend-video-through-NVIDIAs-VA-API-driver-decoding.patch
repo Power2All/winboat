@@ -1,0 +1,763 @@
+vrend: video decoding through NVIDIA's VA-API driver (WinBoat)
+
+With nvidia-vaapi-driver on the host (patch 0006 accepts it) H.264 and HEVC
+decoded nothing, and no decoded picture reached the guest:
+
+- virgl sent VA-API one slice parameter buffer with slice_data_size 0 and the
+  whole picture as slice data. Mesa's drivers cope; NVIDIA's copies
+  slice_data_size bytes per slice parameter buffer. Split the guest's Annex B
+  byte stream at its start codes and send each NAL unit (without its start code:
+  both add their own) after its own slice parameters.
+- Decoded pictures reach the guest's plane textures through DMA-BUF export and
+  an EGL import, which lost the surfaces' DRM format modifier (kept in an int,
+  not passed to EGL): tiled surfaces were taken for linear. Keep the 64-bit
+  modifier and pass it.
+- NVIDIA's surfaces still don't survive that: nvidia-vaapi-driver's block-linear
+  exports are imported, but NVIDIA's EGL reads parts of them wrongly (where the
+  picture has detail; reproduced natively on the host with driver 615 and
+  nvidia-vaapi-driver 0.0.14 and 0.0.18, while vaGetImage reads the same
+  surface right). With NVIDIA's driver, read each picture with vaGetImage and
+  upload its planes instead (an NV12 1080p picture is 3 MB: a copy each way).
+- H.264: the picture size in macroblocks (left uninitialized; NVIDIA's driver
+  reads it), and reference entries without a picture stay invalid instead of
+  short-term references to no surface (the guest packs references from index 0
+  and passes the sequence's maximum as num_ref_frames).
+- HEVC: the scaling lists as an IQ matrix buffer, which virgl never sent
+  (streams with scaling lists decoded with zero lists).
+- MPEG-2: the slices one by one too (with their start codes, as VA-API takes
+  them, and their headers' row, quantizer scale and macroblock offset), the
+  quantizer matrices (never sent either), and the picture size and frame
+  structure (NVIDIA's driver reads them).
+- Decoders' configuration with the one surface format, not every supported
+  one: NVIDIA's driver can't pick from those for VP9 and AV1, and decoded
+  10-bit streams as 8-bit. Whether a stream is 10-bit shows with its first
+  picture's target (P010), so decoders' configuration and context are made at
+  their first picture.
+- AV1: the current picture's surfaces (they were the frame id), the chroma
+  subsampling (from the codec: it was 0, 4:4:4, which NVIDIA's driver reads),
+  and the tile sizes with uniform tile spacing too (NVIDIA's driver reads them
+  always).
+
+diff --git a/src/vrend/virgl_video.c b/src/vrend/virgl_video.c
+index 40dd92f..872b785 100644
+--- a/src/vrend/virgl_video.c
++++ b/src/vrend/virgl_video.c
+@@ -95,6 +95,7 @@ struct virgl_video_buffer {
+     bool interlanced;
+     VASurfaceID va_sfc;
+     struct virgl_video_dma_buf *dmabuf;
++    VAImage image;                              /* read_images: the picture read with vaGetImage */
+     void *opaque;                               /* User opaque data */
+ };
+ 
+@@ -109,6 +110,7 @@ struct virgl_video_codec {
+    uint32_t max_references;
+    VAContextID va_ctx;
+    VAConfigID  va_cfg;
++   uint32_t rt_formats;               /* decoding: the RT formats the driver supports, for the deferred config */
+    struct virgl_video_buffer *buffer;
+    struct virgl_video_buffer *ref_pic_list[32]; /* Enc: reference pictures */
+    VABufferID  va_coded_buf;                    /* Enc: VACodedBuffer */
+@@ -122,6 +124,13 @@ struct virgl_video_supported_entry {
+ 
+ static VADisplay va_dpy;
+ 
++/*
++ * NVIDIA's VA-API driver (nvidia-vaapi-driver) exports its surfaces as block-linear DMA-BUFs that NVIDIA's EGL imports
++ * but reads wrongly: the copy into the guest's planes had parts of the picture wrong (where it has detail). vaGetImage
++ * reads them right: decoded pictures come in memory then (WinBoat).
++ */
++static bool read_images;
++
+ static struct virgl_video_callbacks *callbacks = NULL;
+ 
+ static enum pipe_video_profile pipe_profile_from_va(VAProfile profile)
+@@ -507,6 +516,46 @@ static void decode_completed(struct virgl_video_codec *codec,
+     if (!callbacks || !callbacks->decode_completed)
+         return;
+ 
++    if (read_images) {
++        struct virgl_video_dma_buf picture = {0};
++        void *data = NULL;
++        bool ten = buffer->format == PIPE_FORMAT_P010;
++
++        if (buffer->image.image_id == VA_INVALID_ID) {
++            VAImageFormat format = {
++                .fourcc = ten ? VA_FOURCC_P010 : VA_FOURCC_NV12,
++                .byte_order = VA_LSB_FIRST,
++                .bits_per_pixel = ten ? 24 : 12,
++            };
++            if (VA_STATUS_SUCCESS != vaCreateImage(va_dpy, &format, buffer->width, buffer->height, &buffer->image)) {
++                buffer->image.image_id = VA_INVALID_ID;
++                virgl_error("create image failed\n");
++                return;
++            }
++        }
++        if (VA_STATUS_SUCCESS != vaGetImage(va_dpy, buffer->va_sfc, 0, 0, buffer->width, buffer->height,
++                                            buffer->image.image_id) ||
++            VA_STATUS_SUCCESS != vaMapBuffer(va_dpy, buffer->image.buf, &data)) {
++            virgl_error("read picture failed\n");
++            return;
++        }
++        picture.buf = buffer;
++        picture.drm_format = ten ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
++        picture.width = buffer->width;
++        picture.height = buffer->height;
++        picture.flags = VIRGL_VIDEO_DMABUF_READ_ONLY;
++        picture.num_planes = 2;
++        for (unsigned i = 0; i < 2; i++) {
++            picture.planes[i].fd = -1;
++            picture.planes[i].offset = buffer->image.offsets[i];
++            picture.planes[i].pitch = buffer->image.pitches[i];
++        }
++        picture.data = data;
++        callbacks->decode_completed(codec, &picture);
++        vaUnmapBuffer(va_dpy, buffer->image.buf);
++        return;
++    }
++
+     if (!buffer->dmabuf)
+         buffer->dmabuf = export_video_dma_buf(buffer, VIRGL_VIDEO_DMABUF_READ_ONLY);
+ 
+@@ -580,6 +629,7 @@ int virgl_video_init(int drm_fd,
+         virgl_video_destroy();
+         return -1;
+     }
++    read_images = strstr(driver, "NVDEC") != NULL;
+ 
+     callbacks = cbs;
+ 
+@@ -768,21 +818,30 @@ struct virgl_video_codec *virgl_video_create_codec(
+                   format, attr.value);
+         goto err;
+     }
++    /*
++     * Decoding: the configuration with the one format of the surfaces, not all the supported ones (NVIDIA's driver
++     * can't pick from those for VP9 and AV1, and decoded 10-bit streams as 8-bit). Whether they are 10-bit shows with
++     * the first picture's target (P010): the configuration and context are made then (WinBoat).
++     */
++    if (entrypoint == VAEntrypointVLD) {
++        codec->rt_formats = attr.value;
++    } else {
++        attr.value = format;
++        va_stat = vaCreateConfig(va_dpy, profile, entrypoint, &attr, 1, &cfg);
++        if (VA_STATUS_SUCCESS != va_stat) {
++            virgl_error("create config failed, err = 0x%x\n", va_stat);
++            goto err;
++        }
++        codec->va_cfg = cfg;
+ 
+-    va_stat = vaCreateConfig(va_dpy, profile, entrypoint, &attr, 1, &cfg);
+-    if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("create config failed, err = 0x%x\n", va_stat);
+-        goto err;
+-    }
+-    codec->va_cfg = cfg;
+-
+-    va_stat = vaCreateContext(va_dpy, cfg, args->width, args->height,
+-                                VA_PROGRESSIVE, NULL, 0, &ctx);
+-    if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("create context failed, err = 0x%x\n", va_stat);
+-        goto err;
++        va_stat = vaCreateContext(va_dpy, cfg, args->width, args->height,
++                                    VA_PROGRESSIVE, NULL, 0, &ctx);
++        if (VA_STATUS_SUCCESS != va_stat) {
++            virgl_error("create context failed, err = 0x%x\n", va_stat);
++            goto err;
++        }
++        codec->va_ctx = ctx;
+     }
+-    codec->va_ctx = ctx;
+ 
+     codec->profile = args->profile;
+     codec->level = args->level;
+@@ -860,6 +919,7 @@ struct virgl_video_buffer *virgl_video_create_buffer(
+     }
+ 
+     buffer->va_sfc = sfc;
++    buffer->image.image_id = VA_INVALID_ID;
+     buffer->format = args->format;
+     buffer->width  = args->width;
+     buffer->height = args->height;
+@@ -876,6 +936,9 @@ void virgl_video_destroy_buffer(struct virgl_video_buffer *buffer)
+     if (buffer->dmabuf)
+         destroy_video_dma_buf(buffer->dmabuf);
+ 
++    if (buffer->image.image_id != VA_INVALID_ID)
++        vaDestroyImage(va_dpy, buffer->image.image_id);
++
+     if (buffer->va_sfc)
+         vaDestroySurfaces(va_dpy, &buffer->va_sfc, 1);
+ 
+@@ -914,6 +977,22 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
+     if (codec->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)
+         encode_upload_picture(codec, target);
+ 
++    /* Decoding: the configuration and context for the first picture's surfaces (WinBoat) */
++    if (!codec->va_ctx) {
++        VAConfigAttrib attr = { .type = VAConfigAttribRTFormat };
++        attr.value = target->format == PIPE_FORMAT_P010 && (codec->rt_formats & VA_RT_FORMAT_YUV420_10)
++                   ? VA_RT_FORMAT_YUV420_10 : va_format_from_pipe_chroma(codec->chroma_format);
++        va_stat = vaCreateConfig(va_dpy, va_profile_from_pipe(codec->profile),
++                                 va_entrypoint_from_pipe(codec->entrypoint), &attr, 1, &codec->va_cfg);
++        if (VA_STATUS_SUCCESS == va_stat)
++            va_stat = vaCreateContext(va_dpy, codec->va_cfg, codec->width, codec->height, VA_PROGRESSIVE, NULL, 0,
++                                      &codec->va_ctx);
++        if (VA_STATUS_SUCCESS != va_stat) {
++            virgl_error("create decoder failed, err = 0x%x\n", va_stat);
++            return -1;
++        }
++    }
++
+     codec->buffer = target;
+     va_stat = vaBeginPicture(va_dpy, codec->va_ctx, target->va_sfc);
+     if (VA_STATUS_SUCCESS != va_stat) {
+@@ -974,6 +1053,11 @@ static void h264_fill_picture_param(struct virgl_video_codec *codec,
+     for (i = 0; i < desc->num_ref_frames; i++) {
+         pic = &vapp->ReferenceFrames[i];
+ 
++        /* num_ref_frames is the sequence's maximum: entries without a picture stay invalid, not short-term
++         * references to no surface, which NVIDIA's driver would decode from (WinBoat) */
++        if (desc->buffer_id[i] == VA_INVALID_SURFACE)
++            continue;
++
+         pic->picture_id = desc->buffer_id[i];
+         pic->frame_idx  = desc->frame_num_list[i];
+         pic->flags = (desc->is_long_term[i]
+@@ -991,8 +1075,9 @@ static void h264_fill_picture_param(struct virgl_video_codec *codec,
+         pic->BottomFieldOrderCnt = desc->field_order_cnt_list[i][1];
+     }
+ 
+-    //vapp->picture_width_in_mbs_minus1  = (codec->width - 1) / 16;
+-    //vapp->picture_height_in_mbs_minus1 = (codec->height - 1) / 16;
++    /* NVIDIA's VA-API driver reads the picture size (WinBoat) */
++    vapp->picture_width_in_mbs_minus1  = (codec->width - 1) / 16;
++    vapp->picture_height_in_mbs_minus1 = (codec->height - 1) / 16;
+     ITEM_SET(vapp, &desc->pps.sps, bit_depth_luma_minus8);
+     ITEM_SET(vapp, &desc->pps.sps, bit_depth_chroma_minus8);
+     ITEM_SET(vapp, desc, num_ref_frames);
+@@ -1376,6 +1461,78 @@ static void h264_fill_enc_misc_param_frame_rate(
+     param->framerate_flags.bits.temporal_id = temporal_id;
+ }
+ 
++/*
++ * VA-API takes one slice parameter buffer per slice, and its slice_data_size says how many bytes of the slice data
++ * buffer after it are that slice: NVIDIA's VA-API driver (nvidia-vaapi-driver) copies exactly that many, Mesa's use
++ * them too. The guest sends a picture's slices as one Annex B byte stream (start code, NAL unit, start code, ...):
++ * split it at the start codes and send each NAL unit without its start code (both drivers add their own) after its
++ * own slice parameters. Every codec's slice parameter struct starts with the three slice data fields (WinBoat).
++ */
++struct va_slice_data_fields {
++    uint32_t slice_data_size;
++    uint32_t slice_data_offset;
++    uint32_t slice_data_flag;
++};
++
++static int render_slice(struct virgl_video_codec *codec, void *slice_param, size_t param_size,
++                        const uint8_t *data, unsigned size)
++{
++    struct va_slice_data_fields *fields = slice_param;
++    VABufferID bufs[2];
++    VAStatus va_stat;
++
++    fields->slice_data_size = size;
++    fields->slice_data_offset = 0;
++    fields->slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
++    vaCreateBuffer(va_dpy, codec->va_ctx, VASliceParameterBufferType, param_size, 1, slice_param, &bufs[0]);
++    vaCreateBuffer(va_dpy, codec->va_ctx, VASliceDataBufferType, size, 1, (void *)data, &bufs[1]);
++    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, bufs, 2);
++    vaDestroyBuffer(va_dpy, bufs[0]);
++    vaDestroyBuffer(va_dpy, bufs[1]);
++    if (VA_STATUS_SUCCESS != va_stat) {
++        virgl_error("render slice failed, err = 0x%x\n", va_stat);
++        return -1;
++    }
++    return 0;
++}
++
++static int render_nal_slices(struct virgl_video_codec *codec, void *slice_param, size_t param_size,
++                             unsigned num_buffers, const void * const *buffers, const unsigned *sizes,
++                             bool keep_start_codes,
++                             void (*fill)(void *slice_param, const uint8_t *data, unsigned size))
++{
++    int err = 0;
++
++    for (unsigned b = 0; b < num_buffers; b++) {
++        const uint8_t *p = buffers[b];
++        unsigned size = sizes[b], nal = UINT32_MAX;
++
++        for (unsigned i = 0; i <= size; i++) {
++            bool start_code = i + 2 < size && !p[i] && !p[i + 1] && p[i + 2] == 1;
++            if (!start_code && i < size)
++                continue;
++            /* no start code at all: the buffer is one NAL unit */
++            if (nal == UINT32_MAX && i == size)
++                nal = 0;
++            if (nal != UINT32_MAX) {
++                unsigned end = i;
++                /* the zero byte of the next 4-byte start code */
++                while (end > nal && !p[end - 1])
++                    end--;
++                /* MPEG-2's slices are with their start codes */
++                unsigned start = keep_start_codes && nal >= 3 ? nal - 3 : nal;
++                if (end > nal && fill)
++                    fill(slice_param, p + start, end - start);
++                if (end > nal && render_slice(codec, slice_param, param_size, p + start, end - start))
++                    err = -1;
++            }
++            nal = i + 3;
++            i += 2;
++        }
++    }
++    return err;
++}
++
+ static int h264_decode_bitstream(struct virgl_video_codec *codec,
+                                  struct virgl_video_buffer *target,
+                                  const struct virgl_h264_picture_desc *desc,
+@@ -1383,76 +1540,30 @@ static int h264_decode_bitstream(struct virgl_video_codec *codec,
+                                  const void * const *buffers,
+                                  const unsigned *sizes)
+ {
+-    unsigned i;
+-    int err = 0;
+     VAStatus va_stat;
+-    VABufferID *slice_data_buf, pic_param_buf, iq_matrix_buf, slice_param_buf;
+-    VAPictureParameterBufferH264 pic_param;
++    VABufferID bufs[2];
++    VAPictureParameterBufferH264 pic_param = {0};
+     VAIQMatrixBufferH264 iq_matrix;
+-    VASliceParameterBufferH264 slice_param;
+-
+-    slice_data_buf = calloc(num_buffers, sizeof(VABufferID));
+-    if (!slice_data_buf) {
+-        virgl_error("alloc slice data buffer id failed\n");
+-        return -1;
+-    }
++    VASliceParameterBufferH264 slice_param = {0};
+ 
+     h264_fill_picture_param(codec, target, desc, &pic_param);
+     vaCreateBuffer(va_dpy, codec->va_ctx, VAPictureParameterBufferType,
+-                   sizeof(pic_param), 1, &pic_param, &pic_param_buf);
++                   sizeof(pic_param), 1, &pic_param, &bufs[0]);
+ 
+     h264_fill_iq_matrix(desc, &iq_matrix);
+     vaCreateBuffer(va_dpy, codec->va_ctx, VAIQMatrixBufferType,
+-                   sizeof(iq_matrix), 1, &iq_matrix, &iq_matrix_buf);
+-
+-    h264_fill_slice_param(desc, &slice_param);
+-    vaCreateBuffer(va_dpy, codec->va_ctx, VASliceParameterBufferType,
+-                   sizeof(slice_param), 1, &slice_param, &slice_param_buf);
+-
+-    for (i = 0; i < num_buffers; i++) {
+-        vaCreateBuffer(va_dpy, codec->va_ctx, VASliceDataBufferType,
+-                      sizes[i], 1, (void *)(buffers[i]), &slice_data_buf[i]);
+-    }
++                   sizeof(iq_matrix), 1, &iq_matrix, &bufs[1]);
+ 
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &pic_param_buf, 1);
++    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, bufs, 2);
++    vaDestroyBuffer(va_dpy, bufs[0]);
++    vaDestroyBuffer(va_dpy, bufs[1]);
+     if (VA_STATUS_SUCCESS != va_stat) {
+         virgl_error("render picture param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &iq_matrix_buf, 1);
+-    if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("render iq matrix failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_param_buf, 1);
+-    if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("render slice param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+-    for (i = 0; i < num_buffers; i++) {
+-        va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_data_buf[i], 1);
+-
+-        if (VA_STATUS_SUCCESS != va_stat) {
+-            virgl_error("render slice data failed, err = 0x%x\n", va_stat);
+-            err = -1;
+-        }
++        return -1;
+     }
+ 
+-err:
+-    vaDestroyBuffer(va_dpy, pic_param_buf);
+-    vaDestroyBuffer(va_dpy, iq_matrix_buf);
+-    vaDestroyBuffer(va_dpy, slice_param_buf);
+-    for (i = 0; i < num_buffers; i++)
+-        vaDestroyBuffer(va_dpy, slice_data_buf[i]);
+-    free(slice_data_buf);
+-
+-    return err;
++    h264_fill_slice_param(desc, &slice_param);
++    return render_nal_slices(codec, &slice_param, sizeof(slice_param), num_buffers, buffers, sizes, false, NULL);
+ }
+ 
+ static int h264_encode_render_sequence(
+@@ -2100,63 +2211,39 @@ static int h265_decode_bitstream(struct virgl_video_codec *codec,
+                                  const void * const *buffers,
+                                  const unsigned *sizes)
+ {
+-    unsigned i;
+-    int err = 0;
+     VAStatus va_stat;
+-    VABufferID *slice_data_buf, pic_param_buf, slice_param_buf;
++    VABufferID bufs[2];
++    unsigned num_bufs = 1;
+     VAPictureParameterBufferHEVC pic_param = {0};
+     VASliceParameterBufferHEVC slice_param = {0};
+ 
+-    slice_data_buf = calloc(num_buffers, sizeof(VABufferID));
+-    if (!slice_data_buf) {
+-        virgl_error("alloc slice data buffer id failed\n");
+-        return -1;
+-    }
+-
+     h265_fill_picture_param(codec, target, desc, &pic_param);
+     vaCreateBuffer(va_dpy, codec->va_ctx, VAPictureParameterBufferType,
+-                   sizeof(pic_param), 1, &pic_param, &pic_param_buf);
+-
+-    h265_fill_slice_param(desc, &slice_param);
+-    vaCreateBuffer(va_dpy, codec->va_ctx, VASliceParameterBufferType,
+-                   sizeof(slice_param), 1, &slice_param, &slice_param_buf);
+-
+-    for (i = 0; i < num_buffers; i++) {
+-        vaCreateBuffer(va_dpy, codec->va_ctx, VASliceDataBufferType,
+-                      sizes[i], 1, (void *)(buffers[i]), &slice_data_buf[i]);
+-    }
+-
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &pic_param_buf, 1);
++                   sizeof(pic_param), 1, &pic_param, &bufs[0]);
++
++    /* The scaling lists, which virgl never sent: NVIDIA's driver decoded streams that have them with zeros (WinBoat) */
++    if (desc->pps.sps.scaling_list_enabled_flag) {
++        VAIQMatrixBufferHEVC iq_matrix;
++        memcpy(iq_matrix.ScalingList4x4, desc->pps.sps.ScalingList4x4, sizeof(iq_matrix.ScalingList4x4));
++        memcpy(iq_matrix.ScalingList8x8, desc->pps.sps.ScalingList8x8, sizeof(iq_matrix.ScalingList8x8));
++        memcpy(iq_matrix.ScalingList16x16, desc->pps.sps.ScalingList16x16, sizeof(iq_matrix.ScalingList16x16));
++        memcpy(iq_matrix.ScalingList32x32, desc->pps.sps.ScalingList32x32, sizeof(iq_matrix.ScalingList32x32));
++        memcpy(iq_matrix.ScalingListDC16x16, desc->pps.sps.ScalingListDCCoeff16x16, sizeof(iq_matrix.ScalingListDC16x16));
++        memcpy(iq_matrix.ScalingListDC32x32, desc->pps.sps.ScalingListDCCoeff32x32, sizeof(iq_matrix.ScalingListDC32x32));
++        vaCreateBuffer(va_dpy, codec->va_ctx, VAIQMatrixBufferType,
++                       sizeof(iq_matrix), 1, &iq_matrix, &bufs[num_bufs++]);
++    }
++
++    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, bufs, num_bufs);
++    for (unsigned i = 0; i < num_bufs; i++)
++        vaDestroyBuffer(va_dpy, bufs[i]);
+     if (VA_STATUS_SUCCESS != va_stat) {
+         virgl_error("render picture param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_param_buf, 1);
+-    if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("render slice param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+-    for (i = 0; i < num_buffers; i++) {
+-        va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_data_buf[i], 1);
+-
+-        if (VA_STATUS_SUCCESS != va_stat) {
+-            virgl_error("render slice data failed, err = 0x%x\n", va_stat);
+-            err = -1;
+-        }
++        return -1;
+     }
+ 
+-err:
+-    vaDestroyBuffer(va_dpy, pic_param_buf);
+-    vaDestroyBuffer(va_dpy, slice_param_buf);
+-    for (i = 0; i < num_buffers; i++)
+-        vaDestroyBuffer(va_dpy, slice_data_buf[i]);
+-    free(slice_data_buf);
+-
+-    return err;
++    h265_fill_slice_param(desc, &slice_param);
++    return render_nal_slices(codec, &slice_param, sizeof(slice_param), num_buffers, buffers, sizes, false, NULL);
+ }
+ 
+ static int h265_encode_render_sequence(
+@@ -2310,13 +2397,33 @@ static void mpeg12_fill_picture_param(struct virgl_video_codec *codec,
+     ITEM_SET(&vapp->picture_coding_extension.bits, desc, q_scale_type);
+     ITEM_SET(&vapp->picture_coding_extension.bits, desc, intra_vlc_format);
+     ITEM_SET(&vapp->picture_coding_extension.bits, desc, alternate_scan);
++    /* The picture size and frame structure, which NVIDIA's driver reads (WinBoat) */
++    vapp->horizontal_size = codec->width;
++    vapp->vertical_size = codec->height;
++    vapp->picture_coding_extension.bits.progressive_frame = desc->picture_structure == 3;
++    /* ponytail: second fields of field pictures aren't known here (not in virgl's picture description) */
++    vapp->picture_coding_extension.bits.is_first_field = 1;
+ }
+ 
+-static void mpeg12_fill_slice_param(const struct virgl_mpeg12_picture_desc *desc,
+-                                    VASliceParameterBufferMPEG2 *vasp)
++/* An MPEG-2 slice's header: its row, quantizer scale and where its macroblocks start (Mesa's drivers read them) */
++static void mpeg12_fill_slice_header(void *param, const uint8_t *data, unsigned size)
+ {
+-    (void)desc;
+-    (void)vasp;
++    VASliceParameterBufferMPEG2 *vasp = param;
++    unsigned pos = 37;
++
++#define SLICE_BIT(n) ((n) / 8 < size ? (data[(n) / 8] >> (7 - (n) % 8)) & 1 : 0)
++    if (size < 5)
++        return;
++    vasp->slice_vertical_position = data[3] - 1;
++    vasp->quantiser_scale_code = data[4] >> 3;
++    vasp->intra_slice_flag = 0;
++    if (SLICE_BIT(pos)) {
++        vasp->intra_slice_flag = SLICE_BIT(pos + 1);
++        for (pos += 9; SLICE_BIT(pos); pos += 9)
++            ;
++    }
++    vasp->macroblock_offset = pos + 1;
++#undef SLICE_BIT
+ }
+ 
+ static int mpeg12_decode_bitstream(struct virgl_video_codec *codec,
+@@ -2326,63 +2433,38 @@ static int mpeg12_decode_bitstream(struct virgl_video_codec *codec,
+                                    const void * const *buffers,
+                                    const unsigned *sizes)
+ {
+-    unsigned i;
+-    int err = 0;
+     VAStatus va_stat;
+-    VABufferID *slice_data_buf, pic_param_buf, slice_param_buf;
++    VABufferID bufs[2];
+     VAPictureParameterBufferMPEG2 pic_param = {0};
++    VAIQMatrixBufferMPEG2 iq_matrix = {0};
+     VASliceParameterBufferMPEG2 slice_param = {0};
+ 
+-    slice_data_buf = calloc(num_buffers, sizeof(VABufferID));
+-    if (!slice_data_buf) {
+-        virgl_error("alloc slice data buffer id failed\n");
+-        return -1;
+-    }
+-
+     mpeg12_fill_picture_param(codec, target, desc, &pic_param);
+     vaCreateBuffer(va_dpy, codec->va_ctx, VAPictureParameterBufferType,
+-                   sizeof(pic_param), 1, &pic_param, &pic_param_buf);
+-
+-    mpeg12_fill_slice_param(desc, &slice_param);
+-    vaCreateBuffer(va_dpy, codec->va_ctx, VASliceParameterBufferType,
+-                   sizeof(slice_param), 1, &slice_param, &slice_param_buf);
+-
+-    for (i = 0; i < num_buffers; i++) {
+-        vaCreateBuffer(va_dpy, codec->va_ctx, VASliceDataBufferType,
+-                       sizes[i], 1, (void *)(buffers[i]), &slice_data_buf[i]);
+-    }
+-
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &pic_param_buf, 1);
+-    if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("render slice param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
++                   sizeof(pic_param), 1, &pic_param, &bufs[0]);
++
++    /* The quantizer matrices, which virgl never sent (streams with their own decoded with the defaults) (WinBoat) */
++    iq_matrix.load_intra_quantiser_matrix = 1;
++    iq_matrix.load_non_intra_quantiser_matrix = 1;
++    iq_matrix.load_chroma_intra_quantiser_matrix = 1;
++    iq_matrix.load_chroma_non_intra_quantiser_matrix = 1;
++    memcpy(iq_matrix.intra_quantiser_matrix, desc->intra_matrix, 64);
++    memcpy(iq_matrix.non_intra_quantiser_matrix, desc->non_intra_matrix, 64);
++    memcpy(iq_matrix.chroma_intra_quantiser_matrix, desc->intra_matrix, 64);
++    memcpy(iq_matrix.chroma_non_intra_quantiser_matrix, desc->non_intra_matrix, 64);
++    vaCreateBuffer(va_dpy, codec->va_ctx, VAIQMatrixBufferType,
++                   sizeof(iq_matrix), 1, &iq_matrix, &bufs[1]);
+ 
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_param_buf, 1);
++    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, bufs, 2);
++    vaDestroyBuffer(va_dpy, bufs[0]);
++    vaDestroyBuffer(va_dpy, bufs[1]);
+     if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("render slice param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+-    for (i = 0; i < num_buffers; i++) {
+-        va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_data_buf[i], 1);
+-
+-        if (VA_STATUS_SUCCESS != va_stat) {
+-            virgl_error("render slice data failed, err = 0x%x\n", va_stat);
+-            err = -1;
+-        }
++        virgl_error("render picture param failed, err = 0x%x\n", va_stat);
++        return -1;
+     }
+ 
+-err:
+-    vaDestroyBuffer(va_dpy, pic_param_buf);
+-    vaDestroyBuffer(va_dpy, slice_param_buf);
+-    for (i = 0; i < num_buffers; i++)
+-        vaDestroyBuffer(va_dpy, slice_data_buf[i]);
+-    free(slice_data_buf);
+-
+-    return err;
++    return render_nal_slices(codec, &slice_param, sizeof(slice_param), num_buffers, buffers, sizes, true,
++                             mpeg12_fill_slice_header);
+ }
+ 
+ static void mjpeg_fill_picture_param(struct virgl_video_codec *codec,
+@@ -2824,9 +2906,16 @@ static void av1_fill_picture_param(struct virgl_video_codec *codec,
+     //subsampling_y
+     //chroma_sample_positio
+     ITEM_SET(&param->seq_info_fields.fields, &desc->picture_parameter.seq_info_fields, film_grain_params_present);
++    /* The chroma subsampling, the codec's: NVIDIA's driver reads it (it was 4:4:4) (WinBoat) */
++    param->seq_info_fields.fields.subsampling_x = codec->chroma_format != PIPE_VIDEO_CHROMA_FORMAT_444;
++    param->seq_info_fields.fields.subsampling_y = codec->chroma_format == PIPE_VIDEO_CHROMA_FORMAT_420;
+ 
+-    param->current_frame = desc->picture_parameter.current_frame_id;
+-    param->current_display_picture = desc->picture_parameter.current_frame_id;
++    /* The picture's surfaces (they were the frame id): the target, and the film grain's when grain is applied
++     * (WinBoat) */
++    param->current_frame = target->va_sfc;
++    param->current_display_picture = desc->picture_parameter.film_grain_info.film_grain_info_fields.apply_grain &&
++                                     desc->film_grain_target != VA_INVALID_SURFACE
++                                   ? desc->film_grain_target : target->va_sfc;
+ 
+     //anchor_frames_num
+     //anchor_frames_list
+@@ -2897,14 +2986,13 @@ static void av1_fill_picture_param(struct virgl_video_codec *codec,
+     ITEM_SET(param, &desc->picture_parameter, tile_cols);
+     ITEM_SET(param, &desc->picture_parameter, tile_rows);
+ 
+-    if (!desc->picture_parameter.pic_info_fields.uniform_tile_spacing_flag) {
+-        for (i = 0; i < ARRAY_SIZE(param->width_in_sbs_minus_1); i++)
+-            if (desc->picture_parameter.width_in_sbs[i] > 0)
+-                param->width_in_sbs_minus_1[i] = desc->picture_parameter.width_in_sbs[i] - 1;
+-        for (i = 0; i < ARRAY_SIZE(param->height_in_sbs_minus_1); i++)
+-            if (desc->picture_parameter.height_in_sbs[i] > 0)
+-                param->height_in_sbs_minus_1[i] = desc->picture_parameter.height_in_sbs[i] - 1;
+-    }
++    /* The tile sizes with uniform spacing too: NVIDIA's driver reads them always (WinBoat) */
++    for (i = 0; i < ARRAY_SIZE(param->width_in_sbs_minus_1); i++)
++        if (desc->picture_parameter.width_in_sbs[i] > 0)
++            param->width_in_sbs_minus_1[i] = desc->picture_parameter.width_in_sbs[i] - 1;
++    for (i = 0; i < ARRAY_SIZE(param->height_in_sbs_minus_1); i++)
++        if (desc->picture_parameter.height_in_sbs[i] > 0)
++            param->height_in_sbs_minus_1[i] = desc->picture_parameter.height_in_sbs[i] - 1;
+ 
+     //tile_count_minus_1
+ 
+diff --git a/src/vrend/virgl_video.h b/src/vrend/virgl_video.h
+index e954559..a8375ca 100644
+--- a/src/vrend/virgl_video.h
++++ b/src/vrend/virgl_video.h
+@@ -93,10 +93,14 @@ struct virgl_video_dma_buf {
+         uint32_t drm_format;
+         int fd;
+         uint32_t size;
+-        int modifier;
++        uint64_t modifier;
+         uint32_t offset;
+         uint32_t pitch;
+     } planes[4];
++
++    /* Or the picture in memory, the planes at their offset and pitch in it (no fds): with NVIDIA's VA-API driver,
++     * whose exported surfaces NVIDIA's EGL reads wrongly (WinBoat) */
++    const void *data;
+ };
+ 
+ /*
+diff --git a/src/vrend/vrend_video.c b/src/vrend/vrend_video.c
+index 57341d8..8c13c6a 100644
+--- a/src/vrend/vrend_video.c
++++ b/src/vrend/vrend_video.c
+@@ -66,6 +66,8 @@
+  */
+ 
+ 
++#include <drm_fourcc.h>
++
+ #include "virgl_video.h"
+ #include "virgl_video_hw.h"
+ 
+@@ -164,17 +166,44 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
+             continue;
+         }
+ 
++        /* the picture in memory (NVIDIA's VA-API driver): uploaded into the plane (WinBoat) */
++        if (dmabuf->data) {
++            bool sixteen = dmabuf->drm_format == DRM_FORMAT_P010;
++            unsigned texel = (sixteen ? 2 : 1) * (i ? 2 : 1);
++
++            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++            glBindTexture(GL_TEXTURE_2D, res->gl_id);
++            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++            glPixelStorei(GL_UNPACK_ROW_LENGTH, dmabuf->planes[i].pitch / texel);
++            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
++                            MIN2(res->base.width0, dmabuf->width / (i + 1)),
++                            MIN2(res->base.height0, dmabuf->height / (i + 1)),
++                            i ? GL_RG : GL_RED, sixteen ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE,
++                            (const uint8_t *)dmabuf->data + dmabuf->planes[i].offset);
++            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++            continue;
++        }
++
+         /* dmabuf -> eglimage */
+         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
+-            EGLint img_attrs[16] = {
++            EGLint img_attrs[17] = {
+                 EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
+                 EGL_WIDTH,                      dmabuf->width / (i + 1),
+                 EGL_HEIGHT,                     dmabuf->height / (i + 1),
+                 EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
+                 EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
+                 EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
+-                EGL_NONE
++                EGL_NONE, EGL_NONE, EGL_NONE, EGL_NONE, EGL_NONE
+             };
++            /* The surface's layout (its DRM format modifier): without it EGL takes tiled surfaces for linear
++             * (WinBoat) */
++            if (dmabuf->planes[i].modifier != DRM_FORMAT_MOD_INVALID) {
++                img_attrs[12] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
++                img_attrs[13] = (EGLint)(dmabuf->planes[i].modifier & 0xffffffff);
++                img_attrs[14] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
++                img_attrs[15] = (EGLint)(dmabuf->planes[i].modifier >> 32);
++            }
+ 
+             plane->egl_image = eglCreateImageKHR(eglGetCurrentDisplay(),
+                     EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
+@@ -227,15 +256,23 @@ static int sync_video_buffer_to_dmabuf(struct vrend_video_buffer *buf,
+ 
+         /* dmabuf -> eglimage */
+         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
+-            EGLint img_attrs[16] = {
++            EGLint img_attrs[17] = {
+                 EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
+                 EGL_WIDTH,                      dmabuf->width / (i + 1),
+                 EGL_HEIGHT,                     dmabuf->height / (i + 1),
+                 EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
+                 EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
+                 EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
+-                EGL_NONE
++                EGL_NONE, EGL_NONE, EGL_NONE, EGL_NONE, EGL_NONE
+             };
++            /* The surface's layout (its DRM format modifier): without it EGL takes tiled surfaces for linear
++             * (WinBoat) */
++            if (dmabuf->planes[i].modifier != DRM_FORMAT_MOD_INVALID) {
++                img_attrs[12] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
++                img_attrs[13] = (EGLint)(dmabuf->planes[i].modifier & 0xffffffff);
++                img_attrs[14] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
++                img_attrs[15] = (EGLint)(dmabuf->planes[i].modifier >> 32);
++            }
+ 
+             plane->egl_image = eglCreateImageKHR(eglGetCurrentDisplay(),
+                     EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);

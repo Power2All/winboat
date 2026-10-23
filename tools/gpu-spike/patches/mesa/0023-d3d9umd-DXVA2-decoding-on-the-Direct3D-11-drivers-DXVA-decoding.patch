@@ -1,0 +1,3660 @@
+From: WinBoat
+Subject: [PATCH] d3d9umd: DXVA2 decoding, on the Direct3D 11 driver's DXVA decoding
+
+Players with DXVA2 hardware decoding (MPC-HC/BE, Kodi, VLC's dxva2) and
+ffmpeg's -hwaccel dxva2 got no decoder: the D3D9 driver's Decode* entry
+points were stubs and its caps listed none.
+
+- d3d10umd: the DXVA decoding (DXVA's structures, now Dxva*-prefixed: the
+  D3D9 side's WDK headers define some of the names; the profiles; the
+  slices; the frame's buffers to a gallium picture description) moves
+  from Video.cpp into DxvaDecode.{h,cpp}, which both drivers build. The
+  frontend brings the pictures: an output texture's array slice in
+  Direct3D 11, unchanged.
+- d3d9umd/decode.cpp: the decoder caps (the NV12 profiles: H.264, HEVC
+  Main, VP9 profile 0, AV1, MPEG-2), the compressed buffers (memory of
+  the driver's, through locks), and the Decode* entry points. Each NV12
+  surface the decoder writes gets the codec's video buffer (R8/R8G8
+  planes, the host's reference too); after each frame a draw on the
+  video context copies them into the surface's L8 texture (luma rows,
+  then chroma rows), which locks, StretchRect and the video processor
+  read. DXVA's surface indices name the surface last decoded with that
+  index. The two contexts' work is finished before the other uses it.
+
+ffmpeg -hwaccel dxva2: H.264 (field and MBAFF conformance clips too),
+HEVC up to 4K, VP9, AV1 with film grain, all bit-exact with software;
+10-bit streams fall back to software (no P010 surfaces in D3D9).
+---
+diff --git a/src/gallium/frontends/d3d10umd/DxvaDecode.cpp b/src/gallium/frontends/d3d10umd/DxvaDecode.cpp
+new file mode 100644
+index 0000000..4b86b12
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/DxvaDecode.cpp
+@@ -0,0 +1,775 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * DxvaDecode.cpp --
++ *    DXVA decoding shared by the Direct3D 10/11 and 9 drivers (DxvaDecode.h): the frame's buffers to a gallium
++ *    picture description, and the decoding. H.264, HEVC, VP9, AV1 and MPEG-2, short slice formats only.
++ */
++
++#include "DxvaDecode.h"
++
++#include "pipe/p_video_codec.h"
++#include "pipe/p_video_state.h"
++#include "util/format/u_format.h"
++#include "util/os_time.h"
++#include "util/u_inlines.h"
++#include "util/u_sampler.h"
++#include "util/u_surface.h"
++#include "util/vl_zscan_data.h"
++/* (C headers without C++ guards) */
++extern "C" {
++#include "vl/vl_compositor.h"
++#include "vl/vl_csc.h"
++#include "vl/vl_video_buffer.h"
++}
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <new>
++#include <type_traits>
++#include <vector>
++
++
++void
++VideoLog(const char *format, ...)
++{
++   static FILE *log = getenv("VIOGPU_VIDEO_LOG") ? fopen(getenv("VIOGPU_VIDEO_LOG"), "a") : NULL;
++   if (log) {
++      va_list ap;
++      va_start(ap, format);
++      vfprintf(log, format, ap);
++      va_end(ap);
++      fflush(log);
++   }
++}
++
++bool
++ProfileSupported(struct pipe_screen *screen, const VideoProfileInfo &p)
++{
++   return screen->get_video_param &&
++          screen->get_video_param(screen, p.profile, PIPE_VIDEO_ENTRYPOINT_BITSTREAM, PIPE_VIDEO_CAP_SUPPORTED);
++}
++
++const VideoProfileInfo *
++FindProfile(struct pipe_screen *screen, const GUID *guid)
++{
++   for (auto &p : PROFILES) {
++      if (IsEqualGUID(p.guid, *guid) && ProfileSupported(screen, p)) {
++         return &p;
++      }
++   }
++   return NULL;
++}
++
++void
++DxvaBeginFrame(DxvaDecoder *dec)
++{
++   dec->pic_params.clear();
++   dec->qmatrix.clear();
++   dec->stream.clear();
++   dec->slices = 0;
++   dec->tiles.clear();
++}
++
++/* A bitstream buffer and its slice control: the slices where the slice control says they are. False when one
++ * lies outside the bitstream */
++bool
++DxvaAddSlices(DxvaDecoder *dec, const uint8_t *slice_control, unsigned slice_control_size,
++              const uint8_t *bitstream, unsigned bitstream_size)
++{
++   /* the slices of this call's bitstream buffer, where its slice control says they are: H.264 and HEVC slices each
++    * after a start code (the host's VA-API driver gets them one by one, split at the start codes) */
++   /* AV1: the bitstream buffer as it is, its tiles where the slice control says */
++   if (slice_control && bitstream && dec->profile->codec == CODEC_AV1) {
++      uint32_t base = (uint32_t)dec->stream.size();
++      for (unsigned i = 0; i < slice_control_size / sizeof(DxvaTile_AV1); i++) {
++         DxvaTile_AV1 t;
++         memcpy(&t, slice_control + i * sizeof t, sizeof t);
++         if (t.DataOffset > bitstream_size || t.DataSize > bitstream_size - t.DataOffset) {
++            VideoLog("SubmitBuffers: tile %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i, t.DataSize,
++                     t.DataOffset, bitstream_size);
++            return false;
++         }
++         t.DataOffset += base;
++         dec->tiles.push_back(t);
++      }
++      dec->stream.insert(dec->stream.end(), bitstream, bitstream + bitstream_size);
++      dec->slices = (unsigned)dec->tiles.size();
++   } else if (slice_control && bitstream && dec->profile->codec == CODEC_MPEG2) {
++      /* MPEG-2: the slices with their start codes, as they are */
++      for (unsigned i = 0; i < slice_control_size / sizeof(DxvaSliceInfo); i++) {
++         DxvaSliceInfo si;
++         memcpy(&si, slice_control + i * sizeof si, sizeof si);
++         uint32_t bytes = si.dwSliceBitsInBuffer / 8;
++         if (si.dwSliceDataLocation > bitstream_size || bytes > bitstream_size - si.dwSliceDataLocation) {
++            VideoLog("SubmitBuffers: slice %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i, bytes,
++                     si.dwSliceDataLocation, bitstream_size);
++            return false;
++         }
++         dec->stream.insert(dec->stream.end(), bitstream + si.dwSliceDataLocation,
++                            bitstream + si.dwSliceDataLocation + bytes);
++         dec->slices++;
++      }
++   } else if (slice_control && bitstream) {
++      static const uint8_t start_code[3] = {0, 0, 1};
++      bool annexb = dec->profile->codec != CODEC_VP9;
++      for (unsigned i = 0; i < slice_control_size / sizeof(DxvaSlice_Short); i++) {
++         DxvaSlice_Short s;
++         memcpy(&s, slice_control + i * sizeof s, sizeof s);
++         if (s.BSNALunitDataLocation > bitstream_size || s.SliceBytesInBuffer > bitstream_size - s.BSNALunitDataLocation) {
++            VideoLog("SubmitBuffers: slice %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i,
++                     s.SliceBytesInBuffer, s.BSNALunitDataLocation, bitstream_size);
++            return false;
++         }
++         const uint8_t *slice = bitstream + s.BSNALunitDataLocation;
++         if (annexb && (s.SliceBytesInBuffer < 3 || memcmp(slice, start_code, 3))) {
++            dec->stream.insert(dec->stream.end(), start_code, start_code + 3);
++         }
++         dec->stream.insert(dec->stream.end(), slice, slice + s.SliceBytesInBuffer);
++         dec->slices++;
++      }
++   }
++   return true;
++}
++
++static struct pipe_video_buffer *
++Surface(DxvaDecoder *dec, unsigned index)
++{
++   return dec->surface(dec, index);
++}
++
++static bool
++H264Picture(DxvaDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DxvaPicParams_H264)) {
++      return false;
++   }
++   const DxvaPicParams_H264 *pp = (const DxvaPicParams_H264 *)dec->pic_params.data();
++   struct pipe_h264_picture_desc *d = &dec->desc.h264;
++   struct pipe_h264_pps *pps = &dec->h264_pps;
++   struct pipe_h264_sps *sps = &dec->h264_sps;
++   memset(d, 0, sizeof *d);
++   memset(pps, 0, sizeof *pps);
++   memset(sps, 0, sizeof *sps);
++   d->pps = pps;
++   pps->sps = sps;
++
++   sps->chroma_format_idc = pp->chroma_format_idc;
++   sps->separate_colour_plane_flag = pp->residual_colour_transform_flag;
++   sps->bit_depth_luma_minus8 = pp->bit_depth_luma_minus8;
++   sps->bit_depth_chroma_minus8 = pp->bit_depth_chroma_minus8;
++   sps->log2_max_frame_num_minus4 = pp->log2_max_frame_num_minus4;
++   sps->pic_order_cnt_type = pp->pic_order_cnt_type;
++   sps->log2_max_pic_order_cnt_lsb_minus4 = pp->log2_max_pic_order_cnt_lsb_minus4;
++   sps->delta_pic_order_always_zero_flag = pp->delta_pic_order_always_zero_flag;
++   sps->max_num_ref_frames = pp->num_ref_frames;
++   sps->frame_mbs_only_flag = pp->frame_mbs_only_flag;
++   sps->mb_adaptive_frame_field_flag = pp->MbaffFrameFlag;
++   sps->direct_8x8_inference_flag = pp->direct_8x8_inference_flag;
++   sps->MinLumaBiPredSize8x8 = pp->MinLumaBipredSize8x8Flag;
++
++   pps->entropy_coding_mode_flag = pp->entropy_coding_mode_flag;
++   pps->bottom_field_pic_order_in_frame_present_flag = pp->pic_order_present_flag;
++   pps->num_slice_groups_minus1 = pp->num_slice_groups_minus1;
++   pps->slice_group_map_type = pp->slice_group_map_type;
++   pps->slice_group_change_rate_minus1 = pp->slice_group_change_rate_minus1;
++   pps->num_ref_idx_l0_default_active_minus1 = pp->num_ref_idx_l0_active_minus1;
++   pps->num_ref_idx_l1_default_active_minus1 = pp->num_ref_idx_l1_active_minus1;
++   pps->weighted_pred_flag = pp->weighted_pred_flag;
++   pps->weighted_bipred_idc = pp->weighted_bipred_idc;
++   pps->pic_init_qp_minus26 = pp->pic_init_qp_minus26;
++   pps->pic_init_qs_minus26 = pp->pic_init_qs_minus26;
++   pps->chroma_qp_index_offset = pp->chroma_qp_index_offset;
++   pps->second_chroma_qp_index_offset = pp->second_chroma_qp_index_offset;
++   pps->deblocking_filter_control_present_flag = pp->deblocking_filter_control_present_flag;
++   pps->constrained_intra_pred_flag = pp->constrained_intra_pred_flag;
++   pps->redundant_pic_cnt_present_flag = pp->redundant_pic_cnt_present_flag;
++   pps->transform_8x8_mode_flag = pp->transform_8x8_mode_flag;
++
++   /* the scaling lists: DXVA's in zig-zag order, gallium's (VA-API's) in raster order; flat without them */
++   memset(pps->ScalingList4x4, 16, sizeof pps->ScalingList4x4);
++   memset(pps->ScalingList8x8, 16, sizeof pps->ScalingList8x8);
++   if (dec->qmatrix.size() >= sizeof(DxvaQmatrix_H264)) {
++      const DxvaQmatrix_H264 *qm = (const DxvaQmatrix_H264 *)dec->qmatrix.data();
++      for (unsigned i = 0; i < 6; i++) {
++         for (unsigned j = 0; j < 16; j++) {
++            pps->ScalingList4x4[i][vl_zscan_normal_16[j]] = qm->bScalingLists4x4[i][j];
++         }
++      }
++      for (unsigned i = 0; i < 2; i++) {
++         for (unsigned j = 0; j < 64; j++) {
++            pps->ScalingList8x8[i][vl_zscan_normal[j]] = qm->bScalingLists8x8[i][j];
++         }
++      }
++   }
++
++   d->frame_num = pp->frame_num;
++   d->field_pic_flag = pp->field_pic_flag;
++   d->bottom_field_flag = pp->field_pic_flag && pp->CurrPic.AssociatedFlag;
++   d->num_ref_idx_l0_active_minus1 = pp->num_ref_idx_l0_active_minus1;
++   d->num_ref_idx_l1_active_minus1 = pp->num_ref_idx_l1_active_minus1;
++   d->slice_count = dec->slices;
++   d->field_order_cnt[0] = pp->CurrFieldOrderCnt[0];
++   d->field_order_cnt[1] = pp->CurrFieldOrderCnt[1];
++   d->is_reference = pp->RefPicFlag;
++   d->num_ref_frames = pp->num_ref_frames;
++
++   /* the references, packed from the first entry (virgl's host reads entries up to num_ref_frames) */
++   unsigned n = 0;
++   for (unsigned i = 0; i < 16; i++) {
++      DxvaPicEntry e = pp->RefFrameList[i];
++      bool top = pp->UsedForReferenceFlags & (1u << (2 * i)), bottom = pp->UsedForReferenceFlags & (2u << (2 * i));
++      struct pipe_video_buffer *ref = e.bPicEntry == DxvaInvalidEntry ? NULL : Surface(dec, e.Index7Bits);
++      if (!ref || (!top && !bottom) || (pp->NonExistingFrameFlags & (1u << i))) {
++         continue;
++      }
++      d->ref[n] = ref;
++      d->is_long_term[n] = e.AssociatedFlag;
++      d->top_is_reference[n] = top;
++      d->bottom_is_reference[n] = bottom;
++      d->field_order_cnt_list[n][0] = pp->FieldOrderCntList[i][0];
++      d->field_order_cnt_list[n][1] = pp->FieldOrderCntList[i][1];
++      d->frame_num_list[n] = pp->FrameNumList[i];
++      n++;
++   }
++   return true;
++}
++
++static bool
++HEVCPicture(DxvaDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DxvaPicParams_HEVC)) {
++      return false;
++   }
++   const DxvaPicParams_HEVC *pp = (const DxvaPicParams_HEVC *)dec->pic_params.data();
++   struct pipe_h265_picture_desc *d = &dec->desc.h265;
++   struct pipe_h265_pps *pps = &dec->h265_pps;
++   struct pipe_h265_sps *sps = &dec->h265_sps;
++   memset(d, 0, sizeof *d);
++   memset(pps, 0, sizeof *pps);
++   memset(sps, 0, sizeof *sps);
++   d->pps = pps;
++   pps->sps = sps;
++
++   unsigned log2_min_cb = pp->log2_min_luma_coding_block_size_minus3 + 3;
++   sps->chroma_format_idc = pp->chroma_format_idc;
++   sps->separate_colour_plane_flag = pp->separate_colour_plane_flag;
++   sps->pic_width_in_luma_samples = pp->PicWidthInMinCbsY << log2_min_cb;
++   sps->pic_height_in_luma_samples = pp->PicHeightInMinCbsY << log2_min_cb;
++   sps->bit_depth_luma_minus8 = pp->bit_depth_luma_minus8;
++   sps->bit_depth_chroma_minus8 = pp->bit_depth_chroma_minus8;
++   sps->log2_max_pic_order_cnt_lsb_minus4 = pp->log2_max_pic_order_cnt_lsb_minus4;
++   sps->sps_max_dec_pic_buffering_minus1 = pp->sps_max_dec_pic_buffering_minus1;
++   sps->log2_min_luma_coding_block_size_minus3 = pp->log2_min_luma_coding_block_size_minus3;
++   sps->log2_diff_max_min_luma_coding_block_size = pp->log2_diff_max_min_luma_coding_block_size;
++   sps->log2_min_transform_block_size_minus2 = pp->log2_min_transform_block_size_minus2;
++   sps->log2_diff_max_min_transform_block_size = pp->log2_diff_max_min_transform_block_size;
++   sps->max_transform_hierarchy_depth_inter = pp->max_transform_hierarchy_depth_inter;
++   sps->max_transform_hierarchy_depth_intra = pp->max_transform_hierarchy_depth_intra;
++   sps->num_short_term_ref_pic_sets = pp->num_short_term_ref_pic_sets;
++   sps->num_long_term_ref_pics_sps = pp->num_long_term_ref_pics_sps;
++   sps->scaling_list_enabled_flag = pp->scaling_list_enabled_flag;
++   sps->amp_enabled_flag = pp->amp_enabled_flag;
++   sps->sample_adaptive_offset_enabled_flag = pp->sample_adaptive_offset_enabled_flag;
++   sps->pcm_enabled_flag = pp->pcm_enabled_flag;
++   sps->pcm_sample_bit_depth_luma_minus1 = pp->pcm_sample_bit_depth_luma_minus1;
++   sps->pcm_sample_bit_depth_chroma_minus1 = pp->pcm_sample_bit_depth_chroma_minus1;
++   sps->log2_min_pcm_luma_coding_block_size_minus3 = pp->log2_min_pcm_luma_coding_block_size_minus3;
++   sps->log2_diff_max_min_pcm_luma_coding_block_size = pp->log2_diff_max_min_pcm_luma_coding_block_size;
++   sps->pcm_loop_filter_disabled_flag = pp->pcm_loop_filter_disabled_flag;
++   sps->long_term_ref_pics_present_flag = pp->long_term_ref_pics_present_flag;
++   sps->sps_temporal_mvp_enabled_flag = pp->sps_temporal_mvp_enabled_flag;
++   sps->strong_intra_smoothing_enabled_flag = pp->strong_intra_smoothing_enabled_flag;
++
++   pps->dependent_slice_segments_enabled_flag = pp->dependent_slice_segments_enabled_flag;
++   pps->output_flag_present_flag = pp->output_flag_present_flag;
++   pps->num_extra_slice_header_bits = pp->num_extra_slice_header_bits;
++   pps->sign_data_hiding_enabled_flag = pp->sign_data_hiding_enabled_flag;
++   pps->cabac_init_present_flag = pp->cabac_init_present_flag;
++   pps->num_ref_idx_l0_default_active_minus1 = pp->num_ref_idx_l0_default_active_minus1;
++   pps->num_ref_idx_l1_default_active_minus1 = pp->num_ref_idx_l1_default_active_minus1;
++   pps->init_qp_minus26 = pp->init_qp_minus26;
++   pps->constrained_intra_pred_flag = pp->constrained_intra_pred_flag;
++   pps->transform_skip_enabled_flag = pp->transform_skip_enabled_flag;
++   pps->cu_qp_delta_enabled_flag = pp->cu_qp_delta_enabled_flag;
++   pps->diff_cu_qp_delta_depth = pp->diff_cu_qp_delta_depth;
++   pps->pps_cb_qp_offset = pp->pps_cb_qp_offset;
++   pps->pps_cr_qp_offset = pp->pps_cr_qp_offset;
++   pps->pps_slice_chroma_qp_offsets_present_flag = pp->pps_slice_chroma_qp_offsets_present_flag;
++   pps->weighted_pred_flag = pp->weighted_pred_flag;
++   pps->weighted_bipred_flag = pp->weighted_bipred_flag;
++   pps->transquant_bypass_enabled_flag = pp->transquant_bypass_enabled_flag;
++   pps->tiles_enabled_flag = pp->tiles_enabled_flag;
++   pps->entropy_coding_sync_enabled_flag = pp->entropy_coding_sync_enabled_flag;
++   pps->uniform_spacing_flag = pp->uniform_spacing_flag;
++   pps->loop_filter_across_tiles_enabled_flag = pp->loop_filter_across_tiles_enabled_flag;
++   pps->pps_loop_filter_across_slices_enabled_flag = pp->pps_loop_filter_across_slices_enabled_flag;
++   pps->deblocking_filter_override_enabled_flag = pp->deblocking_filter_override_enabled_flag;
++   pps->pps_deblocking_filter_disabled_flag = pp->pps_deblocking_filter_disabled_flag;
++   pps->lists_modification_present_flag = pp->lists_modification_present_flag;
++   pps->slice_segment_header_extension_present_flag = pp->slice_segment_header_extension_present_flag;
++   pps->pps_beta_offset_div2 = pp->pps_beta_offset_div2;
++   pps->pps_tc_offset_div2 = pp->pps_tc_offset_div2;
++   pps->log2_parallel_merge_level_minus2 = pp->log2_parallel_merge_level_minus2;
++   pps->st_rps_bits = pp->wNumBitsForShortTermRPSInSlice;
++   if (pp->tiles_enabled_flag) {
++      pps->num_tile_columns_minus1 = pp->num_tile_columns_minus1;
++      pps->num_tile_rows_minus1 = pp->num_tile_rows_minus1;
++      for (unsigned i = 0; i < MIN2(ARRAY_SIZE(pp->column_width_minus1), ARRAY_SIZE(pps->column_width_minus1)); i++) {
++         pps->column_width_minus1[i] = pp->column_width_minus1[i];
++      }
++      for (unsigned i = 0; i < MIN2(ARRAY_SIZE(pp->row_height_minus1), ARRAY_SIZE(pps->row_height_minus1)); i++) {
++         pps->row_height_minus1[i] = pp->row_height_minus1[i];
++      }
++   }
++
++   /* the scaling lists: DXVA's in up-right diagonal order, gallium's (VA-API's) in raster order; flat without them */
++   memset(sps->ScalingList4x4, 16, sizeof sps->ScalingList4x4);
++   memset(sps->ScalingList8x8, 16, sizeof sps->ScalingList8x8);
++   memset(sps->ScalingList16x16, 16, sizeof sps->ScalingList16x16);
++   memset(sps->ScalingList32x32, 16, sizeof sps->ScalingList32x32);
++   memset(sps->ScalingListDCCoeff16x16, 16, sizeof sps->ScalingListDCCoeff16x16);
++   memset(sps->ScalingListDCCoeff32x32, 16, sizeof sps->ScalingListDCCoeff32x32);
++   if (pp->scaling_list_enabled_flag && dec->qmatrix.size() >= sizeof(DxvaQmatrix_HEVC)) {
++      const DxvaQmatrix_HEVC *qm = (const DxvaQmatrix_HEVC *)dec->qmatrix.data();
++      for (unsigned i = 0; i < 6; i++) {
++         for (unsigned j = 0; j < 16; j++) {
++            sps->ScalingList4x4[i][vl_zscan_h265_up_right_diagonal_16[j]] = qm->ucScalingLists0[i][j];
++         }
++         for (unsigned j = 0; j < 64; j++) {
++            sps->ScalingList8x8[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists1[i][j];
++            sps->ScalingList16x16[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists2[i][j];
++            if (i < 2) {
++               sps->ScalingList32x32[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists3[i][j];
++            }
++         }
++      }
++      memcpy(sps->ScalingListDCCoeff16x16, qm->ucScalingListDCCoefSizeID2, sizeof qm->ucScalingListDCCoefSizeID2);
++      memcpy(sps->ScalingListDCCoeff32x32, qm->ucScalingListDCCoefSizeID3, sizeof qm->ucScalingListDCCoefSizeID3);
++   }
++
++   d->IDRPicFlag = pp->IdrPicFlag;
++   d->RAPPicFlag = pp->IrapPicFlag;
++   d->IntraPicFlag = pp->IntraPicFlag;
++   d->NumDeltaPocsOfRefRpsIdx = pp->ucNumDeltaPocsOfRefRpsIdx;
++   d->NumShortTermPictureSliceHeaderBits = pp->wNumBitsForShortTermRPSInSlice;
++   d->UseStRpsBits = true;
++   d->CurrPicOrderCntVal = pp->CurrPicOrderCntVal;
++   for (unsigned i = 0; i < 15; i++) {
++      DxvaPicEntry e = pp->RefPicList[i];
++      d->ref[i] = e.bPicEntry == DxvaInvalidEntry ? NULL : Surface(dec, e.Index7Bits);
++      d->IsLongTerm[i] = e.AssociatedFlag;
++      d->PicOrderCntVal[i] = pp->PicOrderCntValList[i];
++   }
++   for (unsigned i = 0; i < 8; i++) {
++      if (pp->RefPicSetStCurrBefore[i] != DxvaInvalidEntry) {
++         d->RefPicSetStCurrBefore[d->NumPocStCurrBefore++] = pp->RefPicSetStCurrBefore[i];
++      }
++      if (pp->RefPicSetStCurrAfter[i] != DxvaInvalidEntry) {
++         d->RefPicSetStCurrAfter[d->NumPocStCurrAfter++] = pp->RefPicSetStCurrAfter[i];
++      }
++      if (pp->RefPicSetLtCurr[i] != DxvaInvalidEntry) {
++         d->RefPicSetLtCurr[d->NumPocLtCurr++] = pp->RefPicSetLtCurr[i];
++      }
++   }
++   d->NumPocTotalCurr = d->NumPocStCurrBefore + d->NumPocStCurrAfter + d->NumPocLtCurr;
++   /* ponytail: no per-slice reference lists (the short slice format has none): NVIDIA's VA-API driver builds them
++    * from the reference sets, Mesa's (AMD) read RefPicList - those need the slice headers parsed */
++   return true;
++}
++
++static bool
++VP9Picture(DxvaDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DxvaPicParams_VP9)) {
++      return false;
++   }
++   const DxvaPicParams_VP9 *pp = (const DxvaPicParams_VP9 *)dec->pic_params.data();
++   struct pipe_vp9_picture_desc *d = &dec->desc.vp9;
++   memset(d, 0, sizeof *d);
++
++   for (unsigned i = 0; i < 8; i++) {
++      DxvaPicEntry e = pp->ref_frame_map[i];
++      d->ref[i] = e.bPicEntry == DxvaInvalidEntry || e.Index7Bits == 0x7f ? NULL : Surface(dec, e.Index7Bits);
++   }
++   /* DXVA's active references are surfaces, VA-API's (gallium's) slots of ref_frame_map: the slot of each */
++   unsigned slots[3] = {};
++   for (unsigned r = 0; r < 3; r++) {
++      for (unsigned i = 0; i < 8; i++) {
++         if (pp->ref_frame_map[i].bPicEntry != DxvaInvalidEntry &&
++             pp->ref_frame_map[i].Index7Bits == pp->frame_refs[r].Index7Bits) {
++            slots[r] = i;
++            break;
++         }
++      }
++   }
++
++   auto &pic = d->picture_parameter;
++   pic.frame_width = pp->width;
++   pic.frame_height = pp->height;
++   pic.pic_fields.subsampling_x = pp->subsampling_x;
++   pic.pic_fields.subsampling_y = pp->subsampling_y;
++   pic.pic_fields.frame_type = pp->frame_type;
++   pic.pic_fields.show_frame = pp->show_frame;
++   pic.pic_fields.error_resilient_mode = pp->error_resilient_mode;
++   pic.pic_fields.intra_only = pp->intra_only;
++   pic.pic_fields.allow_high_precision_mv = pp->allow_high_precision_mv;
++   /* DXVA's interpolation filters start with smooth, regular; VA-API's (the VP9 spec's) with regular, smooth */
++   pic.pic_fields.mcomp_filter_type = pp->interp_filter ^ (pp->interp_filter <= 1);
++   pic.pic_fields.frame_parallel_decoding_mode = pp->frame_parallel_decoding_mode;
++   pic.pic_fields.reset_frame_context = pp->reset_frame_context;
++   pic.pic_fields.refresh_frame_context = pp->refresh_frame_context;
++   pic.pic_fields.frame_context_idx = pp->frame_context_idx;
++   pic.pic_fields.segmentation_enabled = pp->stVP9Segments.enabled;
++   pic.pic_fields.segmentation_temporal_update = pp->stVP9Segments.temporal_update;
++   pic.pic_fields.segmentation_update_map = pp->stVP9Segments.update_map;
++   pic.pic_fields.last_ref_frame = slots[0];
++   pic.pic_fields.last_ref_frame_sign_bias = pp->ref_frame_sign_bias[1];
++   pic.pic_fields.golden_ref_frame = slots[1];
++   pic.pic_fields.golden_ref_frame_sign_bias = pp->ref_frame_sign_bias[2];
++   pic.pic_fields.alt_ref_frame = slots[2];
++   pic.pic_fields.alt_ref_frame_sign_bias = pp->ref_frame_sign_bias[3];
++   pic.pic_fields.lossless_flag = pp->base_qindex == 0 && pp->y_dc_delta_q == 0 && pp->uv_dc_delta_q == 0 &&
++                                  pp->uv_ac_delta_q == 0;
++   pic.filter_level = pp->filter_level;
++   pic.sharpness_level = pp->sharpness_level;
++   pic.log2_tile_rows = pp->log2_tile_rows;
++   pic.log2_tile_columns = pp->log2_tile_cols;
++   pic.frame_header_length_in_bytes = pp->uncompressed_header_size_byte_aligned;
++   pic.first_partition_size = pp->first_partition_size;
++   memcpy(pic.mb_segment_tree_probs, pp->stVP9Segments.tree_probs, sizeof pic.mb_segment_tree_probs);
++   memcpy(pic.segment_pred_probs, pp->stVP9Segments.pred_probs, sizeof pic.segment_pred_probs);
++   pic.profile = pp->profile;
++   pic.bit_depth = pp->BitDepthMinus8Luma + 8;
++   pic.mode_ref_delta_enabled = pp->mode_ref_delta_enabled;
++   pic.mode_ref_delta_update = pp->mode_ref_delta_update;
++   pic.base_qindex = pp->base_qindex;
++   pic.y_dc_delta_q = pp->y_dc_delta_q;
++   pic.uv_ac_delta_q = pp->uv_ac_delta_q;
++   pic.uv_dc_delta_q = pp->uv_dc_delta_q;
++   pic.abs_delta = pp->stVP9Segments.abs_delta;
++   for (unsigned i = 0; i < 4; i++) {
++      pic.ref_deltas[i] = pp->ref_deltas[i];
++   }
++   for (unsigned i = 0; i < 2; i++) {
++      pic.mode_deltas[i] = pp->mode_deltas[i];
++   }
++
++   auto &slice = d->slice_parameter;
++   slice.slice_count = 1;
++   slice.slice_data_size[0] = dec->stream.size();
++   slice.slice_data_offset[0] = 0;
++   slice.slice_data_flag[0] = PIPE_SLICE_BUFFER_PLACEMENT_TYPE_WHOLE;
++   for (unsigned i = 0; i < 8; i++) {
++      uint8_t mask = pp->stVP9Segments.feature_mask[i];
++      auto &seg = slice.seg_param[i];
++      seg.alt_quant_enabled = mask & 1;
++      seg.alt_quant = pp->stVP9Segments.feature_data[i][0];
++      seg.alt_lf_enabled = (mask >> 1) & 1;
++      seg.alt_lf = pp->stVP9Segments.feature_data[i][1];
++      seg.segment_flags.segment_reference_enabled = (mask >> 2) & 1;
++      seg.segment_flags.segment_reference = pp->stVP9Segments.feature_data[i][2];
++      seg.segment_flags.segment_reference_skipped = (mask >> 3) & 1;
++   }
++   /* ponytail: no per-segment quantizer scales and loop filter levels (VA-API wants them derived): NVIDIA's VA-API
++    * driver reads those from the frame header, Mesa's (AMD) need the derivation (VP9 spec 8.6.1, 8.8.1) */
++   return true;
++}
++
++static bool
++AV1Picture(DxvaDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DxvaPicParams_AV1) || dec->tiles.empty()) {
++      return false;
++   }
++   const DxvaPicParams_AV1 *pp = (const DxvaPicParams_AV1 *)dec->pic_params.data();
++   struct pipe_av1_picture_desc *d = &dec->desc.av1;
++   memset(d, 0, sizeof *d);
++   auto &pic = d->picture_parameter;
++
++   /* the 8 reference slots, and which of them the 7 references are (DXVA's frame_refs[].Index is the slot) */
++   for (unsigned i = 0; i < 8; i++) {
++      d->ref[i] = pp->RefFrameMapTextureIndex[i] == DxvaInvalidEntry ? NULL : Surface(dec, pp->RefFrameMapTextureIndex[i]);
++   }
++   for (unsigned i = 0; i < 7; i++) {
++      const DxvaPicEntry_AV1 &e = pp->frame_refs[i];
++      pic.ref_frame_idx[i] = e.Index == DxvaInvalidEntry ? 0 : e.Index;
++      pic.wm[i].invalid = e.wminvalid;
++      pic.wm[i].wmtype = e.wmtype;
++      for (unsigned j = 0; j < 6; j++) {
++         pic.wm[i].wmmat[j] = e.wmmat[j];
++      }
++   }
++
++   pic.profile = pp->seq_profile;
++   pic.order_hint_bits_minus_1 = pp->order_hint_bits ? pp->order_hint_bits - 1 : 0;
++   pic.bit_depth_idx = pp->bitdepth == 12 ? 2 : pp->bitdepth == 10 ? 1 : 0;
++   pic.matrix_coefficients = pp->film_grain.matrix_coeff_is_identity ? 0 : 1;
++   pic.seq_info_fields.use_128x128_superblock = pp->coding.use_128x128_superblock;
++   pic.seq_info_fields.enable_filter_intra = pp->coding.filter_intra;
++   pic.seq_info_fields.enable_intra_edge_filter = pp->coding.intra_edge_filter;
++   pic.seq_info_fields.enable_interintra_compound = pp->coding.interintra_compound;
++   pic.seq_info_fields.enable_masked_compound = pp->coding.masked_compound;
++   pic.seq_info_fields.enable_dual_filter = pp->coding.dual_filter;
++   pic.seq_info_fields.enable_order_hint = pp->order_hint_bits != 0;
++   pic.seq_info_fields.enable_jnt_comp = pp->coding.jnt_comp;
++   pic.seq_info_fields.enable_cdef = pp->coding.cdef;
++   pic.seq_info_fields.mono_chrome = pp->format.mono_chrome;
++   pic.seq_info_fields.ref_frame_mvs = pp->coding.enable_ref_frame_mvs;
++   pic.seq_info_fields.film_grain_params_present = pp->coding.film_grain;
++
++   pic.frame_width = pp->width;
++   pic.frame_height = pp->height;
++   pic.max_width = pp->max_width;
++   pic.max_height = pp->max_height;
++   pic.primary_ref_frame = pp->primary_ref_frame;
++   pic.order_hint = pp->order_hint;
++   pic.superres_scale_denominator = pp->superres_denom;
++   pic.interp_filter = pp->interp_filter;
++
++   pic.pic_info_fields.frame_type = pp->format.frame_type;
++   pic.pic_info_fields.show_frame = pp->format.show_frame;
++   pic.pic_info_fields.showable_frame = pp->format.showable_frame;
++   pic.pic_info_fields.disable_cdf_update = pp->coding.disable_cdf_update;
++   pic.pic_info_fields.allow_screen_content_tools = pp->coding.screen_content_tools;
++   pic.pic_info_fields.force_integer_mv = pp->coding.integer_mv;
++   pic.pic_info_fields.allow_intrabc = pp->coding.intrabc;
++   pic.pic_info_fields.use_superres = pp->coding.superres;
++   pic.pic_info_fields.allow_high_precision_mv = pp->coding.high_precision_mv;
++   pic.pic_info_fields.is_motion_mode_switchable = pp->coding.switchable_motion_mode;
++   pic.pic_info_fields.use_ref_frame_mvs = pp->coding.use_ref_frame_mvs;
++   pic.pic_info_fields.disable_frame_end_update_cdf = pp->coding.disable_frame_end_update_cdf;
++   pic.pic_info_fields.allow_warped_motion = pp->coding.warped_motion;
++
++   /* the tiles: their sizes in superblocks (DXVA has them for uniform spacing too) */
++   pic.tile_cols = pp->tiles.cols;
++   pic.tile_rows = pp->tiles.rows;
++   pic.context_update_tile_id = pp->tiles.context_update_id;
++   for (unsigned i = 0, start = 0; i < MIN2(pp->tiles.cols, 64u); start += pp->tiles.widths[i], i++) {
++      pic.width_in_sbs[i] = pp->tiles.widths[i];
++      pic.tile_col_start_sb[i] = start;
++   }
++   for (unsigned i = 0, start = 0; i < MIN2(pp->tiles.rows, 64u); start += pp->tiles.heights[i], i++) {
++      pic.height_in_sbs[i] = pp->tiles.heights[i];
++      pic.tile_row_start_sb[i] = start;
++   }
++
++   pic.filter_level[0] = pp->loop_filter.filter_level[0];
++   pic.filter_level[1] = pp->loop_filter.filter_level[1];
++   pic.filter_level_u = pp->loop_filter.filter_level_u;
++   pic.filter_level_v = pp->loop_filter.filter_level_v;
++   pic.loop_filter_info_fields.sharpness_level = pp->loop_filter.sharpness_level;
++   pic.loop_filter_info_fields.mode_ref_delta_enabled = pp->loop_filter.mode_ref_delta_enabled;
++   pic.loop_filter_info_fields.mode_ref_delta_update = pp->loop_filter.mode_ref_delta_update;
++   for (unsigned i = 0; i < 8; i++) {
++      pic.ref_deltas[i] = pp->loop_filter.ref_deltas[i];
++   }
++   pic.mode_deltas[0] = pp->loop_filter.mode_deltas[0];
++   pic.mode_deltas[1] = pp->loop_filter.mode_deltas[1];
++   pic.mode_control_fields.delta_lf_present_flag = pp->loop_filter.delta_lf_present;
++   pic.mode_control_fields.log2_delta_lf_res = pp->loop_filter.delta_lf_res;
++   pic.mode_control_fields.delta_lf_multi = pp->loop_filter.delta_lf_multi;
++
++   /* loop restoration: DXVA has the unit sizes, VA-API (gallium) the shifts */
++   pic.loop_restoration_fields.yframe_restoration_type = pp->loop_filter.frame_restoration_type[0];
++   pic.loop_restoration_fields.cbframe_restoration_type = pp->loop_filter.frame_restoration_type[1];
++   pic.loop_restoration_fields.crframe_restoration_type = pp->loop_filter.frame_restoration_type[2];
++   if (pp->loop_filter.frame_restoration_type[0] || pp->loop_filter.frame_restoration_type[1] ||
++       pp->loop_filter.frame_restoration_type[2]) {
++      pic.loop_restoration_fields.lr_unit_shift = pp->loop_filter.log2_restoration_unit_size[0] - 6;
++      pic.loop_restoration_fields.lr_uv_shift = pp->loop_filter.log2_restoration_unit_size[0] -
++                                                pp->loop_filter.log2_restoration_unit_size[1];
++   }
++
++   pic.base_qindex = pp->quantization.base_qindex;
++   pic.y_dc_delta_q = pp->quantization.y_dc_delta_q;
++   pic.u_dc_delta_q = pp->quantization.u_dc_delta_q;
++   pic.u_ac_delta_q = pp->quantization.u_ac_delta_q;
++   pic.v_dc_delta_q = pp->quantization.v_dc_delta_q;
++   pic.v_ac_delta_q = pp->quantization.v_ac_delta_q;
++   pic.qmatrix_fields.using_qmatrix = pp->quantization.qm_y != 0xff;
++   if (pic.qmatrix_fields.using_qmatrix) {
++      pic.qmatrix_fields.qm_y = pp->quantization.qm_y;
++      pic.qmatrix_fields.qm_u = pp->quantization.qm_u;
++      pic.qmatrix_fields.qm_v = pp->quantization.qm_v;
++   }
++   pic.mode_control_fields.delta_q_present_flag = pp->quantization.delta_q_present;
++   pic.mode_control_fields.log2_delta_q_res = pp->quantization.delta_q_res;
++   pic.mode_control_fields.tx_mode = pp->coding.tx_mode;
++   pic.mode_control_fields.reference_select = pp->coding.reference_mode;
++   pic.mode_control_fields.reduced_tx_set_used = pp->coding.reduced_tx_set;
++   pic.mode_control_fields.skip_mode_present = pp->coding.skip_mode;
++
++   /* CDEF strengths: DXVA's split, VA-API's (gallium's) primary << 2 | secondary */
++   pic.cdef_damping_minus_3 = pp->cdef.damping;
++   pic.cdef_bits = pp->cdef.bits;
++   for (unsigned i = 0; i < 8; i++) {
++      pic.cdef_y_strengths[i] = pp->cdef.y_strengths[i].primary << 2 | pp->cdef.y_strengths[i].secondary;
++      pic.cdef_uv_strengths[i] = pp->cdef.uv_strengths[i].primary << 2 | pp->cdef.uv_strengths[i].secondary;
++   }
++
++   pic.seg_info.segment_info_fields.enabled = pp->segmentation.enabled;
++   pic.seg_info.segment_info_fields.update_map = pp->segmentation.update_map;
++   pic.seg_info.segment_info_fields.update_data = pp->segmentation.update_data;
++   pic.seg_info.segment_info_fields.temporal_update = pp->segmentation.temporal_update;
++   for (unsigned i = 0; i < 8; i++) {
++      pic.seg_info.feature_mask[i] = pp->segmentation.feature_mask[i];
++      for (unsigned j = 0; j < 8; j++) {
++         pic.seg_info.feature_data[i][j] = pp->segmentation.feature_data[i][j];
++      }
++   }
++
++   /* film grain (applied on the target: no separate film grain picture) */
++   auto &fg = pic.film_grain_info;
++   auto &dfg = pp->film_grain;
++   fg.film_grain_info_fields.apply_grain = dfg.apply_grain;
++   if (dfg.apply_grain) {
++      fg.film_grain_info_fields.chroma_scaling_from_luma = dfg.chroma_scaling_from_luma;
++      fg.film_grain_info_fields.grain_scaling_minus_8 = dfg.scaling_shift_minus8;
++      fg.film_grain_info_fields.ar_coeff_lag = dfg.ar_coeff_lag;
++      fg.film_grain_info_fields.ar_coeff_shift_minus_6 = dfg.ar_coeff_shift_minus6;
++      fg.film_grain_info_fields.grain_scale_shift = dfg.grain_scale_shift;
++      fg.film_grain_info_fields.overlap_flag = dfg.overlap_flag;
++      fg.film_grain_info_fields.clip_to_restricted_range = dfg.clip_to_restricted_range;
++      fg.grain_seed = dfg.grain_seed;
++      fg.num_y_points = dfg.num_y_points;
++      for (unsigned i = 0; i < MIN2(dfg.num_y_points, 14u); i++) {
++         fg.point_y_value[i] = dfg.scaling_points_y[i][0];
++         fg.point_y_scaling[i] = dfg.scaling_points_y[i][1];
++      }
++      fg.num_cb_points = dfg.num_cb_points;
++      for (unsigned i = 0; i < MIN2(dfg.num_cb_points, 10u); i++) {
++         fg.point_cb_value[i] = dfg.scaling_points_cb[i][0];
++         fg.point_cb_scaling[i] = dfg.scaling_points_cb[i][1];
++      }
++      fg.num_cr_points = dfg.num_cr_points;
++      for (unsigned i = 0; i < MIN2(dfg.num_cr_points, 10u); i++) {
++         fg.point_cr_value[i] = dfg.scaling_points_cr[i][0];
++         fg.point_cr_scaling[i] = dfg.scaling_points_cr[i][1];
++      }
++      /* DXVA's coefficients are the bitstream's ar_coeffs_*_plus_128, VA's the values */
++      for (unsigned i = 0; i < 24; i++) {
++         fg.ar_coeffs_y[i] = (int8_t)(dfg.ar_coeffs_y[i] - 128);
++      }
++      for (unsigned i = 0; i < 25; i++) {
++         fg.ar_coeffs_cb[i] = (int8_t)(dfg.ar_coeffs_cb[i] - 128);
++         fg.ar_coeffs_cr[i] = (int8_t)(dfg.ar_coeffs_cr[i] - 128);
++      }
++      fg.cb_mult = dfg.cb_mult;
++      fg.cb_luma_mult = dfg.cb_luma_mult;
++      fg.cb_offset = dfg.cb_offset;
++      fg.cr_mult = dfg.cr_mult;
++      fg.cr_luma_mult = dfg.cr_luma_mult;
++      fg.cr_offset = dfg.cr_offset;
++   }
++
++   auto &slice = d->slice_parameter;
++   slice.slice_count = MIN2((unsigned)dec->tiles.size(), (unsigned)ARRAY_SIZE(slice.slice_data_size));
++   for (unsigned i = 0; i < slice.slice_count; i++) {
++      slice.slice_data_size[i] = dec->tiles[i].DataSize;
++      slice.slice_data_offset[i] = dec->tiles[i].DataOffset;
++      slice.slice_data_row[i] = dec->tiles[i].row;
++      slice.slice_data_col[i] = dec->tiles[i].column;
++      slice.slice_data_anchor_frame_idx[i] = dec->tiles[i].anchor_frame;
++   }
++   return true;
++}
++
++/* MPEG-2's default intra quantizer matrix (zig-zag order), for programs that send none */
++static const uint8_t MPEG2_DEFAULT_INTRA[64] = {
++   8,  16, 16, 19, 16, 19, 22, 22, 22, 22, 22, 22, 26, 24, 26, 27, 27, 27, 26, 26, 26, 26, 27, 27, 27, 29, 29, 29, 34, 34, 34, 29,
++   29, 29, 27, 27, 29, 29, 32, 32, 34, 34, 37, 38, 37, 35, 35, 34, 35, 38, 38, 40, 40, 40, 48, 48, 46, 46, 56, 56, 58, 69, 69, 83,
++};
++
++static bool
++MPEG2Picture(DxvaDecoder *dec)
++{
++   if (dec->pic_params.size() < sizeof(DxvaPictureParameters)) {
++      return false;
++   }
++   const DxvaPictureParameters *pp = (const DxvaPictureParameters *)dec->pic_params.data();
++   struct pipe_mpeg12_picture_desc *d = &dec->desc.mpeg2;
++   memset(d, 0, sizeof *d);
++
++   d->picture_coding_type = pp->bPicIntra ? 1 : pp->bPicBackwardPrediction ? 3 : 2;   /* I, B, P */
++   /* f_codes: DXVA's as coded, gallium's (VA-API's) minus one */
++   d->f_code[0][0] = ((pp->wBitstreamFcodes >> 12) & 0xf) - 1;
++   d->f_code[0][1] = ((pp->wBitstreamFcodes >> 8) & 0xf) - 1;
++   d->f_code[1][0] = ((pp->wBitstreamFcodes >> 4) & 0xf) - 1;
++   d->f_code[1][1] = (pp->wBitstreamFcodes & 0xf) - 1;
++   uint16_t pce = pp->wBitstreamPCEelements;
++   d->intra_dc_precision = (pce >> 14) & 3;
++   d->picture_structure = (pce >> 12) & 3;
++   d->top_field_first = (pce >> 11) & 1;
++   d->frame_pred_frame_dct = (pce >> 10) & 1;
++   d->concealment_motion_vectors = (pce >> 9) & 1;
++   d->q_scale_type = (pce >> 8) & 1;
++   d->intra_vlc_format = (pce >> 7) & 1;
++   d->alternate_scan = (pce >> 6) & 1;
++   d->num_slices = dec->slices;
++
++   memcpy(dec->intra_matrix, MPEG2_DEFAULT_INTRA, 64);
++   memset(dec->non_intra_matrix, 16, 64);
++   if (dec->qmatrix.size() >= sizeof(DxvaQmatrixData)) {
++      const DxvaQmatrixData *qm = (const DxvaQmatrixData *)dec->qmatrix.data();
++      for (unsigned i = 0; i < 64; i++) {
++         if (qm->bNewQmatrix[0]) {
++            dec->intra_matrix[i] = (uint8_t)qm->Qmatrix[0][i];
++         }
++         if (qm->bNewQmatrix[1]) {
++            dec->non_intra_matrix[i] = (uint8_t)qm->Qmatrix[1][i];
++         }
++      }
++   }
++   d->intra_matrix = dec->intra_matrix;
++   d->non_intra_matrix = dec->non_intra_matrix;
++
++   d->ref[0] = pp->wForwardRefPictureIndex == 0xffff ? NULL : Surface(dec, pp->wForwardRefPictureIndex);
++   d->ref[1] = pp->wBackwardRefPictureIndex == 0xffff ? NULL : Surface(dec, pp->wBackwardRefPictureIndex);
++   return true;
++}
++
++bool
++DxvaPicture(DxvaDecoder *dec)
++{
++   return dec->profile->codec == CODEC_H264 ? H264Picture(dec)
++        : dec->profile->codec == CODEC_HEVC ? HEVCPicture(dec)
++        : dec->profile->codec == CODEC_VP9  ? VP9Picture(dec)
++        : dec->profile->codec == CODEC_AV1  ? AV1Picture(dec)
++                                            : MPEG2Picture(dec);
++}
++
++int
++DxvaCurrentIndex(const DxvaDecoder *dec)
++{
++   const uint8_t *p = dec->pic_params.data();
++   size_t n = dec->pic_params.size();
++   switch (dec->profile->codec) {
++   case CODEC_H264:
++      return n >= sizeof(DxvaPicParams_H264) ? ((const DxvaPicParams_H264 *)p)->CurrPic.Index7Bits : -1;
++   case CODEC_HEVC:
++      return n >= sizeof(DxvaPicParams_HEVC) ? ((const DxvaPicParams_HEVC *)p)->CurrPic.Index7Bits : -1;
++   case CODEC_VP9:
++      return n >= sizeof(DxvaPicParams_VP9) ? ((const DxvaPicParams_VP9 *)p)->CurrPic.Index7Bits : -1;
++   case CODEC_AV1:
++      return n >= sizeof(DxvaPicParams_AV1) ? ((const DxvaPicParams_AV1 *)p)->CurrPicTextureIndex : -1;
++   default:
++      return n >= sizeof(DxvaPictureParameters) ? ((const DxvaPictureParameters *)p)->wDecodedPictureIndex : -1;
++   }
++}
++
++void
++DxvaDecode(DxvaDecoder *dec, struct pipe_video_buffer *target)
++{
++   struct pipe_picture_desc *picture = &dec->desc.h264.base;
++   picture->profile = dec->profile->profile;
++   picture->entry_point = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
++   const void *buffers[1] = {dec->stream.data()};
++   unsigned sizes[1] = {(unsigned)dec->stream.size()};
++   dec->codec->begin_frame(dec->codec, target, picture);
++   dec->codec->decode_bitstream(dec->codec, target, picture, 1, buffers, sizes);
++   dec->codec->end_frame(dec->codec, target, picture);
++}
+diff --git a/src/gallium/frontends/d3d10umd/DxvaDecode.h b/src/gallium/frontends/d3d10umd/DxvaDecode.h
+new file mode 100644
+index 0000000..0400950
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/DxvaDecode.h
+@@ -0,0 +1,642 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * DxvaDecode.h --
++ *    DXVA decoding, shared by the Direct3D 10/11 driver (Video.cpp) and the Direct3D 9 one (d3d9umd/decode.cpp):
++ *    DXVA's structures, the profiles, and what turns a frame's buffers (picture parameters, quantization matrices,
++ *    slice control, bitstream) into a gallium picture description for virgl's video codec. The frontends bring the
++ *    pictures: the output surface, and the references by their DXVA surface indices.
++ */
++
++#pragma once
++
++#include <windows.h>
++#include <dxgiformat.h>
++#include <stdint.h>
++#include <vector>
++
++#include "pipe/p_video_codec.h"
++#include "pipe/p_video_state.h"
++
++/* VIOGPU_VIDEO_LOG=<file>: what the video entry points refuse, and why */
++void VideoLog(const char *format, ...);
++
++/*
++ * DXVA's structures (DXVA spec, as in Mesa's d3d12 video driver)
++ */
++
++#pragma pack(push, 1)
++struct DxvaPicEntry {
++   union {
++      struct {
++         uint8_t Index7Bits : 7;
++         uint8_t AssociatedFlag : 1;
++      };
++      uint8_t bPicEntry;
++   };
++};
++
++struct DxvaPicParams_H264 {
++   uint16_t wFrameWidthInMbsMinus1;
++   uint16_t wFrameHeightInMbsMinus1;
++   DxvaPicEntry CurrPic; /* flag: bottom field */
++   uint8_t num_ref_frames;
++   union {
++      struct {
++         uint16_t field_pic_flag : 1;
++         uint16_t MbaffFrameFlag : 1;
++         uint16_t residual_colour_transform_flag : 1;
++         uint16_t sp_for_switch_flag : 1;
++         uint16_t chroma_format_idc : 2;
++         uint16_t RefPicFlag : 1;
++         uint16_t constrained_intra_pred_flag : 1;
++         uint16_t weighted_pred_flag : 1;
++         uint16_t weighted_bipred_idc : 2;
++         uint16_t MbsConsecutiveFlag : 1;
++         uint16_t frame_mbs_only_flag : 1;
++         uint16_t transform_8x8_mode_flag : 1;
++         uint16_t MinLumaBipredSize8x8Flag : 1;
++         uint16_t IntraPicFlag : 1;
++      };
++      uint16_t wBitFields;
++   };
++   uint8_t bit_depth_luma_minus8;
++   uint8_t bit_depth_chroma_minus8;
++   uint16_t Reserved16Bits;
++   uint32_t StatusReportFeedbackNumber;
++   DxvaPicEntry RefFrameList[16]; /* flag: long term */
++   int32_t CurrFieldOrderCnt[2];
++   int32_t FieldOrderCntList[16][2];
++   int8_t pic_init_qs_minus26;
++   int8_t chroma_qp_index_offset;
++   int8_t second_chroma_qp_index_offset;
++   uint8_t ContinuationFlag;
++   int8_t pic_init_qp_minus26;
++   uint8_t num_ref_idx_l0_active_minus1;
++   uint8_t num_ref_idx_l1_active_minus1;
++   uint8_t Reserved8BitsA;
++   uint16_t FrameNumList[16];
++   uint32_t UsedForReferenceFlags;
++   uint16_t NonExistingFrameFlags;
++   uint16_t frame_num;
++   uint8_t log2_max_frame_num_minus4;
++   uint8_t pic_order_cnt_type;
++   uint8_t log2_max_pic_order_cnt_lsb_minus4;
++   uint8_t delta_pic_order_always_zero_flag;
++   uint8_t direct_8x8_inference_flag;
++   uint8_t entropy_coding_mode_flag;
++   uint8_t pic_order_present_flag;
++   uint8_t num_slice_groups_minus1;
++   uint8_t slice_group_map_type;
++   uint8_t deblocking_filter_control_present_flag;
++   uint8_t redundant_pic_cnt_present_flag;
++   uint8_t Reserved8BitsB;
++   uint16_t slice_group_change_rate_minus1;
++   uint8_t SliceGroupMap[810];
++};
++
++struct DxvaQmatrix_H264 {
++   uint8_t bScalingLists4x4[6][16];
++   uint8_t bScalingLists8x8[2][64];
++};
++
++/* The short slice control of H.264, HEVC and VPx: where each slice's data is in the bitstream buffer */
++struct DxvaSlice_Short {
++   uint32_t BSNALunitDataLocation;
++   uint32_t SliceBytesInBuffer;
++   uint16_t wBadSliceChopping;
++};
++
++struct DxvaPicParams_HEVC {
++   uint16_t PicWidthInMinCbsY;
++   uint16_t PicHeightInMinCbsY;
++   union {
++      struct {
++         uint16_t chroma_format_idc : 2;
++         uint16_t separate_colour_plane_flag : 1;
++         uint16_t bit_depth_luma_minus8 : 3;
++         uint16_t bit_depth_chroma_minus8 : 3;
++         uint16_t log2_max_pic_order_cnt_lsb_minus4 : 4;
++         uint16_t NoPicReorderingFlag : 1;
++         uint16_t NoBiPredFlag : 1;
++         uint16_t ReservedBits1 : 1;
++      };
++      uint16_t wFormatAndSequenceInfoFlags;
++   };
++   DxvaPicEntry CurrPic;
++   uint8_t sps_max_dec_pic_buffering_minus1;
++   uint8_t log2_min_luma_coding_block_size_minus3;
++   uint8_t log2_diff_max_min_luma_coding_block_size;
++   uint8_t log2_min_transform_block_size_minus2;
++   uint8_t log2_diff_max_min_transform_block_size;
++   uint8_t max_transform_hierarchy_depth_inter;
++   uint8_t max_transform_hierarchy_depth_intra;
++   uint8_t num_short_term_ref_pic_sets;
++   uint8_t num_long_term_ref_pics_sps;
++   uint8_t num_ref_idx_l0_default_active_minus1;
++   uint8_t num_ref_idx_l1_default_active_minus1;
++   int8_t init_qp_minus26;
++   uint8_t ucNumDeltaPocsOfRefRpsIdx;
++   uint16_t wNumBitsForShortTermRPSInSlice;
++   uint16_t ReservedBits2;
++   union {
++      struct {
++         uint32_t scaling_list_enabled_flag : 1;
++         uint32_t amp_enabled_flag : 1;
++         uint32_t sample_adaptive_offset_enabled_flag : 1;
++         uint32_t pcm_enabled_flag : 1;
++         uint32_t pcm_sample_bit_depth_luma_minus1 : 4;
++         uint32_t pcm_sample_bit_depth_chroma_minus1 : 4;
++         uint32_t log2_min_pcm_luma_coding_block_size_minus3 : 2;
++         uint32_t log2_diff_max_min_pcm_luma_coding_block_size : 2;
++         uint32_t pcm_loop_filter_disabled_flag : 1;
++         uint32_t long_term_ref_pics_present_flag : 1;
++         uint32_t sps_temporal_mvp_enabled_flag : 1;
++         uint32_t strong_intra_smoothing_enabled_flag : 1;
++         uint32_t dependent_slice_segments_enabled_flag : 1;
++         uint32_t output_flag_present_flag : 1;
++         uint32_t num_extra_slice_header_bits : 3;
++         uint32_t sign_data_hiding_enabled_flag : 1;
++         uint32_t cabac_init_present_flag : 1;
++         uint32_t ReservedBits3 : 5;
++      };
++      uint32_t dwCodingParamToolFlags;
++   };
++   union {
++      struct {
++         uint32_t constrained_intra_pred_flag : 1;
++         uint32_t transform_skip_enabled_flag : 1;
++         uint32_t cu_qp_delta_enabled_flag : 1;
++         uint32_t pps_slice_chroma_qp_offsets_present_flag : 1;
++         uint32_t weighted_pred_flag : 1;
++         uint32_t weighted_bipred_flag : 1;
++         uint32_t transquant_bypass_enabled_flag : 1;
++         uint32_t tiles_enabled_flag : 1;
++         uint32_t entropy_coding_sync_enabled_flag : 1;
++         uint32_t uniform_spacing_flag : 1;
++         uint32_t loop_filter_across_tiles_enabled_flag : 1;
++         uint32_t pps_loop_filter_across_slices_enabled_flag : 1;
++         uint32_t deblocking_filter_override_enabled_flag : 1;
++         uint32_t pps_deblocking_filter_disabled_flag : 1;
++         uint32_t lists_modification_present_flag : 1;
++         uint32_t slice_segment_header_extension_present_flag : 1;
++         uint32_t IrapPicFlag : 1;
++         uint32_t IdrPicFlag : 1;
++         uint32_t IntraPicFlag : 1;
++         uint32_t ReservedBits4 : 13;
++      };
++      uint32_t dwCodingSettingPicturePropertyFlags;
++   };
++   int8_t pps_cb_qp_offset;
++   int8_t pps_cr_qp_offset;
++   uint8_t num_tile_columns_minus1;
++   uint8_t num_tile_rows_minus1;
++   uint16_t column_width_minus1[19];
++   uint16_t row_height_minus1[21];
++   uint8_t diff_cu_qp_delta_depth;
++   int8_t pps_beta_offset_div2;
++   int8_t pps_tc_offset_div2;
++   uint8_t log2_parallel_merge_level_minus2;
++   int32_t CurrPicOrderCntVal;
++   DxvaPicEntry RefPicList[15];
++   uint8_t ReservedBits5;
++   int32_t PicOrderCntValList[15];
++   uint8_t RefPicSetStCurrBefore[8];
++   uint8_t RefPicSetStCurrAfter[8];
++   uint8_t RefPicSetLtCurr[8];
++   uint16_t ReservedBits6;
++   uint16_t ReservedBits7;
++   uint32_t StatusReportFeedbackNumber;
++};
++
++struct DxvaQmatrix_HEVC {
++   uint8_t ucScalingLists0[6][16];
++   uint8_t ucScalingLists1[6][64];
++   uint8_t ucScalingLists2[6][64];
++   uint8_t ucScalingLists3[2][64];
++   uint8_t ucScalingListDCCoefSizeID2[6];
++   uint8_t ucScalingListDCCoefSizeID3[2];
++};
++
++struct DxvaPicParams_VP9 {
++   DxvaPicEntry CurrPic;
++   uint8_t profile;
++   union {
++      struct {
++         uint16_t frame_type : 1;
++         uint16_t show_frame : 1;
++         uint16_t error_resilient_mode : 1;
++         uint16_t subsampling_x : 1;
++         uint16_t subsampling_y : 1;
++         uint16_t extra_plane : 1;
++         uint16_t refresh_frame_context : 1;
++         uint16_t frame_parallel_decoding_mode : 1;
++         uint16_t intra_only : 1;
++         uint16_t frame_context_idx : 2;
++         uint16_t reset_frame_context : 2;
++         uint16_t allow_high_precision_mv : 1;
++         uint16_t ReservedFormatInfo2Bits : 2;
++      };
++      uint16_t wFormatAndPictureInfoFlags;
++   };
++   uint32_t width;
++   uint32_t height;
++   uint8_t BitDepthMinus8Luma;
++   uint8_t BitDepthMinus8Chroma;
++   uint8_t interp_filter;
++   uint8_t Reserved8Bits;
++   DxvaPicEntry ref_frame_map[8];
++   uint32_t ref_frame_coded_width[8];
++   uint32_t ref_frame_coded_height[8];
++   DxvaPicEntry frame_refs[3];
++   int8_t ref_frame_sign_bias[4];
++   int8_t filter_level;
++   int8_t sharpness_level;
++   union {
++      struct {
++         uint8_t mode_ref_delta_enabled : 1;
++         uint8_t mode_ref_delta_update : 1;
++         uint8_t use_prev_in_find_mv_refs : 1;
++         uint8_t ReservedControlInfo5Bits : 5;
++      };
++      uint8_t wControlInfoFlags;
++   };
++   int8_t ref_deltas[4];
++   int8_t mode_deltas[2];
++   int16_t base_qindex;
++   int8_t y_dc_delta_q;
++   int8_t uv_dc_delta_q;
++   int8_t uv_ac_delta_q;
++   struct {
++      union {
++         struct {
++            uint8_t enabled : 1;
++            uint8_t update_map : 1;
++            uint8_t temporal_update : 1;
++            uint8_t abs_delta : 1;
++            uint8_t ReservedSegmentFlags4Bits : 4;
++         };
++         uint8_t wSegmentInfoFlags;
++      };
++      uint8_t tree_probs[7];
++      uint8_t pred_probs[3];
++      int16_t feature_data[8][4];
++      uint8_t feature_mask[8];
++   } stVP9Segments;
++   uint8_t log2_tile_cols;
++   uint8_t log2_tile_rows;
++   uint16_t uncompressed_header_size_byte_aligned;
++   uint16_t first_partition_size;
++   uint16_t Reserved16Bits;
++   uint32_t Reserved32Bits;
++   uint32_t StatusReportFeedbackNumber;
++};
++struct DxvaPicEntry_AV1 {
++   uint32_t width;
++   uint32_t height;
++   int32_t wmmat[6];
++   union {
++      struct {
++         uint8_t wminvalid : 1;
++         uint8_t wmtype : 2;
++         uint8_t Reserved : 5;
++      };
++      uint8_t GlobalMotionFlags;
++   };
++   uint8_t Index;
++   uint16_t Reserved16Bits;
++};
++
++struct DxvaPicParams_AV1 {
++   uint32_t width;
++   uint32_t height;
++   uint32_t max_width;
++   uint32_t max_height;
++   uint8_t CurrPicTextureIndex;
++   uint8_t superres_denom;
++   uint8_t bitdepth;
++   uint8_t seq_profile;
++   struct {
++      uint8_t cols;
++      uint8_t rows;
++      uint16_t context_update_id;
++      uint16_t widths[64];
++      uint16_t heights[64];
++   } tiles;
++   union {
++      struct {
++         uint32_t use_128x128_superblock : 1;
++         uint32_t intra_edge_filter : 1;
++         uint32_t interintra_compound : 1;
++         uint32_t masked_compound : 1;
++         uint32_t warped_motion : 1;
++         uint32_t dual_filter : 1;
++         uint32_t jnt_comp : 1;
++         uint32_t screen_content_tools : 1;
++         uint32_t integer_mv : 1;
++         uint32_t cdef : 1;
++         uint32_t restoration : 1;
++         uint32_t film_grain : 1;
++         uint32_t intrabc : 1;
++         uint32_t high_precision_mv : 1;
++         uint32_t switchable_motion_mode : 1;
++         uint32_t filter_intra : 1;
++         uint32_t disable_frame_end_update_cdf : 1;
++         uint32_t disable_cdf_update : 1;
++         uint32_t reference_mode : 1;
++         uint32_t skip_mode : 1;
++         uint32_t reduced_tx_set : 1;
++         uint32_t superres : 1;
++         uint32_t tx_mode : 2;
++         uint32_t use_ref_frame_mvs : 1;
++         uint32_t enable_ref_frame_mvs : 1;
++         uint32_t reference_frame_update : 1;
++         uint32_t Reserved : 5;
++      };
++      uint32_t CodingParamToolFlags;
++   } coding;
++   union {
++      struct {
++         uint8_t frame_type : 2;
++         uint8_t show_frame : 1;
++         uint8_t showable_frame : 1;
++         uint8_t subsampling_x : 1;
++         uint8_t subsampling_y : 1;
++         uint8_t mono_chrome : 1;
++         uint8_t Reserved : 1;
++      };
++      uint8_t FormatAndPictureInfoFlags;
++   } format;
++   uint8_t primary_ref_frame;
++   uint8_t order_hint;
++   uint8_t order_hint_bits;
++   DxvaPicEntry_AV1 frame_refs[7];
++   uint8_t RefFrameMapTextureIndex[8];
++   struct {
++      uint8_t filter_level[2];
++      uint8_t filter_level_u;
++      uint8_t filter_level_v;
++      uint8_t sharpness_level;
++      union {
++         struct {
++            uint8_t mode_ref_delta_enabled : 1;
++            uint8_t mode_ref_delta_update : 1;
++            uint8_t delta_lf_multi : 1;
++            uint8_t delta_lf_present : 1;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      int8_t ref_deltas[8];
++      int8_t mode_deltas[2];
++      uint8_t delta_lf_res;
++      uint8_t frame_restoration_type[3];
++      uint16_t log2_restoration_unit_size[3];
++      uint16_t Reserved16Bits;
++   } loop_filter;
++   struct {
++      union {
++         struct {
++            uint8_t delta_q_present : 1;
++            uint8_t delta_q_res : 2;
++            uint8_t Reserved : 5;
++         };
++         uint8_t ControlFlags;
++      };
++      uint8_t base_qindex;
++      int8_t y_dc_delta_q;
++      int8_t u_dc_delta_q;
++      int8_t v_dc_delta_q;
++      int8_t u_ac_delta_q;
++      int8_t v_ac_delta_q;
++      uint8_t qm_y;
++      uint8_t qm_u;
++      uint8_t qm_v;
++      uint16_t Reserved16Bits;
++   } quantization;
++   struct {
++      union {
++         struct {
++            uint8_t damping : 2;
++            uint8_t bits : 2;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      union {
++         struct {
++            uint8_t primary : 6;
++            uint8_t secondary : 2;
++         };
++         uint8_t combined;
++      } y_strengths[8], uv_strengths[8];
++   } cdef;
++   uint8_t interp_filter;
++   struct {
++      union {
++         struct {
++            uint8_t enabled : 1;
++            uint8_t update_map : 1;
++            uint8_t update_data : 1;
++            uint8_t temporal_update : 1;
++            uint8_t Reserved : 4;
++         };
++         uint8_t ControlFlags;
++      };
++      uint8_t Reserved24Bits[3];
++      uint8_t feature_mask[8];
++      int16_t feature_data[8][8];
++   } segmentation;
++   struct {
++      union {
++         struct {
++            uint16_t apply_grain : 1;
++            uint16_t scaling_shift_minus8 : 2;
++            uint16_t chroma_scaling_from_luma : 1;
++            uint16_t ar_coeff_lag : 2;
++            uint16_t ar_coeff_shift_minus6 : 2;
++            uint16_t grain_scale_shift : 2;
++            uint16_t overlap_flag : 1;
++            uint16_t clip_to_restricted_range : 1;
++            uint16_t matrix_coeff_is_identity : 1;
++            uint16_t Reserved : 3;
++         };
++         uint16_t ControlFlags;
++      };
++      uint16_t grain_seed;
++      uint8_t scaling_points_y[14][2];
++      uint8_t num_y_points;
++      uint8_t scaling_points_cb[10][2];
++      uint8_t num_cb_points;
++      uint8_t scaling_points_cr[10][2];
++      uint8_t num_cr_points;
++      uint8_t ar_coeffs_y[24];
++      uint8_t ar_coeffs_cb[25];
++      uint8_t ar_coeffs_cr[25];
++      uint8_t cb_mult;
++      uint8_t cb_luma_mult;
++      uint8_t cr_mult;
++      uint8_t cr_luma_mult;
++      uint8_t Reserved8Bits;
++      int16_t cb_offset;
++      int16_t cr_offset;
++   } film_grain;
++   uint32_t Reserved32Bits;
++   uint32_t StatusReportFeedbackNumber;
++};
++
++/* MPEG-2 (DXVA 1's structures) */
++struct DxvaPictureParameters {
++   uint16_t wDecodedPictureIndex;
++   uint16_t wDeblockedPictureIndex;
++   uint16_t wForwardRefPictureIndex;
++   uint16_t wBackwardRefPictureIndex;
++   uint16_t wPicWidthInMBminus1;
++   uint16_t wPicHeightInMBminus1;
++   uint8_t bMacroblockWidthMinus1;
++   uint8_t bMacroblockHeightMinus1;
++   uint8_t bBlockWidthMinus1;
++   uint8_t bBlockHeightMinus1;
++   uint8_t bBPPminus1;
++   uint8_t bPicStructure;
++   uint8_t bSecondField;
++   uint8_t bPicIntra;
++   uint8_t bPicBackwardPrediction;
++   uint8_t bBidirectionalAveragingMode;
++   uint8_t bMVprecisionAndChromaRelation;
++   uint8_t bChromaFormat;
++   uint8_t bPicScanFixed;
++   uint8_t bPicScanMethod;
++   uint8_t bPicReadbackRequests;
++   uint8_t bRcontrol;
++   uint8_t bPicSpatialResid8;
++   uint8_t bPicOverflowBlocks;
++   uint8_t bPicExtrapolation;
++   uint8_t bPicDeblocked;
++   uint8_t bPicDeblockConfined;
++   uint8_t bPic4MVallowed;
++   uint8_t bPicOBMC;
++   uint8_t bPicBinPB;
++   uint8_t bMV_RPS;
++   uint8_t bReservedBits;
++   uint16_t wBitstreamFcodes;
++   uint16_t wBitstreamPCEelements;
++   uint8_t bBitstreamConcealmentNeed;
++   uint8_t bBitstreamConcealmentMethod;
++};
++
++struct DxvaQmatrixData {
++   uint8_t bNewQmatrix[4];   /* intra, inter (luma), intra, inter (chroma) */
++   uint16_t Qmatrix[4][64];  /* in zig-zag order */
++};
++
++struct DxvaSliceInfo {
++   uint16_t wHorizontalPosition;
++   uint16_t wVerticalPosition;
++   uint32_t dwSliceBitsInBuffer;
++   uint32_t dwSliceDataLocation;
++   uint8_t bStartCodeBitOffset;
++   uint8_t bReservedBits;
++   uint16_t wMBbitOffset;
++   uint16_t wNumberMBsInSlice;
++   uint16_t wQuantizerScaleCode;
++   uint16_t wBadSliceChopping;
++};
++
++/* AV1's slice control: the tiles */
++struct DxvaTile_AV1 {
++   uint32_t DataOffset;
++   uint32_t DataSize;
++   uint16_t row;
++   uint16_t column;
++   uint16_t Reserved16Bits;
++   uint8_t anchor_frame;
++   uint8_t Reserved8Bits;
++};
++#pragma pack(pop)
++
++static const uint8_t DxvaInvalidEntry = 0xff;
++
++
++/*
++ * The decoder profiles (D3D11_DECODER_PROFILE_*), as gallium's
++ */
++
++enum VideoCodec { CODEC_H264, CODEC_HEVC, CODEC_VP9, CODEC_AV1, CODEC_MPEG2 };
++
++struct VideoProfileInfo {
++   GUID guid;
++   enum pipe_video_profile profile;
++   DXGI_FORMAT format;
++   VideoCodec codec;
++   DXGI_FORMAT format2 = DXGI_FORMAT_UNKNOWN;   /* a profile for 8 and 10 bits (AV1's) */
++
++   bool Outputs(DXGI_FORMAT f) const { return f == format || (format2 != DXGI_FORMAT_UNKNOWN && f == format2); }
++};
++
++static const VideoProfileInfo PROFILES[] = {
++   {{0x1b81be68, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}}, /* H264_VLD_NOFGT */
++    PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH, DXGI_FORMAT_NV12, CODEC_H264},
++   {{0x5b11d51b, 0x2f4c, 0x4452, {0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0}}, /* HEVC_VLD_MAIN */
++    PIPE_VIDEO_PROFILE_HEVC_MAIN, DXGI_FORMAT_NV12, CODEC_HEVC},
++   {{0x107af0e0, 0xef1a, 0x4d19, {0xab, 0xa8, 0x67, 0xa1, 0x63, 0x07, 0x3d, 0x13}}, /* HEVC_VLD_MAIN10 */
++    PIPE_VIDEO_PROFILE_HEVC_MAIN_10, DXGI_FORMAT_P010, CODEC_HEVC},
++   {{0x463707f8, 0xa1d0, 0x4585, {0x87, 0x6d, 0x83, 0xaa, 0x6d, 0x60, 0xb8, 0x9e}}, /* VP9_VLD_PROFILE0 */
++    PIPE_VIDEO_PROFILE_VP9_PROFILE0, DXGI_FORMAT_NV12, CODEC_VP9},
++   {{0xa4c749ef, 0x6ecf, 0x48aa, {0x84, 0x48, 0x50, 0xa7, 0xa1, 0x16, 0x5f, 0xf7}}, /* VP9_VLD_10BIT_PROFILE2 */
++    PIPE_VIDEO_PROFILE_VP9_PROFILE2, DXGI_FORMAT_P010, CODEC_VP9},
++   {{0xb8be4ccb, 0xcf53, 0x46ba, {0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a}}, /* AV1_VLD_PROFILE0: 8 and 10 bits */
++    PIPE_VIDEO_PROFILE_AV1_MAIN, DXGI_FORMAT_NV12, CODEC_AV1, DXGI_FORMAT_P010},
++   {{0xee27417f, 0x5e28, 0x4e65, {0xbe, 0xea, 0x1d, 0x26, 0xb5, 0x08, 0xad, 0xc9}}, /* MPEG2_VLD */
++    PIPE_VIDEO_PROFILE_MPEG2_MAIN, DXGI_FORMAT_NV12, CODEC_MPEG2},
++};
++
++/* DXVA_NoEncrypt */
++static const GUID NO_ENCRYPT = {0x1b81bed0, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}};
++
++bool ProfileSupported(struct pipe_screen *screen, const VideoProfileInfo &p);
++const VideoProfileInfo *FindProfile(struct pipe_screen *screen, const GUID *guid);
++
++struct DxvaDecoder {
++   const VideoProfileInfo *profile;
++   struct pipe_video_codec *codec;
++   unsigned width, height;
++
++   /* the frame between BeginFrame and EndFrame */
++   std::vector<uint8_t> pic_params, qmatrix;
++   std::vector<uint8_t> stream;     /* the slices' data, each H.264/HEVC slice after a start code */
++   unsigned slices;
++   std::vector<DxvaTile_AV1> tiles; /* AV1: where each tile is in stream */
++   uint8_t intra_matrix[64], non_intra_matrix[64];   /* MPEG-2's, for its picture description */
++
++   union {
++      struct pipe_h264_picture_desc h264;
++      struct pipe_h265_picture_desc h265;
++      struct pipe_vp9_picture_desc vp9;
++      struct pipe_av1_picture_desc av1;
++      struct pipe_mpeg12_picture_desc mpeg2;
++   } desc;
++   struct pipe_h264_pps h264_pps;
++   struct pipe_h264_sps h264_sps;
++   struct pipe_h265_pps h265_pps;
++   struct pipe_h265_sps h265_sps;
++
++   /* the picture a DXVA surface index names (the frontend's: an array slice of the output texture in D3D11, the
++    * surface decoded with that index in D3D9) */
++   struct pipe_video_buffer *(*surface)(DxvaDecoder *dec, unsigned index);
++};
++
++/* A new frame: the buffers of the last one dropped */
++void DxvaBeginFrame(DxvaDecoder *dec);
++/* A bitstream buffer and its slice control: false when a slice lies outside the bitstream */
++bool DxvaAddSlices(DxvaDecoder *dec, const uint8_t *slice_control, unsigned slice_control_size,
++                   const uint8_t *bitstream, unsigned bitstream_size);
++/* The frame's picture description from its buffers (false: no or short picture parameters) */
++bool DxvaPicture(DxvaDecoder *dec);
++/* The DXVA surface index of the frame's own picture (from its picture parameters; -1 if they have none) */
++int DxvaCurrentIndex(const DxvaDecoder *dec);
++/* The frame decoded into target */
++void DxvaDecode(DxvaDecoder *dec, struct pipe_video_buffer *target);
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index f1805a5..2ba6b23 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include "Video.h"
++#include "DxvaDecode.h"
+ #include "Format.h"
+ #include "State.h"
+ 
+@@ -46,611 +47,6 @@ extern "C" {
+ #include <vector>
+ 
+ /* VIOGPU_VIDEO_LOG=<file>: what the video entry points refuse, and why */
+-static void
+-VideoLog(const char *format, ...)
+-{
+-   static FILE *log = getenv("VIOGPU_VIDEO_LOG") ? fopen(getenv("VIOGPU_VIDEO_LOG"), "a") : NULL;
+-   if (log) {
+-      va_list ap;
+-      va_start(ap, format);
+-      vfprintf(log, format, ap);
+-      va_end(ap);
+-      fflush(log);
+-   }
+-}
+-
+-
+-/*
+- * DXVA's structures (DXVA spec, as in Mesa's d3d12 video driver)
+- */
+-
+-#pragma pack(push, 1)
+-struct DXVA_PicEntry {
+-   union {
+-      struct {
+-         uint8_t Index7Bits : 7;
+-         uint8_t AssociatedFlag : 1;
+-      };
+-      uint8_t bPicEntry;
+-   };
+-};
+-
+-struct DXVA_PicParams_H264 {
+-   uint16_t wFrameWidthInMbsMinus1;
+-   uint16_t wFrameHeightInMbsMinus1;
+-   DXVA_PicEntry CurrPic; /* flag: bottom field */
+-   uint8_t num_ref_frames;
+-   union {
+-      struct {
+-         uint16_t field_pic_flag : 1;
+-         uint16_t MbaffFrameFlag : 1;
+-         uint16_t residual_colour_transform_flag : 1;
+-         uint16_t sp_for_switch_flag : 1;
+-         uint16_t chroma_format_idc : 2;
+-         uint16_t RefPicFlag : 1;
+-         uint16_t constrained_intra_pred_flag : 1;
+-         uint16_t weighted_pred_flag : 1;
+-         uint16_t weighted_bipred_idc : 2;
+-         uint16_t MbsConsecutiveFlag : 1;
+-         uint16_t frame_mbs_only_flag : 1;
+-         uint16_t transform_8x8_mode_flag : 1;
+-         uint16_t MinLumaBipredSize8x8Flag : 1;
+-         uint16_t IntraPicFlag : 1;
+-      };
+-      uint16_t wBitFields;
+-   };
+-   uint8_t bit_depth_luma_minus8;
+-   uint8_t bit_depth_chroma_minus8;
+-   uint16_t Reserved16Bits;
+-   uint32_t StatusReportFeedbackNumber;
+-   DXVA_PicEntry RefFrameList[16]; /* flag: long term */
+-   int32_t CurrFieldOrderCnt[2];
+-   int32_t FieldOrderCntList[16][2];
+-   int8_t pic_init_qs_minus26;
+-   int8_t chroma_qp_index_offset;
+-   int8_t second_chroma_qp_index_offset;
+-   uint8_t ContinuationFlag;
+-   int8_t pic_init_qp_minus26;
+-   uint8_t num_ref_idx_l0_active_minus1;
+-   uint8_t num_ref_idx_l1_active_minus1;
+-   uint8_t Reserved8BitsA;
+-   uint16_t FrameNumList[16];
+-   uint32_t UsedForReferenceFlags;
+-   uint16_t NonExistingFrameFlags;
+-   uint16_t frame_num;
+-   uint8_t log2_max_frame_num_minus4;
+-   uint8_t pic_order_cnt_type;
+-   uint8_t log2_max_pic_order_cnt_lsb_minus4;
+-   uint8_t delta_pic_order_always_zero_flag;
+-   uint8_t direct_8x8_inference_flag;
+-   uint8_t entropy_coding_mode_flag;
+-   uint8_t pic_order_present_flag;
+-   uint8_t num_slice_groups_minus1;
+-   uint8_t slice_group_map_type;
+-   uint8_t deblocking_filter_control_present_flag;
+-   uint8_t redundant_pic_cnt_present_flag;
+-   uint8_t Reserved8BitsB;
+-   uint16_t slice_group_change_rate_minus1;
+-   uint8_t SliceGroupMap[810];
+-};
+-
+-struct DXVA_Qmatrix_H264 {
+-   uint8_t bScalingLists4x4[6][16];
+-   uint8_t bScalingLists8x8[2][64];
+-};
+-
+-/* The short slice control of H.264, HEVC and VPx: where each slice's data is in the bitstream buffer */
+-struct DXVA_Slice_Short {
+-   uint32_t BSNALunitDataLocation;
+-   uint32_t SliceBytesInBuffer;
+-   uint16_t wBadSliceChopping;
+-};
+-
+-struct DXVA_PicParams_HEVC {
+-   uint16_t PicWidthInMinCbsY;
+-   uint16_t PicHeightInMinCbsY;
+-   union {
+-      struct {
+-         uint16_t chroma_format_idc : 2;
+-         uint16_t separate_colour_plane_flag : 1;
+-         uint16_t bit_depth_luma_minus8 : 3;
+-         uint16_t bit_depth_chroma_minus8 : 3;
+-         uint16_t log2_max_pic_order_cnt_lsb_minus4 : 4;
+-         uint16_t NoPicReorderingFlag : 1;
+-         uint16_t NoBiPredFlag : 1;
+-         uint16_t ReservedBits1 : 1;
+-      };
+-      uint16_t wFormatAndSequenceInfoFlags;
+-   };
+-   DXVA_PicEntry CurrPic;
+-   uint8_t sps_max_dec_pic_buffering_minus1;
+-   uint8_t log2_min_luma_coding_block_size_minus3;
+-   uint8_t log2_diff_max_min_luma_coding_block_size;
+-   uint8_t log2_min_transform_block_size_minus2;
+-   uint8_t log2_diff_max_min_transform_block_size;
+-   uint8_t max_transform_hierarchy_depth_inter;
+-   uint8_t max_transform_hierarchy_depth_intra;
+-   uint8_t num_short_term_ref_pic_sets;
+-   uint8_t num_long_term_ref_pics_sps;
+-   uint8_t num_ref_idx_l0_default_active_minus1;
+-   uint8_t num_ref_idx_l1_default_active_minus1;
+-   int8_t init_qp_minus26;
+-   uint8_t ucNumDeltaPocsOfRefRpsIdx;
+-   uint16_t wNumBitsForShortTermRPSInSlice;
+-   uint16_t ReservedBits2;
+-   union {
+-      struct {
+-         uint32_t scaling_list_enabled_flag : 1;
+-         uint32_t amp_enabled_flag : 1;
+-         uint32_t sample_adaptive_offset_enabled_flag : 1;
+-         uint32_t pcm_enabled_flag : 1;
+-         uint32_t pcm_sample_bit_depth_luma_minus1 : 4;
+-         uint32_t pcm_sample_bit_depth_chroma_minus1 : 4;
+-         uint32_t log2_min_pcm_luma_coding_block_size_minus3 : 2;
+-         uint32_t log2_diff_max_min_pcm_luma_coding_block_size : 2;
+-         uint32_t pcm_loop_filter_disabled_flag : 1;
+-         uint32_t long_term_ref_pics_present_flag : 1;
+-         uint32_t sps_temporal_mvp_enabled_flag : 1;
+-         uint32_t strong_intra_smoothing_enabled_flag : 1;
+-         uint32_t dependent_slice_segments_enabled_flag : 1;
+-         uint32_t output_flag_present_flag : 1;
+-         uint32_t num_extra_slice_header_bits : 3;
+-         uint32_t sign_data_hiding_enabled_flag : 1;
+-         uint32_t cabac_init_present_flag : 1;
+-         uint32_t ReservedBits3 : 5;
+-      };
+-      uint32_t dwCodingParamToolFlags;
+-   };
+-   union {
+-      struct {
+-         uint32_t constrained_intra_pred_flag : 1;
+-         uint32_t transform_skip_enabled_flag : 1;
+-         uint32_t cu_qp_delta_enabled_flag : 1;
+-         uint32_t pps_slice_chroma_qp_offsets_present_flag : 1;
+-         uint32_t weighted_pred_flag : 1;
+-         uint32_t weighted_bipred_flag : 1;
+-         uint32_t transquant_bypass_enabled_flag : 1;
+-         uint32_t tiles_enabled_flag : 1;
+-         uint32_t entropy_coding_sync_enabled_flag : 1;
+-         uint32_t uniform_spacing_flag : 1;
+-         uint32_t loop_filter_across_tiles_enabled_flag : 1;
+-         uint32_t pps_loop_filter_across_slices_enabled_flag : 1;
+-         uint32_t deblocking_filter_override_enabled_flag : 1;
+-         uint32_t pps_deblocking_filter_disabled_flag : 1;
+-         uint32_t lists_modification_present_flag : 1;
+-         uint32_t slice_segment_header_extension_present_flag : 1;
+-         uint32_t IrapPicFlag : 1;
+-         uint32_t IdrPicFlag : 1;
+-         uint32_t IntraPicFlag : 1;
+-         uint32_t ReservedBits4 : 13;
+-      };
+-      uint32_t dwCodingSettingPicturePropertyFlags;
+-   };
+-   int8_t pps_cb_qp_offset;
+-   int8_t pps_cr_qp_offset;
+-   uint8_t num_tile_columns_minus1;
+-   uint8_t num_tile_rows_minus1;
+-   uint16_t column_width_minus1[19];
+-   uint16_t row_height_minus1[21];
+-   uint8_t diff_cu_qp_delta_depth;
+-   int8_t pps_beta_offset_div2;
+-   int8_t pps_tc_offset_div2;
+-   uint8_t log2_parallel_merge_level_minus2;
+-   int32_t CurrPicOrderCntVal;
+-   DXVA_PicEntry RefPicList[15];
+-   uint8_t ReservedBits5;
+-   int32_t PicOrderCntValList[15];
+-   uint8_t RefPicSetStCurrBefore[8];
+-   uint8_t RefPicSetStCurrAfter[8];
+-   uint8_t RefPicSetLtCurr[8];
+-   uint16_t ReservedBits6;
+-   uint16_t ReservedBits7;
+-   uint32_t StatusReportFeedbackNumber;
+-};
+-
+-struct DXVA_Qmatrix_HEVC {
+-   uint8_t ucScalingLists0[6][16];
+-   uint8_t ucScalingLists1[6][64];
+-   uint8_t ucScalingLists2[6][64];
+-   uint8_t ucScalingLists3[2][64];
+-   uint8_t ucScalingListDCCoefSizeID2[6];
+-   uint8_t ucScalingListDCCoefSizeID3[2];
+-};
+-
+-struct DXVA_PicParams_VP9 {
+-   DXVA_PicEntry CurrPic;
+-   uint8_t profile;
+-   union {
+-      struct {
+-         uint16_t frame_type : 1;
+-         uint16_t show_frame : 1;
+-         uint16_t error_resilient_mode : 1;
+-         uint16_t subsampling_x : 1;
+-         uint16_t subsampling_y : 1;
+-         uint16_t extra_plane : 1;
+-         uint16_t refresh_frame_context : 1;
+-         uint16_t frame_parallel_decoding_mode : 1;
+-         uint16_t intra_only : 1;
+-         uint16_t frame_context_idx : 2;
+-         uint16_t reset_frame_context : 2;
+-         uint16_t allow_high_precision_mv : 1;
+-         uint16_t ReservedFormatInfo2Bits : 2;
+-      };
+-      uint16_t wFormatAndPictureInfoFlags;
+-   };
+-   uint32_t width;
+-   uint32_t height;
+-   uint8_t BitDepthMinus8Luma;
+-   uint8_t BitDepthMinus8Chroma;
+-   uint8_t interp_filter;
+-   uint8_t Reserved8Bits;
+-   DXVA_PicEntry ref_frame_map[8];
+-   uint32_t ref_frame_coded_width[8];
+-   uint32_t ref_frame_coded_height[8];
+-   DXVA_PicEntry frame_refs[3];
+-   int8_t ref_frame_sign_bias[4];
+-   int8_t filter_level;
+-   int8_t sharpness_level;
+-   union {
+-      struct {
+-         uint8_t mode_ref_delta_enabled : 1;
+-         uint8_t mode_ref_delta_update : 1;
+-         uint8_t use_prev_in_find_mv_refs : 1;
+-         uint8_t ReservedControlInfo5Bits : 5;
+-      };
+-      uint8_t wControlInfoFlags;
+-   };
+-   int8_t ref_deltas[4];
+-   int8_t mode_deltas[2];
+-   int16_t base_qindex;
+-   int8_t y_dc_delta_q;
+-   int8_t uv_dc_delta_q;
+-   int8_t uv_ac_delta_q;
+-   struct {
+-      union {
+-         struct {
+-            uint8_t enabled : 1;
+-            uint8_t update_map : 1;
+-            uint8_t temporal_update : 1;
+-            uint8_t abs_delta : 1;
+-            uint8_t ReservedSegmentFlags4Bits : 4;
+-         };
+-         uint8_t wSegmentInfoFlags;
+-      };
+-      uint8_t tree_probs[7];
+-      uint8_t pred_probs[3];
+-      int16_t feature_data[8][4];
+-      uint8_t feature_mask[8];
+-   } stVP9Segments;
+-   uint8_t log2_tile_cols;
+-   uint8_t log2_tile_rows;
+-   uint16_t uncompressed_header_size_byte_aligned;
+-   uint16_t first_partition_size;
+-   uint16_t Reserved16Bits;
+-   uint32_t Reserved32Bits;
+-   uint32_t StatusReportFeedbackNumber;
+-};
+-struct DXVA_PicEntry_AV1 {
+-   uint32_t width;
+-   uint32_t height;
+-   int32_t wmmat[6];
+-   union {
+-      struct {
+-         uint8_t wminvalid : 1;
+-         uint8_t wmtype : 2;
+-         uint8_t Reserved : 5;
+-      };
+-      uint8_t GlobalMotionFlags;
+-   };
+-   uint8_t Index;
+-   uint16_t Reserved16Bits;
+-};
+-
+-struct DXVA_PicParams_AV1 {
+-   uint32_t width;
+-   uint32_t height;
+-   uint32_t max_width;
+-   uint32_t max_height;
+-   uint8_t CurrPicTextureIndex;
+-   uint8_t superres_denom;
+-   uint8_t bitdepth;
+-   uint8_t seq_profile;
+-   struct {
+-      uint8_t cols;
+-      uint8_t rows;
+-      uint16_t context_update_id;
+-      uint16_t widths[64];
+-      uint16_t heights[64];
+-   } tiles;
+-   union {
+-      struct {
+-         uint32_t use_128x128_superblock : 1;
+-         uint32_t intra_edge_filter : 1;
+-         uint32_t interintra_compound : 1;
+-         uint32_t masked_compound : 1;
+-         uint32_t warped_motion : 1;
+-         uint32_t dual_filter : 1;
+-         uint32_t jnt_comp : 1;
+-         uint32_t screen_content_tools : 1;
+-         uint32_t integer_mv : 1;
+-         uint32_t cdef : 1;
+-         uint32_t restoration : 1;
+-         uint32_t film_grain : 1;
+-         uint32_t intrabc : 1;
+-         uint32_t high_precision_mv : 1;
+-         uint32_t switchable_motion_mode : 1;
+-         uint32_t filter_intra : 1;
+-         uint32_t disable_frame_end_update_cdf : 1;
+-         uint32_t disable_cdf_update : 1;
+-         uint32_t reference_mode : 1;
+-         uint32_t skip_mode : 1;
+-         uint32_t reduced_tx_set : 1;
+-         uint32_t superres : 1;
+-         uint32_t tx_mode : 2;
+-         uint32_t use_ref_frame_mvs : 1;
+-         uint32_t enable_ref_frame_mvs : 1;
+-         uint32_t reference_frame_update : 1;
+-         uint32_t Reserved : 5;
+-      };
+-      uint32_t CodingParamToolFlags;
+-   } coding;
+-   union {
+-      struct {
+-         uint8_t frame_type : 2;
+-         uint8_t show_frame : 1;
+-         uint8_t showable_frame : 1;
+-         uint8_t subsampling_x : 1;
+-         uint8_t subsampling_y : 1;
+-         uint8_t mono_chrome : 1;
+-         uint8_t Reserved : 1;
+-      };
+-      uint8_t FormatAndPictureInfoFlags;
+-   } format;
+-   uint8_t primary_ref_frame;
+-   uint8_t order_hint;
+-   uint8_t order_hint_bits;
+-   DXVA_PicEntry_AV1 frame_refs[7];
+-   uint8_t RefFrameMapTextureIndex[8];
+-   struct {
+-      uint8_t filter_level[2];
+-      uint8_t filter_level_u;
+-      uint8_t filter_level_v;
+-      uint8_t sharpness_level;
+-      union {
+-         struct {
+-            uint8_t mode_ref_delta_enabled : 1;
+-            uint8_t mode_ref_delta_update : 1;
+-            uint8_t delta_lf_multi : 1;
+-            uint8_t delta_lf_present : 1;
+-            uint8_t Reserved : 4;
+-         };
+-         uint8_t ControlFlags;
+-      };
+-      int8_t ref_deltas[8];
+-      int8_t mode_deltas[2];
+-      uint8_t delta_lf_res;
+-      uint8_t frame_restoration_type[3];
+-      uint16_t log2_restoration_unit_size[3];
+-      uint16_t Reserved16Bits;
+-   } loop_filter;
+-   struct {
+-      union {
+-         struct {
+-            uint8_t delta_q_present : 1;
+-            uint8_t delta_q_res : 2;
+-            uint8_t Reserved : 5;
+-         };
+-         uint8_t ControlFlags;
+-      };
+-      uint8_t base_qindex;
+-      int8_t y_dc_delta_q;
+-      int8_t u_dc_delta_q;
+-      int8_t v_dc_delta_q;
+-      int8_t u_ac_delta_q;
+-      int8_t v_ac_delta_q;
+-      uint8_t qm_y;
+-      uint8_t qm_u;
+-      uint8_t qm_v;
+-      uint16_t Reserved16Bits;
+-   } quantization;
+-   struct {
+-      union {
+-         struct {
+-            uint8_t damping : 2;
+-            uint8_t bits : 2;
+-            uint8_t Reserved : 4;
+-         };
+-         uint8_t ControlFlags;
+-      };
+-      union {
+-         struct {
+-            uint8_t primary : 6;
+-            uint8_t secondary : 2;
+-         };
+-         uint8_t combined;
+-      } y_strengths[8], uv_strengths[8];
+-   } cdef;
+-   uint8_t interp_filter;
+-   struct {
+-      union {
+-         struct {
+-            uint8_t enabled : 1;
+-            uint8_t update_map : 1;
+-            uint8_t update_data : 1;
+-            uint8_t temporal_update : 1;
+-            uint8_t Reserved : 4;
+-         };
+-         uint8_t ControlFlags;
+-      };
+-      uint8_t Reserved24Bits[3];
+-      uint8_t feature_mask[8];
+-      int16_t feature_data[8][8];
+-   } segmentation;
+-   struct {
+-      union {
+-         struct {
+-            uint16_t apply_grain : 1;
+-            uint16_t scaling_shift_minus8 : 2;
+-            uint16_t chroma_scaling_from_luma : 1;
+-            uint16_t ar_coeff_lag : 2;
+-            uint16_t ar_coeff_shift_minus6 : 2;
+-            uint16_t grain_scale_shift : 2;
+-            uint16_t overlap_flag : 1;
+-            uint16_t clip_to_restricted_range : 1;
+-            uint16_t matrix_coeff_is_identity : 1;
+-            uint16_t Reserved : 3;
+-         };
+-         uint16_t ControlFlags;
+-      };
+-      uint16_t grain_seed;
+-      uint8_t scaling_points_y[14][2];
+-      uint8_t num_y_points;
+-      uint8_t scaling_points_cb[10][2];
+-      uint8_t num_cb_points;
+-      uint8_t scaling_points_cr[10][2];
+-      uint8_t num_cr_points;
+-      uint8_t ar_coeffs_y[24];
+-      uint8_t ar_coeffs_cb[25];
+-      uint8_t ar_coeffs_cr[25];
+-      uint8_t cb_mult;
+-      uint8_t cb_luma_mult;
+-      uint8_t cr_mult;
+-      uint8_t cr_luma_mult;
+-      uint8_t Reserved8Bits;
+-      int16_t cb_offset;
+-      int16_t cr_offset;
+-   } film_grain;
+-   uint32_t Reserved32Bits;
+-   uint32_t StatusReportFeedbackNumber;
+-};
+-
+-/* MPEG-2 (DXVA 1's structures) */
+-struct DXVA_PictureParameters {
+-   uint16_t wDecodedPictureIndex;
+-   uint16_t wDeblockedPictureIndex;
+-   uint16_t wForwardRefPictureIndex;
+-   uint16_t wBackwardRefPictureIndex;
+-   uint16_t wPicWidthInMBminus1;
+-   uint16_t wPicHeightInMBminus1;
+-   uint8_t bMacroblockWidthMinus1;
+-   uint8_t bMacroblockHeightMinus1;
+-   uint8_t bBlockWidthMinus1;
+-   uint8_t bBlockHeightMinus1;
+-   uint8_t bBPPminus1;
+-   uint8_t bPicStructure;
+-   uint8_t bSecondField;
+-   uint8_t bPicIntra;
+-   uint8_t bPicBackwardPrediction;
+-   uint8_t bBidirectionalAveragingMode;
+-   uint8_t bMVprecisionAndChromaRelation;
+-   uint8_t bChromaFormat;
+-   uint8_t bPicScanFixed;
+-   uint8_t bPicScanMethod;
+-   uint8_t bPicReadbackRequests;
+-   uint8_t bRcontrol;
+-   uint8_t bPicSpatialResid8;
+-   uint8_t bPicOverflowBlocks;
+-   uint8_t bPicExtrapolation;
+-   uint8_t bPicDeblocked;
+-   uint8_t bPicDeblockConfined;
+-   uint8_t bPic4MVallowed;
+-   uint8_t bPicOBMC;
+-   uint8_t bPicBinPB;
+-   uint8_t bMV_RPS;
+-   uint8_t bReservedBits;
+-   uint16_t wBitstreamFcodes;
+-   uint16_t wBitstreamPCEelements;
+-   uint8_t bBitstreamConcealmentNeed;
+-   uint8_t bBitstreamConcealmentMethod;
+-};
+-
+-struct DXVA_QmatrixData {
+-   uint8_t bNewQmatrix[4];   /* intra, inter (luma), intra, inter (chroma) */
+-   uint16_t Qmatrix[4][64];  /* in zig-zag order */
+-};
+-
+-struct DXVA_SliceInfo {
+-   uint16_t wHorizontalPosition;
+-   uint16_t wVerticalPosition;
+-   uint32_t dwSliceBitsInBuffer;
+-   uint32_t dwSliceDataLocation;
+-   uint8_t bStartCodeBitOffset;
+-   uint8_t bReservedBits;
+-   uint16_t wMBbitOffset;
+-   uint16_t wNumberMBsInSlice;
+-   uint16_t wQuantizerScaleCode;
+-   uint16_t wBadSliceChopping;
+-};
+-
+-/* AV1's slice control: the tiles */
+-struct DXVA_Tile_AV1 {
+-   uint32_t DataOffset;
+-   uint32_t DataSize;
+-   uint16_t row;
+-   uint16_t column;
+-   uint16_t Reserved16Bits;
+-   uint8_t anchor_frame;
+-   uint8_t Reserved8Bits;
+-};
+-#pragma pack(pop)
+-
+-static const uint8_t DXVA_INVALID_ENTRY = 0xff;
+-
+-
+-/*
+- * The decoder profiles (D3D11_DECODER_PROFILE_*), as gallium's
+- */
+-
+-enum VideoCodec { CODEC_H264, CODEC_HEVC, CODEC_VP9, CODEC_AV1, CODEC_MPEG2 };
+-
+-struct VideoProfileInfo {
+-   GUID guid;
+-   enum pipe_video_profile profile;
+-   DXGI_FORMAT format;
+-   VideoCodec codec;
+-   DXGI_FORMAT format2 = DXGI_FORMAT_UNKNOWN;   /* a profile for 8 and 10 bits (AV1's) */
+-
+-   bool Outputs(DXGI_FORMAT f) const { return f == format || (format2 != DXGI_FORMAT_UNKNOWN && f == format2); }
+-};
+-
+-static const VideoProfileInfo PROFILES[] = {
+-   {{0x1b81be68, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}}, /* H264_VLD_NOFGT */
+-    PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH, DXGI_FORMAT_NV12, CODEC_H264},
+-   {{0x5b11d51b, 0x2f4c, 0x4452, {0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0}}, /* HEVC_VLD_MAIN */
+-    PIPE_VIDEO_PROFILE_HEVC_MAIN, DXGI_FORMAT_NV12, CODEC_HEVC},
+-   {{0x107af0e0, 0xef1a, 0x4d19, {0xab, 0xa8, 0x67, 0xa1, 0x63, 0x07, 0x3d, 0x13}}, /* HEVC_VLD_MAIN10 */
+-    PIPE_VIDEO_PROFILE_HEVC_MAIN_10, DXGI_FORMAT_P010, CODEC_HEVC},
+-   {{0x463707f8, 0xa1d0, 0x4585, {0x87, 0x6d, 0x83, 0xaa, 0x6d, 0x60, 0xb8, 0x9e}}, /* VP9_VLD_PROFILE0 */
+-    PIPE_VIDEO_PROFILE_VP9_PROFILE0, DXGI_FORMAT_NV12, CODEC_VP9},
+-   {{0xa4c749ef, 0x6ecf, 0x48aa, {0x84, 0x48, 0x50, 0xa7, 0xa1, 0x16, 0x5f, 0xf7}}, /* VP9_VLD_10BIT_PROFILE2 */
+-    PIPE_VIDEO_PROFILE_VP9_PROFILE2, DXGI_FORMAT_P010, CODEC_VP9},
+-   {{0xb8be4ccb, 0xcf53, 0x46ba, {0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a}}, /* AV1_VLD_PROFILE0: 8 and 10 bits */
+-    PIPE_VIDEO_PROFILE_AV1_MAIN, DXGI_FORMAT_NV12, CODEC_AV1, DXGI_FORMAT_P010},
+-   {{0xee27417f, 0x5e28, 0x4e65, {0xbe, 0xea, 0x1d, 0x26, 0xb5, 0x08, 0xad, 0xc9}}, /* MPEG2_VLD */
+-    PIPE_VIDEO_PROFILE_MPEG2_MAIN, DXGI_FORMAT_NV12, CODEC_MPEG2},
+-};
+-
+-/* DXVA_NoEncrypt */
+-static const GUID NO_ENCRYPT = {0x1b81bed0, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}};
+-
+-static bool
+-ProfileSupported(struct pipe_screen *screen, const VideoProfileInfo &p)
+-{
+-   return screen->get_video_param &&
+-          screen->get_video_param(screen, p.profile, PIPE_VIDEO_ENTRYPOINT_BITSTREAM, PIPE_VIDEO_CAP_SUPPORTED);
+-}
+-
+-static const VideoProfileInfo *
+-FindProfile(D3D10DDI_HDEVICE hDevice, const GUID *guid)
+-{
+-   struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
+-   for (auto &p : PROFILES) {
+-      if (IsEqualGUID(p.guid, *guid) && ProfileSupported(screen, p)) {
+-         return &p;
+-      }
+-   }
+-   return NULL;
+-}
+ 
+ 
+ /*
+@@ -1142,33 +538,14 @@ VideoAddFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pForma
+  * The decoder
+  */
+ 
+-struct VideoDecoder {
+-   const VideoProfileInfo *profile;
+-   struct pipe_video_codec *codec;
+-   unsigned width, height;
+-
++struct VideoDecoder : DxvaDecoder {
+    /* the frame between BeginFrame and EndFrame */
+-   Resource *target;
+-   unsigned slice;
+-   std::vector<uint8_t> pic_params, qmatrix;
+-   std::vector<uint8_t> stream;     /* the slices' data, each H.264/HEVC slice after a start code */
+-   unsigned slices;
+-   std::vector<DXVA_Tile_AV1> tiles; /* AV1: where each tile is in stream */
+-   uint8_t intra_matrix[64], non_intra_matrix[64];   /* MPEG-2's, for its picture description */
+-
+-   union {
+-      struct pipe_h264_picture_desc h264;
+-      struct pipe_h265_picture_desc h265;
+-      struct pipe_vp9_picture_desc vp9;
+-      struct pipe_av1_picture_desc av1;
+-      struct pipe_mpeg12_picture_desc mpeg2;
+-   } desc;
+-   struct pipe_h264_pps h264_pps;
+-   struct pipe_h264_sps h264_sps;
+-   struct pipe_h265_pps h265_pps;
+-   struct pipe_h265_sps h265_sps;
++   Resource *target = NULL;
++   unsigned slice = 0;
+ };
+ 
++static struct pipe_video_buffer *Surface(DxvaDecoder *d, unsigned index);
++
+ struct VideoDecoderOutputView {
+    Resource *resource;
+    unsigned slice;
+@@ -1205,7 +582,7 @@ GetVideoDecoderProfile(D3D10DDI_HDEVICE hDevice, UINT Index, GUID *pGuid)
+ static void APIENTRY
+ CheckVideoDecoderFormat(D3D10DDI_HDEVICE hDevice, const GUID *pGuid, DXGI_FORMAT Format, BOOL *pSupported)
+ {
+-   const VideoProfileInfo *p = FindProfile(hDevice, pGuid);
++   const VideoProfileInfo *p = FindProfile(CastPipeContext(hDevice)->screen, pGuid);
+    *pSupported = p && p->Outputs(Format);
+ }
+ 
+@@ -1213,7 +590,7 @@ static bool
+ DecoderSizeSupported(D3D10DDI_HDEVICE hDevice, const D3D11_1DDI_VIDEO_DECODER_DESC *pDesc,
+                      const VideoProfileInfo **pProfile)
+ {
+-   const VideoProfileInfo *p = FindProfile(hDevice, &pDesc->Guid);
++   const VideoProfileInfo *p = FindProfile(CastPipeContext(hDevice)->screen, &pDesc->Guid);
+    if (!p || !p->Outputs(pDesc->OutputFormat)) {
+       return false;
+    }
+@@ -1238,7 +615,7 @@ static void APIENTRY
+ GetVideoDecoderConfig(D3D10DDI_HDEVICE hDevice, const D3D11_1DDI_VIDEO_DECODER_DESC *pDesc, UINT Index,
+                       D3D11_1DDI_VIDEO_DECODER_CONFIG *pConfig)
+ {
+-   const VideoProfileInfo *p = FindProfile(hDevice, &pDesc->Guid);
++   const VideoProfileInfo *p = FindProfile(CastPipeContext(hDevice)->screen, &pDesc->Guid);
+    memset(pConfig, 0, sizeof *pConfig);
+    pConfig->guidConfigBitstreamEncryption = NO_ENCRYPT;
+    pConfig->guidConfigMBcontrolEncryption = NO_ENCRYPT;
+@@ -1269,13 +646,13 @@ GetVideoDecoderBufferInfo(D3D10DDI_HDEVICE hDevice, const D3D11_1DDI_VIDEO_DECOD
+    pInfo->Type = BUFFER_TYPES[MIN2(Index, ARRAY_SIZE(BUFFER_TYPES) - 1)];
+    switch (pInfo->Type) {
+    case D3D11_1DDI_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS:
+-      pInfo->Size = MAX2(sizeof(DXVA_PicParams_H264), sizeof(DXVA_PicParams_AV1));
++      pInfo->Size = MAX2(sizeof(DxvaPicParams_H264), sizeof(DxvaPicParams_AV1));
+       break;
+    case D3D11_1DDI_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX:
+-      pInfo->Size = sizeof(DXVA_Qmatrix_HEVC);
++      pInfo->Size = sizeof(DxvaQmatrix_HEVC);
+       break;
+    case D3D11_1DDI_VIDEO_DECODER_BUFFER_SLICE_CONTROL:
+-      pInfo->Size = 4096 * sizeof(DXVA_Tile_AV1);
++      pInfo->Size = 4096 * sizeof(DxvaTile_AV1);
+       break;
+    default:
+       /* a compressed picture: at most about its raw size */
+@@ -1324,6 +701,7 @@ CreateVideoDecoder(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEODECO
+    dec->codec = codec;
+    dec->width = pCreate->Desc.SampleWidth;
+    dec->height = pCreate->Desc.SampleHeight;
++   dec->surface = Surface;
+    return S_OK;
+ }
+ 
+@@ -1373,11 +751,7 @@ VideoDecoderBeginFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder,
+    }
+    dec->target = view->resource;
+    dec->slice = view->slice;
+-   dec->pic_params.clear();
+-   dec->qmatrix.clear();
+-   dec->stream.clear();
+-   dec->slices = 0;
+-   dec->tiles.clear();
++   DxvaBeginFrame(dec);
+    return S_OK;
+ }
+ 
+@@ -1418,660 +792,22 @@ VideoDecoderSubmitBuffers(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder,
+       }
+    }
+ 
+-   /* the slices of this call's bitstream buffer, where its slice control says they are: H.264 and HEVC slices each
+-    * after a start code (the host's VA-API driver gets them one by one, split at the start codes) */
+-   /* AV1: the bitstream buffer as it is, its tiles where the slice control says */
+-   if (slice_control && bitstream && dec->profile->codec == CODEC_AV1) {
+-      uint32_t base = (uint32_t)dec->stream.size();
+-      for (unsigned i = 0; i < slice_control_size / sizeof(DXVA_Tile_AV1); i++) {
+-         DXVA_Tile_AV1 t;
+-         memcpy(&t, slice_control + i * sizeof t, sizeof t);
+-         if (t.DataOffset > bitstream_size || t.DataSize > bitstream_size - t.DataOffset) {
+-            VideoLog("SubmitBuffers: tile %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i, t.DataSize,
+-                     t.DataOffset, bitstream_size);
+-            return E_INVALIDARG;
+-         }
+-         t.DataOffset += base;
+-         dec->tiles.push_back(t);
+-      }
+-      dec->stream.insert(dec->stream.end(), bitstream, bitstream + bitstream_size);
+-      dec->slices = (unsigned)dec->tiles.size();
+-   } else if (slice_control && bitstream && dec->profile->codec == CODEC_MPEG2) {
+-      /* MPEG-2: the slices with their start codes, as they are */
+-      for (unsigned i = 0; i < slice_control_size / sizeof(DXVA_SliceInfo); i++) {
+-         DXVA_SliceInfo si;
+-         memcpy(&si, slice_control + i * sizeof si, sizeof si);
+-         uint32_t bytes = si.dwSliceBitsInBuffer / 8;
+-         if (si.dwSliceDataLocation > bitstream_size || bytes > bitstream_size - si.dwSliceDataLocation) {
+-            VideoLog("SubmitBuffers: slice %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i, bytes,
+-                     si.dwSliceDataLocation, bitstream_size);
+-            return E_INVALIDARG;
+-         }
+-         dec->stream.insert(dec->stream.end(), bitstream + si.dwSliceDataLocation,
+-                            bitstream + si.dwSliceDataLocation + bytes);
+-         dec->slices++;
+-      }
+-   } else if (slice_control && bitstream) {
+-      static const uint8_t start_code[3] = {0, 0, 1};
+-      bool annexb = dec->profile->codec != CODEC_VP9;
+-      for (unsigned i = 0; i < slice_control_size / sizeof(DXVA_Slice_Short); i++) {
+-         DXVA_Slice_Short s;
+-         memcpy(&s, slice_control + i * sizeof s, sizeof s);
+-         if (s.BSNALunitDataLocation > bitstream_size || s.SliceBytesInBuffer > bitstream_size - s.BSNALunitDataLocation) {
+-            VideoLog("SubmitBuffers: slice %u (%u bytes at %u) outside the bitstream (%u bytes)\n", i,
+-                     s.SliceBytesInBuffer, s.BSNALunitDataLocation, bitstream_size);
+-            return E_INVALIDARG;
+-         }
+-         const uint8_t *slice = bitstream + s.BSNALunitDataLocation;
+-         if (annexb && (s.SliceBytesInBuffer < 3 || memcmp(slice, start_code, 3))) {
+-            dec->stream.insert(dec->stream.end(), start_code, start_code + 3);
+-         }
+-         dec->stream.insert(dec->stream.end(), slice, slice + s.SliceBytesInBuffer);
+-         dec->slices++;
+-      }
++   if (slice_control && bitstream &&
++       !DxvaAddSlices(dec, slice_control, slice_control_size, bitstream, bitstream_size)) {
++      return E_INVALIDARG;
+    }
+    return S_OK;
+ }
+ 
+ /* The picture a DXVA surface index names: in D3D11 the decoder output texture's array slice */
+ static struct pipe_video_buffer *
+-Surface(VideoDecoder *dec, unsigned index)
++Surface(DxvaDecoder *d, unsigned index)
+ {
++   VideoDecoder *dec = static_cast<VideoDecoder *>(d);
+    VideoSurface *v = dec->target->video;
+    return index < v->slices ? v->buffers[index] : NULL;
+ }
+ 
+-static bool
+-H264Picture(VideoDecoder *dec)
+-{
+-   if (dec->pic_params.size() < sizeof(DXVA_PicParams_H264)) {
+-      return false;
+-   }
+-   const DXVA_PicParams_H264 *pp = (const DXVA_PicParams_H264 *)dec->pic_params.data();
+-   struct pipe_h264_picture_desc *d = &dec->desc.h264;
+-   struct pipe_h264_pps *pps = &dec->h264_pps;
+-   struct pipe_h264_sps *sps = &dec->h264_sps;
+-   memset(d, 0, sizeof *d);
+-   memset(pps, 0, sizeof *pps);
+-   memset(sps, 0, sizeof *sps);
+-   d->pps = pps;
+-   pps->sps = sps;
+-
+-   sps->chroma_format_idc = pp->chroma_format_idc;
+-   sps->separate_colour_plane_flag = pp->residual_colour_transform_flag;
+-   sps->bit_depth_luma_minus8 = pp->bit_depth_luma_minus8;
+-   sps->bit_depth_chroma_minus8 = pp->bit_depth_chroma_minus8;
+-   sps->log2_max_frame_num_minus4 = pp->log2_max_frame_num_minus4;
+-   sps->pic_order_cnt_type = pp->pic_order_cnt_type;
+-   sps->log2_max_pic_order_cnt_lsb_minus4 = pp->log2_max_pic_order_cnt_lsb_minus4;
+-   sps->delta_pic_order_always_zero_flag = pp->delta_pic_order_always_zero_flag;
+-   sps->max_num_ref_frames = pp->num_ref_frames;
+-   sps->frame_mbs_only_flag = pp->frame_mbs_only_flag;
+-   sps->mb_adaptive_frame_field_flag = pp->MbaffFrameFlag;
+-   sps->direct_8x8_inference_flag = pp->direct_8x8_inference_flag;
+-   sps->MinLumaBiPredSize8x8 = pp->MinLumaBipredSize8x8Flag;
+-
+-   pps->entropy_coding_mode_flag = pp->entropy_coding_mode_flag;
+-   pps->bottom_field_pic_order_in_frame_present_flag = pp->pic_order_present_flag;
+-   pps->num_slice_groups_minus1 = pp->num_slice_groups_minus1;
+-   pps->slice_group_map_type = pp->slice_group_map_type;
+-   pps->slice_group_change_rate_minus1 = pp->slice_group_change_rate_minus1;
+-   pps->num_ref_idx_l0_default_active_minus1 = pp->num_ref_idx_l0_active_minus1;
+-   pps->num_ref_idx_l1_default_active_minus1 = pp->num_ref_idx_l1_active_minus1;
+-   pps->weighted_pred_flag = pp->weighted_pred_flag;
+-   pps->weighted_bipred_idc = pp->weighted_bipred_idc;
+-   pps->pic_init_qp_minus26 = pp->pic_init_qp_minus26;
+-   pps->pic_init_qs_minus26 = pp->pic_init_qs_minus26;
+-   pps->chroma_qp_index_offset = pp->chroma_qp_index_offset;
+-   pps->second_chroma_qp_index_offset = pp->second_chroma_qp_index_offset;
+-   pps->deblocking_filter_control_present_flag = pp->deblocking_filter_control_present_flag;
+-   pps->constrained_intra_pred_flag = pp->constrained_intra_pred_flag;
+-   pps->redundant_pic_cnt_present_flag = pp->redundant_pic_cnt_present_flag;
+-   pps->transform_8x8_mode_flag = pp->transform_8x8_mode_flag;
+-
+-   /* the scaling lists: DXVA's in zig-zag order, gallium's (VA-API's) in raster order; flat without them */
+-   memset(pps->ScalingList4x4, 16, sizeof pps->ScalingList4x4);
+-   memset(pps->ScalingList8x8, 16, sizeof pps->ScalingList8x8);
+-   if (dec->qmatrix.size() >= sizeof(DXVA_Qmatrix_H264)) {
+-      const DXVA_Qmatrix_H264 *qm = (const DXVA_Qmatrix_H264 *)dec->qmatrix.data();
+-      for (unsigned i = 0; i < 6; i++) {
+-         for (unsigned j = 0; j < 16; j++) {
+-            pps->ScalingList4x4[i][vl_zscan_normal_16[j]] = qm->bScalingLists4x4[i][j];
+-         }
+-      }
+-      for (unsigned i = 0; i < 2; i++) {
+-         for (unsigned j = 0; j < 64; j++) {
+-            pps->ScalingList8x8[i][vl_zscan_normal[j]] = qm->bScalingLists8x8[i][j];
+-         }
+-      }
+-   }
+-
+-   d->frame_num = pp->frame_num;
+-   d->field_pic_flag = pp->field_pic_flag;
+-   d->bottom_field_flag = pp->field_pic_flag && pp->CurrPic.AssociatedFlag;
+-   d->num_ref_idx_l0_active_minus1 = pp->num_ref_idx_l0_active_minus1;
+-   d->num_ref_idx_l1_active_minus1 = pp->num_ref_idx_l1_active_minus1;
+-   d->slice_count = dec->slices;
+-   d->field_order_cnt[0] = pp->CurrFieldOrderCnt[0];
+-   d->field_order_cnt[1] = pp->CurrFieldOrderCnt[1];
+-   d->is_reference = pp->RefPicFlag;
+-   d->num_ref_frames = pp->num_ref_frames;
+-
+-   /* the references, packed from the first entry (virgl's host reads entries up to num_ref_frames) */
+-   unsigned n = 0;
+-   for (unsigned i = 0; i < 16; i++) {
+-      DXVA_PicEntry e = pp->RefFrameList[i];
+-      bool top = pp->UsedForReferenceFlags & (1u << (2 * i)), bottom = pp->UsedForReferenceFlags & (2u << (2 * i));
+-      struct pipe_video_buffer *ref = e.bPicEntry == DXVA_INVALID_ENTRY ? NULL : Surface(dec, e.Index7Bits);
+-      if (!ref || (!top && !bottom) || (pp->NonExistingFrameFlags & (1u << i))) {
+-         continue;
+-      }
+-      d->ref[n] = ref;
+-      d->is_long_term[n] = e.AssociatedFlag;
+-      d->top_is_reference[n] = top;
+-      d->bottom_is_reference[n] = bottom;
+-      d->field_order_cnt_list[n][0] = pp->FieldOrderCntList[i][0];
+-      d->field_order_cnt_list[n][1] = pp->FieldOrderCntList[i][1];
+-      d->frame_num_list[n] = pp->FrameNumList[i];
+-      n++;
+-   }
+-   return true;
+-}
+-
+-static bool
+-HEVCPicture(VideoDecoder *dec)
+-{
+-   if (dec->pic_params.size() < sizeof(DXVA_PicParams_HEVC)) {
+-      return false;
+-   }
+-   const DXVA_PicParams_HEVC *pp = (const DXVA_PicParams_HEVC *)dec->pic_params.data();
+-   struct pipe_h265_picture_desc *d = &dec->desc.h265;
+-   struct pipe_h265_pps *pps = &dec->h265_pps;
+-   struct pipe_h265_sps *sps = &dec->h265_sps;
+-   memset(d, 0, sizeof *d);
+-   memset(pps, 0, sizeof *pps);
+-   memset(sps, 0, sizeof *sps);
+-   d->pps = pps;
+-   pps->sps = sps;
+-
+-   unsigned log2_min_cb = pp->log2_min_luma_coding_block_size_minus3 + 3;
+-   sps->chroma_format_idc = pp->chroma_format_idc;
+-   sps->separate_colour_plane_flag = pp->separate_colour_plane_flag;
+-   sps->pic_width_in_luma_samples = pp->PicWidthInMinCbsY << log2_min_cb;
+-   sps->pic_height_in_luma_samples = pp->PicHeightInMinCbsY << log2_min_cb;
+-   sps->bit_depth_luma_minus8 = pp->bit_depth_luma_minus8;
+-   sps->bit_depth_chroma_minus8 = pp->bit_depth_chroma_minus8;
+-   sps->log2_max_pic_order_cnt_lsb_minus4 = pp->log2_max_pic_order_cnt_lsb_minus4;
+-   sps->sps_max_dec_pic_buffering_minus1 = pp->sps_max_dec_pic_buffering_minus1;
+-   sps->log2_min_luma_coding_block_size_minus3 = pp->log2_min_luma_coding_block_size_minus3;
+-   sps->log2_diff_max_min_luma_coding_block_size = pp->log2_diff_max_min_luma_coding_block_size;
+-   sps->log2_min_transform_block_size_minus2 = pp->log2_min_transform_block_size_minus2;
+-   sps->log2_diff_max_min_transform_block_size = pp->log2_diff_max_min_transform_block_size;
+-   sps->max_transform_hierarchy_depth_inter = pp->max_transform_hierarchy_depth_inter;
+-   sps->max_transform_hierarchy_depth_intra = pp->max_transform_hierarchy_depth_intra;
+-   sps->num_short_term_ref_pic_sets = pp->num_short_term_ref_pic_sets;
+-   sps->num_long_term_ref_pics_sps = pp->num_long_term_ref_pics_sps;
+-   sps->scaling_list_enabled_flag = pp->scaling_list_enabled_flag;
+-   sps->amp_enabled_flag = pp->amp_enabled_flag;
+-   sps->sample_adaptive_offset_enabled_flag = pp->sample_adaptive_offset_enabled_flag;
+-   sps->pcm_enabled_flag = pp->pcm_enabled_flag;
+-   sps->pcm_sample_bit_depth_luma_minus1 = pp->pcm_sample_bit_depth_luma_minus1;
+-   sps->pcm_sample_bit_depth_chroma_minus1 = pp->pcm_sample_bit_depth_chroma_minus1;
+-   sps->log2_min_pcm_luma_coding_block_size_minus3 = pp->log2_min_pcm_luma_coding_block_size_minus3;
+-   sps->log2_diff_max_min_pcm_luma_coding_block_size = pp->log2_diff_max_min_pcm_luma_coding_block_size;
+-   sps->pcm_loop_filter_disabled_flag = pp->pcm_loop_filter_disabled_flag;
+-   sps->long_term_ref_pics_present_flag = pp->long_term_ref_pics_present_flag;
+-   sps->sps_temporal_mvp_enabled_flag = pp->sps_temporal_mvp_enabled_flag;
+-   sps->strong_intra_smoothing_enabled_flag = pp->strong_intra_smoothing_enabled_flag;
+-
+-   pps->dependent_slice_segments_enabled_flag = pp->dependent_slice_segments_enabled_flag;
+-   pps->output_flag_present_flag = pp->output_flag_present_flag;
+-   pps->num_extra_slice_header_bits = pp->num_extra_slice_header_bits;
+-   pps->sign_data_hiding_enabled_flag = pp->sign_data_hiding_enabled_flag;
+-   pps->cabac_init_present_flag = pp->cabac_init_present_flag;
+-   pps->num_ref_idx_l0_default_active_minus1 = pp->num_ref_idx_l0_default_active_minus1;
+-   pps->num_ref_idx_l1_default_active_minus1 = pp->num_ref_idx_l1_default_active_minus1;
+-   pps->init_qp_minus26 = pp->init_qp_minus26;
+-   pps->constrained_intra_pred_flag = pp->constrained_intra_pred_flag;
+-   pps->transform_skip_enabled_flag = pp->transform_skip_enabled_flag;
+-   pps->cu_qp_delta_enabled_flag = pp->cu_qp_delta_enabled_flag;
+-   pps->diff_cu_qp_delta_depth = pp->diff_cu_qp_delta_depth;
+-   pps->pps_cb_qp_offset = pp->pps_cb_qp_offset;
+-   pps->pps_cr_qp_offset = pp->pps_cr_qp_offset;
+-   pps->pps_slice_chroma_qp_offsets_present_flag = pp->pps_slice_chroma_qp_offsets_present_flag;
+-   pps->weighted_pred_flag = pp->weighted_pred_flag;
+-   pps->weighted_bipred_flag = pp->weighted_bipred_flag;
+-   pps->transquant_bypass_enabled_flag = pp->transquant_bypass_enabled_flag;
+-   pps->tiles_enabled_flag = pp->tiles_enabled_flag;
+-   pps->entropy_coding_sync_enabled_flag = pp->entropy_coding_sync_enabled_flag;
+-   pps->uniform_spacing_flag = pp->uniform_spacing_flag;
+-   pps->loop_filter_across_tiles_enabled_flag = pp->loop_filter_across_tiles_enabled_flag;
+-   pps->pps_loop_filter_across_slices_enabled_flag = pp->pps_loop_filter_across_slices_enabled_flag;
+-   pps->deblocking_filter_override_enabled_flag = pp->deblocking_filter_override_enabled_flag;
+-   pps->pps_deblocking_filter_disabled_flag = pp->pps_deblocking_filter_disabled_flag;
+-   pps->lists_modification_present_flag = pp->lists_modification_present_flag;
+-   pps->slice_segment_header_extension_present_flag = pp->slice_segment_header_extension_present_flag;
+-   pps->pps_beta_offset_div2 = pp->pps_beta_offset_div2;
+-   pps->pps_tc_offset_div2 = pp->pps_tc_offset_div2;
+-   pps->log2_parallel_merge_level_minus2 = pp->log2_parallel_merge_level_minus2;
+-   pps->st_rps_bits = pp->wNumBitsForShortTermRPSInSlice;
+-   if (pp->tiles_enabled_flag) {
+-      pps->num_tile_columns_minus1 = pp->num_tile_columns_minus1;
+-      pps->num_tile_rows_minus1 = pp->num_tile_rows_minus1;
+-      for (unsigned i = 0; i < MIN2(ARRAY_SIZE(pp->column_width_minus1), ARRAY_SIZE(pps->column_width_minus1)); i++) {
+-         pps->column_width_minus1[i] = pp->column_width_minus1[i];
+-      }
+-      for (unsigned i = 0; i < MIN2(ARRAY_SIZE(pp->row_height_minus1), ARRAY_SIZE(pps->row_height_minus1)); i++) {
+-         pps->row_height_minus1[i] = pp->row_height_minus1[i];
+-      }
+-   }
+-
+-   /* the scaling lists: DXVA's in up-right diagonal order, gallium's (VA-API's) in raster order; flat without them */
+-   memset(sps->ScalingList4x4, 16, sizeof sps->ScalingList4x4);
+-   memset(sps->ScalingList8x8, 16, sizeof sps->ScalingList8x8);
+-   memset(sps->ScalingList16x16, 16, sizeof sps->ScalingList16x16);
+-   memset(sps->ScalingList32x32, 16, sizeof sps->ScalingList32x32);
+-   memset(sps->ScalingListDCCoeff16x16, 16, sizeof sps->ScalingListDCCoeff16x16);
+-   memset(sps->ScalingListDCCoeff32x32, 16, sizeof sps->ScalingListDCCoeff32x32);
+-   if (pp->scaling_list_enabled_flag && dec->qmatrix.size() >= sizeof(DXVA_Qmatrix_HEVC)) {
+-      const DXVA_Qmatrix_HEVC *qm = (const DXVA_Qmatrix_HEVC *)dec->qmatrix.data();
+-      for (unsigned i = 0; i < 6; i++) {
+-         for (unsigned j = 0; j < 16; j++) {
+-            sps->ScalingList4x4[i][vl_zscan_h265_up_right_diagonal_16[j]] = qm->ucScalingLists0[i][j];
+-         }
+-         for (unsigned j = 0; j < 64; j++) {
+-            sps->ScalingList8x8[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists1[i][j];
+-            sps->ScalingList16x16[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists2[i][j];
+-            if (i < 2) {
+-               sps->ScalingList32x32[i][vl_zscan_h265_up_right_diagonal[j]] = qm->ucScalingLists3[i][j];
+-            }
+-         }
+-      }
+-      memcpy(sps->ScalingListDCCoeff16x16, qm->ucScalingListDCCoefSizeID2, sizeof qm->ucScalingListDCCoefSizeID2);
+-      memcpy(sps->ScalingListDCCoeff32x32, qm->ucScalingListDCCoefSizeID3, sizeof qm->ucScalingListDCCoefSizeID3);
+-   }
+-
+-   d->IDRPicFlag = pp->IdrPicFlag;
+-   d->RAPPicFlag = pp->IrapPicFlag;
+-   d->IntraPicFlag = pp->IntraPicFlag;
+-   d->NumDeltaPocsOfRefRpsIdx = pp->ucNumDeltaPocsOfRefRpsIdx;
+-   d->NumShortTermPictureSliceHeaderBits = pp->wNumBitsForShortTermRPSInSlice;
+-   d->UseStRpsBits = true;
+-   d->CurrPicOrderCntVal = pp->CurrPicOrderCntVal;
+-   for (unsigned i = 0; i < 15; i++) {
+-      DXVA_PicEntry e = pp->RefPicList[i];
+-      d->ref[i] = e.bPicEntry == DXVA_INVALID_ENTRY ? NULL : Surface(dec, e.Index7Bits);
+-      d->IsLongTerm[i] = e.AssociatedFlag;
+-      d->PicOrderCntVal[i] = pp->PicOrderCntValList[i];
+-   }
+-   for (unsigned i = 0; i < 8; i++) {
+-      if (pp->RefPicSetStCurrBefore[i] != DXVA_INVALID_ENTRY) {
+-         d->RefPicSetStCurrBefore[d->NumPocStCurrBefore++] = pp->RefPicSetStCurrBefore[i];
+-      }
+-      if (pp->RefPicSetStCurrAfter[i] != DXVA_INVALID_ENTRY) {
+-         d->RefPicSetStCurrAfter[d->NumPocStCurrAfter++] = pp->RefPicSetStCurrAfter[i];
+-      }
+-      if (pp->RefPicSetLtCurr[i] != DXVA_INVALID_ENTRY) {
+-         d->RefPicSetLtCurr[d->NumPocLtCurr++] = pp->RefPicSetLtCurr[i];
+-      }
+-   }
+-   d->NumPocTotalCurr = d->NumPocStCurrBefore + d->NumPocStCurrAfter + d->NumPocLtCurr;
+-   /* ponytail: no per-slice reference lists (the short slice format has none): NVIDIA's VA-API driver builds them
+-    * from the reference sets, Mesa's (AMD) read RefPicList - those need the slice headers parsed */
+-   return true;
+-}
+-
+-static bool
+-VP9Picture(VideoDecoder *dec)
+-{
+-   if (dec->pic_params.size() < sizeof(DXVA_PicParams_VP9)) {
+-      return false;
+-   }
+-   const DXVA_PicParams_VP9 *pp = (const DXVA_PicParams_VP9 *)dec->pic_params.data();
+-   struct pipe_vp9_picture_desc *d = &dec->desc.vp9;
+-   memset(d, 0, sizeof *d);
+-
+-   for (unsigned i = 0; i < 8; i++) {
+-      DXVA_PicEntry e = pp->ref_frame_map[i];
+-      d->ref[i] = e.bPicEntry == DXVA_INVALID_ENTRY || e.Index7Bits == 0x7f ? NULL : Surface(dec, e.Index7Bits);
+-   }
+-   /* DXVA's active references are surfaces, VA-API's (gallium's) slots of ref_frame_map: the slot of each */
+-   unsigned slots[3] = {};
+-   for (unsigned r = 0; r < 3; r++) {
+-      for (unsigned i = 0; i < 8; i++) {
+-         if (pp->ref_frame_map[i].bPicEntry != DXVA_INVALID_ENTRY &&
+-             pp->ref_frame_map[i].Index7Bits == pp->frame_refs[r].Index7Bits) {
+-            slots[r] = i;
+-            break;
+-         }
+-      }
+-   }
+-
+-   auto &pic = d->picture_parameter;
+-   pic.frame_width = pp->width;
+-   pic.frame_height = pp->height;
+-   pic.pic_fields.subsampling_x = pp->subsampling_x;
+-   pic.pic_fields.subsampling_y = pp->subsampling_y;
+-   pic.pic_fields.frame_type = pp->frame_type;
+-   pic.pic_fields.show_frame = pp->show_frame;
+-   pic.pic_fields.error_resilient_mode = pp->error_resilient_mode;
+-   pic.pic_fields.intra_only = pp->intra_only;
+-   pic.pic_fields.allow_high_precision_mv = pp->allow_high_precision_mv;
+-   /* DXVA's interpolation filters start with smooth, regular; VA-API's (the VP9 spec's) with regular, smooth */
+-   pic.pic_fields.mcomp_filter_type = pp->interp_filter ^ (pp->interp_filter <= 1);
+-   pic.pic_fields.frame_parallel_decoding_mode = pp->frame_parallel_decoding_mode;
+-   pic.pic_fields.reset_frame_context = pp->reset_frame_context;
+-   pic.pic_fields.refresh_frame_context = pp->refresh_frame_context;
+-   pic.pic_fields.frame_context_idx = pp->frame_context_idx;
+-   pic.pic_fields.segmentation_enabled = pp->stVP9Segments.enabled;
+-   pic.pic_fields.segmentation_temporal_update = pp->stVP9Segments.temporal_update;
+-   pic.pic_fields.segmentation_update_map = pp->stVP9Segments.update_map;
+-   pic.pic_fields.last_ref_frame = slots[0];
+-   pic.pic_fields.last_ref_frame_sign_bias = pp->ref_frame_sign_bias[1];
+-   pic.pic_fields.golden_ref_frame = slots[1];
+-   pic.pic_fields.golden_ref_frame_sign_bias = pp->ref_frame_sign_bias[2];
+-   pic.pic_fields.alt_ref_frame = slots[2];
+-   pic.pic_fields.alt_ref_frame_sign_bias = pp->ref_frame_sign_bias[3];
+-   pic.pic_fields.lossless_flag = pp->base_qindex == 0 && pp->y_dc_delta_q == 0 && pp->uv_dc_delta_q == 0 &&
+-                                  pp->uv_ac_delta_q == 0;
+-   pic.filter_level = pp->filter_level;
+-   pic.sharpness_level = pp->sharpness_level;
+-   pic.log2_tile_rows = pp->log2_tile_rows;
+-   pic.log2_tile_columns = pp->log2_tile_cols;
+-   pic.frame_header_length_in_bytes = pp->uncompressed_header_size_byte_aligned;
+-   pic.first_partition_size = pp->first_partition_size;
+-   memcpy(pic.mb_segment_tree_probs, pp->stVP9Segments.tree_probs, sizeof pic.mb_segment_tree_probs);
+-   memcpy(pic.segment_pred_probs, pp->stVP9Segments.pred_probs, sizeof pic.segment_pred_probs);
+-   pic.profile = pp->profile;
+-   pic.bit_depth = pp->BitDepthMinus8Luma + 8;
+-   pic.mode_ref_delta_enabled = pp->mode_ref_delta_enabled;
+-   pic.mode_ref_delta_update = pp->mode_ref_delta_update;
+-   pic.base_qindex = pp->base_qindex;
+-   pic.y_dc_delta_q = pp->y_dc_delta_q;
+-   pic.uv_ac_delta_q = pp->uv_ac_delta_q;
+-   pic.uv_dc_delta_q = pp->uv_dc_delta_q;
+-   pic.abs_delta = pp->stVP9Segments.abs_delta;
+-   for (unsigned i = 0; i < 4; i++) {
+-      pic.ref_deltas[i] = pp->ref_deltas[i];
+-   }
+-   for (unsigned i = 0; i < 2; i++) {
+-      pic.mode_deltas[i] = pp->mode_deltas[i];
+-   }
+-
+-   auto &slice = d->slice_parameter;
+-   slice.slice_count = 1;
+-   slice.slice_data_size[0] = dec->stream.size();
+-   slice.slice_data_offset[0] = 0;
+-   slice.slice_data_flag[0] = PIPE_SLICE_BUFFER_PLACEMENT_TYPE_WHOLE;
+-   for (unsigned i = 0; i < 8; i++) {
+-      uint8_t mask = pp->stVP9Segments.feature_mask[i];
+-      auto &seg = slice.seg_param[i];
+-      seg.alt_quant_enabled = mask & 1;
+-      seg.alt_quant = pp->stVP9Segments.feature_data[i][0];
+-      seg.alt_lf_enabled = (mask >> 1) & 1;
+-      seg.alt_lf = pp->stVP9Segments.feature_data[i][1];
+-      seg.segment_flags.segment_reference_enabled = (mask >> 2) & 1;
+-      seg.segment_flags.segment_reference = pp->stVP9Segments.feature_data[i][2];
+-      seg.segment_flags.segment_reference_skipped = (mask >> 3) & 1;
+-   }
+-   /* ponytail: no per-segment quantizer scales and loop filter levels (VA-API wants them derived): NVIDIA's VA-API
+-    * driver reads those from the frame header, Mesa's (AMD) need the derivation (VP9 spec 8.6.1, 8.8.1) */
+-   return true;
+-}
+-
+-static bool
+-AV1Picture(VideoDecoder *dec)
+-{
+-   if (dec->pic_params.size() < sizeof(DXVA_PicParams_AV1) || dec->tiles.empty()) {
+-      return false;
+-   }
+-   const DXVA_PicParams_AV1 *pp = (const DXVA_PicParams_AV1 *)dec->pic_params.data();
+-   struct pipe_av1_picture_desc *d = &dec->desc.av1;
+-   memset(d, 0, sizeof *d);
+-   auto &pic = d->picture_parameter;
+-
+-   /* the 8 reference slots, and which of them the 7 references are (DXVA's frame_refs[].Index is the slot) */
+-   for (unsigned i = 0; i < 8; i++) {
+-      d->ref[i] = pp->RefFrameMapTextureIndex[i] == DXVA_INVALID_ENTRY ? NULL : Surface(dec, pp->RefFrameMapTextureIndex[i]);
+-   }
+-   for (unsigned i = 0; i < 7; i++) {
+-      const DXVA_PicEntry_AV1 &e = pp->frame_refs[i];
+-      pic.ref_frame_idx[i] = e.Index == DXVA_INVALID_ENTRY ? 0 : e.Index;
+-      pic.wm[i].invalid = e.wminvalid;
+-      pic.wm[i].wmtype = e.wmtype;
+-      for (unsigned j = 0; j < 6; j++) {
+-         pic.wm[i].wmmat[j] = e.wmmat[j];
+-      }
+-   }
+-
+-   pic.profile = pp->seq_profile;
+-   pic.order_hint_bits_minus_1 = pp->order_hint_bits ? pp->order_hint_bits - 1 : 0;
+-   pic.bit_depth_idx = pp->bitdepth == 12 ? 2 : pp->bitdepth == 10 ? 1 : 0;
+-   pic.matrix_coefficients = pp->film_grain.matrix_coeff_is_identity ? 0 : 1;
+-   pic.seq_info_fields.use_128x128_superblock = pp->coding.use_128x128_superblock;
+-   pic.seq_info_fields.enable_filter_intra = pp->coding.filter_intra;
+-   pic.seq_info_fields.enable_intra_edge_filter = pp->coding.intra_edge_filter;
+-   pic.seq_info_fields.enable_interintra_compound = pp->coding.interintra_compound;
+-   pic.seq_info_fields.enable_masked_compound = pp->coding.masked_compound;
+-   pic.seq_info_fields.enable_dual_filter = pp->coding.dual_filter;
+-   pic.seq_info_fields.enable_order_hint = pp->order_hint_bits != 0;
+-   pic.seq_info_fields.enable_jnt_comp = pp->coding.jnt_comp;
+-   pic.seq_info_fields.enable_cdef = pp->coding.cdef;
+-   pic.seq_info_fields.mono_chrome = pp->format.mono_chrome;
+-   pic.seq_info_fields.ref_frame_mvs = pp->coding.enable_ref_frame_mvs;
+-   pic.seq_info_fields.film_grain_params_present = pp->coding.film_grain;
+-
+-   pic.frame_width = pp->width;
+-   pic.frame_height = pp->height;
+-   pic.max_width = pp->max_width;
+-   pic.max_height = pp->max_height;
+-   pic.primary_ref_frame = pp->primary_ref_frame;
+-   pic.order_hint = pp->order_hint;
+-   pic.superres_scale_denominator = pp->superres_denom;
+-   pic.interp_filter = pp->interp_filter;
+-
+-   pic.pic_info_fields.frame_type = pp->format.frame_type;
+-   pic.pic_info_fields.show_frame = pp->format.show_frame;
+-   pic.pic_info_fields.showable_frame = pp->format.showable_frame;
+-   pic.pic_info_fields.disable_cdf_update = pp->coding.disable_cdf_update;
+-   pic.pic_info_fields.allow_screen_content_tools = pp->coding.screen_content_tools;
+-   pic.pic_info_fields.force_integer_mv = pp->coding.integer_mv;
+-   pic.pic_info_fields.allow_intrabc = pp->coding.intrabc;
+-   pic.pic_info_fields.use_superres = pp->coding.superres;
+-   pic.pic_info_fields.allow_high_precision_mv = pp->coding.high_precision_mv;
+-   pic.pic_info_fields.is_motion_mode_switchable = pp->coding.switchable_motion_mode;
+-   pic.pic_info_fields.use_ref_frame_mvs = pp->coding.use_ref_frame_mvs;
+-   pic.pic_info_fields.disable_frame_end_update_cdf = pp->coding.disable_frame_end_update_cdf;
+-   pic.pic_info_fields.allow_warped_motion = pp->coding.warped_motion;
+-
+-   /* the tiles: their sizes in superblocks (DXVA has them for uniform spacing too) */
+-   pic.tile_cols = pp->tiles.cols;
+-   pic.tile_rows = pp->tiles.rows;
+-   pic.context_update_tile_id = pp->tiles.context_update_id;
+-   for (unsigned i = 0, start = 0; i < MIN2(pp->tiles.cols, 64u); start += pp->tiles.widths[i], i++) {
+-      pic.width_in_sbs[i] = pp->tiles.widths[i];
+-      pic.tile_col_start_sb[i] = start;
+-   }
+-   for (unsigned i = 0, start = 0; i < MIN2(pp->tiles.rows, 64u); start += pp->tiles.heights[i], i++) {
+-      pic.height_in_sbs[i] = pp->tiles.heights[i];
+-      pic.tile_row_start_sb[i] = start;
+-   }
+-
+-   pic.filter_level[0] = pp->loop_filter.filter_level[0];
+-   pic.filter_level[1] = pp->loop_filter.filter_level[1];
+-   pic.filter_level_u = pp->loop_filter.filter_level_u;
+-   pic.filter_level_v = pp->loop_filter.filter_level_v;
+-   pic.loop_filter_info_fields.sharpness_level = pp->loop_filter.sharpness_level;
+-   pic.loop_filter_info_fields.mode_ref_delta_enabled = pp->loop_filter.mode_ref_delta_enabled;
+-   pic.loop_filter_info_fields.mode_ref_delta_update = pp->loop_filter.mode_ref_delta_update;
+-   for (unsigned i = 0; i < 8; i++) {
+-      pic.ref_deltas[i] = pp->loop_filter.ref_deltas[i];
+-   }
+-   pic.mode_deltas[0] = pp->loop_filter.mode_deltas[0];
+-   pic.mode_deltas[1] = pp->loop_filter.mode_deltas[1];
+-   pic.mode_control_fields.delta_lf_present_flag = pp->loop_filter.delta_lf_present;
+-   pic.mode_control_fields.log2_delta_lf_res = pp->loop_filter.delta_lf_res;
+-   pic.mode_control_fields.delta_lf_multi = pp->loop_filter.delta_lf_multi;
+-
+-   /* loop restoration: DXVA has the unit sizes, VA-API (gallium) the shifts */
+-   pic.loop_restoration_fields.yframe_restoration_type = pp->loop_filter.frame_restoration_type[0];
+-   pic.loop_restoration_fields.cbframe_restoration_type = pp->loop_filter.frame_restoration_type[1];
+-   pic.loop_restoration_fields.crframe_restoration_type = pp->loop_filter.frame_restoration_type[2];
+-   if (pp->loop_filter.frame_restoration_type[0] || pp->loop_filter.frame_restoration_type[1] ||
+-       pp->loop_filter.frame_restoration_type[2]) {
+-      pic.loop_restoration_fields.lr_unit_shift = pp->loop_filter.log2_restoration_unit_size[0] - 6;
+-      pic.loop_restoration_fields.lr_uv_shift = pp->loop_filter.log2_restoration_unit_size[0] -
+-                                                pp->loop_filter.log2_restoration_unit_size[1];
+-   }
+-
+-   pic.base_qindex = pp->quantization.base_qindex;
+-   pic.y_dc_delta_q = pp->quantization.y_dc_delta_q;
+-   pic.u_dc_delta_q = pp->quantization.u_dc_delta_q;
+-   pic.u_ac_delta_q = pp->quantization.u_ac_delta_q;
+-   pic.v_dc_delta_q = pp->quantization.v_dc_delta_q;
+-   pic.v_ac_delta_q = pp->quantization.v_ac_delta_q;
+-   pic.qmatrix_fields.using_qmatrix = pp->quantization.qm_y != 0xff;
+-   if (pic.qmatrix_fields.using_qmatrix) {
+-      pic.qmatrix_fields.qm_y = pp->quantization.qm_y;
+-      pic.qmatrix_fields.qm_u = pp->quantization.qm_u;
+-      pic.qmatrix_fields.qm_v = pp->quantization.qm_v;
+-   }
+-   pic.mode_control_fields.delta_q_present_flag = pp->quantization.delta_q_present;
+-   pic.mode_control_fields.log2_delta_q_res = pp->quantization.delta_q_res;
+-   pic.mode_control_fields.tx_mode = pp->coding.tx_mode;
+-   pic.mode_control_fields.reference_select = pp->coding.reference_mode;
+-   pic.mode_control_fields.reduced_tx_set_used = pp->coding.reduced_tx_set;
+-   pic.mode_control_fields.skip_mode_present = pp->coding.skip_mode;
+-
+-   /* CDEF strengths: DXVA's split, VA-API's (gallium's) primary << 2 | secondary */
+-   pic.cdef_damping_minus_3 = pp->cdef.damping;
+-   pic.cdef_bits = pp->cdef.bits;
+-   for (unsigned i = 0; i < 8; i++) {
+-      pic.cdef_y_strengths[i] = pp->cdef.y_strengths[i].primary << 2 | pp->cdef.y_strengths[i].secondary;
+-      pic.cdef_uv_strengths[i] = pp->cdef.uv_strengths[i].primary << 2 | pp->cdef.uv_strengths[i].secondary;
+-   }
+-
+-   pic.seg_info.segment_info_fields.enabled = pp->segmentation.enabled;
+-   pic.seg_info.segment_info_fields.update_map = pp->segmentation.update_map;
+-   pic.seg_info.segment_info_fields.update_data = pp->segmentation.update_data;
+-   pic.seg_info.segment_info_fields.temporal_update = pp->segmentation.temporal_update;
+-   for (unsigned i = 0; i < 8; i++) {
+-      pic.seg_info.feature_mask[i] = pp->segmentation.feature_mask[i];
+-      for (unsigned j = 0; j < 8; j++) {
+-         pic.seg_info.feature_data[i][j] = pp->segmentation.feature_data[i][j];
+-      }
+-   }
+-
+-   /* film grain (applied on the target: no separate film grain picture) */
+-   auto &fg = pic.film_grain_info;
+-   auto &dfg = pp->film_grain;
+-   fg.film_grain_info_fields.apply_grain = dfg.apply_grain;
+-   if (dfg.apply_grain) {
+-      fg.film_grain_info_fields.chroma_scaling_from_luma = dfg.chroma_scaling_from_luma;
+-      fg.film_grain_info_fields.grain_scaling_minus_8 = dfg.scaling_shift_minus8;
+-      fg.film_grain_info_fields.ar_coeff_lag = dfg.ar_coeff_lag;
+-      fg.film_grain_info_fields.ar_coeff_shift_minus_6 = dfg.ar_coeff_shift_minus6;
+-      fg.film_grain_info_fields.grain_scale_shift = dfg.grain_scale_shift;
+-      fg.film_grain_info_fields.overlap_flag = dfg.overlap_flag;
+-      fg.film_grain_info_fields.clip_to_restricted_range = dfg.clip_to_restricted_range;
+-      fg.grain_seed = dfg.grain_seed;
+-      fg.num_y_points = dfg.num_y_points;
+-      for (unsigned i = 0; i < MIN2(dfg.num_y_points, 14u); i++) {
+-         fg.point_y_value[i] = dfg.scaling_points_y[i][0];
+-         fg.point_y_scaling[i] = dfg.scaling_points_y[i][1];
+-      }
+-      fg.num_cb_points = dfg.num_cb_points;
+-      for (unsigned i = 0; i < MIN2(dfg.num_cb_points, 10u); i++) {
+-         fg.point_cb_value[i] = dfg.scaling_points_cb[i][0];
+-         fg.point_cb_scaling[i] = dfg.scaling_points_cb[i][1];
+-      }
+-      fg.num_cr_points = dfg.num_cr_points;
+-      for (unsigned i = 0; i < MIN2(dfg.num_cr_points, 10u); i++) {
+-         fg.point_cr_value[i] = dfg.scaling_points_cr[i][0];
+-         fg.point_cr_scaling[i] = dfg.scaling_points_cr[i][1];
+-      }
+-      /* DXVA's coefficients are the bitstream's ar_coeffs_*_plus_128, VA's the values */
+-      for (unsigned i = 0; i < 24; i++) {
+-         fg.ar_coeffs_y[i] = (int8_t)(dfg.ar_coeffs_y[i] - 128);
+-      }
+-      for (unsigned i = 0; i < 25; i++) {
+-         fg.ar_coeffs_cb[i] = (int8_t)(dfg.ar_coeffs_cb[i] - 128);
+-         fg.ar_coeffs_cr[i] = (int8_t)(dfg.ar_coeffs_cr[i] - 128);
+-      }
+-      fg.cb_mult = dfg.cb_mult;
+-      fg.cb_luma_mult = dfg.cb_luma_mult;
+-      fg.cb_offset = dfg.cb_offset;
+-      fg.cr_mult = dfg.cr_mult;
+-      fg.cr_luma_mult = dfg.cr_luma_mult;
+-      fg.cr_offset = dfg.cr_offset;
+-   }
+-
+-   auto &slice = d->slice_parameter;
+-   slice.slice_count = MIN2((unsigned)dec->tiles.size(), (unsigned)ARRAY_SIZE(slice.slice_data_size));
+-   for (unsigned i = 0; i < slice.slice_count; i++) {
+-      slice.slice_data_size[i] = dec->tiles[i].DataSize;
+-      slice.slice_data_offset[i] = dec->tiles[i].DataOffset;
+-      slice.slice_data_row[i] = dec->tiles[i].row;
+-      slice.slice_data_col[i] = dec->tiles[i].column;
+-      slice.slice_data_anchor_frame_idx[i] = dec->tiles[i].anchor_frame;
+-   }
+-   return true;
+-}
+-
+-/* MPEG-2's default intra quantizer matrix (zig-zag order), for programs that send none */
+-static const uint8_t MPEG2_DEFAULT_INTRA[64] = {
+-   8,  16, 16, 19, 16, 19, 22, 22, 22, 22, 22, 22, 26, 24, 26, 27, 27, 27, 26, 26, 26, 26, 27, 27, 27, 29, 29, 29, 34, 34, 34, 29,
+-   29, 29, 27, 27, 29, 29, 32, 32, 34, 34, 37, 38, 37, 35, 35, 34, 35, 38, 38, 40, 40, 40, 48, 48, 46, 46, 56, 56, 58, 69, 69, 83,
+-};
+-
+-static bool
+-MPEG2Picture(VideoDecoder *dec)
+-{
+-   if (dec->pic_params.size() < sizeof(DXVA_PictureParameters)) {
+-      return false;
+-   }
+-   const DXVA_PictureParameters *pp = (const DXVA_PictureParameters *)dec->pic_params.data();
+-   struct pipe_mpeg12_picture_desc *d = &dec->desc.mpeg2;
+-   memset(d, 0, sizeof *d);
+-
+-   d->picture_coding_type = pp->bPicIntra ? 1 : pp->bPicBackwardPrediction ? 3 : 2;   /* I, B, P */
+-   /* f_codes: DXVA's as coded, gallium's (VA-API's) minus one */
+-   d->f_code[0][0] = ((pp->wBitstreamFcodes >> 12) & 0xf) - 1;
+-   d->f_code[0][1] = ((pp->wBitstreamFcodes >> 8) & 0xf) - 1;
+-   d->f_code[1][0] = ((pp->wBitstreamFcodes >> 4) & 0xf) - 1;
+-   d->f_code[1][1] = (pp->wBitstreamFcodes & 0xf) - 1;
+-   uint16_t pce = pp->wBitstreamPCEelements;
+-   d->intra_dc_precision = (pce >> 14) & 3;
+-   d->picture_structure = (pce >> 12) & 3;
+-   d->top_field_first = (pce >> 11) & 1;
+-   d->frame_pred_frame_dct = (pce >> 10) & 1;
+-   d->concealment_motion_vectors = (pce >> 9) & 1;
+-   d->q_scale_type = (pce >> 8) & 1;
+-   d->intra_vlc_format = (pce >> 7) & 1;
+-   d->alternate_scan = (pce >> 6) & 1;
+-   d->num_slices = dec->slices;
+-
+-   memcpy(dec->intra_matrix, MPEG2_DEFAULT_INTRA, 64);
+-   memset(dec->non_intra_matrix, 16, 64);
+-   if (dec->qmatrix.size() >= sizeof(DXVA_QmatrixData)) {
+-      const DXVA_QmatrixData *qm = (const DXVA_QmatrixData *)dec->qmatrix.data();
+-      for (unsigned i = 0; i < 64; i++) {
+-         if (qm->bNewQmatrix[0]) {
+-            dec->intra_matrix[i] = (uint8_t)qm->Qmatrix[0][i];
+-         }
+-         if (qm->bNewQmatrix[1]) {
+-            dec->non_intra_matrix[i] = (uint8_t)qm->Qmatrix[1][i];
+-         }
+-      }
+-   }
+-   d->intra_matrix = dec->intra_matrix;
+-   d->non_intra_matrix = dec->non_intra_matrix;
+-
+-   d->ref[0] = pp->wForwardRefPictureIndex == 0xffff ? NULL : Surface(dec, pp->wForwardRefPictureIndex);
+-   d->ref[1] = pp->wBackwardRefPictureIndex == 0xffff ? NULL : Surface(dec, pp->wBackwardRefPictureIndex);
+-   return true;
+-}
+-
+ static void APIENTRY
+ VideoDecoderEndFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder)
+ {
+@@ -2080,27 +816,15 @@ VideoDecoderEndFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder)
+    if (!dec->target || dec->stream.empty()) {
+       return;
+    }
+-   bool ok = dec->profile->codec == CODEC_H264 ? H264Picture(dec)
+-           : dec->profile->codec == CODEC_HEVC ? HEVCPicture(dec)
+-           : dec->profile->codec == CODEC_VP9  ? VP9Picture(dec)
+-           : dec->profile->codec == CODEC_AV1  ? AV1Picture(dec)
+-                                               : MPEG2Picture(dec);
++   bool ok = DxvaPicture(dec);
+    struct pipe_video_buffer *target = Surface(dec, dec->slice);
+    if (!ok || !target) {
+       VideoLog("EndFrame: %s (picture parameters %zu bytes)\n", ok ? "no target" : "no picture parameters",
+                dec->pic_params.size());
+       return;
+    }
+-   struct pipe_picture_desc *picture = &dec->desc.h264.base;
+-   picture->profile = dec->profile->profile;
+-   picture->entry_point = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+-
+    FlushDevice(pDevice);
+-   const void *buffers[1] = {dec->stream.data()};
+-   unsigned sizes[1] = {(unsigned)dec->stream.size()};
+-   dec->codec->begin_frame(dec->codec, target, picture);
+-   dec->codec->decode_bitstream(dec->codec, target, picture, 1, buffers, sizes);
+-   dec->codec->end_frame(dec->codec, target, picture);
++   DxvaDecode(dec, target);
+    FlushVideo(pDevice);
+    dec->target = NULL;
+ }
+diff --git a/src/gallium/frontends/d3d10umd/meson.build b/src/gallium/frontends/d3d10umd/meson.build
+index 4c59f26..1503e43 100644
+--- a/src/gallium/frontends/d3d10umd/meson.build
++++ b/src/gallium/frontends/d3d10umd/meson.build
+@@ -23,6 +23,7 @@ libd3d10umd = static_library(
+     'Resource.cpp',
+     'Shader.cpp',
+     'Video.cpp',
++    'DxvaDecode.cpp',
+     'ShaderDump.cpp',
+     'ShaderParse.c',
+     'ShaderTGSI.c',
+diff --git a/src/gallium/frontends/d3d9umd/caps.cpp b/src/gallium/frontends/d3d9umd/caps.cpp
+index 72bd122..34aaa89 100644
+--- a/src/gallium/frontends/d3d9umd/caps.cpp
++++ b/src/gallium/frontends/d3d9umd/caps.cpp
+@@ -193,9 +193,9 @@ D3D9UmdGetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *p)
+    default: {
+       /* DXVA2 video processing (video.cpp) */
+       HRESULT hr;
+-      if (D3D9UmdVideoGetCaps(p, &hr))
++      if (D3D9UmdVideoGetCaps(p, &hr) || D3D9UmdDecodeGetCaps(adapter->probeScreen, p, &hr))
+          return hr;
+-      /* Video decoding, overlays, content protection, ...: nothing to report. Counts are zero. */
++      /* Overlays, content protection, ...: nothing to report. Counts are zero. */
+       if (p->pData && p->DataSize)
+          memset(p->pData, 0, p->DataSize);
+       D3D9UMD_TRACE("GetCaps: nothing for type %d", (int)p->Type);
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd.h b/src/gallium/frontends/d3d9umd/d3d9umd.h
+index 231c3cc..fd94107 100644
+--- a/src/gallium/frontends/d3d9umd/d3d9umd.h
++++ b/src/gallium/frontends/d3d9umd/d3d9umd.h
+@@ -47,8 +47,15 @@ struct D3D9UmdResource {
+    UINT surfCount;
+    UINT width, height;      /* of subresource 0 */
+    struct nddi_resource *nine;
++   /* DXVA2 decoding (decode.cpp): a compressed buffer's memory (no nine resource then), or the decoder's pictures of
++    * an NV12 surface's subresources */
++   BYTE *decodeBuffer;
++   UINT decodeBufferSize;
++   struct pipe_video_buffer **decodePictures;
+ };
+ 
++struct D3D9UmdDecodeState;
++
+ 
+ struct D3D9UmdDevice {
+    HANDLE hRTDevice;
+@@ -66,6 +73,8 @@ struct D3D9UmdDevice {
+    D3D9UmdResource *indexBuffer;    /* or user memory indices: */
+    const void *memoryIndices;
+    UINT memoryIndexSize;
++
++   struct D3D9UmdDecodeState *decode;   /* DXVA2 decoding's video context (decode.cpp), at its first decoder */
+ };
+ 
+ static inline D3D9UmdDevice *D3D9UmdCastDevice(HANDLE h) { return (D3D9UmdDevice *)h; }
+@@ -91,6 +100,14 @@ void D3D9UmdFillVideoFuncs(D3DDDI_DEVICEFUNCS *funcs);
+ /* DXVA2 video processor caps (video.cpp): true if it answered the GetCaps type, with the result in *hr */
+ bool D3D9UmdVideoGetCaps(const D3DDDIARG_GETCAPS *p, HRESULT *hr);
+ 
++/* DXVA2 decoding (decode.cpp): the decoder caps (as GetCaps above), the compressed buffer formats, the entry points,
++ * and what a resource or device leaves behind */
++bool D3D9UmdDecodeGetCaps(struct pipe_screen *screen, const D3DDDIARG_GETCAPS *p, HRESULT *hr);
++bool D3D9UmdIsDecodeBuffer(D3DDDIFORMAT format);
++void D3D9UmdFillDecodeFuncs(D3DDDI_DEVICEFUNCS *funcs);
++void D3D9UmdDecodeReleaseResource(D3D9UmdDevice *dev, D3D9UmdResource *res);
++void D3D9UmdDecodeDestroyDevice(D3D9UmdDevice *dev);
++
+ HRESULT APIENTRY D3D9UmdGetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *pData);
+ 
+ #endif /* D3D9UMD_H */
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h b/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
+index 5424a71..da6353a 100644
+--- a/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
++++ b/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
+@@ -227,6 +227,10 @@ int32_t nddi_update_subresource(struct nddi_resource *res, unsigned subresource,
+ /* YUV formats the driver keeps as video surfaces (YUY2, UYVY, NV12) */
+ bool nddi_format_is_video(uint32_t format);
+ 
++/* DXVA2 decoding: the texture an NV12 surface's subresource lives in (L8: the luma rows, then the chroma rows), which
++ * a decoded picture is copied into; NULL for anything else */
++struct pipe_resource *nddi_video_texture(struct nddi_resource *res, unsigned subresource);
++
+ struct nddi_video_sample {
+    struct nddi_resource *src;
+    unsigned src_sub;
+diff --git a/src/gallium/frontends/d3d9umd/decode.cpp b/src/gallium/frontends/d3d9umd/decode.cpp
+new file mode 100644
+index 0000000..c0cb0e7
+--- /dev/null
++++ b/src/gallium/frontends/d3d9umd/decode.cpp
+@@ -0,0 +1,577 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * DXVA2 decoding (what players with DXVA2 hardware decoding, ffmpeg's dxva2 and Kodi use): the decoder caps, the
++ * compressed buffers, and the Decode* entry points. The DXVA buffers become gallium picture descriptions through the
++ * Direct3D 11 driver's DXVA decoding (d3d10umd/DxvaDecode.cpp), on virgl's video codec (the host's VA-API decoder).
++ *
++ * The pictures: each NV12 surface the decoder writes gets the codec's video buffer (separate R8 and R8G8 planes,
++ * which the host keeps as the reference too). After each frame a pass on the video context copies them into the
++ * surface's own texture (L8: the luma rows, then the chroma rows; what locks, StretchRect and the video processor
++ * read). DXVA's surface indices (references, the current picture) name the surface last decoded with that index.
++ *
++ * Decoding and that pass run on a pipe context of their own (as Direct3D 11's video does); each context's work is
++ * finished before the other uses what it wrote. ponytail: NV12 only (no P010: HEVC Main 10, VP9 profile 2), a
++ * synchronous wait per frame (as in Direct3D 11).
++ */
++
++#include "d3d9umd.h"
++#include "../d3d10umd/DxvaDecode.h"
++
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++#include "util/os_time.h"
++#include "util/u_draw.h"
++#include "util/u_inlines.h"
++extern "C" {
++#include "tgsi/tgsi_text.h"
++}
++
++#include <new>
++#include <string.h>
++
++#define NV12_FOURCC ((D3DDDIFORMAT)MAKEFOURCC('N', 'V', '1', '2'))
++
++/* The profiles DXVA2 offers: the 8-bit ones (the surfaces are NV12) */
++static bool
++Offered(struct pipe_screen *screen, const VideoProfileInfo &p)
++{
++   return p.Outputs(DXGI_FORMAT_NV12) && ProfileSupported(screen, p);
++}
++
++static const VideoProfileInfo *
++OfferedProfile(struct pipe_screen *screen, const GUID *guid)
++{
++   const VideoProfileInfo *p = guid ? FindProfile(screen, guid) : NULL;
++   return p && p->Outputs(DXGI_FORMAT_NV12) ? p : NULL;
++}
++
++/* the compressed buffers a decoder takes, and their sizes */
++static const D3DDDIFORMAT BUFFER_TYPES[] = {D3DDDIFMT_PICTUREPARAMSDATA, D3DDDIFMT_INVERSEQUANTIZATIONDATA,
++                                            D3DDDIFMT_SLICECONTROLDATA, D3DDDIFMT_BITSTREAMDATA};
++
++static UINT
++BufferSize(D3DDDIFORMAT type, const DXVADDI_VIDEODESC *desc)
++{
++   switch (type) {
++   case D3DDDIFMT_PICTUREPARAMSDATA:
++      return MAX2(sizeof(DxvaPicParams_H264), sizeof(DxvaPicParams_AV1));
++   case D3DDDIFMT_INVERSEQUANTIZATIONDATA:
++      return sizeof(DxvaQmatrix_HEVC);
++   case D3DDDIFMT_SLICECONTROLDATA:
++      return 4096 * sizeof(DxvaTile_AV1);
++   default:
++      /* a compressed picture: at most about its raw size */
++      return MAX2(desc ? desc->SampleWidth * desc->SampleHeight * 3 / 2 : 0, 1u << 20);
++   }
++}
++
++template <typename T>
++static HRESULT
++PutArray(const D3DDDIARG_GETCAPS *p, const T *values, UINT count)
++{
++   if (!p->pData || p->DataSize < count * sizeof(T))
++      return E_INVALIDARG;
++   memcpy(p->pData, values, count * sizeof(T));
++   return S_OK;
++}
++
++static HRESULT
++PutCount(const D3DDDIARG_GETCAPS *p, UINT count)
++{
++   return PutArray(p, &count, 1);
++}
++
++bool
++D3D9UmdDecodeGetCaps(struct pipe_screen *screen, const D3DDDIARG_GETCAPS *p, HRESULT *hr)
++{
++   switch (p->Type) {
++   case D3DDDICAPS_GETDECODEGUIDCOUNT: {
++      UINT n = 0;
++      for (auto &profile : PROFILES)
++         n += Offered(screen, profile);
++      *hr = PutCount(p, n);
++      return true;
++   }
++   case D3DDDICAPS_GETDECODEGUIDS: {
++      GUID guids[ARRAY_SIZE(PROFILES)];
++      UINT n = 0;
++      for (auto &profile : PROFILES) {
++         if (Offered(screen, profile))
++            guids[n++] = profile.guid;
++      }
++      *hr = PutArray(p, guids, n);
++      return true;
++   }
++   case D3DDDICAPS_GETDECODERTFORMATCOUNT:
++      *hr = PutCount(p, OfferedProfile(screen, (const GUID *)p->pInfo) ? 1 : 0);
++      return true;
++   case D3DDDICAPS_GETDECODERTFORMATS: {
++      D3DDDIFORMAT f = NV12_FOURCC;
++      *hr = OfferedProfile(screen, (const GUID *)p->pInfo) ? PutArray(p, &f, 1) : E_INVALIDARG;
++      return true;
++   }
++   case D3DDDICAPS_GETDECODECOMPRESSEDBUFFERINFOCOUNT:
++   case D3DDDICAPS_GETDECODECONFIGURATIONCOUNT: {
++      const DXVADDI_DECODEINPUT *in = (const DXVADDI_DECODEINPUT *)p->pInfo;
++      bool ok = in && OfferedProfile(screen, in->pGuid);
++      *hr = PutCount(p, !ok ? 0 : p->Type == D3DDDICAPS_GETDECODECONFIGURATIONCOUNT ? 1 : ARRAY_SIZE(BUFFER_TYPES));
++      return true;
++   }
++   case D3DDDICAPS_GETDECODECOMPRESSEDBUFFERINFO: {
++      const DXVADDI_DECODEINPUT *in = (const DXVADDI_DECODEINPUT *)p->pInfo;
++      DXVADDI_DECODEBUFFERINFO info[ARRAY_SIZE(BUFFER_TYPES)];
++      memset(info, 0, sizeof(info));
++      for (unsigned i = 0; i < ARRAY_SIZE(BUFFER_TYPES); i++) {
++         info[i].CompressedBufferType = BUFFER_TYPES[i];
++         info[i].CreationWidth = BufferSize(BUFFER_TYPES[i], in ? &in->VideoDesc : NULL);
++         info[i].CreationHeight = 1;
++         info[i].CreationPool = D3DDDIPOOL_VIDEOMEMORY;
++      }
++      *hr = PutArray(p, info, ARRAY_SIZE(BUFFER_TYPES));
++      return true;
++   }
++   case D3DDDICAPS_GETDECODECONFIGURATIONS: {
++      const DXVADDI_DECODEINPUT *in = (const DXVADDI_DECODEINPUT *)p->pInfo;
++      const VideoProfileInfo *profile = in ? OfferedProfile(screen, in->pGuid) : NULL;
++      DXVADDI_CONFIGPICTUREDECODE c;
++      memset(&c, 0, sizeof(c));
++      c.guidConfigBitstreamEncryption = c.guidConfigMBcontrolEncryption = c.guidConfigResidDiffEncryption = NO_ENCRYPT;
++      /* the short slice format: for H.264 that's 2 (1 is the long one, with slice headers parsed) */
++      c.ConfigBitstreamRaw = profile && profile->codec == CODEC_H264 ? 2 : 1;
++      *hr = profile ? PutArray(p, &c, 1) : E_INVALIDARG;
++      return true;
++   }
++   default:
++      return false;
++   }
++}
++
++
++/*
++ * The compressed buffers: plain memory the application fills through locks
++ */
++
++bool
++D3D9UmdIsDecodeBuffer(D3DDDIFORMAT f)
++{
++   return f >= D3DDDIFMT_DXVACOMPBUFFER_BASE && f <= D3DDDIFMT_DXVA_RESERVED14;
++}
++
++
++/*
++ * The video context, and the copy of a decoded picture into its surface's texture
++ */
++
++struct D3D9UmdDecodeState {
++   struct pipe_context *pipe;
++   void *vs, *fs, *blend, *dsa, *rasterizer, *sampler, *velems;
++};
++
++static void
++Finish(struct pipe_context *pipe)
++{
++   struct pipe_fence_handle *fence = NULL;
++   pipe->flush(pipe, &fence, 0);
++   if (fence) {
++      pipe->screen->fence_finish(pipe->screen, NULL, fence, OS_TIMEOUT_INFINITE);
++      pipe->screen->fence_reference(pipe->screen, &fence, NULL);
++   }
++}
++
++/* A triangle over the whole target, from the vertex index alone */
++static const char COPY_VS[] = "VERT\n"
++                              "DCL SV[0], VERTEXID\n"
++                              "DCL OUT[0], POSITION\n"
++                              "DCL TEMP[0]\n"
++                              "IMM[0] FLT32 {-1.0, 3.0, 0.0, 1.0}\n"
++                              "IMM[1] INT32 {1, 2, 0, 0}\n"
++                              "USEQ TEMP[0].x, SV[0].xxxx, IMM[1].xxxx\n"
++                              "USEQ TEMP[0].y, SV[0].xxxx, IMM[1].yyyy\n"
++                              "UCMP TEMP[0].xy, TEMP[0].xyyy, IMM[0].yyyy, IMM[0].xxxx\n"
++                              "MOV TEMP[0].zw, IMM[0].zzzw\n"
++                              "MOV OUT[0], TEMP[0]\n"
++                              "END\n";
++
++/* Each texel of the L8 surface texture: below the picture's height (CONST[0].x) the luma texel, then the chroma
++ * rows, the even bytes Cb and the odd ones Cr of the R8G8 plane's row */
++static const char COPY_FS[] = "FRAG\n"
++                              "PROPERTY FS_COORD_ORIGIN UPPER_LEFT\n"
++                              "PROPERTY FS_COORD_PIXEL_CENTER HALF_INTEGER\n"
++                              "DCL IN[0], POSITION, LINEAR\n"
++                              "DCL OUT[0], COLOR\n"
++                              "DCL CONST[0]\n"
++                              "DCL SAMP[0]\n"
++                              "DCL SAMP[1]\n"
++                              "DCL SVIEW[0], 2D, FLOAT\n"
++                              "DCL SVIEW[1], 2D, FLOAT\n"
++                              "DCL TEMP[0..3]\n"
++                              "IMM[0] INT32 {0, 1, 0, 0}\n"
++                              "F2I TEMP[0].xy, IN[0].xyyy\n"
++                              "ISLT TEMP[2].x, TEMP[0].yyyy, CONST[0].xxxx\n"
++                              "UIF TEMP[2].xxxx\n"
++                              "  MOV TEMP[3], IMM[0].xxxx\n"
++                              "  MOV TEMP[3].xy, TEMP[0].xyyy\n"
++                              "  TXF TEMP[3], TEMP[3], SAMP[0], 2D\n"
++                              "  MOV OUT[0], TEMP[3].xxxx\n"
++                              "ELSE\n"
++                              "  MOV TEMP[3], IMM[0].xxxx\n"
++                              "  ISHR TEMP[3].x, TEMP[0].xxxx, IMM[0].yyyy\n"
++                              "  INEG TEMP[1].x, CONST[0].xxxx\n"
++                              "  UADD TEMP[3].y, TEMP[0].yyyy, TEMP[1].xxxx\n"
++                              "  TXF TEMP[3], TEMP[3], SAMP[1], 2D\n"
++                              "  AND TEMP[2].y, TEMP[0].xxxx, IMM[0].yyyy\n"
++                              "  UCMP OUT[0], TEMP[2].yyyy, TEMP[3].yyyy, TEMP[3].xxxx\n"
++                              "ENDIF\n"
++                              "END\n";
++
++static void *
++MakeShader(struct pipe_context *pipe, const char *text, bool vertex)
++{
++   struct tgsi_token tokens[1024];
++   if (!tgsi_text_translate(text, tokens, ARRAY_SIZE(tokens))) {
++      D3D9UmdLog("decode: the %s shader doesn't translate", vertex ? "vertex" : "fragment");
++      return NULL;
++   }
++   struct pipe_shader_state state = {};
++   pipe_shader_state_from_tgsi(&state, tokens);
++   return vertex ? pipe->create_vs_state(pipe, &state) : pipe->create_fs_state(pipe, &state);
++}
++
++static D3D9UmdDecodeState *
++DecodeState(D3D9UmdDevice *dev)
++{
++   if (dev->decode)
++      return dev->decode->pipe ? dev->decode : NULL;
++   D3D9UmdDecodeState *s = new (std::nothrow) D3D9UmdDecodeState();
++   if (!s)
++      return NULL;
++   dev->decode = s;
++   struct pipe_context *pipe = dev->screen->context_create(dev->screen, NULL, 0);
++   if (!pipe)
++      return NULL;
++   s->vs = MakeShader(pipe, COPY_VS, true);
++   s->fs = MakeShader(pipe, COPY_FS, false);
++   struct pipe_blend_state blend = {};
++   blend.rt[0].colormask = PIPE_MASK_RGBA;
++   s->blend = pipe->create_blend_state(pipe, &blend);
++   struct pipe_depth_stencil_alpha_state dsa = {};
++   s->dsa = pipe->create_depth_stencil_alpha_state(pipe, &dsa);
++   struct pipe_rasterizer_state rast = {};
++   rast.half_pixel_center = 1;
++   rast.bottom_edge_rule = 1;
++   rast.depth_clip_near = rast.depth_clip_far = 1;
++   s->rasterizer = pipe->create_rasterizer_state(pipe, &rast);
++   struct pipe_sampler_state samp = {};
++   samp.wrap_s = samp.wrap_t = samp.wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
++   samp.min_img_filter = samp.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
++   samp.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
++   s->sampler = pipe->create_sampler_state(pipe, &samp);
++   s->velems = pipe->create_vertex_elements_state(pipe, 0, NULL);
++   if (!s->vs || !s->fs || !s->blend || !s->dsa || !s->rasterizer || !s->sampler) {
++      pipe->destroy(pipe);
++      return NULL;
++   }
++   s->pipe = pipe;
++   return s;
++}
++
++void
++D3D9UmdDecodeDestroyDevice(D3D9UmdDevice *dev)
++{
++   D3D9UmdDecodeState *s = dev->decode;
++   if (!s)
++      return;
++   if (s->pipe) {
++      struct pipe_context *pipe = s->pipe;
++      pipe->delete_vs_state(pipe, s->vs);
++      pipe->delete_fs_state(pipe, s->fs);
++      pipe->delete_blend_state(pipe, s->blend);
++      pipe->delete_depth_stencil_alpha_state(pipe, s->dsa);
++      pipe->delete_rasterizer_state(pipe, s->rasterizer);
++      pipe->delete_sampler_state(pipe, s->sampler);
++      if (s->velems)
++         pipe->delete_vertex_elements_state(pipe, s->velems);
++      pipe->destroy(pipe);
++   }
++   delete s;
++   dev->decode = NULL;
++}
++
++/* The decoded picture (its planes) into the surface's L8 texture, on the video context */
++static bool
++CopyToSurface(D3D9UmdDecodeState *s, struct pipe_video_buffer *picture, struct pipe_resource *texture,
++              unsigned height)
++{
++   struct pipe_context *pipe = s->pipe;
++   struct pipe_sampler_view **planes = picture->get_sampler_view_planes(picture);
++   if (!planes || !planes[0] || !planes[1])
++      return false;
++   struct pipe_surface tmpl = {};
++   tmpl.format = texture->format;
++   struct pipe_surface *target = pipe->create_surface(pipe, texture, &tmpl);
++   if (!target)
++      return false;
++
++   struct pipe_framebuffer_state fb = {};
++   fb.width = texture->width0;
++   fb.height = texture->height0;
++   fb.nr_cbufs = 1;
++   fb.cbufs[0] = target;
++   pipe->set_framebuffer_state(pipe, &fb);
++   struct pipe_viewport_state vp = {};
++   vp.scale[0] = fb.width / 2.0f;
++   vp.scale[1] = fb.height / 2.0f;
++   vp.scale[2] = 1.0f;
++   vp.translate[0] = fb.width / 2.0f;
++   vp.translate[1] = fb.height / 2.0f;
++   vp.swizzle_x = PIPE_VIEWPORT_SWIZZLE_POSITIVE_X;
++   vp.swizzle_y = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Y;
++   vp.swizzle_z = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Z;
++   vp.swizzle_w = PIPE_VIEWPORT_SWIZZLE_POSITIVE_W;
++   pipe->set_viewport_states(pipe, 0, 1, &vp);
++   pipe->bind_blend_state(pipe, s->blend);
++   pipe->bind_depth_stencil_alpha_state(pipe, s->dsa);
++   pipe->bind_rasterizer_state(pipe, s->rasterizer);
++   pipe->bind_vertex_elements_state(pipe, s->velems);
++   pipe->bind_vs_state(pipe, s->vs);
++   pipe->bind_fs_state(pipe, s->fs);
++   void *samplers[2] = {s->sampler, s->sampler};
++   pipe->bind_sampler_states(pipe, PIPE_SHADER_FRAGMENT, 0, 2, samplers);
++   pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 2, 0, false, planes);
++   uint32_t consts[4] = {height, 0, 0, 0};
++   struct pipe_constant_buffer cb = {};
++   cb.user_buffer = consts;
++   cb.buffer_size = sizeof(consts);
++   pipe->set_constant_buffer(pipe, PIPE_SHADER_FRAGMENT, 0, false, &cb);
++   util_draw_arrays(pipe, MESA_PRIM_TRIANGLES, 0, 3);
++
++   /* nothing of the surface's kept bound */
++   pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 0, 2, false, NULL);
++   fb.nr_cbufs = 0;
++   fb.cbufs[0] = NULL;
++   pipe->set_framebuffer_state(pipe, &fb);
++   pipe_surface_reference(&target, NULL);
++   return true;
++}
++
++
++/*
++ * The decoder
++ */
++
++struct D3D9UmdDecoder : DxvaDecoder {
++   D3D9UmdDevice *dev;
++   /* the frame's surface */
++   D3D9UmdResource *target = NULL;
++   unsigned sub = 0;
++   /* the surface each DXVA index was last decoded into */
++   struct {
++      D3D9UmdResource *res;
++      unsigned sub;
++   } byIndex[128] = {};
++};
++
++/* A surface's decoder pictures (made at its first frame), on the video context */
++static struct pipe_video_buffer *
++Picture(D3D9UmdDecoder *dec, D3D9UmdResource *res, unsigned sub)
++{
++   if (!res || sub >= res->surfCount)
++      return NULL;
++   if (!res->decodePictures) {
++      res->decodePictures = (struct pipe_video_buffer **)calloc(res->surfCount, sizeof(*res->decodePictures));
++      if (!res->decodePictures)
++         return NULL;
++   }
++   if (!res->decodePictures[sub]) {
++      struct pipe_context *pipe = dec->dev->decode->pipe;
++      struct pipe_video_buffer tmpl = {};
++      tmpl.buffer_format = PIPE_FORMAT_NV12;
++      tmpl.width = res->width;
++      tmpl.height = res->height;
++      tmpl.interlaced = false;
++      res->decodePictures[sub] = pipe->create_video_buffer(pipe, &tmpl);
++   }
++   return res->decodePictures[sub];
++}
++
++static struct pipe_video_buffer *
++SurfaceOfIndex(DxvaDecoder *d, unsigned index)
++{
++   D3D9UmdDecoder *dec = static_cast<D3D9UmdDecoder *>(d);
++   if (index < ARRAY_SIZE(dec->byIndex) && dec->byIndex[index].res)
++      return Picture(dec, dec->byIndex[index].res, dec->byIndex[index].sub);
++   /* a reference this decoder never wrote (decoding started past it): the frame's own picture, never a crash */
++   return Picture(dec, dec->target, dec->sub);
++}
++
++void
++D3D9UmdDecodeReleaseResource(D3D9UmdDevice *dev, D3D9UmdResource *res)
++{
++   free(res->decodeBuffer);
++   res->decodeBuffer = NULL;
++   if (res->decodePictures) {
++      for (UINT i = 0; i < res->surfCount; i++) {
++         if (res->decodePictures[i])
++            res->decodePictures[i]->destroy(res->decodePictures[i]);
++      }
++      free(res->decodePictures);
++      res->decodePictures = NULL;
++   }
++}
++
++static HRESULT APIENTRY
++CreateDecodeDevice(HANDLE hDevice, D3DDDIARG_CREATEDECODEDEVICE *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   const VideoProfileInfo *profile = OfferedProfile(dev->screen, p->pGuid);
++   D3D9UmdDecodeState *s = profile ? DecodeState(dev) : NULL;
++   if (!s || !s->pipe->create_video_codec) {
++      D3D9UmdLog("CreateDecodeDevice: %s", profile ? "no video context" : "a profile not offered");
++      return E_INVALIDARG;
++   }
++   struct pipe_video_codec templat = {};
++   templat.profile = profile->profile;
++   templat.entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
++   templat.chroma_format = PIPE_VIDEO_CHROMA_FORMAT_420;
++   templat.width = p->VideoDesc.SampleWidth;
++   templat.height = p->VideoDesc.SampleHeight;
++   templat.max_references = 16;
++   templat.expect_chunked_decode = true;
++   struct pipe_video_codec *codec = s->pipe->create_video_codec(s->pipe, &templat);
++   if (!codec) {
++      D3D9UmdLog("CreateDecodeDevice: no codec for profile %d %ux%u", profile->profile, templat.width,
++                 templat.height);
++      return E_FAIL;
++   }
++   D3D9UmdDecoder *dec = new (std::nothrow) D3D9UmdDecoder();
++   if (!dec) {
++      codec->destroy(codec);
++      return E_OUTOFMEMORY;
++   }
++   dec->dev = dev;
++   dec->profile = profile;
++   dec->codec = codec;
++   dec->width = templat.width;
++   dec->height = templat.height;
++   dec->surface = SurfaceOfIndex;
++   p->hDecode = dec;
++   D3D9UMD_TRACE("CreateDecodeDevice profile %d %ux%u -> %p", profile->profile, templat.width, templat.height, dec);
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++DestroyDecodeDevice(HANDLE hDevice, HANDLE hDecode)
++{
++   D3D9UmdDecoder *dec = (D3D9UmdDecoder *)hDecode;
++   dec->codec->destroy(dec->codec);
++   delete dec;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++SetDecodeRenderTarget(HANDLE hDevice, const D3DDDIARG_SETDECODERENDERTARGET *p)
++{
++   D3D9UmdDecoder *dec = (D3D9UmdDecoder *)p->hDecode;
++   D3D9UmdResource *res = D3D9UmdCastResource(p->hRenderTarget);
++   if (res->format != NV12_FOURCC || p->SubResourceIndex >= res->surfCount)
++      return E_INVALIDARG;
++   dec->target = res;
++   dec->sub = p->SubResourceIndex;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++DecodeBeginFrame(HANDLE hDevice, D3DDDIARG_DECODEBEGINFRAME *p)
++{
++   D3D9UmdDecoder *dec = (D3D9UmdDecoder *)p->hDecode;
++   DxvaBeginFrame(dec);
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++DecodeExecute(HANDLE hDevice, const D3DDDIARG_DECODEEXECUTE *p)
++{
++   D3D9UmdDecoder *dec = (D3D9UmdDecoder *)p->hDecode;
++   const uint8_t *slice_control = NULL, *bitstream = NULL;
++   unsigned slice_control_size = 0, bitstream_size = 0;
++   for (UINT i = 0; i < p->NumCompBuffers; i++) {
++      const DXVADDI_DECODEBUFFERDESC &b = p->pCompressedBuffers[i];
++      D3D9UmdResource *res = D3D9UmdCastResource(b.hBuffer);
++      if (!res || !res->decodeBuffer || b.DataOffset > res->decodeBufferSize ||
++          b.DataSize > res->decodeBufferSize - b.DataOffset) {
++         D3D9UmdLog("DecodeExecute: buffer %u (type %u, %u bytes at %u) isn't a decoder buffer of ours", i,
++                    (unsigned)b.CompressedBufferType, b.DataSize, b.DataOffset);
++         return E_INVALIDARG;
++      }
++      const uint8_t *data = res->decodeBuffer + b.DataOffset;
++      switch (b.CompressedBufferType) {
++      case D3DDDIFMT_PICTUREPARAMSDATA:
++         dec->pic_params.assign(data, data + b.DataSize);
++         break;
++      case D3DDDIFMT_INVERSEQUANTIZATIONDATA:
++         dec->qmatrix.assign(data, data + b.DataSize);
++         break;
++      case D3DDDIFMT_SLICECONTROLDATA:
++         slice_control = data;
++         slice_control_size = b.DataSize;
++         break;
++      case D3DDDIFMT_BITSTREAMDATA:
++         bitstream = data;
++         bitstream_size = b.DataSize;
++         break;
++      default:
++         break;
++      }
++   }
++   if (slice_control && bitstream &&
++       !DxvaAddSlices(dec, slice_control, slice_control_size, bitstream, bitstream_size))
++      return E_INVALIDARG;
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++DecodeEndFrame(HANDLE hDevice, D3DDDIARG_DECODEENDFRAME *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdDecoder *dec = (D3D9UmdDecoder *)p->hDecode;
++   if (!dec->target || dec->stream.empty())
++      return S_OK;
++   int index = DxvaCurrentIndex(dec);
++   if (index >= 0 && index < (int)ARRAY_SIZE(dec->byIndex)) {
++      dec->byIndex[index].res = dec->target;
++      dec->byIndex[index].sub = dec->sub;
++   }
++   struct pipe_resource *texture = nddi_video_texture(dec->target->nine, dec->sub);
++   struct pipe_video_buffer *picture = Picture(dec, dec->target, dec->sub);
++   if (!DxvaPicture(dec) || !picture || !texture) {
++      D3D9UmdLog("DecodeEndFrame: %s (picture parameters %zu bytes)", !picture || !texture ? "no target" :
++                 "no picture parameters", dec->pic_params.size());
++      dec->target = NULL;
++      return S_OK;
++   }
++   /* what the device did with the surface first; the picture, its copy into the surface, done before the device
++    * reads it */
++   Finish(nddi_flush(dev->nine));
++   DxvaDecode(dec, picture);
++   if (!CopyToSurface(dev->decode, picture, texture, dec->target->height))
++      D3D9UmdLog("DecodeEndFrame: the picture's planes aren't readable");
++   Finish(dev->decode->pipe);
++   dec->target = NULL;
++   return S_OK;
++}
++
++void
++D3D9UmdFillDecodeFuncs(D3DDDI_DEVICEFUNCS *f)
++{
++   f->pfnCreateDecodeDevice = CreateDecodeDevice;
++   f->pfnDestroyDecodeDevice = DestroyDecodeDevice;
++   f->pfnSetDecodeRenderTarget = SetDecodeRenderTarget;
++   f->pfnDecodeBeginFrame = DecodeBeginFrame;
++   f->pfnDecodeExecute = DecodeExecute;
++   f->pfnDecodeEndFrame = DecodeEndFrame;
++}
+diff --git a/src/gallium/frontends/d3d9umd/device.cpp b/src/gallium/frontends/d3d9umd/device.cpp
+index ce50d29..0504b3e 100644
+--- a/src/gallium/frontends/d3d9umd/device.cpp
++++ b/src/gallium/frontends/d3d9umd/device.cpp
+@@ -22,6 +22,7 @@ DestroyDevice(HANDLE hDevice)
+ {
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UMD_TRACE("DestroyDevice");
++   D3D9UmdDecodeDestroyDevice(dev);
+    nddi_device_destroy(dev->nine);
+    dev->screen->destroy(dev->screen);
+    delete dev;
+@@ -134,6 +135,24 @@ CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *p)
+    res->width = s0.Width;
+    res->height = s0.Height;
+ 
++   /* a DXVA2 compressed buffer (picture parameters, bitstream...): memory of ours, or the runtime's (system memory
++    * pool); the decoder reads it, nothing of nine's */
++   if (D3D9UmdIsDecodeBuffer(p->Format)) {
++      res->decodeBufferSize = s0.Width * MAX2(s0.Height, 1u);
++      res->decodeBuffer = p->Pool == D3DDDIPOOL_SYSTEMMEM && s0.pSysMem ? NULL : (BYTE *)calloc(1, res->decodeBufferSize);
++      if (!res->decodeBuffer && !(p->Pool == D3DDDIPOOL_SYSTEMMEM && s0.pSysMem)) {
++         delete res;
++         return E_OUTOFMEMORY;
++      }
++      if (!res->decodeBuffer) {
++         D3D9UmdLog("CreateResource: DXVA buffer in system memory (format %u): not supported", p->Format);
++         delete res;
++         return E_INVALIDARG;
++      }
++      p->hResource = res;
++      return S_OK;
++   }
++
+    /* The kernel allocations made while creating it belong to the runtime's resource */
+    dev->kmt.hRTResource = p->hResource;
+    HRESULT hr = nddi_resource_create(dev->nine, &desc, &res->nine);
+@@ -199,7 +218,9 @@ DestroyResource(HANDLE hDevice, HANDLE hResource)
+    D3D9UMD_TRACE("DestroyResource %p", res);
+    if (dev->renderTarget0 == res)
+       dev->renderTarget0 = NULL;
+-   nddi_resource_destroy(res->nine);
++   D3D9UmdDecodeReleaseResource(dev, res);
++   if (res->nine)
++      nddi_resource_destroy(res->nine);
+    delete res;
+    return S_OK;
+ }
+@@ -240,6 +261,12 @@ static HRESULT APIENTRY
+ Lock(HANDLE hDevice, D3DDDIARG_LOCK *p)
+ {
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
++   if (res->decodeBuffer) {
++      p->pSurfData = res->decodeBuffer;
++      p->Pitch = res->decodeBufferSize;
++      p->SlicePitch = res->decodeBufferSize;
++      return S_OK;
++   }
+    if (p->Flags.NotifyOnly) {
+       D3D9UMD_TRACE("Lock (notify) resource %p sub %u flags 0x%x", res, p->SubResourceIndex, p->Flags.Value);
+       nddi_resource_written(res->nine);
+@@ -265,6 +292,8 @@ Unlock(HANDLE hDevice, const D3DDDIARG_UNLOCK *p)
+ {
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
+    D3D9UMD_TRACE("Unlock resource %p sub %u flags 0x%x", res, p->SubResourceIndex, p->Flags.Value);
++   if (res->decodeBuffer)
++      return S_OK;
+    if (p->Flags.NotifyOnly) {
+       nddi_resource_written(res->nine);
+       return S_OK;
+@@ -678,6 +707,7 @@ D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *f)
+    f->pfnReleaseResource = ReleaseResource;
+    D3D9UmdFillPipelineFuncs(f);
+    D3D9UmdFillVideoFuncs(f);
++   D3D9UmdFillDecodeFuncs(f);
+ 
+    /* The Windows 8 interface replaces these: the runtime refuses a driver that has both (ValidateUMDeviceFuncs) */
+    f->pfnCreateResource = NULL;
+diff --git a/src/gallium/frontends/d3d9umd/meson.build b/src/gallium/frontends/d3d9umd/meson.build
+index 0339d2f..ea63084 100644
+--- a/src/gallium/frontends/d3d9umd/meson.build
++++ b/src/gallium/frontends/d3d9umd/meson.build
+@@ -15,6 +15,8 @@ libd3d9umd = static_library(
+     'gdikmt_d3d9.cpp',
+     'pipeline.cpp',
+     'video.cpp',
++    'decode.cpp',
++    '../d3d10umd/DxvaDecode.cpp',
+   ),
+   include_directories : [
+     inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_gallium_winsys, inc_winddk,
+diff --git a/src/gallium/frontends/d3d9umd/nine_bridge.c b/src/gallium/frontends/d3d9umd/nine_bridge.c
+index 44a3fae..af05dfd 100644
+--- a/src/gallium/frontends/d3d9umd/nine_bridge.c
++++ b/src/gallium/frontends/d3d9umd/nine_bridge.c
+@@ -354,6 +354,14 @@ nddi_format_is_video(uint32_t format)
+    return format == NDDI_YUY2 || format == NDDI_UYVY || format == NDDI_NV12;
+ }
+ 
++struct pipe_resource *
++nddi_video_texture(struct nddi_resource *res, unsigned subresource)
++{
++   if (!res || res->video_fourcc != NDDI_NV12 || !res->video_textures || subresource >= res->subresource_count)
++      return NULL;
++   return res->video_textures[subresource]->base.base.resource;
++}
++
+ /* YUV surfaces: one dynamic (lockable) texture per surface, in a format the GPU has, with the same bytes per row as
+  * the YUV format: what the application writes through a lock is what the conversion shader reads */
+ static int32_t

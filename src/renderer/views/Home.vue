@@ -129,10 +129,10 @@
 
         <!-- Metrics -->
         <div
-            class="grid grid-cols-3 w-full gap-8 transition-all duration-200"
+            class="grid grid-cols-4 w-full gap-4 2xl:gap-8 transition-all duration-200"
             :class="{ 'blur-sm opacity-50': !winboat.isOnline.value }"
         >
-            <x-card class="bg-neutral-800/20 backdrop-brightness-150 backdrop-blur-xl flex flex-row gap-2 pl-0 my-0">
+            <x-card class="bg-neutral-800/20 backdrop-brightness-150 backdrop-blur-xl flex flex-col items-center gap-0 px-3 my-0 min-w-0 2xl:flex-row 2xl:items-start 2xl:gap-2 2xl:pl-0">
                 <apexchart
                     class="translate-y-2"
                     type="radialBar"
@@ -141,20 +141,20 @@
                     :width="120"
                     :height="120"
                 />
-                <div>
-                    <div class="flex flex-row gap-2 items-center mb-2">
+                <div class="min-w-0 w-full 2xl:w-auto text-center 2xl:text-left">
+                    <div class="flex flex-row gap-2 items-center justify-center mb-2 2xl:justify-start">
                         <Icon class="size-8 text-violet-400" icon="solar:cpu-bold"></Icon>
                         <h2 class="my-0 text-2xl">CPU</h2>
                     </div>
-                    <p class="!my-0 text-gray-400 h-6 overflow-hidden">
+                    <p class="!my-0 text-gray-400 h-6 overflow-hidden truncate">
                         {{ compose?.services.windows.environment.CPU_CORES }} Virtual Cores
                     </p>
-                    <p class="!my-0 text-gray-400 h-6 overflow-hidden">
+                    <p class="!my-0 text-gray-400 h-6 overflow-hidden truncate">
                         Frequency: {{ (winboat.metrics.value.cpu.frequency / 1000).toFixed(2) }} GHz
                     </p>
                 </div>
             </x-card>
-            <x-card class="bg-neutral-800/20 backdrop-brightness-150 backdrop-blur-xl flex flex-row gap-2 pl-0 my-0">
+            <x-card class="bg-neutral-800/20 backdrop-brightness-150 backdrop-blur-xl flex flex-col items-center gap-0 px-3 my-0 min-w-0 2xl:flex-row 2xl:items-start 2xl:gap-2 2xl:pl-0">
                 <apexchart
                     class="translate-y-2"
                     type="radialBar"
@@ -163,20 +163,20 @@
                     :width="120"
                     :height="120"
                 />
-                <div>
-                    <div class="flex flex-row gap-2 items-center mb-2">
+                <div class="min-w-0 w-full 2xl:w-auto text-center 2xl:text-left">
+                    <div class="flex flex-row gap-2 items-center justify-center mb-2 2xl:justify-start">
                         <Icon class="size-8 text-violet-400" icon="game-icons:ram"></Icon>
                         <h2 class="my-0 text-2xl">RAM</h2>
                     </div>
-                    <p class="!my-0 text-gray-400 h-6 overflow-hidden">
+                    <p class="!my-0 text-gray-400 h-6 overflow-hidden truncate">
                         {{ Math.round(winboat.metrics.value.ram.total / 1024).toFixed(2) }} GB Total RAM
                     </p>
-                    <p class="!my-0 text-gray-400 h-6 overflow-hidden">
+                    <p class="!my-0 text-gray-400 h-6 overflow-hidden truncate">
                         {{ (winboat.metrics.value.ram.used / 1024).toFixed(2) }} GB Used RAM
                     </p>
                 </div>
             </x-card>
-            <x-card class="bg-neutral-800/20 backdrop-brightness-150 backdrop-blur-xl flex flex-row gap-2 pl-0 my-0">
+            <x-card class="bg-neutral-800/20 backdrop-brightness-150 backdrop-blur-xl flex flex-col items-center gap-0 px-3 my-0 min-w-0 2xl:flex-row 2xl:items-start 2xl:gap-2 2xl:pl-0">
                 <apexchart
                     class="translate-y-2"
                     type="radialBar"
@@ -185,17 +185,66 @@
                     :width="120"
                     :height="120"
                 />
-                <div>
-                    <div class="flex flex-row gap-2 items-center mb-2">
+                <div class="min-w-0 w-full 2xl:w-auto text-center 2xl:text-left">
+                    <div class="flex flex-row gap-2 items-center justify-center mb-2 2xl:justify-start">
                         <Icon class="size-8 text-violet-400" icon="carbon:vmdk-disk"></Icon>
                         <h2 class="my-0 text-2xl">Disk</h2>
                     </div>
-                    <p class="!my-0 text-gray-400 h-6 overflow-hidden">
+                    <p class="!my-0 text-gray-400 h-6 overflow-hidden truncate">
                         {{ (winboat.metrics.value.disk.total / 1024).toFixed(2) }} GB Total Disk Space
                     </p>
-                    <p class="!my-0 text-gray-400 h-6 overflow-hidden">
+                    <p class="!my-0 text-gray-400 h-6 overflow-hidden truncate">
                         {{ (winboat.metrics.value.disk.used / 1024).toFixed(2) }} GB Used Space
                     </p>
+                </div>
+            </x-card>
+            <x-card class="bg-neutral-800/20 backdrop-brightness-150 backdrop-blur-xl flex flex-col items-center gap-0 px-3 my-0 min-w-0 2xl:flex-row 2xl:items-start 2xl:gap-2 2xl:pl-0">
+                <apexchart
+                    class="translate-y-2"
+                    type="radialBar"
+                    :options="chartOptions"
+                    :series="[winboat.gpuMetrics.value.usage]"
+                    :width="120"
+                    :height="120"
+                />
+                <div class="min-w-0 w-full 2xl:w-auto text-center 2xl:text-left">
+                    <div class="flex flex-row gap-2 items-center justify-center mb-2 2xl:justify-start">
+                        <Icon class="size-8 text-violet-400" icon="bi:gpu-card"></Icon>
+                        <h2 class="my-0 text-2xl">GPU</h2>
+                    </div>
+                    <template v-if="winboat.gpuMetrics.value.state === 'off'">
+                        <p class="!my-0 text-gray-400 h-6 overflow-hidden truncate">No virtual GPU</p>
+                        <p class="!my-0 text-gray-400 h-6 overflow-hidden truncate">Windows draws on the CPU</p>
+                    </template>
+                    <template v-else>
+                        <p
+                            class="!my-0 text-gray-400 h-6 overflow-hidden truncate"
+                            :title="winboat.gpuMetrics.value.name"
+                        >
+                            {{ winboat.gpuMetrics.value.name || "Host GPU" }}
+                        </p>
+                        <p v-if="winboat.gpuMetrics.value.state === 'unavailable'" class="!my-0 text-gray-400 h-6 overflow-hidden truncate">
+                            Can't be measured here
+                        </p>
+                        <p v-else-if="winboat.gpuMetrics.value.state === 'measuring'" class="!my-0 text-gray-400 h-6 overflow-hidden truncate">
+                            Measuring…
+                        </p>
+                        <p
+                            v-else-if="winboat.gpuMetrics.value.memoryUsed !== null"
+                            class="!my-0 text-gray-400 h-6 overflow-hidden truncate"
+                            :title="hostUsageTitle"
+                        >
+                            {{ (winboat.gpuMetrics.value.memoryUsed / 1024).toFixed(2) }} GB Video Memory
+                        </p>
+                        <p v-else class="!my-0 text-gray-400 h-6 overflow-hidden truncate">{{ hostUsageTitle }}</p>
+                        <p
+                            v-if="gpuTrafficText"
+                            class="!my-0 text-gray-400 h-6 overflow-hidden truncate"
+                            title="Commands Windows' driver sends the virtual GPU, the data that goes with them, and the frames the display gets"
+                        >
+                            {{ gpuTrafficText }}
+                        </p>
+                    </template>
                 </div>
             </x-card>
         </div>
@@ -203,7 +252,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { Winboat } from "../lib/winboat";
 import { ContainerStatus } from "../lib/containers/common";
 import { type ComposeConfig } from "../../types";
@@ -214,6 +263,31 @@ import { openAnchorLink, openContainerLogFile } from "../utils/openLink";
 
 const winboat = Winboat.getInstance();
 const compose = ref<ComposeConfig | null>(null);
+
+// The VM's GPU use is measured while this view shows
+const stopWatchingGpu = winboat.watchGpu();
+onUnmounted(stopWatchingGpu);
+// What goes through the virtual GPU: commands and data per second, and frames per second (the parts that are known)
+const gpuTrafficText = computed(() => {
+    const { commandsPerSecond } = winboat.gpuMetrics.value;
+    const { bytesPerSecond, framesPerSecond } = winboat.gpuTraffic.value;
+    const parts: string[] = [];
+    if (commandsPerSecond !== null) parts.push(`${commandsPerSecond} cmd/s`);
+    if (bytesPerSecond !== null) {
+        parts.push(
+            bytesPerSecond >= 1024 * 1024
+                ? `${(bytesPerSecond / 1024 / 1024).toFixed(1)} MB/s`
+                : `${Math.round(bytesPerSecond / 1024)} KB/s`,
+        );
+    }
+    if (framesPerSecond !== null) parts.push(`${framesPerSecond} fps`);
+    return parts.join(" · ");
+});
+const hostUsageTitle = computed(() =>
+    winboat.gpuMetrics.value.hostUsage === null
+        ? "The VM's share of the host GPU"
+        : `Host GPU ${winboat.gpuMetrics.value.hostUsage}% busy in all`,
+);
 const wallpaper = ref("");
 
 onMounted(async () => {

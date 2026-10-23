@@ -1,0 +1,350 @@
+From: WinBoat
+Subject: [PATCH] d3d9umd, d3d10umd, wgl: the user-mode drivers on Windows 7
+
+Windows 7 (the kernel driver's WDDM 1.1 build) didn't load the drivers or used Windows 8 interfaces they then lacked:
+- util/futex: WaitOnAddress and WakeByAddress* are Windows 8's (an import every driver had: none loaded, 0x8007007F):
+  looked up in kernelbase, else a condition variable per address bucket (a waiter checks the value under the bucket's
+  lock, a waker takes it to wake the bucket's waiters)
+- gdikmt_create_from_luid: no D3DKMTOpenAdapterFromLuid: the enumerated adapter with the LUID (Direct3D 9 had no HAL)
+- d3d9umd: the runtime's (interface 0x2003) device function table ends before Windows 8's entries (VolBlt1 on): only
+  that much written, and CreateResource, Flush, Present and the Tex/Vol/BufBlt it calls kept (Windows 8 and later
+  still get them cleared for their 1/2 versions)
+- d3d9umd, d3d10umd: the device callbacks end before Windows 8's (SignalSynchronizationObject2Cb on): what follows them
+  in the copy zeroed (a call through it jumped to the runtime's version number, 0x2003); the completion events then go
+  through gdi32's D3DKMTSignalSynchronizationObject2 (gdikmt_signal_cpu_event, WGL's path too), which on Windows 7
+  can't enqueue a CPU event: the event is set at once (the host runs all contexts' work in submission order and the
+  CPU's reads wait for their resources, so only the CPU's frame pacing is lost)
+---
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt.h b/src/gallium/auxiliary/gdikmt/gdikmt.h
+index 0cc1af4..15d1bba 100644
+--- a/src/gallium/auxiliary/gdikmt/gdikmt.h
++++ b/src/gallium/auxiliary/gdikmt/gdikmt.h
+@@ -116,6 +116,12 @@ gdikmt_wddm2_make_resident(struct gdikmt_wddm2_residency *residency, const struc
+  * (Windows 8.1) the desktop's displays' adapters. Returns how many */
+ UINT gdikmt_enum_adapters(D3DKMT_ADAPTERINFO *adapters, UINT max);
+ 
++/* Windows 7: the D3D runtimes' callbacks end before Windows 8's (SignalSynchronizationObject2Cb on) */
++bool gdikmt_windows7(void);
++/* A CPU event set once the context's work so far is done, through gdi32 (for runtimes without the callback); set
++ * at once where the kernel can't (Windows 7) */
++NTSTATUS gdikmt_signal_cpu_event(D3DKMT_HANDLE hContext, HANDLE event);
++
+ struct gdikmt_device *gdikmt_create_from_hdc(HDC hDC);
+ /* Opens the adapter with this LUID through the D3DKMT* functions */
+ struct gdikmt_device *gdikmt_create_from_luid(LUID luid);
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+index b3218bd..8fe60ec 100644
+--- a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
++++ b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+@@ -13,7 +13,6 @@ struct d3dkmt_callbacks {
+    PFND3DKMT_QUERYADAPTERINFO queryAdapterInfo;
+    PFND3DKMT_ESCAPE escape;
+    PFND3DKMT_RENDER render;
+-   PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signalSynchronizationObject2;
+    PFND3DKMT_CREATECONTEXT createContext;
+    PFND3DKMT_DESTROYCONTEXT destroyContext;
+    PFND3DKMT_CREATEALLOCATION createAllocation;
+@@ -40,9 +39,6 @@ gdikmt_load_callbacks(HINSTANCE gdi32lib, struct d3dkmt_callbacks *cb)
+       gdi32lib, "D3DKMTQueryAdapterInfo");
+    cb->escape = (PFND3DKMT_ESCAPE)GetProcAddress(gdi32lib, "D3DKMTEscape");
+    cb->render = (PFND3DKMT_RENDER)GetProcAddress(gdi32lib, "D3DKMTRender");
+-   cb->signalSynchronizationObject2 =
+-      (PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECT2)GetProcAddress(
+-         gdi32lib, "D3DKMTSignalSynchronizationObject2");
+    cb->createContext =
+       (PFND3DKMT_CREATECONTEXT)GetProcAddress(gdi32lib, "D3DKMTCreateContext");
+    cb->destroyContext = (PFND3DKMT_DESTROYCONTEXT)GetProcAddress(
+@@ -169,16 +165,8 @@ gdikmt_d3dkmt_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
+ 
+    NTSTATUS Status = device->cb.render(&render);
+ 
+-   if (options->CompletionEvent) {
+-      D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signalEvent;
+-      memset(&signalEvent, 0, sizeof(signalEvent));
+-      signalEvent.hContext = ctx->hContext;
+-      signalEvent.ObjectCount = 0;
+-      signalEvent.BroadcastContextCount = 0;
+-      signalEvent.Flags.EnqueueCpuEvent = TRUE;
+-      signalEvent.CpuEventHandle = options->CompletionEvent;
+-      device->cb.signalSynchronizationObject2(&signalEvent);
+-   }
++   if (options->CompletionEvent)
++      gdikmt_signal_cpu_event(ctx->hContext, options->CompletionEvent);
+ 
+    ctx->base.pCommandBuffer = render.pNewCommandBuffer;
+    ctx->base.pAllocationList = render.pNewAllocationList;
+@@ -534,8 +522,23 @@ gdikmt_create_from_luid(LUID luid)
+    D3DKMT_OPENADAPTERFROMLUID openFromLuid;
+    memset(&openFromLuid, 0, sizeof(openFromLuid));
+    openFromLuid.AdapterLuid = luid;
+-   NTSTATUS Status = device->cb.openAdapterFromLuid ? device->cb.openAdapterFromLuid(&openFromLuid)
+-                                                     : (NTSTATUS)0xC00000BBL /* STATUS_NOT_SUPPORTED */;
++   NTSTATUS Status = (NTSTATUS)0xC00000BBL; /* STATUS_NOT_SUPPORTED */
++   if (device->cb.openAdapterFromLuid) {
++      Status = device->cb.openAdapterFromLuid(&openFromLuid);
++   } else {
++      /* Windows 7 has no D3DKMTOpenAdapterFromLuid: the enumerated adapter with that LUID */
++      D3DKMT_ADAPTERINFO adapters[16];
++      UINT count = gdikmt_enum_adapters(adapters, ARRAY_SIZE(adapters));
++      for (UINT i = 0; i < count; i++) {
++         if (!NT_SUCCESS(Status) && !memcmp(&adapters[i].AdapterLuid, &luid, sizeof(luid))) {
++            openFromLuid.hAdapter = adapters[i].hAdapter;
++            Status = 0;
++         } else {
++            D3DKMT_CLOSEADAPTER close = {adapters[i].hAdapter};
++            device->cb.closeAdapter(&close);
++         }
++      }
++   }
+    if (!NT_SUCCESS(Status)) {
+       _debug_printf(
+          "Failed to open device(D3DKMTOpenAdapterFromLuid) with status code: %lx\n",
+@@ -547,6 +550,35 @@ gdikmt_create_from_luid(LUID luid)
+    return gdikmt_create_on_adapter(device, openFromLuid.hAdapter);
+ }
+ 
++bool
++gdikmt_windows7(void)
++{
++   /* (Windows 8's gdi32 has it) */
++   HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
++   return gdi32 && !GetProcAddress(gdi32, "D3DKMTOpenAdapterFromLuid");
++}
++
++NTSTATUS
++gdikmt_signal_cpu_event(D3DKMT_HANDLE hContext, HANDLE event)
++{
++   HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
++   PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signal =
++      gdi32 ? (PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECT2)GetProcAddress(gdi32, "D3DKMTSignalSynchronizationObject2") : NULL;
++   D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signalEvent;
++   memset(&signalEvent, 0, sizeof(signalEvent));
++   signalEvent.hContext = hContext;
++   signalEvent.Flags.EnqueueCpuEvent = TRUE;
++   signalEvent.CpuEventHandle = event;
++   NTSTATUS status = signal ? signal(&signalEvent) : (NTSTATUS)0xC00000BBL; /* STATUS_NOT_SUPPORTED */
++   /* Windows 7 has the function but not EnqueueCpuEvent (Windows 8's): the event set now. The host runs all contexts'
++    * work in submission order and the CPU's reads wait for their resources (VIOGPU_RES_BUSY), so only the CPU's pacing
++    * is lost. ponytail: no frame throttling on Windows 7; a kernel escape setting the event at the submission's
++    * completion if games run ahead */
++   if (!NT_SUCCESS(status))
++      SetEvent(event);
++   return status;
++}
++
+ UINT
+ gdikmt_enum_adapters(D3DKMT_ADAPTERINFO *adapters, UINT max)
+ {
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index be31819..c6fc75d 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -148,6 +148,10 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    pDevice->device.hRTDevice = (HANDLE)pCreateData->hRTDevice.handle;
+ 
+    pDevice->device.KTCallbacks = *pCreateData->pKTCallbacks;
++   /* Windows 7's callbacks end before Windows 8's: what follows them in the copy isn't the runtime's */
++   if (gdikmt_windows7())
++      memset(&pDevice->device.KTCallbacks.pfnOfferAllocationsCb, 0,
++             sizeof(pDevice->device.KTCallbacks) - offsetof(D3DDDI_DEVICECALLBACKS, pfnOfferAllocationsCb));
+    /* Windows 8.1's callbacks have no WDDM 2.0 residency ones: what follows them isn't ours to call */
+    pDevice->device.residency.tried = HostKernelIsWddm1();
+    pDevice->device.pAdapterCallbacks = &pAdapter->AdapterCallbacks;
+diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
+index fabf12c..999d6dd 100644
+--- a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
++++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
+@@ -85,7 +85,10 @@ gdikmt_d3dddi_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
+       signalEvent.BroadcastContextCount = 0;
+       signalEvent.Flags.EnqueueCpuEvent = TRUE;
+       signalEvent.CpuEventHandle = options->CompletionEvent;
+-      dev->KTCallbacks.pfnSignalSynchronizationObject2Cb(dev->hRTDevice, &signalEvent);
++      if (dev->KTCallbacks.pfnSignalSynchronizationObject2Cb)
++         dev->KTCallbacks.pfnSignalSynchronizationObject2Cb(dev->hRTDevice, &signalEvent);
++      else
++         gdikmt_signal_cpu_event((D3DKMT_HANDLE)(uintptr_t)ctx->hContext, options->CompletionEvent);
+    }
+ 
+    ctx->base.pCommandBuffer = render.pNewCommandBuffer;
+diff --git a/src/gallium/frontends/d3d9umd/adapter.cpp b/src/gallium/frontends/d3d9umd/adapter.cpp
+index 7427ef8..05bdeae 100644
+--- a/src/gallium/frontends/d3d9umd/adapter.cpp
++++ b/src/gallium/frontends/d3d9umd/adapter.cpp
+@@ -225,6 +225,10 @@ CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *pCreateData)
+    device->kmt.hRTAdapter = adapter->hRTAdapter;
+    device->kmt.hRTDevice = pCreateData->hDevice;
+    device->kmt.callbacks = *pCreateData->pCallbacks;
++   /* Windows 7's callbacks end before Windows 8's: what follows them in the copy isn't the runtime's */
++   if (pCreateData->Version < D3D_UMD_INTERFACE_VERSION_WIN8)
++      memset(&device->kmt.callbacks.pfnOfferAllocationsCb, 0,
++             sizeof(device->kmt.callbacks) - offsetof(D3DDDI_DEVICECALLBACKS, pfnOfferAllocationsCb));
+    device->kmt.adapterCallbacks = &adapter->callbacks;
+    gdikmt_d3d9_init(&device->kmt);
+    /* A WDDM 1.3 kernel driver (Windows 8.1): its runtime's callbacks end before WDDM 2.0's residency ones, whatever
+@@ -248,15 +252,16 @@ CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *pCreateData)
+    device->viewport.max_z = 1.0f;
+ 
+    /* The runtime's table ends where its interface version does: Windows 8.1's (WDDM 1.3) before the WDDM 2.0 entries
+-    * (TrimResidencySet on). Writing ours whole there corrupted its heap (0xC0000374). SetMarker and SetMarkerMode are
++    * (TrimResidencySet on), Windows 7's before Windows 8's (VolBlt1 on). Writing ours whole there corrupted its heap (0xC0000374). SetMarker and SetMarkerMode are
+     * 8.1's though: without them its runtime doesn't take Flush1 and Present1 but calls the (null) Flush */
+    const size_t size = pCreateData->Version >= D3D_UMD_INTERFACE_VERSION_WDDM2_0 ? sizeof(D3DDDI_DEVICEFUNCS)
+-                                                                               : offsetof(D3DDDI_DEVICEFUNCS, pfnTrimResidencySet);
++                       : pCreateData->Version >= D3D_UMD_INTERFACE_VERSION_WIN8 ? offsetof(D3DDDI_DEVICEFUNCS, pfnTrimResidencySet)
++                                                                                : offsetof(D3DDDI_DEVICEFUNCS, pfnVolBlt1);
+    /* (starting from what the runtime put in its table: entries we don't fill stay its own) */
+    D3DDDI_DEVICEFUNCS funcs = {};
+    memcpy(&funcs, pCreateData->pDeviceFuncs, size);
+    D3D9UmdFillStubs(&funcs);
+-   D3D9UmdFillDeviceFuncs(&funcs);
++   D3D9UmdFillDeviceFuncs(&funcs, pCreateData->Version);
+    memcpy(pCreateData->pDeviceFuncs, &funcs, size);
+    for (size_t i = 0; i < size / sizeof(void *); i++) {
+       if (!((void *const *)&funcs)[i])
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd.h b/src/gallium/frontends/d3d9umd/d3d9umd.h
+index fd94107..38044f4 100644
+--- a/src/gallium/frontends/d3d9umd/d3d9umd.h
++++ b/src/gallium/frontends/d3d9umd/d3d9umd.h
+@@ -93,7 +93,7 @@ HRESULT D3D9UmdUnimplemented(const char *name);
+ void D3D9UmdInstallCrashHandler(void);
+ 
+ void D3D9UmdFillStubs(D3DDDI_DEVICEFUNCS *funcs);
+-void D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *funcs);
++void D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *funcs, UINT runtimeVersion);
+ void D3D9UmdFillPipelineFuncs(D3DDDI_DEVICEFUNCS *funcs);
+ void D3D9UmdFillVideoFuncs(D3DDDI_DEVICEFUNCS *funcs);
+ 
+diff --git a/src/gallium/frontends/d3d9umd/device.cpp b/src/gallium/frontends/d3d9umd/device.cpp
+index 0504b3e..82795f1 100644
+--- a/src/gallium/frontends/d3d9umd/device.cpp
++++ b/src/gallium/frontends/d3d9umd/device.cpp
+@@ -663,7 +663,7 @@ SetMarkerMode(HANDLE hDevice, D3DDDI_MARKERTYPE Type, UINT Flags)
+ }
+ 
+ void
+-D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *f)
++D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *f, UINT runtimeVersion)
+ {
+    f->pfnDestroyDevice = DestroyDevice;
+    f->pfnFlush = Flush;
+@@ -709,11 +709,14 @@ D3D9UmdFillDeviceFuncs(D3DDDI_DEVICEFUNCS *f)
+    D3D9UmdFillVideoFuncs(f);
+    D3D9UmdFillDecodeFuncs(f);
+ 
+-   /* The Windows 8 interface replaces these: the runtime refuses a driver that has both (ValidateUMDeviceFuncs) */
+-   f->pfnCreateResource = NULL;
+-   f->pfnFlush = NULL;
+-   f->pfnPresent = NULL;
+-   f->pfnTexBlt = NULL;
+-   f->pfnVolBlt = NULL;
+-   f->pfnBufBlt = NULL;
++   /* The Windows 8 interface replaces these: its runtimes refuse a driver that has both (ValidateUMDeviceFuncs).
++    * Windows 7's table ends before the replacements: it calls these */
++   if (runtimeVersion >= D3D_UMD_INTERFACE_VERSION_WIN8) {
++      f->pfnCreateResource = NULL;
++      f->pfnFlush = NULL;
++      f->pfnPresent = NULL;
++      f->pfnTexBlt = NULL;
++      f->pfnVolBlt = NULL;
++      f->pfnBufBlt = NULL;
++   }
+ }
+diff --git a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
+index 0d5531e..f552f3d 100644
+--- a/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
++++ b/src/gallium/frontends/d3d9umd/gdikmt_d3d9.cpp
+@@ -80,7 +80,10 @@ render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
+       signal.hContext = ctx->hContext;
+       signal.Flags.EnqueueCpuEvent = TRUE;
+       signal.CpuEventHandle = options->CompletionEvent;
+-      dev->callbacks.pfnSignalSynchronizationObject2Cb(dev->hRTDevice, &signal);
++      if (dev->callbacks.pfnSignalSynchronizationObject2Cb)
++         dev->callbacks.pfnSignalSynchronizationObject2Cb(dev->hRTDevice, &signal);
++      else
++         gdikmt_signal_cpu_event((D3DKMT_HANDLE)(uintptr_t)ctx->hContext, options->CompletionEvent);
+    }
+ 
+    ctx->base.pCommandBuffer = r.pNewCommandBuffer;
+diff --git a/src/util/futex.c b/src/util/futex.c
+index df3e949..f72f7b2 100644
+--- a/src/util/futex.c
++++ b/src/util/futex.c
+@@ -122,16 +122,54 @@ int futex_wait(uint32_t *addr, int32_t value, const struct timespec *timeout)
+ #include <assert.h>
+ #include <errno.h>
+ 
++#include "util/macros.h"
++#include "util/u_atomic.h"
++
++/* WaitOnAddress is Windows 8's: looked up, so the drivers load on Windows 7 too, which waits on a condition variable
++ * of the address's bucket instead (a waiter checks the value under the bucket's lock, a waker takes it to wake all of
++ * the bucket's waiters: they check their values again)
++ */
++typedef BOOL (WINAPI *PFN_WaitOnAddress)(volatile VOID *, PVOID, SIZE_T, DWORD);
++typedef VOID (WINAPI *PFN_WakeByAddress)(PVOID);
++static PFN_WaitOnAddress wait_on_address;
++static PFN_WakeByAddress wake_by_address_single, wake_by_address_all;
++static INIT_ONCE futex_once = INIT_ONCE_STATIC_INIT;
++static struct {
++   SRWLOCK lock;
++   CONDITION_VARIABLE cond;
++} futex_buckets[64]; /* zeroed: SRWLOCK_INIT, CONDITION_VARIABLE_INIT */
++
++static BOOL CALLBACK
++futex_init(PINIT_ONCE once, PVOID param, PVOID *context)
++{
++   HMODULE kernelbase = GetModuleHandleA("kernelbase.dll");
++   if (kernelbase) {
++      wait_on_address = (PFN_WaitOnAddress)GetProcAddress(kernelbase, "WaitOnAddress");
++      wake_by_address_single = (PFN_WakeByAddress)GetProcAddress(kernelbase, "WakeByAddressSingle");
++      wake_by_address_all = (PFN_WakeByAddress)GetProcAddress(kernelbase, "WakeByAddressAll");
++   }
++   if (!wake_by_address_single || !wake_by_address_all)
++      wait_on_address = NULL;
++   return TRUE;
++}
++
++#define futex_bucket(addr) (&futex_buckets[((uintptr_t)(addr) >> 2) % ARRAY_SIZE(futex_buckets)])
++
+ int futex_wake(uint32_t *addr, int32_t count)
+ {
+    /* All current callers fall into one of these buckets, and we'll get the semantics
+     * wrong if someone tries to be more clever.
+     */
+    assert(count == 1 || count == INT32_MAX);
+-   if (count == 1)
+-      WakeByAddressSingle(addr);
++   InitOnceExecuteOnce(&futex_once, futex_init, NULL, NULL);
++   if (!wait_on_address) {
++      AcquireSRWLockExclusive(&futex_bucket(addr)->lock);
++      WakeAllConditionVariable(&futex_bucket(addr)->cond);
++      ReleaseSRWLockExclusive(&futex_bucket(addr)->lock);
++   } else if (count == 1)
++      wake_by_address_single(addr);
+    else
+-      WakeByAddressAll(addr);
++      wake_by_address_all(addr);
+    return count;
+ }
+ 
+@@ -146,7 +184,19 @@ int futex_wait(uint32_t *addr, int32_t value, const struct timespec *timeout)
+                    (timeout->tv_nsec - tsnow.tv_nsec) / 1000000;
+    }
+ 
+-   if (WaitOnAddress(addr, &value, sizeof(value), timeout_ms))
++   InitOnceExecuteOnce(&futex_once, futex_init, NULL, NULL);
++   if (!wait_on_address) {
++      BOOL woken = TRUE;
++      AcquireSRWLockExclusive(&futex_bucket(addr)->lock);
++      if (p_atomic_read(addr) == (uint32_t)value)
++         woken = SleepConditionVariableSRW(&futex_bucket(addr)->cond, &futex_bucket(addr)->lock, timeout_ms, 0);
++      ReleaseSRWLockExclusive(&futex_bucket(addr)->lock);
++      if (woken)
++         return 0;
++      return GetLastError() == ERROR_TIMEOUT ? ETIMEDOUT : -1;
++   }
++
++   if (wait_on_address(addr, &value, sizeof(value), timeout_ms))
+       return 0;
+    return GetLastError() == ERROR_TIMEOUT ? ETIMEDOUT : -1;
+ }

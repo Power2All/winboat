@@ -1,0 +1,62 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: the local memory segment on Windows 11 only
+
+Windows 10 (19041-19045) bugchecked at boot with Venus (0x7E, a null read in dxgmms2
+VIDMM_GLOBAL::InitPagingProcessVaSpace) once the driver reported the host-visible window as a second segment (local
+memory, patch 0018): its video memory manager doesn't find the page table segment after it. The segment, and with it
+the dedicated video memory DXGI reports, is there from build 22000 on; on Windows 10 page tables stay in segment 2.
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 32389ad..cbb2505 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -754,7 +754,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 DXGK_QUERYSEGMENTOUT4 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT4 *)pQueryAdapterInfo->pOutputData;
+                 if (!pSegmentInfo->pSegmentDescriptor)
+                 {
+-                    pSegmentInfo->NbSegment = m_HostmemSize ? 2 : 1;
++                    pSegmentInfo->NbSegment = m_LocalSegment ? 2 : 1;
+                     return STATUS_SUCCESS;
+                 }
+                 // Paging buffers in system memory (segment 0): the CPU fills them, and the aperture isn't CPU-visible.
+@@ -773,7 +773,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 pSegmentDesc->Flags.DirectFlip = TRUE;
+                 pSegmentDesc->Size = 256 * 1024 * 4096;
+                 pSegmentDesc->CommitLimit = 256 * 1024 * 4096;
+-                if (m_HostmemSize)
++                if (m_LocalSegment)
+                 {
+                     SIZE_T stride = pSegmentInfo->SegmentDescriptorStride ? pSegmentInfo->SegmentDescriptorStride
+                                                                           : sizeof(*pSegmentDesc);
+@@ -1534,6 +1534,8 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
+                       m_HostmemPA.QuadPart,
+                       m_HostmemSize));
+             AckFeature(VIRTIO_GPU_F_RESOURCE_BLOB);
++            RTL_OSVERSIONINFOW os = {sizeof(os)};
++            m_LocalSegment = NT_SUCCESS(RtlGetVersion(&os)) && os.dwBuildNumber >= 22000;
+         }
+ 
+         status = virtio_set_features(&m_VioDev, m_u64GuestFeatures);
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index eb271ff..9be94f8 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -112,6 +112,9 @@ class VioGpuAdapter : IVioGpuPCI
+     // HOSTMEM_RANGEs, sorted by offset
+     PHYSICAL_ADDRESS m_HostmemPA;
+     ULONGLONG m_HostmemSize;
++    // The local memory segment over the window (QUERYSEGMENT4): Windows 11 only. Windows 10's video memory manager
++    // (19041) faults (bugcheck 0x7E in dxgmms2 InitPagingProcessVaSpace) setting up the paging process with it there
++    bool m_LocalSegment = false;
+ 
+     // GPU resource memory in use, and its limit (GpuMemoryLimitMB)
+     volatile LONG64 m_AllocatedBytes = 0;
+@@ -140,7 +143,7 @@ class VioGpuAdapter : IVioGpuPCI
+     // The system memory segment GpuMmu adds, after ours (helper.h)
+     UINT SysmemSegmentId() const
+     {
+-        return m_HostmemSize ? 3 : 2;
++        return m_LocalSegment ? 3 : 2;
+     }
+ 
+   private:

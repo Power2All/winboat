@@ -1,0 +1,120 @@
+vrend: copy a transfer's rows without walking the iovecs again for each row
+
+read_transfer_data/write_transfer_data copy row by row when the rows aren't
+contiguous in the guest's memory, and vrend_read_from_iovec/
+vrend_write_to_iovec walk the iovec list from its start to each row's offset.
+With a backing of 4 KiB pages that is rows times pages steps: for a guest
+screen of 5120x2065 (2065 rows, ~10000 pages) more time than the copying, on
+the thread that also runs the guest's other GL work. Keep the iovec the last
+row was in (the rows' offsets increase, also when inverting).
+
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8964,6 +8964,41 @@
+    }
+ }
+ 
++/*
++ * A transfer copies its rows one by one when they aren't contiguous in the guest's memory, at increasing offsets.
++ * vrend_read_from_iovec/vrend_write_to_iovec walk the iovec list from its start to each row's offset: with a
++ * backing of 4 KiB pages, that is rows times pages steps (a 5120x2065 screen: 2065 rows, 10000 pages), more than the
++ * copying itself. The cursor keeps the iovec the last row was in.
++ */
++struct iov_cursor {
++   const struct iovec *iov;   /* the current iovec */
++   int left;                  /* iovecs from it to the end */
++   uint64_t base;             /* the offset it starts at */
++};
++
++static void iov_cursor_init(struct iov_cursor *c, const struct iovec *iov, int num_iovs)
++{
++   c->iov = iov;
++   c->left = num_iovs;
++   c->base = 0;
++}
++
++/* The iovecs from the one offset is in, and offset within it (a smaller offset than before starts over) */
++static const struct iovec *iov_cursor_seek(struct iov_cursor *c, const struct iovec *iov, int num_iovs,
++                                           uint64_t offset, int *left, size_t *rel)
++{
++   if (offset < c->base)
++      iov_cursor_init(c, iov, num_iovs);
++   while (c->left > 1 && offset >= c->base + c->iov->iov_len) {
++      c->base += c->iov->iov_len;
++      c->iov++;
++      c->left--;
++   }
++   *left = c->left;
++   *rel = offset - c->base;
++   return c->iov;
++}
++
+ static void read_transfer_data(const struct iovec *iov,
+                                unsigned int num_iovs,
+                                char *data,
+@@ -8981,6 +9016,12 @@
+    uint32_t bwx = util_format_get_nblocksx(format, box->width) * blsize;
+    int32_t bh = util_format_get_nblocksy(format, box->height);
+    int d, h;
++   struct iov_cursor cursor;
++   const struct iovec *row_iov;
++   int row_iovs;
++   size_t row_offset;
++
++   iov_cursor_init(&cursor, iov, num_iovs);
+ 
+    if ((send_size == size || bh == 1) && !invert && box->depth == 1)
+       vrend_read_from_iovec(iov, num_iovs, offset, data, send_size);
+@@ -8990,7 +9031,8 @@
+             uint32_t myoffset = offset + d * src_layer_stride;
+             for (h = bh - 1; h >= 0; h--) {
+                void *ptr = data + (h * bwx) + d * (bh * bwx);
+-               vrend_read_from_iovec(iov, num_iovs, myoffset, ptr, bwx);
++               row_iov = iov_cursor_seek(&cursor, iov, num_iovs, myoffset, &row_iovs, &row_offset);
++               vrend_read_from_iovec(row_iov, row_iovs, row_offset, ptr, bwx);
+                myoffset += src_stride;
+             }
+          }
+@@ -8999,7 +9041,8 @@
+             uint32_t myoffset = offset + d * src_layer_stride;
+             for (h = 0; h < bh; h++) {
+                void *ptr = data + (h * bwx) + d * (bh * bwx);
+-               vrend_read_from_iovec(iov, num_iovs, myoffset, ptr, bwx);
++               row_iov = iov_cursor_seek(&cursor, iov, num_iovs, myoffset, &row_iovs, &row_offset);
++               vrend_read_from_iovec(row_iov, row_iovs, row_offset, ptr, bwx);
+                myoffset += src_stride;
+             }
+          }
+@@ -9025,6 +9068,12 @@
+    int32_t bh = util_format_get_nblocksy(res->format, box->height);
+    int d, h;
+    uint32_t stride = dst_stride ? dst_stride : util_format_get_nblocksx(res->format, u_minify(res->width0, level)) * blsize;
++   struct iov_cursor cursor;
++   const struct iovec *row_iov;
++   int row_iovs;
++   size_t row_offset;
++
++   iov_cursor_init(&cursor, iov, num_iovs);
+ 
+    if ((send_size == size || bh == 1) && !invert && box->depth == 1) {
+       vrend_write_to_iovec(iov, num_iovs, offset, data, send_size);
+@@ -9033,7 +9082,8 @@
+          uint32_t myoffset = offset + d * stride * u_minify(res->height0, level);
+          for (h = bh - 1; h >= 0; h--) {
+             void *ptr = data + (h * bwx) + d * (bh * bwx);
+-            vrend_write_to_iovec(iov, num_iovs, myoffset, ptr, bwx);
++            row_iov = iov_cursor_seek(&cursor, iov, num_iovs, myoffset, &row_iovs, &row_offset);
++            vrend_write_to_iovec(row_iov, row_iovs, row_offset, ptr, bwx);
+             myoffset += stride;
+          }
+       }
+@@ -9042,7 +9092,8 @@
+          uint32_t myoffset = offset + d * stride * u_minify(res->height0, level);
+          for (h = 0; h < bh; h++) {
+             void *ptr = data + (h * bwx) + d * (bh * bwx);
+-            vrend_write_to_iovec(iov, num_iovs, myoffset, ptr, bwx);
++            row_iov = iov_cursor_seek(&cursor, iov, num_iovs, myoffset, &row_iovs, &row_offset);
++            vrend_write_to_iovec(row_iov, row_iovs, row_offset, ptr, bwx);
+             myoffset += stride;
+          }
+       }

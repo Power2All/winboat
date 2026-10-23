@@ -1,0 +1,285 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: DDI 0102, expanded sampler heaps and UAV-only MSAA
+
+Microsoft's runtime refuses a DDI 0102 driver (saying nothing) unless it
+reports sampler heaps of at least 4096 descriptors and rendering without
+outputs at 1, 2, 4, 8 and 16 samples. Both are there now:
+
+vkd3d: shader-visible sampler heaps of 4096 where descriptor sets take
+them (maxDescriptorSetUpdateAfterBindSamplers and the per-stage limit;
+descriptor buffers keep 2048): only the pipeline layouts' sampler arrays
+grow, and samplers were already deduplicated against
+maxSamplerAllocationCount. SupportedSampleCountsWithNoOutputs comes from
+framebufferNoAttachmentsSampleCounts: without render targets a draw
+already takes the pipeline's sample count.
+
+viogpu_umd: DDI 0102 offered first where the device has both (0100 and
+0082 stay for older runtimes and other devices); its tables (the same
+entries); OPTIONS_0102 from OPTIONS19, OPTIONS_0101 none; from 0102 the
+rasterizer desc carries the line rasterization mode itself, in place of
+the multisample and antialiased line switches.
+---
+diff --git a/libs/viogpu_umd/gen_tables.py b/libs/viogpu_umd/gen_tables.py
+index 1936add6..6190c375 100644
+--- a/libs/viogpu_umd/gen_tables.py
++++ b/libs/viogpu_umd/gen_tables.py
+@@ -5,7 +5,7 @@
+ import re, sys
+ h12, hdxgi, out = sys.argv[1:4]
+ tables = [
+-    ("DEVICE", h12, "D3D12DDI_DEVICE_FUNCS_CORE_0100"),
++    ("DEVICE", h12, "D3D12DDI_DEVICE_FUNCS_CORE_0102"),
+     ("COMMAND_LIST", h12, "D3D12DDI_COMMAND_LIST_FUNCS_3D_0099"),
+     ("COMMAND_QUEUE", h12, "D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001"),
+     ("DXGI", hdxgi, "DXGI1_4_DDI_BASE_FUNCTIONS"),
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+index 54d26801..e87b0307 100644
+--- a/libs/viogpu_umd/umd_ddi.cpp
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -12,11 +12,11 @@
+  * (OutputDebugString, and the file VIOGPU_D3D12_LOG names) and returns 0. Each stub has its entry's own type, so that
+  * on x86 it pops the caller's arguments (__stdcall).
+  *
+- * DDI versions: D3D12DDI_SUPPORTED_0100 (interface R8, build 100: shader models 6.7 and 6.8) and, for older runtimes,
+- * 0082 (shader model 6.6). The tables are 0100's; an older runtime's are a prefix of them, and the arguments that
+- * changed meaning on the way go by the build the runtime chose (device_ddi, umd_private.h). Not 0102 on: there the
+- * runtime insists on sampler heaps of 4096 descriptors (and UAV-only rendering at every sample count up to 16), where
+- * vkd3d-proton's shader-visible sampler heaps stop at 2048.
++ * DDI versions: D3D12DDI_SUPPORTED_0102 (interface R8, build 102: the Vulkan-on-12 caps, line rasterization modes),
++ * 0100 (shader models 6.7 and 6.8) and, for older runtimes, 0082 (shader model 6.6). The tables are 0102's; an older
++ * runtime's are a prefix of them, and the arguments that changed meaning on the way go by the build the runtime chose
++ * (device_ddi, umd_private.h). 0102 only where the device has the sampler heaps of 4096 descriptors and the UAV-only
++ * rendering at every sample count up to 16 that runtime insists on (adapter_offers_0102).
+  */
+ 
+ #include "umd_private.h"
+@@ -301,19 +301,6 @@ adapter_vkd3d(viogpu_adapter *adapter)
+    return adapter->vkd3d;
+ }
+ 
+-static const UINT64 supported_versions[] = { D3D12DDI_SUPPORTED_0100, D3D12DDI_SUPPORTED_0082 };
+-
+-static HRESULT APIENTRY
+-adapter_get_supported_versions(D3D12DDI_HADAPTER, UINT32 *entries, UINT64 *versions)
+-{
+-   if (versions && *entries < ARRAYSIZE(supported_versions))
+-      return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+-   *entries = ARRAYSIZE(supported_versions);
+-   if (versions)
+-      memcpy(versions, supported_versions, sizeof(supported_versions));
+-   return S_OK;
+-}
+-
+ /* the caps struct, as much of it as the runtime's version has room for */
+ template <typename T>
+ static HRESULT
+@@ -335,6 +322,7 @@ struct viogpu_caps {
+    /* the caps of DDI 0090 on, one struct per build */
+    D3D12DDI_OPTIONS_DATA_0091 options0091;
+    D3D12DDI_OPTIONS_DATA_0093 options0093;
++   D3D12DDI_OPTIONS_DATA_0102 options0102;
+    UINT gpuvaBits;
+    /* highest shader model, in D3D_SHADER_MODEL's terms (0x51, 0x60...) */
+    UINT shaderModel;
+@@ -461,6 +449,13 @@ caps_from_vkd3d(ID3D12Device *device, viogpu_caps *caps)
+    device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &o14, sizeof(o14));
+    caps->options0093.AdvancedTextureOpsSupported = o14.AdvancedTextureOpsSupported;
+    caps->options0093.WriteableMSAATexturesSupported = o14.WriteableMSAATexturesSupported;
++   /* 0102: UAV-only rendering's sample counts and the descriptor heaps' sizes */
++   D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19 = {};
++   device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof(o19));
++   caps->options0102.SupportedSampleCountsWithNoOutputs = o19.SupportedSampleCountsWithNoOutputs;
++   caps->options0102.MaxSamplerDescriptorHeapSize = o19.MaxSamplerDescriptorHeapSize;
++   caps->options0102.MaxSamplerDescriptorHeapSizeWithStaticSamplers = o19.MaxSamplerDescriptorHeapSizeWithStaticSamplers;
++   caps->options0102.MaxViewDescriptorHeapSize = o19.MaxViewDescriptorHeapSize;
+ 
+    /* the heaps the runtime makes out of DEFAULT/UPLOAD/READBACK follow this, vkd3d-proton's custom heaps too */
+    D3D12_FEATURE_DATA_ARCHITECTURE arch = {};
+@@ -504,6 +499,35 @@ adapter_caps(viogpu_adapter *adapter)
+    return adapter->caps;
+ }
+ 
++static const UINT64 supported_versions[] = { D3D12DDI_SUPPORTED_0102, D3D12DDI_SUPPORTED_0100, D3D12DDI_SUPPORTED_0082 };
++
++/* 0102 where the device has what that runtime insists on (it refuses the device otherwise, saying nothing): sampler
++ * heaps of 4096 descriptors and UAV-only rendering at 1, 2, 4, 8 and 16 samples */
++static bool
++adapter_offers_0102(viogpu_adapter *adapter)
++{
++   const viogpu_caps *caps = adapter_caps(adapter);
++   return caps && (caps->options0102.SupportedSampleCountsWithNoOutputs & 0x1f) == 0x1f &&
++          caps->options0102.MaxSamplerDescriptorHeapSize >= 4096;
++}
++
++static HRESULT APIENTRY
++adapter_get_supported_versions(D3D12DDI_HADAPTER hAdapter, UINT32 *entries, UINT64 *versions)
++{
++   const UINT64 *offered = supported_versions;
++   UINT32 count = ARRAYSIZE(supported_versions);
++   if (!adapter_offers_0102((viogpu_adapter *)hAdapter.pDrvPrivate)) {
++      offered++;
++      count--;
++   }
++   if (versions && *entries < count)
++      return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++   *entries = count;
++   if (versions)
++      memcpy(versions, offered, count * sizeof(*offered));
++   return S_OK;
++}
++
+ static HRESULT
+ adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps);
+ 
+@@ -543,6 +567,8 @@ adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps
+ 
+    case D3D12DDICAPS_TYPE_OPTIONS_0091:
+       return answer(caps, dev->options0091);
++   case D3D12DDICAPS_TYPE_OPTIONS_0102:
++      return answer(caps, dev->options0102);
+    case D3D12DDICAPS_TYPE_OPTIONS_0093:
+       return answer(caps, dev->options0093);
+ 
+@@ -622,8 +648,9 @@ adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps
+    case D3D12DDICAPS_TYPE_0073_SUPPORT_BATCHED_MARKERS:
+    case D3D12DDICAPS_TYPE_OPTIONS_0090:
+    case D3D12DDICAPS_TYPE_OPTIONS_0098:
++   case D3D12DDICAPS_TYPE_OPTIONS_0101:
+       /* none of it: queue flags 0, not compute-only, no hardware scheduling, FALSE; no relaxed format casting (the
+-       * castable format lists aren't passed on) or fully CPU-accessible L1 memory */
++       * castable format lists aren't passed on), fully CPU-accessible L1 memory or compute-only custom heaps */
+       if (!caps->pData)
+          return E_INVALIDARG;
+       memset(caps->pData, 0, caps->DataSize);
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+index 01b81229..f9712811 100644
+--- a/libs/viogpu_umd/umd_private.h
++++ b/libs/viogpu_umd/umd_private.h
+@@ -31,7 +31,7 @@ void viogpu_log(const char *format, ...);
+ 
+ /* The tables of the newest DDI version the driver offers (umd_ddi.cpp); a runtime of an older version gets the part
+  * its own tables have (the tables only grow, and arguments of a newer version extend the older ones) */
+-typedef D3D12DDI_DEVICE_FUNCS_CORE_0100 viogpu_device_funcs;
++typedef D3D12DDI_DEVICE_FUNCS_CORE_0102 viogpu_device_funcs;
+ typedef D3D12DDI_COMMAND_LIST_FUNCS_3D_0099 viogpu_command_list_funcs;
+ 
+ struct viogpu_device {
+diff --git a/libs/viogpu_umd/umd_state.cpp b/libs/viogpu_umd/umd_state.cpp
+index da6aaec9..0a98e9f7 100644
+--- a/libs/viogpu_umd/umd_state.cpp
++++ b/libs/viogpu_umd/umd_state.cpp
+@@ -447,10 +447,10 @@ destroy_depth_stencil(D3D12DDI_HDEVICE, D3D12DDI_HDEPTHSTENCILSTATE)
+ {
+ }
+ 
+-/* The API's DESC2 (its line rasterization mode from the multisample and antialiased line switches, as the API's
+- * DESC1 -> DESC2 does). The DDI's depth bias is an integer before 0099 */
++/* The API's DESC2: the DDI's line rasterization mode from 0102 on, before it from the multisample and antialiased
++ * line switches (as the API's DESC1 -> DESC2 does). The DDI's depth bias is an integer before 0099 */
+ static SIZE_T APIENTRY
+-calc_rasterizer_size(D3D12DDI_HDEVICE, const D3D12DDI_RASTERIZER_DESC_0099 *)
++calc_rasterizer_size(D3D12DDI_HDEVICE, const D3D12DDI_RASTERIZER_DESC_0102 *)
+ {
+    return sizeof(D3D12_RASTERIZER_DESC2);
+ }
+@@ -481,12 +481,18 @@ line_mode(const T *desc)
+ }
+ 
+ static VOID APIENTRY
+-create_rasterizer(D3D12DDI_HDEVICE hDevice, const D3D12DDI_RASTERIZER_DESC_0099 *desc, D3D12DDI_HRASTERIZERSTATE h)
++create_rasterizer(D3D12DDI_HDEVICE hDevice, const D3D12DDI_RASTERIZER_DESC_0102 *desc, D3D12DDI_HRASTERIZERSTATE h)
+ {
+    D3D12_RASTERIZER_DESC2 *d = (D3D12_RASTERIZER_DESC2 *)h.pDrvPrivate;
+-   if (device_ddi(device_from(hDevice), D3D12DDI_BUILD_VERSION_0099)) {
++   viogpu_device *device = device_from(hDevice);
++   if (device_ddi(device, D3D12DDI_BUILD_VERSION_0102)) {
+       rasterizer_common(d, desc);
+-      d->LineRasterizationMode = line_mode(desc);
++      /* the same values as the API's */
++      d->LineRasterizationMode = (D3D12_LINE_RASTERIZATION_MODE)desc->LineRasterizationMode;
++   } else if (device_ddi(device, D3D12DDI_BUILD_VERSION_0099)) {
++      const D3D12DDI_RASTERIZER_DESC_0099 *desc0099 = (const D3D12DDI_RASTERIZER_DESC_0099 *)desc;
++      rasterizer_common(d, desc0099);
++      d->LineRasterizationMode = line_mode(desc0099);
+    } else {
+       const D3D12DDI_RASTERIZER_DESC_0010 *old = (const D3D12DDI_RASTERIZER_DESC_0010 *)desc;
+       rasterizer_common(d, old);
+diff --git a/libs/viogpu_umd/umd_tables.h b/libs/viogpu_umd/umd_tables.h
+index 71afb2a6..bf801201 100644
+--- a/libs/viogpu_umd/umd_tables.h
++++ b/libs/viogpu_umd/umd_tables.h
+@@ -1,7 +1,7 @@
+ /* Generated by gen_tables.py from the WDK's d3d12umddi.h and dxgiddi.h: do not edit */
+ #pragma once
+ 
+-#define VIOGPU_D3D12_DEVICE_ENTRIES 122 /* D3D12DDI_DEVICE_FUNCS_CORE_0100 */
++#define VIOGPU_D3D12_DEVICE_ENTRIES 122 /* D3D12DDI_DEVICE_FUNCS_CORE_0102 */
+ static const char *const viogpu_d3d12_device_names[] = {
+    "pfnCheckFormatSupport",
+    "pfnCheckMultisampleQualityLevels",
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index bd0ba46d..c3224f80 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9346,15 +9346,20 @@ static D3D12_SAMPLER_FEEDBACK_TIER d3d12_device_determine_sampler_feedback_tier(
+ 
+ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device, D3D12_DESCRIPTOR_HEAP_TYPE heap_type)
+ {
+-    /* For now, hard-code descriptor counts to the minimum numbers required by D3D12.
+-     * We could support more based on device capabilities, but that would change
+-     * pipeline layouts. */
++    /* The minimum view count D3D12 requires (more would change pipeline layouts); samplers below */
+     switch (heap_type)
+     {
+         case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+             return VKD3D_MIN_VIEW_DESCRIPTOR_COUNT;
+ 
+         case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
++            /* The expanded sampler heaps (4096; Microsoft's runtime wants them from DDI 0102 on) where the
++             * descriptor sets take them: only the pipeline layouts' sampler arrays grow. Descriptor buffers
++             * keep the minimum (their sampler address space is the device's own limit). */
++            if (!device->vk_info.EXT_descriptor_buffer &&
++                    device->device_info.vulkan_1_2_properties.maxDescriptorSetUpdateAfterBindSamplers >= VKD3D_EXPANDED_SAMPLER_DESCRIPTOR_COUNT &&
++                    device->device_info.vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindSamplers >= VKD3D_EXPANDED_SAMPLER_DESCRIPTOR_COUNT)
++                return VKD3D_EXPANDED_SAMPLER_DESCRIPTOR_COUNT;
+             return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
+ 
+         default:
+@@ -9702,8 +9707,11 @@ static void d3d12_device_caps_init_feature_options19(struct d3d12_device *device
+     /* We trivially support this by not validating resource types in rendering
+      * and computing renderArea to be the intersection of all bound views. */
+     options19->MismatchingOutputDimensionsSupported = TRUE;
+-    /* Requires SampleCount > 1 for pipelinesm, not just ForcedSamplecount */
+-    options19->SupportedSampleCountsWithNoOutputs = 0x1;
++    /* UAV-only rendering at the pipeline's SampleDesc.Count (not just ForcedSampleCount): without render targets
++     * the draw takes the pipeline's sample count (d3d12_command_list_recompute_fb_size), which Vulkan allows at
++     * framebufferNoAttachmentsSampleCounts */
++    options19->SupportedSampleCountsWithNoOutputs =
++            device->device_info.properties2.properties.limits.framebufferNoAttachmentsSampleCounts & 0x1f;
+     /* D3D12 expectations w.r.t. rounding match Vulkan spec.
+      * However, both AMD and Intel native drivers round to even. RADV has no-trunc-coord workarounds.
+      * Turnip enables round-to-even behavior for vkd3d. Same for ANV. */
+@@ -9715,9 +9723,8 @@ static void d3d12_device_caps_init_feature_options19(struct d3d12_device *device
+     /* We default to a line width of 1.0 anyway */
+     options19->NarrowQuadrilateralLinesSupported = TRUE;
+     options19->AnisoFilterWithPointMipSupported = TRUE;
+-    /* Report legacy D3D12 limits for now. Increasing descriptor count limits
+-     * would require changing changing descriptor set layouts, and more samplers
+-     * need additional considerations w.r.t. Vulkan device limits. */
++    /* The legacy view limit; the expanded sampler heaps where the device takes them
++     * (d3d12_device_get_max_descriptor_heap_size). Static samplers are immutable samplers in their own set. */
+     options19->MaxSamplerDescriptorHeapSize = d3d12_device_get_max_descriptor_heap_size(device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+     options19->MaxSamplerDescriptorHeapSizeWithStaticSamplers = options19->MaxSamplerDescriptorHeapSize;
+     options19->MaxViewDescriptorHeapSize = d3d12_device_get_max_descriptor_heap_size(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 83cfc4b8..556db3a5 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -65,6 +65,7 @@
+ 
+ #define VKD3D_MIN_VIEW_DESCRIPTOR_COUNT (1000000u)
+ #define VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT (2048u)
++#define VKD3D_EXPANDED_SAMPLER_DESCRIPTOR_COUNT (4096u)
+ 
+ #define VKD3D_TILE_SIZE (65536ull)
+ 

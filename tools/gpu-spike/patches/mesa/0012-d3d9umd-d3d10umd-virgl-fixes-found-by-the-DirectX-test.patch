@@ -1,0 +1,978 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: indirect draws, MSAA, subroutine inlining; report feature level 11_0 (stage 4)
+
+- Feature level 11_0 (and 10_1) is reported when the host can do it: compute and tessellation shaders, 4x MSAA
+  and 8 images and shader buffers in pixel and compute shaders. The runtime asks before any device exists, so the
+  adapter reads the virgl caps itself (D3DKMTEnumAdapters2, the VioGPU adapter's GET_CAPS escape).
+  WINBOAT_D3D_FL11=0 reports 10_0 anyway, =1 11_0 anyway.
+- DrawInstancedIndirect / DrawIndexedInstancedIndirect: D3D's argument layouts are GL's. virglrenderer ignores
+  the index buffer offset in indirect draws: with one, the indices from it on are copied to a temporary buffer
+  (on the GPU). Without host indirect draws (or without an index buffer) the arguments are read back.
+- MSAA: quality levels, MULTISAMPLE_RENDERTARGET/LOAD, ResolveSubresource and DXGI Blt/Blt1 (resolves,
+  conversions and stretches for multisampled swap chains; Blt was a stub), multisampled rasterization. The
+  runtime checks the answers against each other at device creation (a typeless format and the formats it casts
+  to that have MULTISAMPLE_RENDERTARGET report the same quality levels) and refused every device when they
+  disagreed: sample counts are offered per format family.
+- The 11.1 DDI's format caps: vertex and typed buffers, UAV writes, gather.
+- call/callc: virglrenderer has no TGSI subroutines (a shader with them failed and stopped the context's
+  rendering). Calls are inlined, each body in a run-once loop that ret leaves; loops and switches are looked up
+  by token offset (an inlined body is translated once per call).
+- Fixes found on the way:
+  - D24S8 depth buffers were never created: virgl hosts only have GL's packed format (PIPE_FORMAT_S8_UINT_Z24_UNORM).
+  - The pixel shader coverage input (SV_Coverage) was declared as a compute thread ID (its operand type is
+    numbered among them).
+---
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -35,6 +35,7 @@
+ #include "pipe/p_state.h"
+ #include "nir/nir_to_tgsi.h"
+ #include "util/format/u_format.h"
++#include "util/format_srgb.h"
+ #include "indices/u_primconvert.h"
+ #include "util/u_draw.h"
+ #include "util/u_inlines.h"
+@@ -920,6 +921,25 @@
+ {
+    struct virgl_context *vctx = virgl_context(ctx);
+ 
++   /* The host clears on a framebuffer of its own, where GL_FRAMEBUFFER_SRGB is whatever the bound framebuffer
++    * left: an sRGB surface would get the linear color, or not, depending on what's bound. Clear a linear view of
++    * it with the color encoded, as rendering it would store. */
++   if (util_format_is_srgb(dst->format)) {
++      struct pipe_surface templ = *dst;
++      templ.format = util_format_linear(dst->format);
++      struct pipe_surface *linear = ctx->create_surface(ctx, dst->texture, &templ);
++      if (linear) {
++         union pipe_color_union encoded = *color;
++         for (unsigned i = 0; i < 3; i++)
++            encoded.f[i] = util_format_linear_to_srgb_float(color->f[i]);
++         virgl_encode_clear_surface(vctx, linear, PIPE_CLEAR_COLOR0, &encoded,
++                                    dstx, dsty, width, height, render_condition_enabled);
++         pipe_surface_release(ctx, &linear);
++         virgl_resource_dirty(virgl_resource(dst->texture), dst->u.tex.level);
++         return;
++      }
++   }
++
+    virgl_encode_clear_surface(vctx, dst, PIPE_CLEAR_COLOR0, color,
+                              dstx, dsty, width, height, render_condition_enabled);
+ 
+diff --git a/src/gallium/drivers/virgl/virgl_query.c b/src/gallium/drivers/virgl/virgl_query.c
+--- a/src/gallium/drivers/virgl/virgl_query.c
++++ b/src/gallium/drivers/virgl/virgl_query.c
+@@ -43,6 +43,11 @@
+ 
+    bool ready;
+    uint64_t result;
++
++   /* Queries the host has no single query for, made of host queries: PIPE_QUERY_PIPELINE_STATISTICS (one per
++    * statistic) and PIPE_QUERY_SO_STATISTICS (primitives emitted, generated) */
++   unsigned num_parts;
++   struct virgl_query *parts[PIPE_STAT_QUERY_CS_INVOCATIONS + 1];
+ };
+ 
+ #define VIRGL_QUERY_OCCLUSION_COUNTER     0
+@@ -74,6 +79,7 @@
+    VIRGL_QUERY_SO_OVERFLOW_ANY_PREDICATE,
+    VIRGL_QUERY_GPU_FINISHED,
+    VIRGL_QUERY_PIPELINE_STATISTICS,
++   VIRGL_QUERY_PIPELINE_STATISTICS, /* PIPE_QUERY_PIPELINE_STATISTICS_SINGLE: the host's query is per statistic */
+ };
+ 
+ static int pipe_to_virgl_query(enum pipe_query_type ptype)
+@@ -119,6 +125,9 @@
+    virgl_encoder_render_condition(vctx, handle, condition, mode);
+ }
+ 
++static void virgl_destroy_query(struct pipe_context *ctx,
++                                struct pipe_query *q);
++
+ static struct pipe_query *virgl_create_query(struct pipe_context *ctx,
+                                             unsigned query_type, unsigned index)
+ {
+@@ -131,8 +140,30 @@
+ 
+    query->type = query_type;
+ 
+-   if (query->type == PIPE_QUERY_GPU_FINISHED)
++   /* No host query: the host's timestamps are nanoseconds (GL_TIMESTAMP) and never disjoint. virglrenderer doesn't
++    * know the type, and a query it can't make is a context error that stops all later rendering. */
++   if (query->type == PIPE_QUERY_GPU_FINISHED || query->type == PIPE_QUERY_TIMESTAMP_DISJOINT)
++      return (struct pipe_query *)query;
++
++   if (query->type == PIPE_QUERY_PIPELINE_STATISTICS || query->type == PIPE_QUERY_SO_STATISTICS) {
++      if (query->type == PIPE_QUERY_PIPELINE_STATISTICS) {
++         query->num_parts = PIPE_STAT_QUERY_CS_INVOCATIONS + 1;
++         for (unsigned i = 0; i < query->num_parts; i++)
++            query->parts[i] = (struct virgl_query *)
++               virgl_create_query(ctx, PIPE_QUERY_PIPELINE_STATISTICS_SINGLE, i);
++      } else {
++         query->num_parts = 2;
++         query->parts[0] = (struct virgl_query *)virgl_create_query(ctx, PIPE_QUERY_PRIMITIVES_EMITTED, index);
++         query->parts[1] = (struct virgl_query *)virgl_create_query(ctx, PIPE_QUERY_PRIMITIVES_GENERATED, index);
++      }
++      for (unsigned i = 0; i < query->num_parts; i++) {
++         if (!query->parts[i]) {
++            virgl_destroy_query(ctx, (struct pipe_query *)query);
++            return NULL;
++         }
++      }
+       return (struct pipe_query *)query;
++   }
+ 
+    query->buf = (struct virgl_resource *)
+       pipe_buffer_create(ctx->screen, PIPE_BIND_CUSTOM, PIPE_USAGE_STAGING,
+@@ -146,7 +177,7 @@
+    query->result_size = (query_type == PIPE_QUERY_TIMESTAMP ||
+                          query_type == PIPE_QUERY_TIME_ELAPSED) ? 8 : 4;
+ 
+-   if (query_type == PIPE_QUERY_PIPELINE_STATISTICS) {
++   if (query_type == PIPE_QUERY_PIPELINE_STATISTICS_SINGLE) {
+       query->pipeline_stats = index;
+ 
+       index = pipe_stats_query_to_virgl(index);
+@@ -170,7 +201,13 @@
+    struct virgl_context *vctx = virgl_context(ctx);
+    struct virgl_query *query = virgl_query(q);
+ 
+-   if (query->type == PIPE_QUERY_GPU_FINISHED) {
++   if (query->num_parts) {
++      for (unsigned i = 0; i < query->num_parts; i++) {
++         if (query->parts[i])
++            virgl_destroy_query(ctx, (struct pipe_query *)query->parts[i]);
++      }
++   } else if (query->type == PIPE_QUERY_TIMESTAMP_DISJOINT) {
++   } else if (query->type == PIPE_QUERY_GPU_FINISHED) {
+       ctx->screen->fence_reference(ctx->screen, &query->fence, NULL);
+    } else {
+       virgl_encode_delete_object(vctx, query->handle, VIRGL_OBJECT_QUERY);
+@@ -186,6 +223,11 @@
+    struct virgl_context *vctx = virgl_context(ctx);
+    struct virgl_query *query = virgl_query(q);
+ 
++   for (unsigned i = 0; i < query->num_parts; i++)
++      virgl_begin_query(ctx, (struct pipe_query *)query->parts[i]);
++   if (query->num_parts || query->type == PIPE_QUERY_TIMESTAMP_DISJOINT)
++      return true;
++
+    virgl_encoder_begin_query(vctx, query->handle);
+ 
+    return true;
+@@ -199,6 +241,15 @@
+    struct virgl_query *query = virgl_query(q);
+    struct virgl_host_query_state *host_state;
+ 
++   if (query->num_parts) {
++      bool ok = true;
++      for (unsigned i = 0; i < query->num_parts; i++)
++         ok &= virgl_end_query(ctx, (struct pipe_query *)query->parts[i]);
++      return ok;
++   }
++   if (query->type == PIPE_QUERY_TIMESTAMP_DISJOINT)
++      return true;
++
+    if (query->type == PIPE_QUERY_GPU_FINISHED) {
+       ctx->flush(ctx, &query->fence, PIPE_FLUSH_DEFERRED);
+       return true;
+@@ -227,6 +278,31 @@
+ {
+    struct virgl_query *query = virgl_query(q);
+ 
++   if (query->type == PIPE_QUERY_TIMESTAMP_DISJOINT) {
++      result->timestamp_disjoint.frequency = 1000000000;
++      result->timestamp_disjoint.disjoint = false;
++      return true;
++   }
++
++   if (query->num_parts) {
++      union pipe_query_result part;
++      for (unsigned i = 0; i < query->num_parts; i++) {
++         if (!virgl_get_query_result(ctx, (struct pipe_query *)query->parts[i], wait, &part))
++            return false;
++         if (query->type == PIPE_QUERY_PIPELINE_STATISTICS)
++            result->pipeline_statistics.counters[i] = part.u64;
++         else if (i == 0)
++            result->so_statistics.num_primitives_written = part.u64;
++         else
++            result->so_statistics.primitives_storage_needed = part.u64;
++      }
++      if (query->type == PIPE_QUERY_PIPELINE_STATISTICS) {
++         for (unsigned i = query->num_parts; i < ARRAY_SIZE(result->pipeline_statistics.counters); i++)
++            result->pipeline_statistics.counters[i] = 0;
++      }
++      return true;
++   }
++
+    if (query->type == PIPE_QUERY_GPU_FINISHED) {
+       struct pipe_screen *screen = ctx->screen;
+ 
+@@ -280,21 +356,8 @@
+       query->ready = true;
+    }
+ 
+-   switch (query->pipeline_stats) {
+-   case PIPE_STAT_QUERY_IA_VERTICES: result->pipeline_statistics.ia_vertices = query->result; break;
+-   case PIPE_STAT_QUERY_IA_PRIMITIVES: result->pipeline_statistics.ia_primitives = query->result; break;
+-   case PIPE_STAT_QUERY_VS_INVOCATIONS: result->pipeline_statistics.vs_invocations = query->result; break;
+-   case PIPE_STAT_QUERY_GS_INVOCATIONS: result->pipeline_statistics.gs_invocations = query->result; break;
+-   case PIPE_STAT_QUERY_GS_PRIMITIVES: result->pipeline_statistics.gs_primitives = query->result; break;
+-   case PIPE_STAT_QUERY_PS_INVOCATIONS: result->pipeline_statistics.ps_invocations = query->result; break;
+-   case PIPE_STAT_QUERY_HS_INVOCATIONS: result->pipeline_statistics.hs_invocations = query->result; break;
+-   case PIPE_STAT_QUERY_CS_INVOCATIONS: result->pipeline_statistics.cs_invocations = query->result; break;
+-   case PIPE_STAT_QUERY_C_INVOCATIONS: result->pipeline_statistics.c_invocations = query->result; break;
+-   case PIPE_STAT_QUERY_C_PRIMITIVES: result->pipeline_statistics.c_primitives = query->result; break;
+-   case PIPE_STAT_QUERY_DS_INVOCATIONS: result->pipeline_statistics.ds_invocations = query->result; break;
+-   default:
+-      result->u64 = query->result;
+-   }
++   /* PIPE_QUERY_PIPELINE_STATISTICS_SINGLE too */
++   result->u64 = query->result;
+ 
+    return true;
+ }
+@@ -317,6 +380,17 @@
+    struct virgl_query *query = virgl_query(q);
+    struct virgl_resource *qbo = (struct virgl_resource *)resource;
+ 
++   /* A statistic of a composite query is its part's result */
++   if (query->num_parts) {
++      unsigned part = query->type == PIPE_QUERY_SO_STATISTICS ? (index == 1) : (unsigned)MAX2(index, 0);
++      if (part >= query->num_parts)
++         return;
++      query = query->parts[part];
++      index = index < 0 ? index : 0; /* -1 asks for availability */
++   }
++   if (query->type == PIPE_QUERY_TIMESTAMP_DISJOINT)
++      return;
++
+    virgl_resource_dirty(qbo, 0);
+    virgl_encode_get_query_result_qbo(vctx, query->handle, qbo, (flags & PIPE_QUERY_WAIT), result_type, offset, index);
+ }
+diff --git a/src/gallium/drivers/virgl/virgl_resource.c b/src/gallium/drivers/virgl/virgl_resource.c
+--- a/src/gallium/drivers/virgl/virgl_resource.c
++++ b/src/gallium/drivers/virgl/virgl_resource.c
+@@ -653,6 +653,13 @@
+    vflags = pipe_to_virgl_flags(vs, templ->flags);
+    virgl_resource_layout(&res->b, &res->metadata, 0, 0, 0, 0);
+ 
++   /* virglrenderer takes a buffer with several bind flags only when one of them is the sampler view's (it makes
++    * it a texture buffer); others are refused, and the missing resource's first use fails the whole context. D3D
++    * buffers are often vertex and index, or vertex and stream output, buffers at once. */
++   if (templ->target == PIPE_BUFFER && util_bitcount(vbind) > 1 &&
++       !(vbind & (VIRGL_BIND_SAMPLER_VIEW | VIRGL_BIND_CUSTOM | VIRGL_BIND_STAGING)))
++      vbind |= VIRGL_BIND_SAMPLER_VIEW;
++
+    if ((vs->caps.caps.v2.capability_bits & VIRGL_CAP_APP_TWEAK_SUPPORT) &&
+        vs->tweak_gles_emulate_bgra &&
+       (templ->format == PIPE_FORMAT_B8G8R8A8_SRGB ||
+diff --git a/src/gallium/drivers/virgl/virgl_screen.c b/src/gallium/drivers/virgl/virgl_screen.c
+--- a/src/gallium/drivers/virgl/virgl_screen.c
++++ b/src/gallium/drivers/virgl/virgl_screen.c
+@@ -229,6 +229,8 @@
+    case PIPE_CAP_ENDIANNESS:
+       return 0;
+    case PIPE_CAP_QUERY_PIPELINE_STATISTICS:
++   /* The host's queries are per statistic: GL gets one each; PIPE_QUERY_PIPELINE_STATISTICS makes all of them */
++   case PIPE_CAP_QUERY_PIPELINE_STATISTICS_SINGLE:
+       return !!(vscreen->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY);
+    case PIPE_CAP_MIXED_FRAMEBUFFER_SIZES:
+    case PIPE_CAP_MIXED_COLOR_DEPTH_BITS:
+diff --git a/src/gallium/drivers/virgl/virgl_streamout.c b/src/gallium/drivers/virgl/virgl_streamout.c
+--- a/src/gallium/drivers/virgl/virgl_streamout.c
++++ b/src/gallium/drivers/virgl/virgl_streamout.c
+@@ -76,6 +76,13 @@
+ {
+    struct virgl_context *vctx = virgl_context(ctx);
+    int i;
++
++   /* Unbinding comes as NULL targets (D3D's SoSetTargets): without the trailing ones. virglrenderer makes a transform
++    * feedback object for any list of targets, also an empty one, and begins it at the next draw, which fails
++    * (GL_INVALID_OPERATION) and stops all the context's later rendering. */
++   while (num_targets && !targets[num_targets - 1])
++      num_targets--;
++
+    for (i = 0; i < num_targets; i++) {
+       if (targets[i]) {
+          struct virgl_winsys *vws = virgl_screen(vctx->base.screen)->vws;
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -372,6 +372,8 @@
+ 
+    pipe->bind_fs_state(pipe, NULL);
+    pipe->bind_vs_state(pipe, NULL);
++   if (pDevice->so_vs_handle)
++      pipe->delete_vs_state(pipe, pDevice->so_vs_handle);
+    cso_destroy_context(pDevice->cso);
+ 
+    DeleteEmptyShader(pDevice, PIPE_SHADER_FRAGMENT, pDevice->empty_fs);
+diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/Draw.cpp
+@@ -70,37 +70,41 @@
+ }
+ 
+ /*
+- * We have to resolve the stream output state for empty geometry shaders.
+- * In particular we've remapped the output indices when translating the
+- * shaders so now the register_index variables in the stream output
+- * state are incorrect and we need to remap them back to the correct
+- * state.
++ * Stream output without a geometry shader: the GS bound is an "empty" one, a declaration of which vertex shader
++ * outputs to write. Gallium streams out from the last vertex stage, so the vertex shader gets the declaration: a
++ * translation of it with the declaration's registers mapped to its outputs, made for the pair and bound for the
++ * draw.
+  */
+ static void
+ ResolveState(Device *pDevice)
+ {
+-   if (pDevice->bound_empty_gs && pDevice->bound_vs &&
+-       pDevice->bound_vs->state.tokens) {
++   struct pipe_context *pipe = pDevice->pipe;
++   Shader *vs = pDevice->bound_vs;
++   if (pDevice->bound_empty_gs && vs && vs->state.tokens) {
+       Shader *gs = pDevice->bound_empty_gs;
+-      Shader *vs = pDevice->bound_vs;
+-      bool remapped = false;
+-      struct pipe_context *pipe = pDevice->pipe;
+-      if (!gs->output_resolved) {
+-         for (unsigned i = 0; i < gs->state.stream_output.num_outputs; ++i) {
+-            unsigned mapping =
+-               ShaderFindOutputMapping(vs, gs->state.stream_output.output[i].register_index);
+-            if (mapping != gs->state.stream_output.output[i].register_index) {
+-               gs->state.stream_output.output[i].register_index = mapping;
+-               remapped = true;
+-            }
+-         }
+-         if (remapped) {
+-            pipe->delete_gs_state(pipe, gs->handle);
+-            gs->handle = pipe->create_gs_state(pipe, &gs->state);
++      if (!pDevice->so_vs_handle || pDevice->so_vs_vs != vs || pDevice->so_vs_gs != gs) {
++         if (pDevice->so_vs_handle) {
++            if (pDevice->so_vs_bound)
++               pipe->bind_vs_state(pipe, pDevice->empty_vs);
++            pipe->delete_vs_state(pipe, pDevice->so_vs_handle);
+          }
+-         gs->output_resolved = true;
++         struct pipe_shader_state state = vs->state;
++         state.stream_output = gs->state.stream_output;
++         for (unsigned i = 0; i < state.stream_output.num_outputs; ++i)
++            state.stream_output.output[i].register_index =
++               ShaderFindOutputMapping(vs, gs->state.stream_output.output[i].register_index);
++         pDevice->so_vs_handle = pipe->create_vs_state(pipe, &state);
++         pDevice->so_vs_vs = vs;
++         pDevice->so_vs_gs = gs;
++         pDevice->so_vs_bound = false;
++      }
++      if (!pDevice->so_vs_bound) {
++         pipe->bind_vs_state(pipe, pDevice->so_vs_handle);
++         pDevice->so_vs_bound = true;
+       }
+-      pipe->bind_gs_state(pipe, gs->handle);
++   } else if (pDevice->so_vs_bound) {
++      pipe->bind_vs_state(pipe, vs && vs->handle ? vs->handle : pDevice->empty_vs);
++      pDevice->so_vs_bound = false;
+    }
+    update_velems(pDevice);
+    ShaderBindTexSlots(pDevice);
+@@ -476,7 +480,9 @@
+    info.mode = pDevice->primitive;
+    memset(&indirect, 0, sizeof indirect);
+    indirect.count_from_stream_output = pDevice->draw_so_target;
++   /* Drivers read the draw even when the count comes from elsewhere */
++   struct pipe_draw_start_count_bias draw = {};
+ 
+-   pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, &indirect, NULL, 1);
++   pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, &indirect, &draw, 1);
+    PostDraw(pDevice);
+ }
+diff --git a/src/gallium/frontends/d3d10umd/Query.cpp b/src/gallium/frontends/d3d10umd/Query.cpp
+--- a/src/gallium/frontends/d3d10umd/Query.cpp
++++ b/src/gallium/frontends/d3d10umd/Query.cpp
+@@ -78,12 +78,37 @@
+       return PIPE_QUERY_SO_STATISTICS;
+    case D3D10DDI_QUERY_STREAMOVERFLOWPREDICATE:
+       return PIPE_QUERY_SO_OVERFLOW_PREDICATE;
++   /* Feature level 11: statistics with the hull, domain and compute shaders' counts, and per-stream queries */
++   case D3D11DDI_QUERY_PIPELINESTATS:
++      return PIPE_QUERY_PIPELINE_STATISTICS;
++   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM0:
++   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM1:
++   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM2:
++   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM3:
++      return PIPE_QUERY_SO_STATISTICS;
++   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM0:
++   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM1:
++   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM2:
++   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM3:
++      return PIPE_QUERY_SO_OVERFLOW_PREDICATE;
+    default:
+       LOG_UNSUPPORTED(true);
+       return PIPE_QUERY_TYPES;
+    }
+ }
+ 
++/* The stream of a per-stream query (feature level 11) */
++static unsigned
++QueryStream(D3D10DDI_QUERY query)
++{
++   if (query >= D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM0 && query <= D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM3)
++      return query - D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM0;
++   if (query >= D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM0 &&
++       query <= D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM3)
++      return query - D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM0;
++   return 0;
++}
++
+ 
+ /*
+  * ----------------------------------------------------------------------
+@@ -116,7 +141,7 @@
+ 
+    pQuery->pipe_type = TranslateQueryType(pCreateQuery->Query);
+    if (pQuery->pipe_type < PIPE_QUERY_TYPES) {
+-      pQuery->handle = pipe->create_query(pipe, pQuery->pipe_type, 0);
++      pQuery->handle = pipe->create_query(pipe, pQuery->pipe_type, QueryStream(pCreateQuery->Query));
+    }
+ }
+ 
+@@ -267,6 +292,10 @@
+       case D3D10DDI_QUERY_EVENT:
+       case D3D10DDI_QUERY_OCCLUSIONPREDICATE:
+       case D3D10DDI_QUERY_STREAMOVERFLOWPREDICATE:
++      case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM0:
++      case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM1:
++      case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM2:
++      case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM3:
+          *(BOOL *)pData = result.b;
+          break;
+       case D3D10DDI_QUERY_OCCLUSION:
+@@ -293,11 +322,29 @@
+             pResult->CInvocations = result.pipeline_statistics.c_invocations;
+             pResult->CPrimitives = result.pipeline_statistics.c_primitives;
+             pResult->PSInvocations = result.pipeline_statistics.ps_invocations;
+-            //pResult->HSInvocations = result.pipeline_statistics.hs_invocations;
+-            //pResult->DSInvocations = result.pipeline_statistics.ds_invocations;
+-            //pResult->CSInvocations = result.pipeline_statistics.cs_invocations;
+          }
+          break;
++      case D3D11DDI_QUERY_PIPELINESTATS:
++         {
++            D3D11_DDI_QUERY_DATA_PIPELINE_STATISTICS *pResult =
++              (D3D11_DDI_QUERY_DATA_PIPELINE_STATISTICS *)pData;
++            pResult->IAVertices = result.pipeline_statistics.ia_vertices;
++            pResult->IAPrimitives = result.pipeline_statistics.ia_primitives;
++            pResult->VSInvocations = result.pipeline_statistics.vs_invocations;
++            pResult->GSInvocations = result.pipeline_statistics.gs_invocations;
++            pResult->GSPrimitives = result.pipeline_statistics.gs_primitives;
++            pResult->CInvocations = result.pipeline_statistics.c_invocations;
++            pResult->CPrimitives = result.pipeline_statistics.c_primitives;
++            pResult->PSInvocations = result.pipeline_statistics.ps_invocations;
++            pResult->HSInvocations = result.pipeline_statistics.hs_invocations;
++            pResult->DSInvocations = result.pipeline_statistics.ds_invocations;
++            pResult->CSInvocations = result.pipeline_statistics.cs_invocations;
++         }
++         break;
++      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM0:
++      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM1:
++      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM2:
++      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM3:
+       case D3D10DDI_QUERY_STREAMOUTPUTSTATS:
+          {
+             D3D10_DDI_QUERY_DATA_SO_STATISTICS *pResult =
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -599,9 +599,24 @@
+ {
+    LOG_ENTRYPOINT();
+ 
++   Device *pDevice = CastDevice(hDevice);
+    struct pipe_context *pipe = CastPipeContext(hDevice);
+    Shader *pShader = CastShader(hShader);
+ 
++   /* The stream output vertex shader made with it */
++   if (pDevice->so_vs_handle && (pDevice->so_vs_vs == pShader || pDevice->so_vs_gs == pShader)) {
++      if (pDevice->so_vs_bound) {
++         pipe->bind_vs_state(pipe, pDevice->bound_vs && pDevice->bound_vs->handle ? pDevice->bound_vs->handle
++                                                                                  : pDevice->empty_vs);
++         pDevice->so_vs_bound = false;
++      }
++      pipe->delete_vs_state(pipe, pDevice->so_vs_handle);
++      pDevice->so_vs_handle = NULL;
++      pDevice->so_vs_vs = pDevice->so_vs_gs = NULL;
++   }
++   if (pDevice->bound_empty_gs == pShader)
++      pDevice->bound_empty_gs = NULL;
++
+    if (pShader->handle) {
+       switch (pShader->type) {
+       case PIPE_SHADER_FRAGMENT:
+@@ -909,6 +924,7 @@
+    }
+ 
+    pipe->bind_vs_state(pipe, state);
++   pDevice->so_vs_bound = false;
+ }
+ 
+ 
+@@ -1047,6 +1063,7 @@
+    pDevice->bindings_dirty[PIPE_SHADER_GEOMETRY] = true;
+    if (pShader && !pShader->state.tokens) {
+       pDevice->bound_empty_gs = pShader;
++      pipe->bind_gs_state(pipe, NULL);
+    } else {
+       pDevice->bound_empty_gs = NULL;
+       pipe->bind_gs_state(pipe, state);
+@@ -1229,6 +1246,7 @@
+       total_components[pOutputStreamDecl->OutputSlot] += num_components;
+    }
+    pShader->state.stream_output.num_outputs = pData->NumEntries - num_holes;
++   /* Without code the outputs are the vertex shader's: its translation goes with the declaration (ResolveState) */
+    for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; ++i) {
+       /* stream_output.stride[i] is in dwords */
+       if (all_slot_zero) {
+@@ -1239,7 +1257,7 @@
+       }
+    }
+ 
+-   pShader->handle = pipe->create_gs_state(pipe, &pShader->state);
++   pShader->handle = pShader->state.tokens ? pipe->create_gs_state(pipe, &pShader->state) : NULL;
+ }
+ 
+ 
+@@ -1290,11 +1308,12 @@
+             resource->so_target = so_target;
+          }
+       }
+-      pDevice->so_targets[i] = so_target;
++      /* The device holds references of its own (DestroyDevice drops them; a resource's may be replaced) */
++      pipe_so_target_reference(&pDevice->so_targets[i], so_target);
+    }
+ 
+    for (i = 0; i < ClearTargets; ++i) {
+-      pDevice->so_targets[SOTargets + i] = NULL;
++      pipe_so_target_reference(&pDevice->so_targets[SOTargets + i], NULL);
+    }
+ 
+    if (!pipe->set_stream_output_targets) {
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -116,6 +116,11 @@
+    struct pipe_stream_output_target *draw_so_target;
+    Shader *bound_empty_gs;
+    Shader *bound_vs;
++   /* Stream output without a geometry shader (an "empty" one, with only the declaration): the vertex shader with
++    * the declaration, made at draw time for that pair (ResolveState) */
++   void *so_vs_handle;
++   Shader *so_vs_vs, *so_vs_gs;
++   bool so_vs_bound;
+    Shader *bound_shader[PIPE_SHADER_TYPES];      /* whose bindings to bind (Shader_bindings) */
+    bool bindings_dirty[PIPE_SHADER_TYPES];
+    struct ShaderResourceView *srvs[PIPE_SHADER_TYPES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
+diff --git a/src/gallium/frontends/nine/basetexture9.c b/src/gallium/frontends/nine/basetexture9.c
+--- a/src/gallium/frontends/nine/basetexture9.c
++++ b/src/gallium/frontends/nine/basetexture9.c
+@@ -514,6 +514,11 @@
+             swizzle[2] = PIPE_SWIZZLE_X;
+             swizzle[3] = PIPE_SWIZZLE_X;
+         }
++    } else if (This->format == D3DFMT_A8L8 && resource->format == PIPE_FORMAT_R8G8_UNORM) {
++        /* A8L8 kept as R8G8 (d3d9_to_pipe_format_checked): luminance in r, alpha in g */
++        swizzle[1] = PIPE_SWIZZLE_X;
++        swizzle[2] = PIPE_SWIZZLE_X;
++        swizzle[3] = PIPE_SWIZZLE_Y;
+     } else if (resource->format == PIPE_FORMAT_RGTC2_UNORM) {
+         swizzle[0] = PIPE_SWIZZLE_Y;
+         swizzle[1] = PIPE_SWIZZLE_X;
+diff --git a/src/gallium/frontends/nine/nine_pipe.h b/src/gallium/frontends/nine/nine_pipe.h
+--- a/src/gallium/frontends/nine/nine_pipe.h
++++ b/src/gallium/frontends/nine/nine_pipe.h
+@@ -319,6 +319,14 @@
+      * isn't limited to the formats supported by the
+      * device, and to check we are not using a format
+      * fallback. */
++    /* virgl's hosts have no L8A8 (the GL core profile has no luminance-alpha formats): R8G8 holds the same bytes
++     * and the sampler view swizzles it (NineBaseTexture9_UpdateSamplerView). Also when the check is bypassed, so
++     * that the resource and its lock format agree and locks need no conversion. Not for rendering: the shader's
++     * alpha would land in the luminance's neighbor. */
++    if (format == D3DFMT_A8L8 && !srgb && !(bindings & PIPE_BIND_RENDER_TARGET) &&
++        !format_check_internal(result) && format_check_internal(PIPE_FORMAT_R8G8_UNORM))
++        return PIPE_FORMAT_R8G8_UNORM;
++
+     if (bypass_check || format_check_internal(result))
+         return result;
+ 
+diff --git a/src/gallium/frontends/nine/nine_shader.c b/src/gallium/frontends/nine/nine_shader.c
+--- a/src/gallium/frontends/nine/nine_shader.c
++++ b/src/gallium/frontends/nine/nine_shader.c
+@@ -3234,10 +3234,20 @@
+ static const struct sm1_op_info inst_comment =
+     _OPI(COMMENT, NOP, V(0,0), V(3,0), V(0,0), V(3,0), 0, 0, SPECIAL(COMMENT));
+ 
++/* The version the instruction table is checked against. vs_2_x and ps_2_x shaders carry the 2.0 version token
++ * (the 2_x instructions are enabled by the caps), so 2.0 shaders may use them: Windows' own fixed-function to
++ * vertex shader conversion emits ifc in vs_2_0 shaders, for one. */
++static inline unsigned
++sm1_op_version(const struct shader_translator *tx)
++{
++    const unsigned version = (tx->version.major << 8) | tx->version.minor;
++    return version == 0x200 ? 0x201 : version;
++}
++
+ static void
+ create_op_info_map(struct shader_translator *tx)
+ {
+-    const unsigned version = (tx->version.major << 8) | tx->version.minor;
++    const unsigned version = sm1_op_version(tx);
+     unsigned i;
+ 
+     for (i = 0; i < ARRAY_SIZE(tx->op_info_map); ++i)
+@@ -3535,7 +3545,7 @@
+     {
+         unsigned min = IS_VS ? info->vert_version.min : info->frag_version.min;
+         unsigned max = IS_VS ? info->vert_version.max : info->frag_version.max;
+-        unsigned ver = (tx->version.major << 8) | tx->version.minor;
++        unsigned ver = sm1_op_version(tx);
+         if (ver < min || ver > max) {
+             DBG("opcode not supported in this shader version: %x <= %x <= %x\n",
+                 min, ver, max);
+diff --git a/src/gallium/frontends/d3d9umd/caps.cpp b/src/gallium/frontends/d3d9umd/caps.cpp
+--- a/src/gallium/frontends/d3d9umd/caps.cpp
++++ b/src/gallium/frontends/d3d9umd/caps.cpp
+@@ -158,12 +158,15 @@
+       return S_OK;
+    }
+    case D3DDDICAPS_GETD3DQUERYCOUNT:
+-      return Put(p, (UINT)2);
++      return Put(p, (UINT)(nddi_adapter_has_timestamps(adapter->nine) ? 5 : 2));
+    case D3DDDICAPS_GETD3DQUERYDATA: {
+-      const D3DDDIQUERYTYPE queries[] = {D3DDDIQUERYTYPE_EVENT, D3DDDIQUERYTYPE_OCCLUSION};
+-      if (!p->pData || p->DataSize < sizeof(queries))
++      const D3DDDIQUERYTYPE queries[] = {D3DDDIQUERYTYPE_EVENT, D3DDDIQUERYTYPE_OCCLUSION,
++                                         D3DDDIQUERYTYPE_TIMESTAMP, D3DDDIQUERYTYPE_TIMESTAMPDISJOINT,
++                                         D3DDDIQUERYTYPE_TIMESTAMPFREQ};
++      UINT count = nddi_adapter_has_timestamps(adapter->nine) ? 5 : 2;
++      if (!p->pData || p->DataSize < count * sizeof(queries[0]))
+          return E_INVALIDARG;
+-      memcpy(p->pData, queries, sizeof(queries));
++      memcpy(p->pData, queries, count * sizeof(queries[0]));
+       return S_OK;
+    }
+    case D3DDDICAPS_GETD3D3CAPS: {
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h b/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
+--- a/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
++++ b/src/gallium/frontends/d3d9umd/d3d9umd_bridge.h
+@@ -59,6 +59,8 @@
+                                uint32_t rtype, uint32_t format);
+ 
+ /* IDirect3D9::CheckDeviceMultiSampleType; returns false if unsupported */
++/* Timestamp queries (TIMESTAMP, TIMESTAMPDISJOINT, TIMESTAMPFREQ) */
++bool nddi_adapter_has_timestamps(struct nddi_adapter *adapter);
+ bool nddi_adapter_check_multisample(struct nddi_adapter *adapter, uint32_t format, uint32_t samples,
+                                     uint32_t *quality_levels);
+ 
+@@ -94,6 +96,7 @@
+    bool system_memory;
+    void *const *sysmem;
+    const uint32_t *sysmem_pitch;
++   const uint32_t *sysmem_slice_pitch; /* volume textures */
+ };
+ 
+ int32_t nddi_resource_create(struct nddi_device *dev, const struct nddi_resource_desc *desc,
+@@ -115,6 +118,10 @@
+  * filter is D3DTEXTUREFILTERTYPE. */
+ int32_t nddi_blt(struct nddi_device *dev, struct nddi_resource *src, unsigned src_sub, const struct nddi_rect *src_rect,
+                  struct nddi_resource *dst, unsigned dst_sub, const struct nddi_rect *dst_rect, uint32_t filter);
++/* Copies a box of a volume texture level to another volume texture's level (UpdateTexture for volumes) */
++int32_t nddi_volume_blt(struct nddi_device *dev, struct nddi_resource *src, unsigned src_level,
++                        const struct nddi_box *src_box, struct nddi_resource *dst, unsigned dst_level, uint32_t dst_x,
++                        uint32_t dst_y, uint32_t dst_z);
+ int32_t nddi_color_fill(struct nddi_device *dev, struct nddi_resource *res, unsigned subresource,
+                         const struct nddi_rect *rect, uint32_t color);
+ 
+diff --git a/src/gallium/frontends/d3d9umd/device.cpp b/src/gallium/frontends/d3d9umd/device.cpp
+--- a/src/gallium/frontends/d3d9umd/device.cpp
++++ b/src/gallium/frontends/d3d9umd/device.cpp
+@@ -105,7 +105,7 @@
+    desc.fvf = p->Fvf;
+ 
+    std::vector<void *> sysmem;
+-   std::vector<uint32_t> pitches;
++   std::vector<uint32_t> pitches, slicePitches;
+    if (p->Pool == D3DDDIPOOL_SYSTEMMEM) {
+       desc.system_memory = true;
+       for (UINT i = 0; i < p->SurfCount; i++) {
+@@ -113,9 +113,11 @@
+          D3D9UMD_TRACE("  surface %u: system memory %p pitch %u", i, p->pSurfList[i].pSysMem,
+                        p->pSurfList[i].SysMemPitch);
+          pitches.push_back(p->pSurfList[i].SysMemPitch);
++         slicePitches.push_back(p->pSurfList[i].SysMemSlicePitch);
+       }
+       desc.sysmem = sysmem.data();
+       desc.sysmem_pitch = pitches.data();
++      desc.sysmem_slice_pitch = slicePitches.data();
+    }
+ 
+    D3D9UmdResource *res = new (std::nothrow) D3D9UmdResource();
+diff --git a/src/gallium/frontends/d3d9umd/nine_bridge.c b/src/gallium/frontends/d3d9umd/nine_bridge.c
+--- a/src/gallium/frontends/d3d9umd/nine_bridge.c
++++ b/src/gallium/frontends/d3d9umd/nine_bridge.c
+@@ -25,6 +25,7 @@
+ #include "surface9.h"
+ #include "texture9.h"
+ #include "vertexbuffer9.h"
++#include "volume9.h"
+ #include "volumetexture9.h"
+ 
+ #include "pipe/p_screen.h"
+@@ -74,6 +75,7 @@
+    unsigned levels;
+    unsigned subresource_count;
+    struct NineSurface9 **sysmem;     /* system memory: one surface wrapping runtime memory per subresource */
++   struct NineVolume9 **sysmem_volumes; /* system memory volume textures: one volume per level */
+ };
+ 
+ static void
+@@ -148,6 +150,12 @@
+    return SUCCEEDED(hr);
+ }
+ 
++bool
++nddi_adapter_has_timestamps(struct nddi_adapter *adapter)
++{
++   return adapter->ctx.hal->get_param(adapter->ctx.hal, PIPE_CAP_QUERY_TIMESTAMP);
++}
++
+ /* ---- Device ---- */
+ 
+ struct nddi_device *
+@@ -217,6 +225,16 @@
+    }
+ }
+ 
++static struct NineVolume9 *
++nddi_volume(struct nddi_resource *res, unsigned level)
++{
++   if (res->kind != NDDI_VOLUME_TEXTURE || level >= res->subresource_count)
++      return NULL;
++   if (res->sysmem_volumes)
++      return res->sysmem_volumes[level];
++   return NineVolumeTexture9(res->obj)->volumes[level];
++}
++
+ static int32_t
+ nddi_create_sysmem(struct nddi_device *dev, const struct nddi_resource_desc *desc, struct nddi_resource *res)
+ {
+@@ -239,8 +257,32 @@
+       return D3D_OK;
+    }
+    if (desc->kind == NDDI_VOLUME_TEXTURE) {
+-      _debug_printf("d3d9umd: system memory volume textures aren't supported yet\n");
+-      return D3DERR_INVALIDCALL;
++      /* One stand-alone volume per level, its memory swapped for the runtime's */
++      res->subresource_count = desc->levels;
++      res->sysmem_volumes = CALLOC(res->subresource_count, sizeof(*res->sysmem_volumes));
++      if (!res->sysmem_volumes)
++         return E_OUTOFMEMORY;
++      for (unsigned level = 0; level < res->subresource_count; level++) {
++         D3DVOLUME_DESC vd;
++         memset(&vd, 0, sizeof(vd));
++         vd.Format = (D3DFORMAT)desc->format;
++         vd.Type = D3DRTYPE_VOLUME;
++         vd.Pool = D3DPOOL_SYSTEMMEM;
++         vd.Width = MAX2(desc->width >> level, 1);
++         vd.Height = MAX2(desc->height >> level, 1);
++         vd.Depth = MAX2(desc->depth >> level, 1);
++         struct NineVolume9 *vol = NULL;
++         HRESULT hr = NineVolume9_new(dev->device, NULL, NULL, level, &vd, &vol);
++         if (FAILED(hr))
++            return hr;
++         res->sysmem_volumes[level] = vol;
++         align_free(vol->data);
++         vol->data = desc->sysmem[level];
++         vol->stride = desc->sysmem_pitch[level];
++         if (desc->sysmem_slice_pitch && desc->sysmem_slice_pitch[level])
++            vol->layer_stride = desc->sysmem_slice_pitch[level];
++      }
++      return D3D_OK;
+    }
+    unsigned faces = desc->kind == NDDI_CUBE_TEXTURE ? 6 : 1;
+    unsigned levels = desc->kind == NDDI_TEXTURE || desc->kind == NDDI_CUBE_TEXTURE ? desc->levels : 1;
+@@ -352,6 +394,16 @@
+       }
+       FREE(res->sysmem);
+    }
++   if (res->sysmem_volumes) {
++      for (unsigned i = 0; i < res->subresource_count; i++) {
++         if (res->sysmem_volumes[i]) {
++            /* The memory is the runtime's */
++            res->sysmem_volumes[i]->data = NULL;
++            NineUnknown_Release(NineUnknown(res->sysmem_volumes[i]));
++         }
++      }
++      FREE(res->sysmem_volumes);
++   }
+    if (res->obj)
+       NineUnknown_Release(res->obj);
+    FREE(res);
+@@ -384,6 +436,21 @@
+       return NineIndexBuffer9_Lock((struct NineIndexBuffer9 *)res->obj, offset, size, data, flags);
+    }
+    case NDDI_VOLUME_TEXTURE: {
++      if (res->sysmem_volumes) {
++         /* The runtime's own memory */
++         struct NineVolume9 *vol = nddi_volume(res, subresource);
++         if (!vol)
++            return D3DERR_INVALIDCALL;
++         enum pipe_format format = vol->info.format;
++         *data = (uint8_t *)vol->data;
++         if (box)
++            *data = (uint8_t *)*data + box->front * vol->layer_stride +
++                    box->top / util_format_get_blockheight(format) * vol->stride +
++                    util_format_get_stride(format, box->left);
++         *pitch = vol->stride;
++         *slice_pitch = vol->layer_stride;
++         return D3D_OK;
++      }
+       D3DLOCKED_BOX locked;
+       D3DBOX b;
+       if (box) {
+@@ -427,6 +494,8 @@
+    case NDDI_INDEX_BUFFER:
+       return NineIndexBuffer9_Unlock((struct NineIndexBuffer9 *)res->obj);
+    case NDDI_VOLUME_TEXTURE:
++      if (res->sysmem_volumes)
++         return D3D_OK;
+       return NineVolumeTexture9_UnlockBox(NineVolumeTexture9(res->obj), subresource);
+    default: {
+       struct NineSurface9 *surf = nddi_surface(res, subresource);
+@@ -512,6 +581,40 @@
+ }
+ 
+ int32_t
++nddi_volume_blt(struct nddi_device *dev, struct nddi_resource *src, unsigned src_level, const struct nddi_box *src_box,
++                struct nddi_resource *dst, unsigned dst_level, uint32_t dst_x, uint32_t dst_y, uint32_t dst_z)
++{
++   struct NineVolume9 *s = nddi_volume(src, src_level), *d = nddi_volume(dst, dst_level);
++   if (!s || !d)
++      return D3DERR_INVALIDCALL;
++   struct pipe_box box;
++   u_box_3d(src_box->left, src_box->top, src_box->front, src_box->right - src_box->left,
++            src_box->bottom - src_box->top, src_box->back - src_box->front, &box);
++   if (s->desc.Pool == D3DPOOL_SYSTEMMEM && d->desc.Pool != D3DPOOL_SYSTEMMEM) {
++      NineVolume9_CopyMemToDefault(d, s, dst_x, dst_y, dst_z, &box);
++      return D3D_OK;
++   }
++   if (s->desc.Pool == D3DPOOL_SYSTEMMEM && d->desc.Pool == D3DPOOL_SYSTEMMEM && s->desc.Format == d->desc.Format) {
++      /* Row by row, in blocks for compressed formats */
++      enum pipe_format format = s->info.format;
++      unsigned bh = util_format_get_blockheight(format);
++      unsigned row = util_format_get_stride(format, box.width), rows = DIV_ROUND_UP(box.height, bh);
++      for (int z = 0; z < box.depth; z++) {
++         for (unsigned y = 0; y < rows; y++) {
++            const uint8_t *from = (const uint8_t *)s->data + (box.z + z) * s->layer_stride +
++                                  (box.y / bh + y) * s->stride + util_format_get_stride(format, box.x);
++            uint8_t *to = (uint8_t *)d->data + (dst_z + z) * d->layer_stride + (dst_y / bh + y) * d->stride +
++                          util_format_get_stride(format, dst_x);
++            memcpy(to, from, row);
++         }
++      }
++      return D3D_OK;
++   }
++   _debug_printf("d3d9umd: volume copy from pool %u to pool %u isn't supported\n", s->desc.Pool, d->desc.Pool);
++   return D3DERR_INVALIDCALL;
++}
++
++int32_t
+ nddi_color_fill(struct nddi_device *dev, struct nddi_resource *res, unsigned subresource, const struct nddi_rect *rect,
+                 uint32_t color)
+ {
+diff --git a/src/gallium/frontends/d3d9umd/pipeline.cpp b/src/gallium/frontends/d3d9umd/pipeline.cpp
+--- a/src/gallium/frontends/d3d9umd/pipeline.cpp
++++ b/src/gallium/frontends/d3d9umd/pipeline.cpp
+@@ -158,9 +158,9 @@
+ CreateVertexShaderFunc(HANDLE hDevice, D3DDDIARG_CREATEVERTEXSHADERFUNC *p, const UINT *pCode)
+ {
+    nddi_object *shader = NULL;
+-   HRESULT hr = nddi_create_vertex_shader(D3D9UmdCastDevice(hDevice)->nine, (const uint32_t *)pCode, &shader);
+-   D3D9UMD_TRACE("CreateVertexShaderFunc %u bytes -> 0x%08lx", p->Size, hr);
++   /* The code first: the translation is what may fail */
+    if (D3D9UmdTracing()) {
++      D3D9UmdTraceLog("CreateVertexShaderFunc %u bytes:", p->Size);
+       for (UINT i = 0; i < p->Size / 4; i += 8) {
+          char line[128];
+          int n = 0;
+@@ -169,6 +169,8 @@
+          D3D9UmdTraceLog("  %s", line);
+       }
+    }
++   HRESULT hr = nddi_create_vertex_shader(D3D9UmdCastDevice(hDevice)->nine, (const uint32_t *)pCode, &shader);
++   D3D9UMD_TRACE("CreateVertexShaderFunc -> 0x%08lx", hr);
+    p->ShaderHandle = shader;
+    return hr;
+ }
+@@ -341,6 +343,25 @@
+    return hr;
+ }
+ 
++/* UpdateTexture for volume textures: like TexBlt, every level of the destination from the source's matching one */
++static HRESULT APIENTRY
++VolBlt(HANDLE hDevice, const D3DDDIARG_VOLUMEBLT *p)
++{
++   D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
++   D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource), *dst = D3D9UmdCastResource(p->hDstResource);
++   UINT skip = src->surfCount > dst->surfCount ? src->surfCount - dst->surfCount : 0;
++   HRESULT hr = S_OK;
++   for (UINT level = 0; level < dst->surfCount && SUCCEEDED(hr); level++) {
++      UINT sl = level + skip;
++      nddi_box box = {p->SrcBox.Left >> sl, p->SrcBox.Top >> sl, MAX2(p->SrcBox.Right >> sl, 1),
++                      MAX2(p->SrcBox.Bottom >> sl, 1), p->SrcBox.Front >> sl, MAX2(p->SrcBox.Back >> sl, 1)};
++      hr = nddi_volume_blt(dev->nine, src->nine, sl, &box, dst->nine, level, p->DstX >> level, p->DstY >> level,
++                           p->DstZ >> level);
++   }
++   D3D9UMD_TRACE("VolBlt %p -> %p levels %u -> 0x%08lx", src, dst, dst->surfCount, hr);
++   return hr;
++}
++
+ /* ---- Fixed function ---- */
+ 
+ /* The DDI may name the world matrices with their pre-D3D9 numbers */
+@@ -439,7 +460,9 @@
+ IssueQuery(HANDLE hDevice, const D3DDDIARG_ISSUEQUERY *p)
+ {
+    DWORD flags = (p->Flags.Begin ? D3DISSUE_BEGIN : 0) | (p->Flags.End ? D3DISSUE_END : 0);
+-   return nddi_issue_query(Obj(p->hQuery), flags);
++   HRESULT hr = nddi_issue_query(Obj(p->hQuery), flags);
++   D3D9UMD_TRACE("IssueQuery %p flags 0x%x -> 0x%08lx", p->hQuery, p->Flags.Value, hr);
++   return hr;
+ }
+ 
+ static HRESULT APIENTRY
+@@ -447,8 +470,13 @@
+ {
+    nddi_object *query = Obj(p->hQuery);
+    HRESULT hr = nddi_get_query_data(query, p->pData, p->pData ? nddi_get_query_data_size(query) : 0);
+-   /* Not ready yet: the DDI says so with WASSTILLDRAWING */
+-   return hr == S_FALSE ? D3DERR_WASSTILLDRAWING : hr;
++   D3D9UMD_TRACE("GetQueryData %p data %p (%u bytes: 0x%llx) -> 0x%08lx", p->hQuery, p->pData,
++                 nddi_get_query_data_size(query),
++                 hr == S_OK && p->pData && nddi_get_query_data_size(query) >= 8 ? *(unsigned long long *)p->pData
++                 : hr == S_OK && p->pData ? (unsigned long long)*(DWORD *)p->pData : 0ull, hr);
++   /* Not ready yet is S_FALSE: the runtime (CD3DDDIDX10::GetQueryData) takes any failure, WASSTILLDRAWING too, for
++    * a lost device and fails the app's GetData with E_FAIL */
++   return hr;
+ }
+ 
+ void
+@@ -482,6 +510,7 @@
+    f->pfnSetTextureStageState = SetTextureStageState;
+    f->pfnGenerateMipSubLevels = GenerateMipSubLevels;
+    f->pfnTexBlt = TexBlt;
++   f->pfnVolBlt = VolBlt;
+    f->pfnSetTransform = SetTransform;
+    f->pfnMultiplyTransform = MultiplyTransform;
+    f->pfnSetMaterial = SetMaterial;

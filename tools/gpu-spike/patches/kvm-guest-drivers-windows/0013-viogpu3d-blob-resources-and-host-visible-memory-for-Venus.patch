@@ -1,0 +1,1129 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: blob resources and host-visible memory for Venus
+
+Vulkan in the guest (Mesa's Venus driver) keeps its command rings and all
+host-visible device memory in blob resources that the host maps into the
+device's host-visible memory window (virtio shared memory region 1, a 64-bit
+BAR). The driver did not know about blobs, context types or that window.
+
+- Acknowledge VIRTIO_GPU_F_CONTEXT_INIT, and VIRTIO_GPU_F_RESOURCE_BLOB when
+  the device has a host-visible memory window (found by walking the virtio
+  vendor capabilities for a shared memory capability with id 1).
+- RESOURCE_CREATE_BLOB, RESOURCE_MAP_BLOB and RESOURCE_UNMAP_BLOB on the
+  control queue, and fences on a context's ring (VIRTIO_GPU_FLAG_INFO_RING_IDX).
+  A new blob is attached to its context (CTX_ATTACH_RESOURCE): Venus looks
+  the blobs its commands name up in the context, and Linux' driver attaches
+  them the same way.
+- Four escapes for the user-mode Vulkan driver, all per D3DKMT device (its
+  virgl context): VIOGPU_BLOB_CREATE, VIOGPU_BLOB_MAP (maps the blob at a
+  free range of the window, then into the calling process with the caching
+  the host asks for), VIOGPU_BLOB_DESTROY and VIOGPU_EXECBUFFER (submits a
+  command stream on a ring and sets an event when its fence signals; the
+  stream may be empty, which Venus uses just to have a ring's fence signal).
+- Blobs a process leaves behind are unmapped and destroyed with its device.
+- The adapter info reports SupportsBlob, so the user-mode driver can tell.
+
+The window is handed out by a first-fit allocator; dxgkrnl's memory manager
+is not involved, since these allocations never back a D3D resource.
+---
+---
+diff --git a/viogpu/common/viogpu.h b/viogpu/common/viogpu.h
+--- a/viogpu/common/viogpu.h
++++ b/viogpu/common/viogpu.h
+@@ -58,6 +58,9 @@
+     VIRTIO_GPU_CMD_GET_CAPSET_INFO,
+     VIRTIO_GPU_CMD_GET_CAPSET,
+     VIRTIO_GPU_CMD_GET_EDID,
++    VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID,
++    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
++    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,
+ 
+     /* 3d commands */
+     VIRTIO_GPU_CMD_CTX_CREATE = 0x0200,
+@@ -68,6 +71,8 @@
+     VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
+     VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D,
+     VIRTIO_GPU_CMD_SUBMIT_3D,
++    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
++    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
+ 
+     /* cursor commands */
+     VIRTIO_GPU_CMD_UPDATE_CURSOR = 0x0300,
+@@ -79,6 +84,8 @@
+     VIRTIO_GPU_RESP_OK_CAPSET_INFO,
+     VIRTIO_GPU_RESP_OK_CAPSET,
+     VIRTIO_GPU_RESP_OK_EDID,
++    VIRTIO_GPU_RESP_OK_RESOURCE_UUID,
++    VIRTIO_GPU_RESP_OK_MAP_INFO,
+ 
+     /* error responses */
+     VIRTIO_GPU_RESP_ERR_UNSPEC = 0x1200,
+@@ -128,6 +135,8 @@
+ #pragma pack()
+ 
+ #define VIRTIO_GPU_FLAG_FENCE (1 << 0)
++// The fence is on ring ring_idx of the context (context_init: Venus' queues), not the device's single timeline
++#define VIRTIO_GPU_FLAG_INFO_RING_IDX (1 << 1)
+ 
+ #pragma pack(1)
+ typedef struct virtio_gpu_ctrl_hdr
+@@ -136,7 +145,8 @@
+     ULONG flags;
+     ULONGLONG fence_id;
+     ULONG ctx_id;
+-    ULONG padding;
++    UCHAR ring_idx;
++    UCHAR padding[3];
+ } GPU_CTRL_HDR, *PGPU_CTRL_HDR;
+ #pragma pack()
+ 
+@@ -448,8 +458,57 @@
+ 
+ #pragma pack(pop)
+ 
+-#define VIRTIO_GPU_F_VIRGL 0
+-#define VIRTIO_GPU_F_EDID  1
++#define VIRTIO_GPU_F_VIRGL         0
++#define VIRTIO_GPU_F_EDID          1
++#define VIRTIO_GPU_F_RESOURCE_UUID 2
++#define VIRTIO_GPU_F_RESOURCE_BLOB 3
++#define VIRTIO_GPU_F_CONTEXT_INIT  4
++
++// Blob resources (VIRTIO_GPU_F_RESOURCE_BLOB): memory the host allocates (Venus' Vulkan memory and command ring),
++// mapped into the device's host-visible memory window (the shared memory region below)
++#define VIRTIO_GPU_SHM_ID_HOST_VISIBLE 1
++
++#pragma pack(1)
++typedef struct virtio_gpu_resource_create_blob
++{
++    GPU_CTRL_HDR hdr;
++    ULONG resource_id;
++    ULONG blob_mem;
++    ULONG blob_flags;
++    ULONG nr_entries;
++    ULONGLONG blob_id;
++    ULONGLONG size;
++} GPU_RES_CREATE_BLOB, *PGPU_RES_CREATE_BLOB;
++
++typedef struct virtio_gpu_resource_map_blob
++{
++    GPU_CTRL_HDR hdr;
++    ULONG resource_id;
++    ULONG padding;
++    ULONGLONG offset;
++} GPU_RES_MAP_BLOB, *PGPU_RES_MAP_BLOB;
++
++typedef struct virtio_gpu_resp_map_info
++{
++    GPU_CTRL_HDR hdr;
++    ULONG map_info;
++    ULONG padding;
++} GPU_RESP_MAP_INFO, *PGPU_RESP_MAP_INFO;
++
++typedef struct virtio_gpu_resource_unmap_blob
++{
++    GPU_CTRL_HDR hdr;
++    ULONG resource_id;
++    ULONG padding;
++} GPU_RES_UNMAP_BLOB, *PGPU_RES_UNMAP_BLOB;
++#pragma pack()
++
++// map_info of a mapped blob: how the guest should cache it
++#define VIRTIO_GPU_MAP_CACHE_MASK     0x0f
++#define VIRTIO_GPU_MAP_CACHE_NONE     0x00
++#define VIRTIO_GPU_MAP_CACHE_CACHED   0x01
++#define VIRTIO_GPU_MAP_CACHE_UNCACHED 0x02
++#define VIRTIO_GPU_MAP_CACHE_WC       0x03
+ 
+ #define ISR_REASON_DISPLAY 1
+ #define ISR_REASON_CURSOR  2
+diff --git a/viogpu/common/viogpu_pci.cpp b/viogpu/common/viogpu_pci.cpp
+--- a/viogpu/common/viogpu_pci.cpp
++++ b/viogpu/common/viogpu_pci.cpp
+@@ -465,6 +465,66 @@
+     return true;
+ }
+ 
++bool CPciResources::FindSharedMemory(UCHAR id, _Out_ PHYSICAL_ADDRESS *pa, _Out_ ULONGLONG *length)
++{
++    PAGED_CODE();
++
++    UCHAR config[256];
++    ULONG read = 0;
++    pa->QuadPart = 0;
++    *length = 0;
++    if (!NT_SUCCESS(m_pDxgkInterface->DxgkCbReadDeviceSpace(m_pDxgkInterface->DeviceHandle,
++                                                            DXGK_WHICHSPACE_CONFIG,
++                                                            config,
++                                                            0,
++                                                            sizeof(config),
++                                                            &read)) ||
++        read != sizeof(config))
++    {
++        return false;
++    }
++    PPCI_COMMON_HEADER header = (PPCI_COMMON_HEADER)config;
++    if (!(header->Status & PCI_STATUS_CAPABILITIES_LIST))
++    {
++        return false;
++    }
++
++    // struct virtio_pci_cap64: cap_vndr, cap_next, cap_len, cfg_type, bar, id, padding[2], offset, length,
++    // offset_hi, length_hi
++    UCHAR pos = header->u.type0.CapabilitiesPtr & ~3;
++    for (int guard = 0; pos && pos <= sizeof(config) - 24 && guard < 48; guard++)
++    {
++        const UCHAR *cap = &config[pos];
++        if (cap[0] == PCI_CAPABILITY_ID_VENDOR_SPECIFIC && cap[3] == 8 /* VIRTIO_PCI_CAP_SHARED_MEMORY_CFG */ &&
++            cap[5] == id && cap[4] < PCI_TYPE0_ADDRESSES)
++        {
++            ULONGLONG offset = *(const ULONG *)&cap[8] | ((ULONGLONG) * (const ULONG *)&cap[16] << 32);
++            ULONGLONG len = *(const ULONG *)&cap[12] | ((ULONGLONG) * (const ULONG *)&cap[20] << 32);
++            UCHAR bar = cap[4];
++            ULONG low = header->u.type0.BaseAddresses[bar];
++            if (low & PCI_ADDRESS_IO_SPACE)
++            {
++                return false;
++            }
++            PHYSICAL_ADDRESS base;
++            base.QuadPart = low & PCI_ADDRESS_MEMORY_ADDRESS_MASK;
++            if ((low & PCI_ADDRESS_MEMORY_TYPE_MASK) == PCI_TYPE_64BIT && bar + 1 < PCI_TYPE0_ADDRESSES)
++            {
++                base.HighPart = header->u.type0.BaseAddresses[bar + 1];
++            }
++            if (base.QuadPart == 0 || len == 0)
++            {
++                return false;
++            }
++            pa->QuadPart = base.QuadPart + offset;
++            *length = len;
++            return true;
++        }
++        pos = cap[1] & ~3;
++    }
++    return false;
++}
++
+ PVOID CPciResources::GetMappedAddress(UINT bar, ULONG uOffset)
+ {
+     PVOID BaseVA = nullptr;
+diff --git a/viogpu/common/viogpu_pci.h b/viogpu/common/viogpu_pci.h
+--- a/viogpu/common/viogpu_pci.h
++++ b/viogpu/common/viogpu_pci.h
+@@ -97,6 +97,10 @@
+ 
+     PVOID GetMappedAddress(UINT bar, ULONG uOffset);
+ 
++    // A virtio shared memory region (VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) with the given id: where it is in physical
++    // memory and how big it is. FALSE if the device has none
++    bool FindSharedMemory(UCHAR id, _Out_ PHYSICAL_ADDRESS *pa, _Out_ ULONGLONG *length);
++
+   private:
+     PDXGKRNL_INTERFACE m_pDxgkInterface;
+     USHORT m_InterruptFlags;
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -510,6 +510,22 @@
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ }
+ 
++void CtrlQueue::AttachResource(UINT ctx_id, UINT res_id)
++{
++    PAGED_CODE();
++
++    PGPU_CMD_CTX_RESOURCE cmd;
++    PGPU_VBUFFER vbuf;
++    cmd = (PGPU_CMD_CTX_RESOURCE)AllocCmd(&vbuf, sizeof(*cmd));
++    RtlZeroMemory(cmd, sizeof(*cmd));
++
++    cmd->hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
++    cmd->hdr.ctx_id = ctx_id;
++    cmd->resource_id = res_id;
++
++    QueueBuffer(vbuf);
++}
++
+ void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y)
+ {
+     PAGED_CODE();
+@@ -654,6 +670,138 @@
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ }
+ 
++void CtrlQueue::SubmitCommandRing(void *cmdbuf,
++                                  ULONG size,
++                                  ULONG ctx_id,
++                                  bool fence,
++                                  ULONG ring_idx,
++                                  void (*complete_cb)(void *),
++                                  void *complete_ctx)
++{
++    PAGED_CODE();
++
++    PGPU_CMD_SUBMIT cmd;
++    PGPU_VBUFFER vbuf;
++    cmd = (PGPU_CMD_SUBMIT)AllocCmd(&vbuf, sizeof(*cmd));
++    RtlZeroMemory(cmd, sizeof(*cmd));
++
++    cmd->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
++    cmd->hdr.ctx_id = ctx_id;
++    cmd->size = size;
++    if (fence)
++    {
++        // Fences on a context's rings only need to grow per ring: the device-wide counter does
++        cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
++        cmd->hdr.fence_id = InterlockedIncrement(&m_FenceIdr);
++        cmd->hdr.ring_idx = (UCHAR)ring_idx;
++    }
++
++    vbuf->data_buf = cmdbuf;
++    vbuf->data_size = size;
++    vbuf->complete_cb = complete_cb;
++    vbuf->complete_ctx = complete_ctx;
++
++    QueueBuffer(vbuf);
++}
++
++// Sends a command and waits for the host's answer. No timeout: the response buffer and the event must stay valid
++// until the host answered, and a guest can't take a command back
++ULONG CtrlQueue::QueueAndWait(PGPU_VBUFFER vbuf)
++{
++    PAGED_CODE();
++
++    KEVENT event;
++    KeInitializeEvent(&event, NotificationEvent, FALSE);
++    vbuf->complete_cb = NotifyEventCompleteCB;
++    vbuf->complete_ctx = &event;
++    vbuf->auto_release = false;
++
++    if (QueueBuffer(vbuf) != 0)
++    {
++        ReleaseBuffer(vbuf);
++        return VIRTIO_GPU_RESP_ERR_UNSPEC;
++    }
++    KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
++
++    ULONG type = ((PGPU_CTRL_HDR)vbuf->resp_buf)->type;
++    return type;
++}
++
++ULONG CtrlQueue::CreateBlob(UINT res_id,
++                            UINT ctx_id,
++                            ULONG blob_mem,
++                            ULONG blob_flags,
++                            ULONGLONG blob_id,
++                            ULONGLONG size)
++{
++    PAGED_CODE();
++
++    PGPU_RES_CREATE_BLOB cmd;
++    PGPU_VBUFFER vbuf;
++    cmd = (PGPU_RES_CREATE_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
++    RtlZeroMemory(cmd, sizeof(*cmd));
++
++    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
++    cmd->hdr.ctx_id = ctx_id;
++    cmd->resource_id = res_id;
++    cmd->blob_mem = blob_mem;
++    cmd->blob_flags = blob_flags;
++    cmd->blob_id = blob_id;
++    cmd->size = size;
++    cmd->nr_entries = 0; // host memory only (VIRTIO_GPU_BLOB_MEM_HOST3D)
++
++    ULONG type = QueueAndWait(vbuf);
++    ReleaseBuffer(vbuf);
++    return type;
++}
++
++ULONG CtrlQueue::MapBlob(UINT res_id, ULONGLONG offset, _Out_ ULONG *map_info)
++{
++    PAGED_CODE();
++
++    PGPU_RES_MAP_BLOB cmd;
++    PGPU_VBUFFER vbuf;
++    // Freed by ReleaseBuffer like any response bigger than the inline space (delete[] of a BYTE array)
++    PGPU_RESP_MAP_INFO resp = reinterpret_cast<PGPU_RESP_MAP_INFO>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_MAP_INFO)]);
++    *map_info = 0;
++    if (!resp)
++    {
++        return VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
++    }
++    RtlZeroMemory(resp, sizeof(*resp));
++    cmd = (PGPU_RES_MAP_BLOB)AllocCmdResp(&vbuf, sizeof(*cmd), resp, sizeof(*resp));
++    RtlZeroMemory(cmd, sizeof(*cmd));
++
++    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
++    cmd->resource_id = res_id;
++    cmd->offset = offset;
++
++    ULONG type = QueueAndWait(vbuf);
++    if (type == VIRTIO_GPU_RESP_OK_MAP_INFO)
++    {
++        *map_info = resp->map_info;
++    }
++    ReleaseBuffer(vbuf); // frees resp too
++    return type;
++}
++
++ULONG CtrlQueue::UnmapBlob(UINT res_id)
++{
++    PAGED_CODE();
++
++    PGPU_RES_UNMAP_BLOB cmd;
++    PGPU_VBUFFER vbuf;
++    cmd = (PGPU_RES_UNMAP_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
++    RtlZeroMemory(cmd, sizeof(*cmd));
++
++    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
++    cmd->resource_id = res_id;
++
++    ULONG type = QueueAndWait(vbuf);
++    ReleaseBuffer(vbuf);
++    return type;
++}
++
+ void CtrlQueue::TransferHostCmd(bool to_host,
+                                 ULONG ctx_id,
+                                 VIOGPU_TRANSFER_CMD *options,
+diff --git a/viogpu/common/viogpu_queue.h b/viogpu/common/viogpu_queue.h
+--- a/viogpu/common/viogpu_queue.h
++++ b/viogpu/common/viogpu_queue.h
+@@ -272,8 +272,30 @@
+ 
+     void CreateCtx(UINT ctx_id, UINT context_init);
+     void DestroyCtx(UINT ctx_id);
++    // Lets a context use a resource (Venus looks a blob up in its context's resources)
++    void AttachResource(UINT ctx_id, UINT res_id);
++
++    // Blob resources (Venus). These wait for the host's answer and return its response type
++    ULONG CreateBlob(UINT res_id,
++                     UINT ctx_id,
++                     ULONG blob_mem,
++                     ULONG blob_flags,
++                     ULONGLONG blob_id,
++                     ULONGLONG size);
++    ULONG MapBlob(UINT res_id, ULONGLONG offset, _Out_ ULONG *map_info);
++    ULONG UnmapBlob(UINT res_id);
++    // A command stream for a context; with fence, the host answers once ring ring_idx finished it
++    void SubmitCommandRing(void *cmdbuf,
++                           ULONG size,
++                           ULONG ctx_id,
++                           bool fence,
++                           ULONG ring_idx,
++                           void (*complete_cb)(void *),
++                           void *complete_ctx);
+ 
+   private:
++    ULONG QueueAndWait(PGPU_VBUFFER vbuf);
++
+     volatile LONG m_FenceIdr;
+     volatile LONG64 m_Commands;
+     volatile LONG64 m_CommandBytes;
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -52,7 +52,8 @@
+     struct
+     {
+         UINT Supports3d : 1;
+-        UINT Reserved : 31;
++        UINT SupportsBlob : 1; // Venus: blob resources with a host-visible memory window (VIOGPU_BLOB_*)
++        UINT Reserved : 30;
+     } Flags;
+     ULONGLONG SupportedCapsetIDs;
+ } VIOGPU_ADAPTERINFO;
+@@ -68,6 +69,11 @@
+ 
+ #define VIOGPU_CTX_INIT              0x200
+ 
++#define VIOGPU_BLOB_CREATE           0x300
++#define VIOGPU_BLOB_MAP              0x301
++#define VIOGPU_BLOB_DESTROY          0x302
++#define VIOGPU_EXECBUFFER            0x303
++
+ #pragma pack(1)
+ typedef struct _VIOGPU_DISP_MODE
+ {
+@@ -129,6 +135,55 @@
+ } VIOGPU_STATS_REQ;
+ #pragma pack()
+ 
++// Venus (Vulkan): blob resources, mapped into the calling process, and command streams for a Venus context.
++// The device (D3DKMTCreateDevice) owns its blobs: the driver destroys what is left when the device goes away.
++#define VIOGPU_BLOB_MEM_GUEST         0x0001
++#define VIOGPU_BLOB_MEM_HOST3D        0x0002
++#define VIOGPU_BLOB_MEM_HOST3D_GUEST  0x0003
++#define VIOGPU_BLOB_FLAG_USE_MAPPABLE    0x0001
++#define VIOGPU_BLOB_FLAG_USE_SHAREABLE   0x0002
++#define VIOGPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
++
++#pragma pack(1)
++typedef struct _VIOGPU_BLOB_CREATE_REQ
++{
++    ULONG BlobMem;   // VIOGPU_BLOB_MEM_*
++    ULONG BlobFlags; // VIOGPU_BLOB_FLAG_*
++    UINT64 BlobId;   // the context's object (Venus: a VkDeviceMemory's id, 0 for shared memory)
++    UINT64 Size;
++    ULONG ResId;     // out: the host resource
++} VIOGPU_BLOB_CREATE_REQ;
++#pragma pack()
++
++#pragma pack(1)
++typedef struct _VIOGPU_BLOB_MAP_REQ
++{
++    ULONG ResId;
++    ULONG MapInfo;   // out: VIRTIO_GPU_MAP_CACHE_* the host asked for
++    UINT64 Address;  // out: where the blob is in the calling process
++} VIOGPU_BLOB_MAP_REQ;
++#pragma pack()
++
++#pragma pack(1)
++typedef struct _VIOGPU_BLOB_DESTROY_REQ
++{
++    ULONG ResId;     // unmapped too, if it is mapped
++} VIOGPU_BLOB_DESTROY_REQ;
++#pragma pack()
++
++// A command stream for the device's context. With Event, the host answers once the ring's work is done
++// (ring 0: once the host processed the commands) and the driver then sets the event.
++#pragma pack(1)
++typedef struct _VIOGPU_EXECBUFFER_REQ
++{
++    UINT64 Command;  // user-mode address of the commands
++    ULONG Size;      // their size in bytes (at most VIOGPU_EXECBUFFER_MAX_SIZE)
++    ULONG RingIdx;
++    UINT64 Event;    // HANDLE of an event to set when done, or 0
++} VIOGPU_EXECBUFFER_REQ;
++#pragma pack()
++#define VIOGPU_EXECBUFFER_MAX_SIZE (512 * 1024)
++
+ #pragma pack(1)
+ typedef struct _VIOGPU_ESCAPE
+ {
+@@ -145,6 +200,11 @@
+ 
+         VIOGPU_CTX_INIT_REQ CtxInit;
+ 
++        VIOGPU_BLOB_CREATE_REQ BlobCreate;
++        VIOGPU_BLOB_MAP_REQ BlobMap;
++        VIOGPU_BLOB_DESTROY_REQ BlobDestroy;
++        VIOGPU_EXECBUFFER_REQ ExecBuffer;
++
+         VIOGPU_STATS_REQ Stats;
+     } DUMMYUNIONNAME;
+ } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -116,6 +116,84 @@
+     m_pCursorBuf = NULL;
+     m_CursorX = 0;
+     m_CursorY = 0;
++    m_HostmemPA.QuadPart = 0;
++    m_HostmemSize = 0;
++    ExInitializeFastMutex(&m_HostmemLock);
++    InitializeListHead(&m_HostmemRanges);
++}
++
++// A range of the host-visible memory window in use
++struct HOSTMEM_RANGE
++{
++    LIST_ENTRY entry;
++    ULONGLONG offset;
++    ULONGLONG size;
++};
++
++bool VioGpuAdapter::HostmemAlloc(ULONGLONG size, _Out_ ULONGLONG *offset)
++{
++    PAGED_CODE();
++
++    *offset = 0;
++    size = (size + PAGE_SIZE - 1) & ~(ULONGLONG)(PAGE_SIZE - 1);
++    if (!size || size > m_HostmemSize)
++    {
++        return false;
++    }
++    HOSTMEM_RANGE *range = new (PagedPool) HOSTMEM_RANGE;
++    if (!range)
++    {
++        return false;
++    }
++
++    // First fit: the gap before each range in use, then the one after the last
++    ExAcquireFastMutex(&m_HostmemLock);
++    ULONGLONG start = 0;
++    LIST_ENTRY *next = m_HostmemRanges.Flink;
++    for (; next != &m_HostmemRanges; next = next->Flink)
++    {
++        HOSTMEM_RANGE *used = CONTAINING_RECORD(next, HOSTMEM_RANGE, entry);
++        if (used->offset - start >= size)
++        {
++            break;
++        }
++        start = used->offset + used->size;
++    }
++    bool found = next != &m_HostmemRanges || m_HostmemSize - start >= size;
++    if (found)
++    {
++        range->offset = start;
++        range->size = size;
++        InsertTailList(next, &range->entry); // before next: the list stays sorted
++        *offset = start;
++    }
++    ExReleaseFastMutex(&m_HostmemLock);
++
++    if (!found)
++    {
++        delete range;
++    }
++    return found;
++}
++
++void VioGpuAdapter::HostmemFree(ULONGLONG offset)
++{
++    PAGED_CODE();
++
++    HOSTMEM_RANGE *found = NULL;
++    ExAcquireFastMutex(&m_HostmemLock);
++    for (LIST_ENTRY *e = m_HostmemRanges.Flink; e != &m_HostmemRanges; e = e->Flink)
++    {
++        HOSTMEM_RANGE *range = CONTAINING_RECORD(e, HOSTMEM_RANGE, entry);
++        if (range->offset == offset)
++        {
++            RemoveEntryList(&range->entry);
++            found = range;
++            break;
++        }
++    }
++    ExReleaseFastMutex(&m_HostmemLock);
++    delete found;
+ }
+ 
+ VioGpuAdapter::~VioGpuAdapter(void)
+@@ -469,6 +547,7 @@
+                 VIOGPU_ADAPTERINFO *info = (VIOGPU_ADAPTERINFO *)pQueryAdapterInfo->pOutputData;
+                 info->IamVioGPU = VIOGPU_IAM;
+                 info->Flags.Supports3d = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_VIRGL);
++                info->Flags.SupportsBlob = SupportsBlob();
+                 info->Flags.Reserved = 0;
+                 info->SupportedCapsetIDs = m_supportedCapsetIDs;
+                 return STATUS_SUCCESS;
+@@ -775,6 +854,64 @@
+                 context->Init(&pVioGpuEscape->CtxInit);
+                 break;
+             }
++        case VIOGPU_BLOB_CREATE:
++        case VIOGPU_BLOB_MAP:
++        case VIOGPU_BLOB_DESTROY:
++        case VIOGPU_EXECBUFFER:
++            {
++                // Venus, on the device the caller created (it owns its blobs)
++                switch (pVioGpuEscape->Type)
++                {
++                    case VIOGPU_BLOB_CREATE:
++                        size = sizeof(VIOGPU_BLOB_CREATE_REQ);
++                        break;
++                    case VIOGPU_BLOB_MAP:
++                        size = sizeof(VIOGPU_BLOB_MAP_REQ);
++                        break;
++                    case VIOGPU_BLOB_DESTROY:
++                        size = sizeof(VIOGPU_BLOB_DESTROY_REQ);
++                        break;
++                    default:
++                        size = sizeof(VIOGPU_EXECBUFFER_REQ);
++                        break;
++                }
++                if (pVioGpuEscape->DataLength < size ||
++                    pEscape->PrivateDriverDataSize < FIELD_OFFSET(VIOGPU_ESCAPE, BlobCreate) + size)
++                {
++                    DbgPrint(TRACE_LEVEL_ERROR,
++                             ("%s buffer too small %d, should be at least %d\n",
++                              __FUNCTION__,
++                              pVioGpuEscape->DataLength,
++                              size));
++                    return STATUS_INVALID_BUFFER_SIZE;
++                }
++                VioGpuDevice *device = reinterpret_cast<VioGpuDevice *>(pEscape->hDevice);
++                if (device == NULL)
++                {
++                    DbgPrint(TRACE_LEVEL_ERROR, ("%s no hDevice supplied\n", __FUNCTION__));
++                    return STATUS_INVALID_PARAMETER;
++                }
++                if (pVioGpuEscape->Type != VIOGPU_EXECBUFFER && !SupportsBlob())
++                {
++                    return STATUS_NOT_SUPPORTED;
++                }
++                switch (pVioGpuEscape->Type)
++                {
++                    case VIOGPU_BLOB_CREATE:
++                        status = device->BlobCreate(&pVioGpuEscape->BlobCreate);
++                        break;
++                    case VIOGPU_BLOB_MAP:
++                        status = device->BlobMap(&pVioGpuEscape->BlobMap);
++                        break;
++                    case VIOGPU_BLOB_DESTROY:
++                        status = device->BlobDestroy(pVioGpuEscape->BlobDestroy.ResId);
++                        break;
++                    default:
++                        status = device->ExecBuffer(&pVioGpuEscape->ExecBuffer);
++                        break;
++                }
++                break;
++            }
+ 
+         default:
+             DbgPrint(TRACE_LEVEL_ERROR, ("%s: invalid Escape type 0x%x\n", __FUNCTION__, pVioGpuEscape->Type));
+@@ -1158,6 +1295,17 @@
+         // VIRGL (vhost-user-gpu, the GPU in a process of its own) otherwise treats them as unknown 2D commands
+         AckFeature(VIRTIO_GPU_F_VIRGL);
+         AckFeature(VIRTIO_GPU_F_EDID);
++        // Venus (Vulkan): contexts of another capset, and blob resources the host maps into its memory window
++        AckFeature(VIRTIO_GPU_F_CONTEXT_INIT);
++        if (m_PciResources.FindSharedMemory(VIRTIO_GPU_SHM_ID_HOST_VISIBLE, &m_HostmemPA, &m_HostmemSize))
++        {
++            DbgPrint(TRACE_LEVEL_FATAL,
++                     ("%s host-visible memory at %I64x, %I64u bytes\n",
++                      __FUNCTION__,
++                      m_HostmemPA.QuadPart,
++                      m_HostmemSize));
++            AckFeature(VIRTIO_GPU_F_RESOURCE_BLOB);
++        }
+ 
+         status = virtio_set_features(&m_VioDev, m_u64GuestFeatures);
+         if (!NT_SUCCESS(status))
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -106,6 +106,13 @@
+     ULONG m_Id;
+     CAPSET_INFO m_capsetInfos[VIRTIO_GPU_MAX_CAPSET_ID + 1];
+ 
++    // Venus: the device's host-visible memory window (a BAR), where the host maps blob resources. Ranges in use are
++    // HOSTMEM_RANGEs, sorted by offset
++    PHYSICAL_ADDRESS m_HostmemPA;
++    ULONGLONG m_HostmemSize;
++    FAST_MUTEX m_HostmemLock;
++    LIST_ENTRY m_HostmemRanges;
++
+   public:
+     VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject);
+     ~VioGpuAdapter(void);
+@@ -206,6 +213,21 @@
+         return m_PciResources.IsMSIEnabled();
+     }
+ 
++    // Blob resources (Venus): the guest acknowledged them and the device has a host-visible memory window
++    bool SupportsBlob()
++    {
++        return m_HostmemSize && virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_RESOURCE_BLOB);
++    }
++    // A free range of the window (page aligned), and its physical address
++    bool HostmemAlloc(ULONGLONG size, _Out_ ULONGLONG *offset);
++    void HostmemFree(ULONGLONG offset);
++    PHYSICAL_ADDRESS HostmemAddress(ULONGLONG offset)
++    {
++        PHYSICAL_ADDRESS pa;
++        pa.QuadPart = m_HostmemPA.QuadPart + offset;
++        return pa;
++    }
++
+     VioGpuAllocation *AllocationFromHandle(D3DKMT_HANDLE handle);
+     VioGpuResource *ResourceFromHandle(D3DKMT_HANDLE handle);
+ 
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -3,6 +3,15 @@
+ #include "baseobj.h"
+ #include "virgl_hw.h"
+ 
++// From ntifs.h, which a display driver's headers don't include: attaching to the process that mapped a blob, to unmap
++// it from another one. KAPC_STATE is 0x30 bytes on x64; the buffer has room to spare and pointer alignment
++extern "C" NTKERNELAPI VOID NTAPI KeStackAttachProcess(_Inout_ PEPROCESS Process, _Out_ PVOID ApcState);
++extern "C" NTKERNELAPI VOID NTAPI KeUnstackDetachProcess(_In_ PVOID ApcState);
++typedef struct
++{
++    ULONG_PTR Opaque[16];
++} VIOGPU_APC_STATE;
++
+ #pragma code_seg(push)
+ #pragma code_seg()
+ // Called when the host finished a transfer TransferSync waits for (from the DPC: not paged)
+@@ -21,6 +30,8 @@
+ 
+     m_pAdapter = pAdapter;
+     m_flags = flags;
++    ExInitializeFastMutex(&m_BlobLock);
++    InitializeListHead(&m_Blobs);
+     m_id = pAdapter->ctxIdr.GetId();
+     pAdapter->ctrlQueue.CreateCtx(m_id, 0);
+ }
+@@ -30,6 +41,13 @@
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s", __FUNCTION__));
+ 
++    // Blobs the process left (it exited, or didn't clean up)
++    while (!IsListEmpty(&m_Blobs))
++    {
++        Blob *blob = CONTAINING_RECORD(RemoveHeadList(&m_Blobs), Blob, entry);
++        DestroyBlob(blob);
++    }
++
+     m_pAdapter->ctrlQueue.DestroyCtx(m_id);
+     m_pAdapter->ctxIdr.PutId(m_id);
+ }
+@@ -49,6 +67,313 @@
+     return STATUS_SUCCESS;
+ }
+ 
++VioGpuDevice::Blob *VioGpuDevice::FindBlob(ULONG resId)
++{
++    PAGED_CODE();
++
++    for (LIST_ENTRY *e = m_Blobs.Flink; e != &m_Blobs; e = e->Flink)
++    {
++        Blob *blob = CONTAINING_RECORD(e, Blob, entry);
++        if (blob->resId == resId)
++        {
++            return blob;
++        }
++    }
++    return NULL;
++}
++
++NTSTATUS VioGpuDevice::BlobCreate(_Inout_ VIOGPU_BLOB_CREATE_REQ *req)
++{
++    PAGED_CODE();
++
++    // Host memory only: Venus' memory and shared memory. The size must fit an MDL when it is mapped
++    if (req->BlobMem != VIOGPU_BLOB_MEM_HOST3D || !req->Size || req->Size > MAXULONG - PAGE_SIZE)
++    {
++        return STATUS_INVALID_PARAMETER;
++    }
++    Blob *blob = new (NonPagedPoolNx) Blob;
++    if (!blob)
++    {
++        return STATUS_NO_MEMORY;
++    }
++    RtlZeroMemory(blob, sizeof(*blob));
++    blob->resId = m_pAdapter->resourceIdr.GetId();
++    blob->size = (req->Size + PAGE_SIZE - 1) & ~(ULONGLONG)(PAGE_SIZE - 1);
++
++    ULONG type = m_pAdapter->ctrlQueue.CreateBlob(blob->resId,
++                                                  m_id,
++                                                  req->BlobMem,
++                                                  req->BlobFlags,
++                                                  req->BlobId,
++                                                  blob->size);
++    if (type != VIRTIO_GPU_RESP_OK_NODATA)
++    {
++        DbgPrint(TRACE_LEVEL_ERROR, ("%s host refused blob %I64u: %x\n", __FUNCTION__, req->BlobId, type));
++        m_pAdapter->resourceIdr.PutId(blob->resId);
++        delete blob;
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    // The context's commands name the blob (Venus' rings, its memory), and the host looks it up in the context.
++    // Destroying the resource later detaches it from every context
++    m_pAdapter->ctrlQueue.AttachResource(m_id, blob->resId);
++
++    ExAcquireFastMutex(&m_BlobLock);
++    InsertTailList(&m_Blobs, &blob->entry);
++    ExReleaseFastMutex(&m_BlobLock);
++    req->ResId = blob->resId;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS VioGpuDevice::BlobMap(_Inout_ VIOGPU_BLOB_MAP_REQ *req)
++{
++    PAGED_CODE();
++
++    NTSTATUS status = STATUS_SUCCESS;
++    ExAcquireFastMutex(&m_BlobLock);
++    Blob *blob = FindBlob(req->ResId);
++    if (!blob)
++    {
++        ExReleaseFastMutex(&m_BlobLock);
++        return STATUS_INVALID_PARAMETER;
++    }
++    if (blob->mapped)
++    {
++        req->Address = (UINT64)(ULONG_PTR)blob->userVa;
++        ExReleaseFastMutex(&m_BlobLock);
++        return STATUS_SUCCESS;
++    }
++
++    ULONG mapInfo = 0;
++    if (!m_pAdapter->HostmemAlloc(blob->size, &blob->offset))
++    {
++        DbgPrint(TRACE_LEVEL_ERROR, ("%s host-visible memory is full (%I64u bytes)\n", __FUNCTION__, blob->size));
++        ExReleaseFastMutex(&m_BlobLock);
++        return STATUS_NO_MEMORY;
++    }
++    ULONG type = m_pAdapter->ctrlQueue.MapBlob(blob->resId, blob->offset, &mapInfo);
++    if (type != VIRTIO_GPU_RESP_OK_MAP_INFO)
++    {
++        DbgPrint(TRACE_LEVEL_ERROR, ("%s host didn't map resource %u: %x\n", __FUNCTION__, blob->resId, type));
++        m_pAdapter->HostmemFree(blob->offset);
++        ExReleaseFastMutex(&m_BlobLock);
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    // The window's pages, mapped like the host asked: a kernel mapping describes them in an MDL, and the MDL maps
++    // them into the process
++    MEMORY_CACHING_TYPE caching;
++    ULONG protect;
++    switch (mapInfo & VIRTIO_GPU_MAP_CACHE_MASK)
++    {
++        case VIRTIO_GPU_MAP_CACHE_CACHED:
++            caching = MmCached;
++            protect = PAGE_READWRITE;
++            break;
++        case VIRTIO_GPU_MAP_CACHE_WC:
++            caching = MmWriteCombined;
++            protect = PAGE_READWRITE | PAGE_WRITECOMBINE;
++            break;
++        default:
++            caching = MmNonCached;
++            protect = PAGE_READWRITE | PAGE_NOCACHE;
++            break;
++    }
++    blob->kernelVa = MmMapIoSpaceEx(m_pAdapter->HostmemAddress(blob->offset), (SIZE_T)blob->size, protect);
++    if (blob->kernelVa)
++    {
++        blob->mdl = IoAllocateMdl(blob->kernelVa, (ULONG)blob->size, FALSE, FALSE, NULL);
++    }
++    if (blob->mdl)
++    {
++        MmBuildMdlForNonPagedPool(blob->mdl);
++        __try
++        {
++            blob->userVa = MmMapLockedPagesSpecifyCache(blob->mdl,
++                                                        UserMode,
++                                                        caching,
++                                                        NULL,
++                                                        FALSE,
++                                                        NormalPagePriority | MdlMappingNoExecute);
++        }
++        __except (EXCEPTION_EXECUTE_HANDLER)
++        {
++            blob->userVa = NULL;
++        }
++    }
++    if (!blob->userVa)
++    {
++        DbgPrint(TRACE_LEVEL_ERROR, ("%s mapping resource %u into the process failed\n", __FUNCTION__, blob->resId));
++        if (blob->mdl)
++        {
++            IoFreeMdl(blob->mdl);
++            blob->mdl = NULL;
++        }
++        if (blob->kernelVa)
++        {
++            MmUnmapIoSpace(blob->kernelVa, (SIZE_T)blob->size);
++            blob->kernelVa = NULL;
++        }
++        m_pAdapter->ctrlQueue.UnmapBlob(blob->resId);
++        m_pAdapter->HostmemFree(blob->offset);
++        status = STATUS_NO_MEMORY;
++    }
++    else
++    {
++        blob->process = PsGetCurrentProcess();
++        ObReferenceObject(blob->process);
++        blob->mapped = true;
++        req->Address = (UINT64)(ULONG_PTR)blob->userVa;
++        req->MapInfo = mapInfo;
++    }
++    ExReleaseFastMutex(&m_BlobLock);
++    return status;
++}
++
++void VioGpuDevice::UnmapBlob(Blob *blob)
++{
++    PAGED_CODE();
++
++    if (!blob->mapped)
++    {
++        return;
++    }
++    // The process's mapping goes in its own context (the device can go away while another process runs, e.g. when
++    // the process exits)
++    if (PsGetCurrentProcess() == blob->process)
++    {
++        MmUnmapLockedPages(blob->userVa, blob->mdl);
++    }
++    else
++    {
++        VIOGPU_APC_STATE apc;
++        KeStackAttachProcess(blob->process, &apc);
++        MmUnmapLockedPages(blob->userVa, blob->mdl);
++        KeUnstackDetachProcess(&apc);
++    }
++    ObDereferenceObject(blob->process);
++    IoFreeMdl(blob->mdl);
++    MmUnmapIoSpace(blob->kernelVa, (SIZE_T)blob->size);
++    m_pAdapter->ctrlQueue.UnmapBlob(blob->resId);
++    m_pAdapter->HostmemFree(blob->offset);
++    blob->mapped = false;
++    blob->process = NULL;
++    blob->mdl = NULL;
++    blob->kernelVa = NULL;
++    blob->userVa = NULL;
++}
++
++void VioGpuDevice::DestroyBlob(Blob *blob)
++{
++    PAGED_CODE();
++
++    UnmapBlob(blob);
++    m_pAdapter->ctrlQueue.DestroyResource(blob->resId);
++    m_pAdapter->resourceIdr.PutId(blob->resId);
++    delete blob;
++}
++
++NTSTATUS VioGpuDevice::BlobDestroy(ULONG resId)
++{
++    PAGED_CODE();
++
++    ExAcquireFastMutex(&m_BlobLock);
++    Blob *blob = FindBlob(resId);
++    if (blob)
++    {
++        RemoveEntryList(&blob->entry);
++    }
++    ExReleaseFastMutex(&m_BlobLock);
++    if (!blob)
++    {
++        return STATUS_INVALID_PARAMETER;
++    }
++    DestroyBlob(blob);
++    return STATUS_SUCCESS;
++}
++
++// A command stream the host is processing, and the event to set when it is done. The control queue owns the
++// commands once they are queued (they are the command's data buffer, which it frees with the command)
++struct EXECBUFFER_DONE
++{
++    PVOID commands;
++    PKEVENT event;
++};
++
++#pragma code_seg(push)
++#pragma code_seg()
++// From the DPC: not paged
++static void ExecBufferDone(void *context)
++{
++    EXECBUFFER_DONE *done = (EXECBUFFER_DONE *)context;
++    if (done->event)
++    {
++        KeSetEvent(done->event, IO_NO_INCREMENT, FALSE);
++        ObDereferenceObject(done->event);
++    }
++    delete done;
++}
++#pragma code_seg(pop)
++
++NTSTATUS VioGpuDevice::ExecBuffer(_In_ VIOGPU_EXECBUFFER_REQ *req)
++{
++    PAGED_CODE();
++
++    // An empty stream is allowed: Venus submits one just to have a ring's fence signal
++    if (req->Size > VIOGPU_EXECBUFFER_MAX_SIZE || (req->Size & 3) || req->RingIdx > 63)
++    {
++        return STATUS_INVALID_PARAMETER;
++    }
++    EXECBUFFER_DONE *done = new (NonPagedPoolNx) EXECBUFFER_DONE;
++    if (!done)
++    {
++        return STATUS_NO_MEMORY;
++    }
++    done->event = NULL;
++    done->commands = req->Size ? new (NonPagedPoolNx) BYTE[req->Size] : NULL;
++    if (req->Size && !done->commands)
++    {
++        delete done;
++        return STATUS_NO_MEMORY;
++    }
++    __try
++    {
++        PVOID src = (PVOID)(ULONG_PTR)req->Command;
++        ProbeForRead(src, req->Size, 1);
++        memcpy(done->commands, src, req->Size);
++    }
++    __except (EXCEPTION_EXECUTE_HANDLER)
++    {
++        delete[] reinterpret_cast<BYTE *>(done->commands);
++        delete done;
++        return STATUS_INVALID_PARAMETER;
++    }
++    if (req->Event)
++    {
++        NTSTATUS status = ObReferenceObjectByHandle((HANDLE)(ULONG_PTR)req->Event,
++                                                    EVENT_MODIFY_STATE,
++                                                    *ExEventObjectType,
++                                                    UserMode,
++                                                    (PVOID *)&done->event,
++                                                    NULL);
++        if (!NT_SUCCESS(status))
++        {
++            delete[] reinterpret_cast<BYTE *>(done->commands);
++            delete done;
++            return status;
++        }
++    }
++
++    m_pAdapter->ctrlQueue.SubmitCommandRing(done->commands,
++                                            req->Size,
++                                            m_id,
++                                            done->event != NULL,
++                                            req->RingIdx,
++                                            ExecBufferDone,
++                                            done);
++    return STATUS_SUCCESS;
++}
++
+ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuAllocation *src, VioGpuAllocation *dst)
+ {
+     UCHAR *dmaBuf = (UCHAR *)pPresent->pDmaBuffer;
+diff --git a/viogpu/viogpu3d/viogpu_device.h b/viogpu/viogpu3d/viogpu_device.h
+--- a/viogpu/viogpu3d/viogpu_device.h
++++ b/viogpu/viogpu3d/viogpu_device.h
+@@ -30,10 +30,36 @@
+     // Copies an allocation's texture between the host and its pages and waits for it
+     void TransferSync(bool to_host, VioGpuAllocation *allocation);
+ 
++    // Venus (VIOGPU_BLOB_* and VIOGPU_EXECBUFFER escapes): blob resources the host allocates, mapped into the
++    // process that created the device, and command streams for the device's context
++    NTSTATUS BlobCreate(_Inout_ VIOGPU_BLOB_CREATE_REQ *req);
++    NTSTATUS BlobMap(_Inout_ VIOGPU_BLOB_MAP_REQ *req);
++    NTSTATUS BlobDestroy(ULONG resId);
++    NTSTATUS ExecBuffer(_In_ VIOGPU_EXECBUFFER_REQ *req);
++
+   private:
++    struct Blob
++    {
++        LIST_ENTRY entry;
++        ULONG resId;
++        ULONGLONG size;
++        // Where it is mapped: the host-visible memory window, the kernel and the process
++        bool mapped;
++        ULONGLONG offset;
++        PVOID kernelVa;
++        PMDL mdl;
++        PVOID userVa;
++        PEPROCESS process;
++    };
++    Blob *FindBlob(ULONG resId);
++    void UnmapBlob(Blob *blob);
++    void DestroyBlob(Blob *blob);
++
+     VioGpuAdapter *m_pAdapter;
+     ULONG m_id;
+     UINT m_flags; // DXGK_CREATEDEVICEFLAGS
++    FAST_MUTEX m_BlobLock;
++    LIST_ENTRY m_Blobs;
+ };
+ 
+ class VioGpuDeviceAllocation

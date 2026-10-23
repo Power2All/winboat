@@ -1,0 +1,30 @@
+vkr: plain fences for the queues' fence syncs (WinBoat)
+
+A fence on a Venus queue's timeline (virgl_renderer_context_create_fence with
+a ring index) retires once the sync thread's VkFence signals. That fence was
+created SYNC_FD-exportable, and NVIDIA's driver (615.78, RTX 3080 laptop) signals
+such a fence up to 10 ms after the GPU work before it finished: an exportable
+fence after a 4 MB copy waits 10 ms, a plain one 0.35 ms (on the host, no VM).
+Nothing exports these fences (vkGetFenceFdKHR is for the guest's own fences),
+so they are plain ones now. Mesa's Venus from 25.x on backs every VkFence with
+such a fence: a Windows guest's Vulkan swapchain ran at 92 fps on a GPU idling.
+
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -28,13 +28,11 @@
+       if (!sync)
+          return NULL;
+ 
+-      const VkExportFenceCreateInfo export_info = {
+-         .sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
+-         .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
+-      };
++      /* Not exportable: nothing exports these fences (the guest's own fences are separate), and NVIDIA's
++       * driver signals a SYNC_FD-exportable fence up to 10 ms after the work it waits for is done, where a
++       * plain fence takes a fraction of a millisecond (WinBoat) */
+       const struct VkFenceCreateInfo create_info = {
+          .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+-         .pNext = dev->physical_device->KHR_external_fence_fd ? &export_info : NULL,
+       };
+       VkResult result =
+          vk->CreateFence(dev->base.handle.device, &create_info, NULL, &sync->fence);

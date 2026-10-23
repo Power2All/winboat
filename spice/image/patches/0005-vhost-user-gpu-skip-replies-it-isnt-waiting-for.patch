@@ -1,0 +1,40 @@
+contrib/vhost-user-gpu: skip replies it isn't waiting for
+
+When a reply isn't the one the backend waits for, vg_recv_msg failed an
+assertion and returned without reading the message's payload, and every later
+message was read from the middle of it (hundreds of assertion failures when a
+SPICE client connected, until the stream happened to line up again). Read and
+drop the whole message, log it, and keep waiting. Applies on top of patch 0003.
+
+--- a/contrib/vhost-user-gpu/vhost-user-gpu.c
++++ b/contrib/vhost-user-gpu/vhost-user-gpu.c
+@@ -199,9 +199,26 @@
+         goto err;
+     }
+ 
+-    g_return_val_if_fail(req == expect_req, false);
+-    g_return_val_if_fail(flags & VHOST_USER_GPU_MSG_FLAG_REPLY, false);
+-    g_return_val_if_fail(size == expect_size, false);
++    if (req != expect_req || !(flags & VHOST_USER_GPU_MSG_FLAG_REPLY) ||
++        size != expect_size) {
++        /*
++         * Not the reply waited for: skip all of it, or every later message is
++         * read from the middle of this one
++         */
++        char skip[256];
++        uint32_t left = size;
++
++        g_warning("skipping message %u (flags %x, %u bytes) while waiting for "
++                  "the reply to %u", req, flags, size, expect_req);
++        while (left > 0) {
++            ssize_t n = MIN(left, sizeof(skip));
++            if (vg_sock_fd_read(g->sock_fd, skip, n) != n) {
++                goto err;
++            }
++            left -= n;
++        }
++        return false;
++    }
+ 
+     if (size && vg_sock_fd_read(g->sock_fd, payload, size) != size) {
+         goto err;

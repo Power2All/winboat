@@ -1,0 +1,393 @@
+From: WinBoat
+Subject: [PATCH] venus, wsi/win32: fast Vulkan presents on Windows
+
+Presenting a Vulkan frame took 15.6 ms however small the window (63 fps),
+and the application waited for all of it.
+
+- os_time_sleep on Windows slept with Sleep(), which lasts at least one
+  tick of the system timer (15.6 ms by default). Venus waits by polling with
+  short sleeps (vn_relax starts at 160 us), so every wait for the GPU took a
+  whole tick. Sleep on a high-resolution waitable timer instead (Windows 10
+  1803 and later; older Windows keep Sleep()).
+- Win32 WSI's software path draws straight from the mapped image with
+  StretchDIBits instead of copying it into a DIB section first.
+- The software path presents on a thread of its own: it waits for the
+  image's rendering and draws it while the application renders the next
+  frame. FIFO and MAILBOX keep to the compositor's pace (DwmFlush), and
+  IMMEDIATE and MAILBOX are offered too (MAILBOX drops a waiting frame when a
+  newer one comes). Swapchains get at least 2 images (3 for MAILBOX).
+  wsi_swapchain::present_waits_for_fence tells the common code not to wait
+  for the fence itself.
+- Venus no longer waits for the queue to go idle before a present on
+  Windows: the software path waits for the image's fence before it reads it.
+
+1200x781 window in the spike: 63 fps -> 1093 fps (IMMEDIATE), FIFO at the
+display's 60 Hz, MAILBOX 1373 frames/s rendered; swapchains recreated with
+frames still queued work in all three modes.
+---
+---
+diff --git a/src/util/os_time.c b/src/util/os_time.c
+--- a/src/util/os_time.c
++++ b/src/util/os_time.c
+@@ -75,6 +75,26 @@
+    usleep(usecs);
+ 
+ #elif DETECT_OS_WINDOWS
++   if (usecs <= 0)
++      return;
++   /* Sleep() lasts at least one tick of the system timer, 15.6 ms unless some process raised its resolution: a
++    * wait that polls with short sleeps (Venus' vn_relax starts at 160 us) then waits a whole tick each time. A
++    * high-resolution waitable timer (Windows 10 1803 and later) sleeps for the time asked.
++    */
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++   HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                         TIMER_ALL_ACCESS);
++   if (timer) {
++      LARGE_INTEGER due;
++      due.QuadPart = -usecs * 10; /* relative, in 100 ns units */
++      if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
++         WaitForSingleObject(timer, INFINITE);
++      CloseHandle(timer);
++      return;
++   }
++
+    DWORD dwMilliseconds = (DWORD) ((usecs + 999) / 1000);
+    /* Avoid Sleep(O) as that would cause to sleep for an undetermined duration */
+    if (dwMilliseconds) {
+diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
+--- a/src/virtio/vulkan/vn_queue.c
++++ b/src/virtio/vulkan/vn_queue.c
+@@ -1017,6 +1017,12 @@
+       };
+       vn_renderer_submit(dev->renderer, &renderer_submit);
+    } else {
++#if DETECT_OS_WINDOWS
++      /* Win32 WSI's software path waits for the image's fence before it reads the image: nothing reads it behind
++       * the queue's back
++       */
++      return;
++#endif
+       if (VN_DEBUG(WSI)) {
+          static uint32_t num_rate_limit_warning = 0;
+ 
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -1524,7 +1524,7 @@
+ #endif
+       }
+ 
+-      if (wsi->sw)
++      if (wsi->sw && !swapchain->present_waits_for_fence)
+ 	      wsi->WaitForFences(device, 1, &swapchain->fences[image_index],
+ 				 true, ~0ull);
+ 
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -200,6 +200,11 @@
+ 
+    bool capture_key_pressed;
+ 
++   /* A software swapchain whose queue_present waits for the image's fence itself (Win32's present thread), so
++    * wsi_common_queue_present doesn't wait before calling it
++    */
++   bool present_waits_for_fence;
++
+    /* Command pools, one per queue family */
+    VkCommandPool *cmd_pools;
+ 
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -26,6 +26,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include "util/os_time.h"
+ #include "vk_format.h"
+ #include "vk_instance.h"
+ #include "vk_physical_device.h"
+@@ -77,6 +78,8 @@
+       HBITMAP bmp;
+       int bmp_row_pitch;
+       void *ppvBits;
++      /* order of the queued presents (wsi_win32_present_thread) */
++      uint64_t serial;
+    } sw;
+ };
+ 
+@@ -105,6 +108,21 @@
+    VkExtent2D                 extent;
+    HWND wnd;
+    HDC chain_dc;
++
++   /* Software presents run on a thread of their own: it waits for an image's rendering and draws it into the
++    * window while the application renders the next frame. lock guards the images' states, cond is signalled when
++    * an image is queued or becomes idle.
++    */
++   struct {
++      HANDLE thread;
++      CRITICAL_SECTION lock;
++      CONDITION_VARIABLE cond;
++      uint64_t serial;
++      /* the image the thread is drawing */
++      struct wsi_win32_image *current;
++      bool stop;
++   } sw;
++
+    struct wsi_win32_image     images[0];
+ };
+ 
+@@ -354,7 +372,11 @@
+    return vk_outarray_status(&out);
+ }
+ 
++/* The software path presents on a thread (wsi_win32_present_thread): FIFO and MAILBOX keep to the compositor's
++ * pace, IMMEDIATE draws as fast as frames come */
+ static const VkPresentModeKHR present_modes_gdi[] = {
++   VK_PRESENT_MODE_IMMEDIATE_KHR,
++   VK_PRESENT_MODE_MAILBOX_KHR,
+    VK_PRESENT_MODE_FIFO_KHR,
+ };
+ static const VkPresentModeKHR present_modes_dxgi[] = {
+@@ -579,6 +601,24 @@
+    struct wsi_win32_swapchain *chain =
+       (struct wsi_win32_swapchain *) drv_chain;
+ 
++   if (chain->sw.thread) {
++      /* the queued presents are drawn first */
++      EnterCriticalSection(&chain->sw.lock);
++      for (;;) {
++         uint32_t i;
++         for (i = 0; i < chain->base.image_count && chain->images[i].state != WSI_IMAGE_QUEUED; i++) {}
++         if (i == chain->base.image_count || chain->status != VK_SUCCESS)
++            break;
++         SleepConditionVariableCS(&chain->sw.cond, &chain->sw.lock, INFINITE);
++      }
++      chain->sw.stop = true;
++      WakeAllConditionVariable(&chain->sw.cond);
++      LeaveCriticalSection(&chain->sw.lock);
++      WaitForSingleObject(chain->sw.thread, INFINITE);
++      CloseHandle(chain->sw.thread);
++      DeleteCriticalSection(&chain->sw.lock);
++   }
++
+    for (uint32_t i = 0; i < chain->base.image_count; i++)
+       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
+ 
+@@ -615,12 +655,18 @@
+    if (chain->status == VK_ERROR_SURFACE_LOST_KHR)
+       return chain->status;
+ 
++   if (chain->sw.thread)
++      EnterCriticalSection(&chain->sw.lock);
+    for (uint32_t i = 0; i < count; i++) {
+       uint32_t index = indices[i];
+       assert(index < chain->base.image_count);
+       assert(chain->images[index].state == WSI_IMAGE_DRAWING);
+       chain->images[index].state = WSI_IMAGE_IDLE;
+    }
++   if (chain->sw.thread) {
++      WakeAllConditionVariable(&chain->sw.cond);
++      LeaveCriticalSection(&chain->sw.lock);
++   }
+ 
+    return VK_SUCCESS;
+ }
+@@ -638,6 +684,35 @@
+    if (chain->status != VK_SUCCESS)
+       return chain->status;
+ 
++   if (chain->sw.thread) {
++      /* the present thread gives images back as it draws them */
++      const uint64_t deadline = os_time_get_absolute_timeout(info->timeout);
++      EnterCriticalSection(&chain->sw.lock);
++      VkResult result = VK_SUCCESS;
++      for (;;) {
++         if (chain->status != VK_SUCCESS) {
++            result = chain->status;
++            break;
++         }
++         uint32_t i;
++         for (i = 0; i < chain->base.image_count && chain->images[i].state != WSI_IMAGE_IDLE; i++) {}
++         if (i < chain->base.image_count) {
++            *image_index = i;
++            chain->images[i].state = WSI_IMAGE_DRAWING;
++            break;
++         }
++         const int64_t now = os_time_get_nano();
++         if (info->timeout == 0 || (info->timeout != UINT64_MAX && (uint64_t)now >= deadline)) {
++            result = info->timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
++            break;
++         }
++         const DWORD ms = info->timeout == UINT64_MAX ? INFINITE : (DWORD)MAX2((deadline - now) / 1000000, 1);
++         SleepConditionVariableCS(&chain->sw.cond, &chain->sw.lock, ms);
++      }
++      LeaveCriticalSection(&chain->sw.lock);
++      return result;
++   }
++
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       if (chain->images[i].state == WSI_IMAGE_IDLE) {
+          *image_index = i;
+@@ -708,6 +783,78 @@
+    return VK_SUCCESS;
+ }
+ 
++/* GDI draws straight from the mapped image: a top-down 32-bit DIB as wide as a row of it (its pitch is a multiple of
++ * 4 bytes), clipped to the swapchain's width. Copying it into the DIB section first cost a pass over every pixel.
++ */
++static bool
++wsi_win32_draw_image(struct wsi_win32_swapchain *chain, struct wsi_win32_image *image, HDC dc)
++{
++   BITMAPINFO info = {};
++   info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++   info.bmiHeader.biWidth = image->base.row_pitches[0] / 4;
++   info.bmiHeader.biHeight = -(LONG)chain->extent.height;
++   info.bmiHeader.biPlanes = 1;
++   info.bmiHeader.biBitCount = 32;
++   info.bmiHeader.biCompression = BI_RGB;
++   return StretchDIBits(dc, 0, 0, chain->extent.width, chain->extent.height, 0, 0, chain->extent.width,
++                        chain->extent.height, image->base.cpu_map, &info, DIB_RGB_COLORS, SRCCOPY) != 0;
++}
++
++static DWORD WINAPI
++wsi_win32_present_thread(void *data)
++{
++   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)data;
++   const struct wsi_device *wsi = chain->base.wsi;
++   HDC dc = GetDC(chain->wnd);
++   /* FIFO and MAILBOX: one frame per composition of the desktop (DwmFlush waits for the next one) */
++   typedef HRESULT(WINAPI * PFN_DwmFlush)(void);
++   HMODULE dwmapi = chain->base.present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR ? LoadLibraryA("dwmapi.dll") : NULL;
++   PFN_DwmFlush dwm_flush = dwmapi ? (PFN_DwmFlush)GetProcAddress(dwmapi, "DwmFlush") : NULL;
++
++   EnterCriticalSection(&chain->sw.lock);
++   while (!chain->sw.stop) {
++      /* the oldest queued image: presents keep their order (FIFO) */
++      struct wsi_win32_image *image = NULL;
++      for (uint32_t i = 0; i < chain->base.image_count; i++) {
++         struct wsi_win32_image *candidate = &chain->images[i];
++         if (candidate->state == WSI_IMAGE_QUEUED && (!image || candidate->sw.serial < image->sw.serial))
++            image = candidate;
++      }
++      if (!image) {
++         SleepConditionVariableCS(&chain->sw.cond, &chain->sw.lock, INFINITE);
++         continue;
++      }
++      chain->sw.current = image;
++      LeaveCriticalSection(&chain->sw.lock);
++
++      const uint32_t index = image - chain->images;
++      VkResult result = wsi->WaitForFences(chain->base.device, 1, &chain->base.fences[index], true, UINT64_MAX);
++      if (result == VK_SUCCESS && !wsi_win32_draw_image(chain, image, dc))
++         result = VK_ERROR_SURFACE_LOST_KHR;
++
++      /* GDI has copied the pixels: the image goes back before the wait for the compositor */
++      EnterCriticalSection(&chain->sw.lock);
++      if (result != VK_SUCCESS && chain->status == VK_SUCCESS)
++         chain->status = result;
++      image->state = WSI_IMAGE_IDLE;
++      chain->sw.current = NULL;
++      WakeAllConditionVariable(&chain->sw.cond);
++
++      if (result == VK_SUCCESS && dwm_flush) {
++         LeaveCriticalSection(&chain->sw.lock);
++         if (FAILED(dwm_flush()))
++            Sleep(1); /* no composition (a minimized or hidden desktop): don't spin */
++         EnterCriticalSection(&chain->sw.lock);
++      }
++   }
++   LeaveCriticalSection(&chain->sw.lock);
++
++   ReleaseDC(chain->wnd, dc);
++   if (dwmapi)
++      FreeLibrary(dwmapi);
++   return 0;
++}
++
+ static VkResult
+ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+                         uint32_t image_index,
+@@ -723,15 +870,26 @@
+    if (chain->dxgi)
+       return wsi_win32_queue_present_dxgi(chain, image, damage);
+ 
+-   char *ptr = (char *)image->base.cpu_map;
+-   char *dptr = (char *)image->sw.ppvBits;
+-
+-   for (unsigned h = 0; h < chain->extent.height; h++) {
+-      memcpy(dptr, ptr, chain->extent.width * 4);
+-      dptr += image->sw.bmp_row_pitch;
+-      ptr += image->base.row_pitches[0];
++   if (chain->sw.thread) {
++      EnterCriticalSection(&chain->sw.lock);
++      if (chain->base.present_mode == VK_PRESENT_MODE_MAILBOX_KHR) {
++         /* only the newest frame is shown: one still waiting goes back unseen (later work on it is ordered after
++          * its rendering on the queue) */
++         for (uint32_t i = 0; i < chain->base.image_count; i++) {
++            struct wsi_win32_image *older = &chain->images[i];
++            if (older->state == WSI_IMAGE_QUEUED && older != chain->sw.current)
++               older->state = WSI_IMAGE_IDLE;
++         }
++      }
++      image->state = WSI_IMAGE_QUEUED;
++      image->sw.serial = ++chain->sw.serial;
++      WakeAllConditionVariable(&chain->sw.cond);
++      VkResult status = chain->status;
++      LeaveCriticalSection(&chain->sw.lock);
++      return status;
+    }
+-   if (!StretchBlt(chain->chain_dc, 0, 0, chain->extent.width, chain->extent.height, image->sw.dc, 0, 0, chain->extent.width, chain->extent.height, SRCCOPY))
++
++   if (!wsi_win32_draw_image(chain, image, chain->chain_dc))
+       chain->status = VK_ERROR_MEMORY_MAP_FAILED;
+ 
+    image->state = WSI_IMAGE_IDLE;
+@@ -812,7 +970,15 @@
+ 
+    assert(create_info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+ 
+-   const unsigned num_images = create_info->minImageCount;
++   bool supports_dxgi = wsi->dxgi.factory &&
++                        wsi->dxgi.dcomp &&
++                        wsi->wsi->win32.get_d3d12_command_queue;
++   /* Software presents: a second image to render into while the present thread draws one, a third for MAILBOX to
++    * replace the waiting one with (Vulkan allows more images than asked for) */
++   const unsigned sw_min_images =
++      wsi_swapchain_get_present_mode(wsi_device, create_info) == VK_PRESENT_MODE_MAILBOX_KHR ? 3 : 2;
++   const unsigned num_images =
++      supports_dxgi ? create_info->minImageCount : MAX2(create_info->minImageCount, sw_min_images);
+    struct wsi_win32_swapchain *chain;
+    size_t size = sizeof(*chain) + num_images * sizeof(chain->images[0]);
+ 
+@@ -831,9 +997,6 @@
+       { WSI_IMAGE_TYPE_CPU },
+    };
+ 
+-   bool supports_dxgi = wsi->dxgi.factory &&
+-                        wsi->dxgi.dcomp &&
+-                        wsi->wsi->win32.get_d3d12_command_queue;
+    struct wsi_base_image_params *image_params = supports_dxgi ?
+       &dxgi_image_params.base : &cpu_image_params.base;
+ 
+@@ -874,6 +1037,16 @@
+       chain->base.image_count++;
+    }
+ 
++   if (!chain->dxgi) {
++      InitializeCriticalSection(&chain->sw.lock);
++      InitializeConditionVariable(&chain->sw.cond);
++      chain->sw.thread = CreateThread(NULL, 0, wsi_win32_present_thread, chain, 0, NULL);
++      if (chain->sw.thread)
++         chain->base.present_waits_for_fence = true;
++      else
++         DeleteCriticalSection(&chain->sw.lock);
++   }
++
+    *swapchain_out = &chain->base;
+ 
+    return VK_SUCCESS;

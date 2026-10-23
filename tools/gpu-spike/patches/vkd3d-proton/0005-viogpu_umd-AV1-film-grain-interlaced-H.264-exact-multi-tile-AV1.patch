@@ -1,0 +1,552 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: AV1 film grain, interlaced H.264, exact multi-tile AV1
+
+D3D12 video decoding, on top of the decoder (0004): ffmpeg's d3d12va now
+decodes every test clip bit-exact against libavcodec/libdav1d (H.264
+progressive, MBAFF, field pictures and mixed; HEVC Main/Main 10/4K; VP9 8/10;
+AV1 8/10-bit, 1080p with tiles, film grain 8/10-bit).
+
+- AV1: inline session parameters (VK_KHR_video_maintenance2, enabled by
+  vkd3d-proton where the device has it): NVIDIA's decoder takes a sequence
+  header from a parameters object differently from the same one passed with
+  the decode; a 4-tile 8-bit clip came out with chroma off by one here and
+  there. Every decode parameter, the bitstream layout, images and session
+  were compared with ffmpeg's Vulkan decoder (bit-exact on the same GPU): the
+  parameters object was the one difference. refresh_frame_flags (not in
+  DXVA) turned out not to matter.
+- AV1 film grain: the profile with film grain support; a picture that applies
+  grain decodes out of place, into one more image after the DPB slots', and
+  that is what lands in the application's texture, while its DPB picture
+  stays without grain for the pictures that reference it (as ffmpeg's Vulkan
+  decoder does with NVIDIA's coinciding DPB and output). DXVA's grain
+  parameters are the picture's as they apply, so update_grain is always set.
+- AV1 loop restoration unit sizes for every plane whenever one restores.
+- Interlaced H.264: streams that aren't frames-only get the interleaved
+  picture layout; field pictures decode into one slot per frame (the second
+  field into the first's), the setup and references carry the fields decoded
+  (field-coded references only, as ffmpeg's Vulkan decoder has them), the
+  first field of a pair is a complementary field pair, and a second field
+  that references its first doesn't bind its slot twice.
+- HEVC encoding caps: minimum coding unit 16x16 (the encoder's is 8x8):
+  applications pad reconstructed pictures to it, and a decoder's 1088-line
+  frames then match them (ffmpeg's hevc_d3d12va fed straight from d3d12va at
+  1080p failed the runtime's reference size check).
+---
+diff --git a/libs/viogpu_umd/umd_video.cpp b/libs/viogpu_umd/umd_video.cpp
+index 96cbd7af..6f984933 100644
+--- a/libs/viogpu_umd/umd_video.cpp
++++ b/libs/viogpu_umd/umd_video.cpp
+@@ -86,6 +86,11 @@ video_get(viogpu_device *device)
+    if (video->family == VK_QUEUE_FAMILY_IGNORED && video->decodeFamily == VK_QUEUE_FAMILY_IGNORED)
+       return NULL;
+    video->GetPhysicalDeviceMemoryProperties(video->physical, &video->memory);
++   VkPhysicalDeviceVideoMaintenance2FeaturesKHR maintenance2 = {
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR};
++   VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance2};
++   video->GetPhysicalDeviceFeatures2(video->physical, &features);
++   video->maintenance2 = maintenance2.videoMaintenance2;
+    video->ok = true;
+    viogpu_log("video: encoding on queue family %d, decoding on %d", (int)video->family, (int)video->decodeFamily);
+    return video;
+@@ -509,9 +514,11 @@ video_get_caps_(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_VIDEO_GETCAPS_0020 *
+             s->SupportFlags |=
+                D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_0083_0_ASYMETRIC_MOTION_PARTITION_SUPPORT |
+                D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_0083_0_ASYMETRIC_MOTION_PARTITION_REQUIRED;
+-         /* coding units 8x8 up to the CTB, transform units 4x4 up to 32x32, the full hierarchy */
++         /* coding units 16x16 up to the CTB, transform units 4x4 up to 32x32, the full hierarchy. 16, not the
++          * encoder's 8: applications pad their reconstructed pictures to it (ffmpeg's hevc_d3d12va does), and
++          * decoders' 1088-line frames then match them (with 8, 1080p from a decoder fails the runtime's check) */
+          UINT ctb = block_size(c, true);
+-         s->MinLumaCodingUnitSize = D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_0080_CUSIZE_8x8;
++         s->MinLumaCodingUnitSize = D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_0080_CUSIZE_16x16;
+          s->MaxLumaCodingUnitSize = (D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_0080)(log2_of(ctb) - 3);
+          s->MinLumaTransformUnitSize = D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_TUSIZE_0082_0_4x4;
+          s->MaxLumaTransformUnitSize = D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_TUSIZE_0082_0_32x32;
+diff --git a/libs/viogpu_umd/umd_video.h b/libs/viogpu_umd/umd_video.h
+index de20a3f9..d92ddb97 100644
+--- a/libs/viogpu_umd/umd_video.h
++++ b/libs/viogpu_umd/umd_video.h
+@@ -21,6 +21,7 @@
+    X(GetDeviceProcAddr)                                                                                                \
+    X(GetPhysicalDeviceQueueFamilyProperties)                                                                           \
+    X(GetPhysicalDeviceMemoryProperties)                                                                                \
++   X(GetPhysicalDeviceFeatures2)                                                                                       \
+    X(GetPhysicalDeviceVideoCapabilitiesKHR)                                                                            \
+    X(GetPhysicalDeviceVideoFormatPropertiesKHR)
+ 
+@@ -93,6 +94,8 @@ struct viogpu_video {
+    uint32_t family;
+    uint32_t decodeFamily;
+    VkPhysicalDeviceMemoryProperties memory;
++   /* VK_KHR_video_maintenance2 (vkd3d-proton enables it where the device has it): inline session parameters */
++   bool maintenance2;
+ #define X(f) PFN_vk##f f;
+    INSTANCE_FUNCS(X)
+    DEVICE_FUNCS(X)
+diff --git a/libs/viogpu_umd/umd_video_decode.cpp b/libs/viogpu_umd/umd_video_decode.cpp
+index a19f33ff..22396b5c 100644
+--- a/libs/viogpu_umd/umd_video_decode.cpp
++++ b/libs/viogpu_umd/umd_video_decode.cpp
+@@ -98,7 +98,7 @@ decode_profile_fill(decode_profile *p, int index)
+       p->info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR;
+       p->h264.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PROFILE_INFO_KHR;
+       p->h264.stdProfileIdc = (StdVideoH264ProfileIdc)d.stdProfile;
+-      /* ponytail: progressive only; interlaced H.264 (field pictures, MBAFF) would need the interleaved layout */
++      /* interlaced streams' sessions: the interleaved layout (decode_session_get) */
+       p->h264.pictureLayout = VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR;
+       p->info.pNext = &p->h264;
+       break;
+@@ -118,8 +118,8 @@ decode_profile_fill(decode_profile *p, int index)
+       p->info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
+       p->av1.sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_PROFILE_INFO_KHR;
+       p->av1.stdProfile = (StdVideoAV1Profile)d.stdProfile;
+-      /* film grain needs an output picture apart from the DPB (see decode_av1) */
+-      p->av1.filmGrainSupport = VK_FALSE;
++      /* film grain: such pictures decode into an output picture apart from their DPB picture (decode_frame) */
++      p->av1.filmGrainSupport = VK_TRUE;
+       p->info.pNext = &p->av1;
+       break;
+    }
+@@ -364,6 +364,9 @@ struct decode_slot {
+    ID3D12Resource *texture;
+    UINT subresource;
+    VkExtent2D extent;
++   /* H.264: the fields decoded into it (1 top, 2 bottom, 3 both or a frame), whether as field pictures */
++   UINT fields;
++   bool fieldCoded;
+    StdVideoDecodeAV1ReferenceInfo av1;
+ };
+ 
+@@ -396,12 +399,19 @@ struct decode_session {
+    std::vector<uint8_t> paramsKey;
+    /* parameters replaced while lists may still use them: freed with the session */
+    std::vector<VkVideoSessionParametersKHR> oldParams;
+-   /* one image per slot (as ffmpeg's Vulkan decoder has them) */
++   /* one image per slot (as ffmpeg's Vulkan decoder has them); AV1: one more after them, the output of pictures with
++    * film grain (their DPB picture stays without, as later pictures reference it) */
+    std::vector<VkImage> dpb;
+    std::vector<VkDeviceMemory> dpbMemory;
+    std::vector<VkImageView> dpbViews;
+    std::vector<decode_slot> slots;
+    bool reset;
++   /* AV1 with inline session parameters (VK_KHR_video_maintenance2), the sequence header passed with each decode:
++    * NVIDIA's decoder takes the one in a parameters object differently (multi-tile 8-bit clips came out with chroma
++    * off by one here and there; inline, as ffmpeg's Vulkan decoder has it, bit-exact) */
++   bool inlineParams;
++   StdVideoAV1SequenceHeader inlineSeq;
++   StdVideoAV1ColorConfig inlineColor;
+ };
+ 
+ struct viogpu_video_decoder_heap {
+@@ -505,9 +515,11 @@ align_up(UINT v, UINT a)
+    return a ? (v + a - 1) / a * a : v;
+ }
+ 
+-/* The session and its DPB, made by the heap's first DecodeFrame */
++/* The session and its DPB, made by the heap's first DecodeFrame; interlaced: an H.264 stream that may have field
++ * pictures and MBAFF frames (ponytail: as the first picture says, a progressive stream turning interlaced later would
++ * need a new session) */
+ static decode_session *
+-decode_session_get(viogpu_video_decoder_heap *heap)
++decode_session_get(viogpu_video_decoder_heap *heap, bool interlaced)
+ {
+    if (heap->session)
+       return heap->session;
+@@ -515,6 +527,8 @@ decode_session_get(viogpu_video_decoder_heap *heap)
+    decode_session *s = new decode_session();
+    s->video = v;
+    decode_profile_fill(&s->profile, heap->profile);
++   if (interlaced && s->profile.codec == CODEC_H264)
++      s->profile.h264.pictureLayout = VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_INTERLACED_INTERLEAVED_LINES_BIT_KHR;
+    s->caps = decode_caps_get(v, heap->profile);
+    /* the heap's size as the codecs' coded sizes (macroblock, CTB aligned) and the decoder's access granularity round
+     * it */
+@@ -536,6 +550,9 @@ decode_session_get(viogpu_video_decoder_heap *heap)
+    info.maxDpbSlots = slots;
+    info.maxActiveReferencePictures = std::min(s->caps->caps.maxActiveReferencePictures, slots - 1);
+    info.pStdHeaderVersion = &s->caps->caps.stdHeaderVersion;
++   s->inlineParams = s->profile.codec == CODEC_AV1 && v->maintenance2;
++   if (s->inlineParams)
++      info.flags |= VK_VIDEO_SESSION_CREATE_INLINE_SESSION_PARAMETERS_BIT_KHR;
+    VkResult r = v->CreateVideoSessionKHR(v->device, &info, NULL, &s->session);
+    if (r != VK_SUCCESS) {
+       viogpu_log("video: decode vkCreateVideoSessionKHR: %d", (int)r);
+@@ -580,7 +597,7 @@ decode_session_get(viogpu_video_decoder_heap *heap)
+    image.usage = DPB_USAGE;
+    image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+-   for (uint32_t i = 0; i < slots; i++) {
++   for (uint32_t i = 0; i < slots + (s->profile.codec == CODEC_AV1); i++) {
+       VkImage handle;
+       if ((r = v->CreateImage(v->device, &image, NULL, &handle)) != VK_SUCCESS) {
+          viogpu_log("video: decode DPB image: %d", (int)r);
+@@ -668,6 +685,8 @@ struct decode_picture {
+    int setup;
+    const void *setupInfo;
+    const void *pictureInfo;
++   /* AV1: film grain applied, the picture decoded into the session's grain output */
++   bool grain = false;
+ };
+ 
+ /* A DXVA texture index -> the application's texture */
+@@ -685,7 +704,7 @@ ref_texture(const D3D12DDI_VIDEO_DECODE_REFERENCE_FRAMES_0032 &frames, UINT inde
+ /* The kept references' slots (-1: never decoded, as at a stream starting with a non-key picture; pictures that use
+  * one decode without it), the slots of textures no reference names free again, and a slot for the current picture */
+ static bool
+-decode_slots_assign(decode_session *s, decode_picture *pic, ID3D12Resource *output, UINT outputSub)
++decode_slots_assign(decode_session *s, decode_picture *pic, ID3D12Resource *output, UINT outputSub, UINT field = 0)
+ {
+    pic->extent.width = std::min(pic->extent.width, s->maxExtent.width);
+    pic->extent.height = std::min(pic->extent.height, s->maxExtent.height);
+@@ -701,10 +720,22 @@ decode_slots_assign(decode_session *s, decode_picture *pic, ID3D12Resource *outp
+          }
+       }
+    }
++   /* a field picture whose other field is in the output's slot already: the second of the pair, into the same slot */
++   pic->setup = -1;
++   for (size_t slot = 0; field && slot < s->slots.size(); slot++) {
++      decode_slot &d = s->slots[slot];
++      if (d.used && d.texture == output && d.subresource == outputSub && d.fieldCoded && d.fields == (3 ^ field)) {
++         keep[slot] = true;
++         pic->setup = (int)slot;
++      }
++   }
+    for (size_t slot = 0; slot < s->slots.size(); slot++)
+       if (!keep[slot])
+          s->slots[slot].used = false;
+-   pic->setup = -1;
++   if (pic->setup >= 0) {
++      s->slots[pic->setup].fields |= field;
++      return true;
++   }
+    for (size_t slot = 0; slot < s->slots.size() && pic->setup < 0; slot++) {
+       decode_slot &d = s->slots[slot];
+       if (!d.used) {
+@@ -712,6 +743,8 @@ decode_slots_assign(decode_session *s, decode_picture *pic, ID3D12Resource *outp
+          d.texture = output;
+          d.subresource = outputSub;
+          d.extent = pic->extent;
++         d.fields = field ? field : 3;
++         d.fieldCoded = field != 0;
+          pic->setup = (int)slot;
+       }
+    }
+@@ -887,21 +920,30 @@ decode_h264(const decode_input &d, decode_picture *pic, h264_picture *h)
+       keep_add(pic, d.in->ReferenceFrames, pp->RefFrameList[i].Index7Bits);
+       listed.push_back(i);
+    }
+-   if (!decode_slots_assign(d.s, pic, d.output, d.outputSub))
++   UINT field = pp->field_pic_flag ? (pp->CurrPic.AssociatedFlag ? 2 : 1) : 0;
++   if (!decode_slots_assign(d.s, pic, d.output, d.outputSub, field))
+       return false;
++   bool secondField = field && d.s->slots[pic->setup].fields == 3;
+    UINT n = 0;
+    for (UINT i : listed) {
++      /* field-coded references: the fields used of those decoded (as ffmpeg's Vulkan decoder has them); frames none */
++      int k = keep_index(pic, d.in->ReferenceFrames, pp->RefFrameList[i].Index7Bits);
++      const decode_slot *slot = k >= 0 && pic->keep[k].slot >= 0 ? &d.s->slots[pic->keep[k].slot] : NULL;
+       UINT used = (pp->UsedForReferenceFlags >> (2 * i)) & 3;
++      if (slot && slot->fieldCoded)
++         used &= slot->fields & (pic->keep[k].slot == pic->setup ? 3 ^ field : 3);
++      else
++         used = 0;
+       StdVideoDecodeH264ReferenceInfo &ri = h->refInfo[n];
+-      ri.flags.top_field_flag = used == 1;
+-      ri.flags.bottom_field_flag = used == 2;
++      ri.flags.top_field_flag = (used & 1) != 0;
++      ri.flags.bottom_field_flag = (used & 2) != 0;
+       ri.flags.used_for_long_term_reference = pp->RefFrameList[i].AssociatedFlag;
+       ri.FrameNum = pp->FrameNumList[i];
+       ri.PicOrderCnt[0] = pp->FieldOrderCntList[i][0];
+       ri.PicOrderCnt[1] = pp->FieldOrderCntList[i][1];
+       h->refSlot[n].sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_DPB_SLOT_INFO_KHR;
+       h->refSlot[n].pStdReferenceInfo = &ri;
+-      use_add(pic, keep_index(pic, d.in->ReferenceFrames, pp->RefFrameList[i].Index7Bits), &h->refSlot[n]);
++      use_add(pic, k, &h->refSlot[n]);
+       n++;
+    }
+    StdVideoDecodeH264PictureInfo &std = h->std;
+@@ -909,11 +951,15 @@ decode_h264(const decode_input &d, decode_picture *pic, h264_picture *h)
+    std.flags.is_intra = pp->IntraPicFlag;
+    /* DXVA has no IDR flag: an intra picture with frame_num 0 and no references is one */
+    std.flags.IdrPicFlag = pp->IntraPicFlag && pp->frame_num == 0 && listed.empty();
+-   std.flags.bottom_field_flag = pp->field_pic_flag && pp->CurrPic.AssociatedFlag;
++   std.flags.bottom_field_flag = field == 2;
++   /* as ffmpeg's Vulkan decoder has it: set on the first field of a pair */
++   std.flags.complementary_field_pair = field && !secondField;
+    std.flags.is_reference = pp->RefPicFlag;
+    std.frame_num = pp->frame_num;
+    std.PicOrderCnt[0] = pp->CurrFieldOrderCnt[0];
+    std.PicOrderCnt[1] = pp->CurrFieldOrderCnt[1];
++   h->setupInfo.flags.top_field_flag = field == 1;
++   h->setupInfo.flags.bottom_field_flag = field == 2;
+    h->setupInfo.FrameNum = pp->frame_num;
+    h->setupInfo.PicOrderCnt[0] = pp->CurrFieldOrderCnt[0];
+    h->setupInfo.PicOrderCnt[1] = pp->CurrFieldOrderCnt[1];
+@@ -1259,6 +1305,7 @@ struct av1_picture {
+    StdVideoAV1CDEF cdef;
+    StdVideoAV1LoopRestoration restoration;
+    StdVideoAV1GlobalMotion globalMotion;
++   StdVideoAV1FilmGrain filmGrain;
+    std::vector<uint32_t> tileOffsets, tileSizes;
+    StdVideoDecodeAV1ReferenceInfo setupInfo;
+    VkVideoDecodeAV1DpbSlotInfoKHR setupSlot;
+@@ -1313,7 +1360,14 @@ av1_params_get(decode_session *s, const DXVA_PicParams_AV1 *pp)
+    /* not in DXVA: unspecified (0 would be identity matrix coefficients, RGB) */
+    p.color.color_primaries = STD_VIDEO_AV1_COLOR_PRIMARIES_UNSPECIFIED;
+    p.color.transfer_characteristics = STD_VIDEO_AV1_TRANSFER_CHARACTERISTICS_UNSPECIFIED;
+-   p.color.matrix_coefficients = STD_VIDEO_AV1_MATRIX_COEFFICIENTS_UNSPECIFIED;
++   p.color.matrix_coefficients = pp->film_grain.matrix_coeff_is_identity ? STD_VIDEO_AV1_MATRIX_COEFFICIENTS_IDENTITY
++                                                                         : STD_VIDEO_AV1_MATRIX_COEFFICIENTS_UNSPECIFIED;
++   if (s->inlineParams) {
++      s->inlineSeq = p.seq;
++      s->inlineColor = p.color;
++      s->inlineSeq.pColorConfig = &s->inlineColor;
++      return true;
++   }
+    if (!params_changed(s, p))
+       return true;
+    p.seq.pColorConfig = &p.color;
+@@ -1325,7 +1379,8 @@ av1_params_get(decode_session *s, const DXVA_PicParams_AV1 *pp)
+ 
+ /* DXVA's AV1 parameters lack what is about the references: their order hints and frame types, the skip mode frames,
+  * sign biases. Each DPB slot keeps that of its picture (decode_slot::av1); the rest is derived as the AV1 spec does.
+- * Film grain isn't applied (ponytail: it needs an output picture apart from the DPB, VK_KHR_video's distinct mode). */
++ * Film grain applies to the output only: such pictures decode out of place (decode_frame), as ffmpeg's Vulkan decoder
++ * has it, with NVIDIA's coinciding DPB and output too. */
+ static bool
+ decode_av1(const decode_input &d, decode_picture *pic, av1_picture *h)
+ {
+@@ -1490,11 +1545,13 @@ decode_av1(const decode_input &d, decode_picture *pic, av1_picture *h)
+       h->cdef.cdef_uv_sec_strength[i] = pp->cdef.uv_strengths[i].secondary;
+    }
+ 
+-   /* restoration types as the spec numbers them (both); unit sizes: DXVA's log2, Vulkan's log2 - 5 */
++   /* restoration types as the spec numbers them (both); unit sizes: DXVA's log2, Vulkan's log2 - 5, every plane's
++    * whenever a plane restores (the spec defines them all then, ffmpeg's Vulkan decoder passes them so) */
++   bool usesLr = lf.frame_restoration_type[0] || lf.frame_restoration_type[1] || lf.frame_restoration_type[2];
+    for (int i = 0; i < 3; i++) {
+       h->restoration.FrameRestorationType[i] = (StdVideoAV1FrameRestorationType)lf.frame_restoration_type[i];
+       h->restoration.LoopRestorationSize[i] =
+-         lf.frame_restoration_type[i] && lf.log2_restoration_unit_size[i] >= 5 ? lf.log2_restoration_unit_size[i] - 5 : 1;
++         usesLr && lf.log2_restoration_unit_size[i] >= 5 ? lf.log2_restoration_unit_size[i] - 5 : 1;
+    }
+ 
+    /* global motion per reference (index 0, the intra frame: unused) */
+@@ -1504,6 +1561,48 @@ decode_av1(const decode_input &d, decode_picture *pic, av1_picture *h)
+          h->globalMotion.gm_params[1 + i][j] = pp->frame_refs[i].wmmat[j];
+    }
+ 
++   /* film grain: DXVA's are the picture's parameters as they apply (loaded from a reference's when not updated) */
++   const auto &fg = pp->film_grain;
++   if (fg.apply_grain) {
++      StdVideoAV1FilmGrain &g = h->filmGrain;
++      g.flags.chroma_scaling_from_luma = fg.chroma_scaling_from_luma;
++      g.flags.overlap_flag = fg.overlap_flag;
++      g.flags.clip_to_restricted_range = fg.clip_to_restricted_range;
++      g.flags.update_grain = 1;
++      g.grain_scaling_minus_8 = fg.scaling_shift_minus8;
++      g.ar_coeff_lag = fg.ar_coeff_lag;
++      g.ar_coeff_shift_minus_6 = fg.ar_coeff_shift_minus6;
++      g.grain_scale_shift = fg.grain_scale_shift;
++      g.grain_seed = fg.grain_seed;
++      g.num_y_points = std::min<uint8_t>(fg.num_y_points, STD_VIDEO_AV1_MAX_NUM_Y_POINTS);
++      for (int i = 0; i < g.num_y_points; i++) {
++         g.point_y_value[i] = fg.scaling_points_y[i][0];
++         g.point_y_scaling[i] = fg.scaling_points_y[i][1];
++      }
++      g.num_cb_points = std::min<uint8_t>(fg.num_cb_points, STD_VIDEO_AV1_MAX_NUM_CB_POINTS);
++      for (int i = 0; i < g.num_cb_points; i++) {
++         g.point_cb_value[i] = fg.scaling_points_cb[i][0];
++         g.point_cb_scaling[i] = fg.scaling_points_cb[i][1];
++      }
++      g.num_cr_points = std::min<uint8_t>(fg.num_cr_points, STD_VIDEO_AV1_MAX_NUM_CR_POINTS);
++      for (int i = 0; i < g.num_cr_points; i++) {
++         g.point_cr_value[i] = fg.scaling_points_cr[i][0];
++         g.point_cr_scaling[i] = fg.scaling_points_cr[i][1];
++      }
++      memcpy(g.ar_coeffs_y_plus_128, fg.ar_coeffs_y, sizeof(g.ar_coeffs_y_plus_128));
++      memcpy(g.ar_coeffs_cb_plus_128, fg.ar_coeffs_cb, sizeof(g.ar_coeffs_cb_plus_128));
++      memcpy(g.ar_coeffs_cr_plus_128, fg.ar_coeffs_cr, sizeof(g.ar_coeffs_cr_plus_128));
++      g.cb_mult = fg.cb_mult;
++      g.cb_luma_mult = fg.cb_luma_mult;
++      g.cb_offset = (uint16_t)fg.cb_offset;
++      g.cr_mult = fg.cr_mult;
++      g.cr_luma_mult = fg.cr_luma_mult;
++      g.cr_offset = (uint16_t)fg.cr_offset;
++      std.flags.apply_grain = 1;
++      std.pFilmGrain = &g;
++      pic->grain = true;
++   }
++
+    /* shown key frames are error resilient (the spec infers it) */
+    std.flags.error_resilient_mode = pp->format.frame_type == STD_VIDEO_AV1_FRAME_TYPE_KEY && pp->format.show_frame;
+    std.flags.disable_cdf_update = pp->coding.disable_cdf_update;
+@@ -1527,14 +1626,12 @@ decode_av1(const decode_input &d, decode_picture *pic, av1_picture *h)
+    std.flags.segmentation_update_map = pp->segmentation.update_map;
+    std.flags.segmentation_temporal_update = pp->segmentation.temporal_update;
+    std.flags.segmentation_update_data = pp->segmentation.update_data;
+-   std.flags.UsesLr = lf.frame_restoration_type[0] || lf.frame_restoration_type[1] || lf.frame_restoration_type[2];
++   std.flags.UsesLr = usesLr;
+    std.flags.usesChromaLr = lf.frame_restoration_type[1] || lf.frame_restoration_type[2];
+    std.frame_type = (StdVideoAV1FrameType)pp->format.frame_type;
+    std.OrderHint = (uint8_t)cur;
+    std.primary_ref_frame = pp->primary_ref_frame;
+-   /* not in DXVA (NVIDIA's decoder does use it, consistently 0xff keeps its reference state consistent); ponytail:
+-    * multi-tile 8-bit streams then decode with off-by-one chroma samples here and there (one test clip: U at ~75 dB,
+-    * all else bit-exact), the real value would need the frame header, which DXVA doesn't pass */
++   /* not in DXVA (the frame header's); 0xff whenever the picture is kept: the DPB slots say which are referenced */
+    std.refresh_frame_flags = pp->coding.reference_frame_update ? 0xff : 0;
+    std.interpolation_filter = (StdVideoAV1InterpolationFilter)pp->interp_filter;
+    std.TxMode = (StdVideoAV1TxMode)pp->coding.tx_mode;
+@@ -1590,7 +1687,14 @@ decode_frame(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HVIDEODECODER_0020,
+    };
+    viogpu_video *v = device->video;
+    viogpu_video_decoder_heap *heap = (viogpu_video_decoder_heap *)in->hDrvVideoDecoderHeap.pDrvPrivate;
+-   decode_session *s = v && heap ? decode_session_get(heap) : NULL;
++   /* H.264 that isn't frames only: the interlaced layout */
++   bool interlaced = false;
++   if (heap && heap->profile >= 0 && DECODE_PROFILES[heap->profile].codec == CODEC_H264) {
++      const auto *pp = (const DXVA_PicParams_H264 *)frame_argument(
++         in, D3D12DDI_VIDEO_DECODE_PARAMETER_TYPE_0020_PICTURE_PARAMETERS, sizeof(DXVA_PicParams_H264));
++      interlaced = pp && !pp->frame_mbs_only_flag;
++   }
++   decode_session *s = v && heap ? decode_session_get(heap, interlaced) : NULL;
+    if (!s)
+       return fail(E_FAIL, "no session");
+    if (out->ConversionArguments.Enable)
+@@ -1638,6 +1742,15 @@ decode_frame(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HVIDEODECODER_0020,
+       refSlots[u].pPictureResource = &refPictures[u];
+    }
+    VkVideoPictureResourceInfoKHR setupPicture = picture_resource(pic.setup);
++   /* AV1 film grain: the picture into the grain output (the image after the slots'), its DPB picture without */
++   VkImage source = s->dpb[pic.setup];
++   VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR;
++   VkVideoPictureResourceInfoKHR dstPicture = setupPicture;
++   if (pic.grain) {
++      source = s->dpb.back();
++      sourceLayout = VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR;
++      dstPicture.imageViewBinding = s->dpbViews.back();
++   }
+    VkVideoReferenceSlotInfoKHR setupSlot = {VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR};
+    setupSlot.pNext = pic.setupInfo;
+    setupSlot.slotIndex = pic.setup;
+@@ -1679,19 +1792,28 @@ decode_frame(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HVIDEODECODER_0020,
+          s->slots[slot].initialized = true;
+       }
+    }
++   if (pic.grain)
++      images.push_back(image_barrier(source, 0, VK_IMAGE_LAYOUT_UNDEFINED, sourceLayout));
+    /* earlier decodes' and copies' DPB accesses before this one */
+    barrier(v, cmd, images.data(), (uint32_t)images.size(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+ 
++   /* the current picture's slot bound inactive, unless it is an active reference already (an H.264 second field
++    * referencing its first) */
+    std::vector<VkVideoReferenceSlotInfoKHR> beginSlots(refSlots);
+-   VkVideoReferenceSlotInfoKHR activate = setupSlot;
+-   activate.slotIndex = -1;
+-   activate.pNext = NULL;
+-   beginSlots.push_back(activate);
++   bool bound = false;
++   for (const VkVideoReferenceSlotInfoKHR &r : refSlots)
++      bound |= r.slotIndex == pic.setup;
++   if (!bound) {
++      VkVideoReferenceSlotInfoKHR activate = setupSlot;
++      activate.slotIndex = -1;
++      activate.pNext = NULL;
++      beginSlots.push_back(activate);
++   }
+    VkVideoBeginCodingInfoKHR begin = {VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR};
+    begin.videoSession = s->session;
+-   begin.videoSessionParameters = s->params;
++   begin.videoSessionParameters = s->inlineParams ? VK_NULL_HANDLE : s->params;
+    begin.referenceSlotCount = (uint32_t)beginSlots.size();
+    begin.pReferenceSlots = beginSlots.data();
+    v->CmdBeginVideoCodingKHR(cmd, &begin);
+@@ -1703,10 +1825,17 @@ decode_frame(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HVIDEODECODER_0020,
+    }
+    VkVideoDecodeInfoKHR decode = {VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR};
+    decode.pNext = pic.pictureInfo;
++   VkVideoDecodeAV1InlineSessionParametersInfoKHR inlineInfo = {
++      VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_INLINE_SESSION_PARAMETERS_INFO_KHR};
++   if (s->inlineParams) {
++      inlineInfo.pNext = pic.pictureInfo;
++      inlineInfo.pStdSequenceHeader = &s->inlineSeq;
++      decode.pNext = &inlineInfo;
++   }
+    decode.srcBuffer = vk_handle<VkBuffer>(bufferHandle);
+    decode.srcBufferOffset = srcOffset;
+    decode.srcBufferRange = srcRange;
+-   decode.dstPictureResource = setupPicture;
++   decode.dstPictureResource = dstPicture;
+    decode.pSetupReferenceSlot = &setupSlot;
+    decode.referenceSlotCount = (uint32_t)refSlots.size();
+    decode.pReferenceSlots = refSlots.data();
+@@ -1718,7 +1847,7 @@ decode_frame(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HVIDEODECODER_0020,
+    VkImageLayout dstLayout = outputLayout == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL
+                                                                      : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkImageMemoryBarrier2 toCopy[2] = {
+-      image_barrier(s->dpb[pic.setup], 0, VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
++      image_barrier(source, 0, sourceLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+       image_barrier(outputImage, outputLayer, outputLayout, dstLayout),
+    };
+    barrier(v, cmd, toCopy, dstLayout != outputLayout ? 2 : 1, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+@@ -1733,9 +1862,9 @@ decode_frame(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HVIDEODECODER_0020,
+       planes[plane].dstSubresource = {(VkImageAspectFlags)aspect, 0, outputLayer, 1};
+       planes[plane].extent = {plane ? (width + 1) / 2 : width, plane ? (height + 1) / 2 : height, 1};
+    }
+-   v->CmdCopyImage(cmd, s->dpb[pic.setup], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, outputImage, dstLayout, 2, planes);
++   v->CmdCopyImage(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, outputImage, dstLayout, 2, planes);
+    images.clear();
+-   images.push_back(image_barrier(s->dpb[pic.setup], 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR));
++   images.push_back(image_barrier(source, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sourceLayout));
+    if (dstLayout != outputLayout)
+       images.push_back(image_barrier(outputImage, outputLayer, dstLayout, outputLayout));
+    barrier(v, cmd, images.data(), (uint32_t)images.size(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 0f399bf0..ee7f306c 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -143,6 +143,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION(KHR_VIDEO_DECODE_AV1, KHR_video_decode_av1),
+     VK_EXTENSION(KHR_VIDEO_DECODE_VP9, KHR_video_decode_vp9),
+     VK_EXTENSION(KHR_VIDEO_MAINTENANCE_1, KHR_video_maintenance1),
++    VK_EXTENSION(KHR_VIDEO_MAINTENANCE_2, KHR_video_maintenance2),
+     /* AMD extensions */
+     VK_EXTENSION(AMD_BUFFER_MARKER, AMD_buffer_marker),
+     VK_EXTENSION(AMD_DEVICE_COHERENT_MEMORY, AMD_device_coherent_memory),
+@@ -2468,6 +2469,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_prepend_struct(&info->features2, &info->video_maintenance1_features);
+     }
+ 
++    if (vulkan_info->KHR_video_maintenance2)
++    {
++        info->video_maintenance2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR;
++        vk_prepend_struct(&info->features2, &info->video_maintenance2_features);
++    }
++
+     if (vulkan_info->KHR_video_decode_vp9)
+     {
+         info->video_decode_vp9_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR;
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 0419e4d8..d49affa9 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -210,6 +210,7 @@ struct vkd3d_vulkan_info
+     bool KHR_video_decode_av1;
+     bool KHR_video_decode_vp9;
+     bool KHR_video_maintenance1;
++    bool KHR_video_maintenance2;
+     bool NV_shader_sm_builtins;
+     bool NVX_binary_import;
+     bool NVX_image_view_handle;
+@@ -5112,6 +5113,7 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceDepthBiasControlFeaturesEXT depth_bias_control_features;
+     VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow_nv_features;
+     VkPhysicalDeviceVideoMaintenance1FeaturesKHR video_maintenance1_features;
++    VkPhysicalDeviceVideoMaintenance2FeaturesKHR video_maintenance2_features;
+     VkPhysicalDeviceVideoDecodeVP9FeaturesKHR video_decode_vp9_features;
+     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix_features;
+     VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT zero_initialize_device_memory_features;

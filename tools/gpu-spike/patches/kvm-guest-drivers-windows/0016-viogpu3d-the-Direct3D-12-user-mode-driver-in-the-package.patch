@@ -1,0 +1,91 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: the Direct3D 12 user-mode driver in the package
+
+viogpu_d3d12.dll and viogpu_d3d12_x86.dll go into the driver package and are
+the fourth names of UserModeDriverName and UserModeDriverNameWow, the ones
+the Direct3D 12 runtime loads (KMTUMDVERSION_DX12) in 64- and 32-bit
+programs. viogpu_d3d12-licenses.txt goes along with them: the licenses of
+what they link (vkd3d-proton, dxil-spirv, dxbc-spirv, SPIRV-Headers).
+---
+diff --git a/viogpu/viogpu3d/viogpu3d.inx b/viogpu/viogpu3d/viogpu3d.inx
+--- a/viogpu/viogpu3d/viogpu3d.inx
++++ b/viogpu/viogpu3d/viogpu3d.inx
+@@ -30,9 +30,12 @@
+ viogpu3d.sys = 1,,f
+ viogpu_d3d9.dll = 1,,
+ viogpu_d3d10.dll = 1,,
++viogpu_d3d12.dll = 1,,
++viogpu_d3d12-licenses.txt = 1,,
+ viogpu_wgl.dll = 1,,
+ viogpu_d3d9_x86.dll = 1,,
+ viogpu_d3d10_x86.dll = 1,,
++viogpu_d3d12_x86.dll = 1,,
+ viogpu_wgl_x86.dll = 1,,
+ viogpu_vk.dll = 1,,
+ viogpu_vk.json = 1,,
+@@ -54,9 +57,12 @@
+ [VioGpu3D_Files.Usermode]
+ viogpu_d3d9.dll,,,0
+ viogpu_d3d10.dll,,,0
++viogpu_d3d12.dll,,,0
++viogpu_d3d12-licenses.txt,,,0
+ viogpu_wgl.dll,,,0
+ viogpu_d3d9_x86.dll,,,0
+ viogpu_d3d10_x86.dll,,,0
++viogpu_d3d12_x86.dll,,,0
+ viogpu_wgl_x86.dll,,,0
+ viogpu_vk.dll,,,0
+ viogpu_vk.json,,,0
+@@ -103,14 +109,15 @@
+ HKR,, FlexResolution,              %REG_DWORD%, 1
+ HKR,, UsePhysicalMemory,           %REG_DWORD%, 0
+ ; The first entry is the Direct3D 9 driver, the others Direct3D 10/11
+-HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\viogpu_d3d9.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll
++; DX9, DX10, DX11, DX12 (KMTUMDVERSION order)
++HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\viogpu_d3d9.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d12.dll
+ HKR,, OpenGLDriverName,            %REG_MULTI_SZ%, %13%\viogpu_wgl.dll
+ HKR,, OpenGLFlags,                 %REG_DWORD%, 3
+ HKR,, OpenGLVersion,               %REG_DWORD%, 4096
+ ; Vulkan (Mesa's Venus): the ICD manifests, which name their DLLs next to them
+ HKR,, VulkanDriverName,            %REG_MULTI_SZ%, %13%\viogpu_vk.json
+ ; 32-bit (WOW64) apps
+-HKR,, UserModeDriverNameWow,       %REG_MULTI_SZ%, %13%\viogpu_d3d9_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll
++HKR,, UserModeDriverNameWow,       %REG_MULTI_SZ%, %13%\viogpu_d3d9_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d12_x86.dll
+ HKR,, OpenGLDriverNameWow,         %REG_MULTI_SZ%, %13%\viogpu_wgl_x86.dll
+ HKR,, OpenGLFlagsWow,              %REG_DWORD%, 3
+ HKR,, OpenGLVersionWow,            %REG_DWORD%, 4096
+diff --git a/viogpu/viogpu3d/viogpu3d.vcxproj b/viogpu/viogpu3d/viogpu3d.vcxproj
+--- a/viogpu/viogpu3d/viogpu3d.vcxproj
++++ b/viogpu/viogpu3d/viogpu3d.vcxproj
+@@ -196,6 +196,10 @@
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
++    <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_d3d12.dll;$(MESA_PREFIX)\bin\viogpu_d3d12-licenses.txt">
++      <PackageRelativeDirectory>
++      </PackageRelativeDirectory>
++    </FilesToPackage>
+     <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_wgl.dll">
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+@@ -204,7 +208,7 @@
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
+-    <FilesToPackage Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll">
++    <FilesToPackage Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll;$(MESA_PREFIX32)\bin\viogpu_d3d12_x86.dll">
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
+@@ -229,9 +233,10 @@
+     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.pdb" />
+     <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_d3d9.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_d3d10.dll" />
++    <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_d3d12.dll;$(MESA_PREFIX)\bin\viogpu_d3d12-licenses.txt" />
+     <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_wgl.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d9_x86.dll" />
+-    <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll" />
++    <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll;$(MESA_PREFIX32)\bin\viogpu_d3d12_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_wgl_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_vk.dll;$(MESA_PREFIX)\bin\viogpu_vk.json;$(MESA_PREFIX)\bin\vulkan-1.dll;$(MESA_PREFIX)\bin\vulkan-1-license.txt;$(MESA_PREFIX32)\bin\viogpu_vk_x86.dll;$(MESA_PREFIX32)\bin\viogpu_vk_x86.json;$(MESA_PREFIX32)\bin\vulkan-1_x86.dll" />
+   </ItemGroup>

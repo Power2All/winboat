@@ -1,0 +1,72 @@
+hevc: the range extension parameters (WinBoat)
+
+VA-API's HEVC range extension parameters (VAPictureParameterBufferHEVCRext,
+after the base parameters in a VAPictureParameterBufferHEVCExtension buffer)
+never reached NVDEC: streams using the RExt coding tools (persistent Rice
+adaptation, SAO offset scaling, transform skip/RDPCM, chroma QP offset lists,
+cross-component prediction...) decoded wrong on every frame. They now fill
+CUVIDHEVCPICPARAMS' range extension fields; sps/pps_range_extension_flag,
+which VA doesn't carry, are set when any of their fields is.
+The FATE suite's 4:4:4 RExt clips (QMATRIX_A 8-bit, IPCM_B, PERSIST_RPARAM_A,
+SAO_A 12-bit) are bit-exact against libavcodec through VA-API (surfaces of the
+stream's format, vaGetImage in 444P/Q416), as are x265 encodes (4:4:4 8/10/12,
+4:2:0 12) which decoded right before too.
+
+diff --git a/src/hevc.c b/src/hevc.c
+index 8babd57..b61e9df 100644
+--- a/src/hevc.c
++++ b/src/hevc.c
+@@ -2,6 +2,7 @@
+ 
+ #include "vabackend.h"
+ #include <stdlib.h>
++#include <stddef.h>
+ 
+ #if !defined(__GLIBC__)
+ typedef int (*__compar_d_fn_t) (const void *, const void *, void *);
+@@ -215,11 +216,40 @@ static void copyHEVCPicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *p
+     for (int i = 0; i <= ppc->num_tile_rows_minus1; i++)
+         ppc->row_height_minus1[i] = buf->row_height_minus1[i];
+ 
+-    //in VAPictureParameterBufferHEVCRext
+-//    for (int i = 0; i <= ppc->chroma_qp_offset_list_len_minus1; i++) {
+-//        ppc->cb_qp_offset_list[i] = buf->cb_qp_offset_list[i];
+-//        ppc->cr_qp_offset_list[i] = buf->cr_qp_offset_list[i];
+-//    }
++    //Range extensions (4:4:4, 12 bits): VA puts them after the base parameters in the same buffer
++    //(VAPictureParameterBufferHEVCExtension); its two extension flags are implied by the fields (WinBoat)
++    if (buffer->size >= offsetof(VAPictureParameterBufferHEVCExtension, rext) + sizeof(VAPictureParameterBufferHEVCRext)) {
++        const VAPictureParameterBufferHEVCRext *rext = &((VAPictureParameterBufferHEVCExtension*) buffer->ptr)->rext;
++        ppc->transform_skip_rotation_enabled_flag = rext->range_extension_pic_fields.bits.transform_skip_rotation_enabled_flag;
++        ppc->transform_skip_context_enabled_flag = rext->range_extension_pic_fields.bits.transform_skip_context_enabled_flag;
++        ppc->implicit_rdpcm_enabled_flag = rext->range_extension_pic_fields.bits.implicit_rdpcm_enabled_flag;
++        ppc->explicit_rdpcm_enabled_flag = rext->range_extension_pic_fields.bits.explicit_rdpcm_enabled_flag;
++        ppc->extended_precision_processing_flag = rext->range_extension_pic_fields.bits.extended_precision_processing_flag;
++        ppc->intra_smoothing_disabled_flag = rext->range_extension_pic_fields.bits.intra_smoothing_disabled_flag;
++        ppc->high_precision_offsets_enabled_flag = rext->range_extension_pic_fields.bits.high_precision_offsets_enabled_flag;
++        ppc->persistent_rice_adaptation_enabled_flag = rext->range_extension_pic_fields.bits.persistent_rice_adaptation_enabled_flag;
++        ppc->cabac_bypass_alignment_enabled_flag = rext->range_extension_pic_fields.bits.cabac_bypass_alignment_enabled_flag;
++        ppc->sps_range_extension_flag = ppc->transform_skip_rotation_enabled_flag || ppc->transform_skip_context_enabled_flag ||
++                                        ppc->implicit_rdpcm_enabled_flag || ppc->explicit_rdpcm_enabled_flag ||
++                                        ppc->extended_precision_processing_flag || ppc->intra_smoothing_disabled_flag ||
++                                        ppc->high_precision_offsets_enabled_flag || ppc->persistent_rice_adaptation_enabled_flag ||
++                                        ppc->cabac_bypass_alignment_enabled_flag;
++
++        ppc->cross_component_prediction_enabled_flag = rext->range_extension_pic_fields.bits.cross_component_prediction_enabled_flag;
++        ppc->chroma_qp_offset_list_enabled_flag = rext->range_extension_pic_fields.bits.chroma_qp_offset_list_enabled_flag;
++        ppc->diff_cu_chroma_qp_offset_depth = rext->diff_cu_chroma_qp_offset_depth;
++        ppc->chroma_qp_offset_list_len_minus1 = rext->chroma_qp_offset_list_len_minus1;
++        ppc->log2_sao_offset_scale_luma = rext->log2_sao_offset_scale_luma;
++        ppc->log2_sao_offset_scale_chroma = rext->log2_sao_offset_scale_chroma;
++        ppc->log2_max_transform_skip_block_size_minus2 = rext->log2_max_transform_skip_block_size_minus2;
++        for (int i = 0; i < 6; i++) {
++            ppc->cb_qp_offset_list[i] = rext->cb_qp_offset_list[i];
++            ppc->cr_qp_offset_list[i] = rext->cr_qp_offset_list[i];
++        }
++        ppc->pps_range_extension_flag = ppc->log2_max_transform_skip_block_size_minus2 || ppc->cross_component_prediction_enabled_flag ||
++                                        ppc->chroma_qp_offset_list_enabled_flag || ppc->log2_sao_offset_scale_luma ||
++                                        ppc->log2_sao_offset_scale_chroma;
++    }
+ 
+     //double check this
+     VAPictureHEVC *pic = &buf->CurrPic;

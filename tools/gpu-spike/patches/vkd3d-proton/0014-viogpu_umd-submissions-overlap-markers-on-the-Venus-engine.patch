@@ -1,0 +1,248 @@
+diff --git a/libs/viogpu_umd/umd_command.cpp b/libs/viogpu_umd/umd_command.cpp
+index b881d734..3cd4b636 100644
+--- a/libs/viogpu_umd/umd_command.cpp
++++ b/libs/viogpu_umd/umd_command.cpp
+@@ -14,6 +14,7 @@
+  * work to the kernel context's timeline). */
+ 
+ #include "umd_private.h"
++#include "umd_viogpu.h"
+ #include <stdlib.h>
+ 
+ D3D12DDI_HRTTABLE viogpu_command_list_rt_tables[2];
+@@ -799,6 +800,13 @@ struct viogpu_command_queue {
+     * runtime's operations are, e.g. a kernel-side queue that completes a DMA buffer per submission. */
+    ID3D12Fence *gate;
+    ID3D12Fence *done;
++   /* On the kernel driver's Venus engine (markers: kvm-guest-drivers-windows 0023) instead: a submission is a marker
++    * command buffer, which releases the semaphore when the scheduler hands it over (the runtime's waits before it are
++    * done: gateThread opens the gate) and completes once doneThread reports the lists done (VIOGPU_QUEUE_DONE) - so
++    * the runtime's signals after it still come once they ran, and several submissions are in flight */
++   bool markers;
++   HANDLE semaphore;
++   ULONG kmQueue;
+    D3DKMT_HANDLE kmIn, kmOut;
+    const volatile UINT64 *kmInValue;
+    UINT64 submitted;
+@@ -1135,6 +1143,37 @@ km_fence_destroy(viogpu_device *device, D3DKMT_HANDLE handle)
+ }
+ 
+ /* Opens vkd3d-proton's gate for the submissions whose place on the kernel context has been reached */
++/* The kernel driver's VIOGPU_QUEUE_* escapes, on the device */
++static HRESULT
++queue_escape(viogpu_device *device, VIOGPU_UMD_ESCAPE_QUEUE_DATA *data, USHORT type)
++{
++   data->Type = type;
++   data->DataLength = sizeof(*data) - 2 * sizeof(USHORT);
++   D3DDDICB_ESCAPE escape = {};
++   escape.hDevice = device->hRTDevice.handle;
++   escape.pPrivateDriverData = data;
++   escape.PrivateDriverDataSize = sizeof(*data);
++   return device->ktCallbacks->pfnEscapeCb(device->hRTAdapter, &escape);
++}
++
++/* Markers: one gate opening for each marker the scheduler hands over (the semaphore's count), in order */
++static DWORD WINAPI
++marker_gate_thread(void *param)
++{
++   viogpu_command_queue *queue = (viogpu_command_queue *)param;
++   for (UINT64 n = 1;; n++) {
++      WaitForSingleObject(queue->semaphore, INFINITE);
++      EnterCriticalSection(&queue->lock);
++      bool stop = queue->stop;
++      LeaveCriticalSection(&queue->lock);
++      if (stop)
++         return 0;
++      /* the kernel releases one count per sequence number, a failed submission's included (opened here early) */
++      if (queue->gate->GetCompletedValue() < n)
++         queue->gate->Signal(n);
++   }
++}
++
+ static DWORD WINAPI
+ gate_thread(void *param)
+ {
+@@ -1193,11 +1232,18 @@ done_thread(void *param)
+       UINT64 completed = queue->done->GetCompletedValue();
+       if (completed < n)
+          completed = n;
+-      D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU signal = {};
+-      signal.ObjectCount = 1;
+-      signal.ObjectHandleArray = &queue->kmOut;
+-      signal.FenceValueArray = &completed;
+-      device->ktCallbacks->pfnSignalSynchronizationObjectFromCpuCb(device->hRTDevice.handle, &signal);
++      if (queue->markers) {
++         VIOGPU_UMD_ESCAPE_QUEUE_DATA data = {};
++         data.Queue = queue->kmQueue;
++         data.Done = completed;
++         queue_escape(device, &data, VIOGPU_UMD_ESCAPE_QUEUE_DONE);
++      } else {
++         D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMCPU signal = {};
++         signal.ObjectCount = 1;
++         signal.ObjectHandleArray = &queue->kmOut;
++         signal.FenceValueArray = &completed;
++         device->ktCallbacks->pfnSignalSynchronizationObjectFromCpuCb(device->hRTDevice.handle, &signal);
++      }
+       EnterCriticalSection(&queue->lock);
+       queue->doneNext = completed + 1;
+       LeaveCriticalSection(&queue->lock);
+@@ -1252,25 +1298,38 @@ create_command_queue(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATECOMMANDQU
+       if (SUCCEEDED(hr) && !(queue->video = viogpu_video_queue_create(device, queue->gpuDone, queue->done)))
+          hr = E_OUTOFMEMORY;
+    }
++   /* the kernel driver's Venus engine where it has one (markers), else the context waits for every submission */
++   if (SUCCEEDED(hr) && !video && !getenv("VIOGPU_UMD_SERIALIZE") &&
++       (queue->semaphore = CreateSemaphoreA(NULL, 0, 0x7fffffff, NULL))) {
++      VIOGPU_UMD_ESCAPE_QUEUE_DATA data = {};
++      data.Semaphore = (UINT64)(ULONG_PTR)queue->semaphore;
++      HRESULT reg = queue_escape(device, &data, VIOGPU_UMD_ESCAPE_QUEUE_REGISTER);
++      queue->markers = SUCCEEDED(reg);
++      if (!queue->markers)
++         viogpu_log("queue registration: 0x%08lx", (unsigned long)reg);
++      queue->kmQueue = data.Queue;
++   }
+    if (SUCCEEDED(hr)) {
+       D3DDDICB_CREATECONTEXTVIRTUAL context = {};
+-      context.NodeOrdinal = 0;
++      context.NodeOrdinal = queue->markers ? VIOGPU_UMD_VENUS_NODE : 0;
+       context.EngineAffinity = 1;
+       hr = device->umCallbacks->pfnCreateContextVirtualCb(hRT, &context);
+       queue->hContext = context.hContext;
+    }
+-   if (SUCCEEDED(hr))
++   if (SUCCEEDED(hr) && !queue->markers)
+       hr = km_fence_create(device, &queue->kmIn, &queue->kmInValue);
+-   if (SUCCEEDED(hr))
++   if (SUCCEEDED(hr) && !queue->markers)
+       hr = km_fence_create(device, &queue->kmOut, NULL);
+    if (SUCCEEDED(hr)) {
+-      queue->gateThread = CreateThread(NULL, 0, gate_thread, queue, 0, NULL);
++      queue->gateThread = CreateThread(NULL, 0, queue->markers ? marker_gate_thread : gate_thread, queue, 0, NULL);
+       queue->doneThread = CreateThread(NULL, 0, done_thread, queue, 0, NULL);
+       if (!queue->gateThread || !queue->doneThread)
+          hr = E_OUTOFMEMORY;
+    }
+    if (FAILED(hr))
+       viogpu_log("CreateCommandQueue (flags 0x%x): 0x%08lx", (UINT)args->QueueFlags, (unsigned long)hr);
++   else
++      viogpu_log("command queue: %s (kernel queue %lu)", queue->markers ? "markers" : "serialized", (unsigned long)queue->kmQueue);
+    return hr;
+ }
+ 
+@@ -1286,6 +1345,8 @@ destroy_command_queue(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDQUEUE h)
+    queue->stop = true;
+    LeaveCriticalSection(&queue->lock);
+    WakeAllConditionVariable(&queue->wake);
++   if (queue->semaphore)
++      ReleaseSemaphore(queue->semaphore, 1, NULL);
+    for (HANDLE t : {queue->gateThread, queue->doneThread}) {
+       if (t) {
+          WaitForSingleObject(t, INFINITE);
+@@ -1304,6 +1365,13 @@ destroy_command_queue(D3D12DDI_HDEVICE, D3D12DDI_HCOMMANDQUEUE h)
+       queue->gpuDone->Release();
+    km_fence_destroy(device, queue->kmIn);
+    km_fence_destroy(device, queue->kmOut);
++   if (queue->markers) {
++      VIOGPU_UMD_ESCAPE_QUEUE_DATA data = {};
++      data.Queue = queue->kmQueue;
++      queue_escape(device, &data, VIOGPU_UMD_ESCAPE_QUEUE_UNREGISTER);
++   }
++   if (queue->semaphore)
++      CloseHandle(queue->semaphore);
+    if (queue->hContext) {
+       D3DDDICB_DESTROYCONTEXT destroy = {};
+       destroy.hContext = queue->hContext;
+@@ -1326,6 +1394,38 @@ queue_submit(viogpu_command_queue *queue, UINT count, ID3D12CommandList *const *
+              const D3D12DDI_HCOMMANDLIST *ddiLists)
+ {
+    viogpu_device *device = queue->device;
++   if (queue->markers) {
++      EnterCriticalSection(&queue->lock);
++      UINT64 n = queue->submitted + 1;
++      /* vkd3d-proton runs the lists once the marker's gate opens, then the marker completes */
++      HRESULT hr = queue->queue->Wait(queue->gate, n);
++      if (SUCCEEDED(hr)) {
++         queue->queue->ExecuteCommandLists(count, api);
++         hr = queue->queue->Signal(queue->done, n);
++      }
++      if (SUCCEEDED(hr)) {
++         VIOGPU_UMD_MARKER marker = {VIOGPU_UMD_MARKER_MAGIC, queue->kmQueue, n};
++         D3DDDICB_SUBMITCOMMAND submit = {};
++         submit.BroadcastContextCount = 1;
++         submit.BroadcastContext[0] = queue->hContext;
++         /* never read (the kernel driver takes the marker from the private data), but dxgkrnl drops an empty
++          * submission without handing it over */
++         submit.Commands = 0x10000;
++         submit.CommandLength = 16;
++         submit.pPrivateDriverData = &marker;
++         submit.PrivateDriverDataSize = sizeof(marker);
++         hr = device->ktCallbacks->pfnSubmitCommandCb(device->hRTDevice.handle, &submit);
++         if (FAILED(hr)) {
++            /* never handed over: open its gate here (the order of the runtime's work around it is lost) */
++            viogpu_log("marker submission: 0x%08lx", (unsigned long)hr);
++            queue->gate->Signal(n);
++         }
++         queue->submitted = n;
++      }
++      LeaveCriticalSection(&queue->lock);
++      WakeAllConditionVariable(&queue->wake);
++      return hr;
++   }
+    EnterCriticalSection(&queue->lock);
+    UINT64 n = queue->submitted + 1;
+    /* its place on the kernel context (see viogpu_command_queue) */
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+index 6a776248..1b6980ba 100644
+--- a/libs/viogpu_umd/umd_ddi.cpp
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -23,6 +23,8 @@
+ #include "umd_private.h"
+ #include "umd_tables.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
+ #include <type_traits>
+ 
+ /* ---------------------------------------------------------------------------------------------------------------- */
+@@ -42,6 +44,9 @@ viogpu_log(const char *format, ...)
+    line[n] = 0;
+    OutputDebugStringA("viogpu_d3d12: ");
+    OutputDebugStringA(line);
++   /* diagnostics in a console */
++   if (getenv("VIOGPU_UMD_STDERR"))
++      fprintf(stderr, "viogpu_d3d12: %s", line);
+ 
+    static char path[MAX_PATH];
+    static LONG pathState; /* 0: not read yet, 1: no log file, 2: path */
+diff --git a/libs/viogpu_umd/umd_viogpu.h b/libs/viogpu_umd/umd_viogpu.h
+index 76cc6d52..a4f609ee 100644
+--- a/libs/viogpu_umd/umd_viogpu.h
++++ b/libs/viogpu_umd/umd_viogpu.h
+@@ -64,4 +64,27 @@ typedef struct VIOGPU_UMD_ESCAPE_RES_INFO_DATA {
+ } VIOGPU_UMD_ESCAPE_RES_INFO_DATA;
+ #pragma pack(pop)
+ 
++/* The kernel driver's D3D12 queues on its Venus engine (VIOGPU_QUEUE_*, kvm-guest-drivers-windows 0023): markers
++ * (command buffers whose private data is a VIOGPU_UMD_MARKER) open the queue's gate when the scheduler hands them
++ * over and complete once the queue reports its lists done */
++#define VIOGPU_UMD_VENUS_NODE 1
++#define VIOGPU_UMD_ESCAPE_QUEUE_REGISTER 0x305
++#define VIOGPU_UMD_ESCAPE_QUEUE_UNREGISTER 0x306
++#define VIOGPU_UMD_ESCAPE_QUEUE_DONE 0x307
++#pragma pack(push, 1)
++typedef struct VIOGPU_UMD_ESCAPE_QUEUE_DATA {
++   USHORT Type;
++   USHORT DataLength;
++   UINT64 Semaphore; /* REGISTER: a semaphore HANDLE */
++   ULONG Queue;      /* REGISTER: out */
++   UINT64 Done;      /* DONE: the queue's submissions up to this one are done */
++} VIOGPU_UMD_ESCAPE_QUEUE_DATA;
++#pragma pack(pop)
++#define VIOGPU_UMD_MARKER_MAGIC 0x4b52414du
++typedef struct VIOGPU_UMD_MARKER {
++   ULONG Magic;
++   ULONG Queue;
++   UINT64 Seq;
++} VIOGPU_UMD_MARKER;
++
+ #endif

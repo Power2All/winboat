@@ -1,0 +1,68 @@
+display: drags that leave the window go on
+
+In client mouse mode a drag stopped where the pointer left the widget: spice-gtk drops the window system's pointer
+grab on every button press (so a drag can end on another display's widget), which stops the motion events from
+outside the window; motion outside the widget was dropped anyway; and a release outside it too, so the guest kept
+the button down. Moving a Windows window by its title bar in the desktop window stopped as soon as the pointer went
+out of the window, and stuck to the pointer once it came back.
+
+WinBoat shows one display per window: the grab stays, motion outside the widget with a button down goes to the guest
+clamped to the display's edge, and releases always go to the guest.
+
+--- a/src/spice-widget.c
+
+--- a/src/spice-widget.c
++++ b/src/spice-widget.c
+@@ -2234,6 +2234,14 @@
+             y >= 0 && y < d->area.height) {
+             spice_inputs_channel_position(d->inputs, x, y, get_display_id(display),
+                                           button_mask_gdk_to_spice(motion->state));
++        } else if (motion->state & (GDK_BUTTON1_MASK | GDK_BUTTON2_MASK | GDK_BUTTON3_MASK)) {
++            /* Dragging past the widget's edge (a guest window by its title bar, a selection): the drag goes on
++             * along the display's edge instead of stopping where the pointer left */
++            spice_inputs_channel_position(d->inputs,
++                                          CLAMP(x, 0, MAX(d->area.width - 1, 0)),
++                                          CLAMP(y, 0, MAX(d->area.height - 1, 0)),
++                                          get_display_id(display),
++                                          button_mask_gdk_to_spice(motion->state));
+         }
+         break;
+     case SPICE_MOUSE_MODE_SERVER:
+@@ -2321,8 +2329,10 @@
+     transform_input(display, button->x, button->y, &x, &y);
+     if ((x < 0 || x >= d->area.width ||
+          y < 0 || y >= d->area.height) &&
+-        d->mouse_mode == SPICE_MOUSE_MODE_CLIENT) {
+-        /* rule out clicks in outside region */
++        d->mouse_mode == SPICE_MOUSE_MODE_CLIENT &&
++        button->type != GDK_BUTTON_RELEASE) {
++        /* rule out clicks in outside region (but not the end of a drag that left it: the guest would keep the
++         * button down) */
+         return true;
+     }
+ 
+@@ -2332,21 +2342,10 @@
+             try_mouse_grab(display);
+             return true;
+         }
+-    } else {
+-        /* allow to drag and drop between windows/displays:
+-
+-           By default, X (and other window system) do a pointer grab
+-           when you press a button, so that the release event is
+-           received by the same window regardless of where the pointer
+-           is. Here, we change that behaviour, so that you can press
+-           and release in two differents displays. This is only
+-           supported in client mouse mode.
+-
+-           FIXME: should be multiple widget grab, but how?
+-           or should know the position of the other widgets?
+-        */
+-        ungrab_pointer(display);
+     }
++    /* Client mode used to drop the window system's pointer grab here, so a drag could end on another display's
++       widget. WinBoat shows one display per window, and the grab is what brings the motion of a drag that leaves the
++       window (a guest window dragged by its title bar): it stays. */
+ 
+     if (!d->inputs)
+         return true;

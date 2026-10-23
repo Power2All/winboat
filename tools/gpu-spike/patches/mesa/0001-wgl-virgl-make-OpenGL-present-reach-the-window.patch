@@ -1,0 +1,287 @@
+wgl/virgl: make OpenGL frames reach the window
+
+Applies to max8rr8/mesa@viogpu_win (62f1e49). Without it, OpenGL renders on the GPU but nothing is shown:
+
+- The DXGI swapchain framebuffer created its D3D11 device with D3D11_CREATE_DEVICE_DEBUG, which fails unless the
+  optional Graphics Tools (d3d11sdklayers.dll) are installed, so there was never a swapchain. Create the device
+  without it, up front (a failure now falls back to the GDI path), build the swapchain from the device's factory,
+  and only ask for tearing when DXGI supports it.
+- Create that device on the adapter the window's DC belongs to (the one the virgl screen opened). In an RDP session
+  DXGI lists the GPU twice with different LUIDs, and the default adapter's shared textures can't be opened by
+  virgl, so every frame was dropped.
+- The GDI path (pixel formats with PFD_SUPPORT_GDI, or the fallback) presented through gdikmt, whose present is a
+  stub. Read the frame back and draw it with StretchDIBits instead.
+- Log why importing a shared resource fails instead of failing silently.
+
+diff --git a/src/gallium/targets/wgl/dxgi_framebuffer.cpp b/src/gallium/targets/wgl/dxgi_framebuffer.cpp
+index 7a69eab..8b4a853 100644
+--- a/src/gallium/targets/wgl/dxgi_framebuffer.cpp
++++ b/src/gallium/targets/wgl/dxgi_framebuffer.cpp
+@@ -43,8 +43,11 @@
+ #include <string.h>
+ #include <winerror.h>
+ #include <dxgi1_4.h>
++#include <dxgi1_5.h>
+ 
+ #include <wrl/client.h>
++#include <winternl.h>
++#include <d3dkmthk.h>
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+@@ -58,8 +61,10 @@ struct wgl_dxgi_framebuffer {
+    HWND window;
+ 
+    HINSTANCE d3d11;
++   bool allow_tearing;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
++   ComPtr<IDXGIFactory> factory;
+    ComPtr<IDXGISwapChain> swapchain;
+ 
+    D3D11_TEXTURE2D_DESC textureDesc;
+@@ -101,6 +106,7 @@ wgl_dxgi_framebuffer_destroy(struct stw_winsys_framebuffer *_fb,
+ 
+    fb->context.Reset();
+    fb->swapchain.Reset();
++   fb->factory.Reset();
+    fb->device.Reset();
+ 
+    FreeLibrary(fb->d3d11);
+@@ -141,7 +147,7 @@ wgl_dxgi_framebuffer_resize(struct stw_winsys_framebuffer *_fb,
+    ZeroMemory(&desc, sizeof desc);
+    desc.BufferCount = NUM_BUFFERS;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+-   desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
++   desc.Flags = fb->allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    desc.BufferDesc.Format = DxgiFormatFromPipe(templ->format);
+    desc.BufferDesc.Width = templ->width0;
+    desc.BufferDesc.Height = templ->height0;
+@@ -150,22 +156,12 @@ wgl_dxgi_framebuffer_resize(struct stw_winsys_framebuffer *_fb,
+    desc.Windowed = true;
+    desc.OutputWindow = fb->window;
+ 
+-   static const D3D_FEATURE_LEVEL FeatureLevels[] = {D3D_FEATURE_LEVEL_10_0};
+-
+    fb->pformat = templ->format;
+ 
+    if (!fb->swapchain) {
+-      PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN createDeviceAndSwapchain =
+-         (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN)GetProcAddress(
+-            fb->d3d11, "D3D11CreateDeviceAndSwapChain");
+-
+-      HRESULT hr = createDeviceAndSwapchain(
+-         NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_DEBUG,
+-         FeatureLevels, _countof(FeatureLevels), D3D11_SDK_VERSION, &desc,
+-         &fb->swapchain, &fb->device, NULL, &fb->context);
+-
++      HRESULT hr = fb->factory->CreateSwapChain(fb->device.Get(), &desc, &fb->swapchain);
+       if (FAILED(hr)) {
+-         _debug_printf("Failed to create framebuffer dxgi device: %x\n", hr);
++         _debug_printf("Failed to create dxgi swapchain: %x\n", hr);
+          return;
+       }
+    } else {
+@@ -211,7 +207,7 @@ wgl_dxgi_framebuffer_present(struct stw_winsys_framebuffer *_fb, int interval,
+    }
+ 
+    return S_OK == fb->swapchain->Present(
+-                     0, interval < 1 ? DXGI_PRESENT_ALLOW_TEARING : 0);
++                     0, interval < 1 && fb->allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+ }
+ 
+ static struct pipe_resource *
+@@ -256,6 +252,47 @@ wgl_dxgi_framebuffer_get_resource(struct stw_winsys_framebuffer *pframebuffer,
+    return texture;
+ }
+ 
++/* The adapter Windows renders this window's DC with. The virgl screen opens the same one (gdikmt_create_from_hdc),
++ * and the swapchain textures it imports through shared handles can only be opened there. In an RDP session DXGI
++ * lists the GPU more than once, so the default adapter isn't necessarily the right one. */
++static ComPtr<IDXGIAdapter>
++wgl_dxgi_adapter_for_window(HWND hWnd)
++{
++   ComPtr<IDXGIAdapter> result;
++   HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
++   HMODULE dxgi = GetModuleHandleA("dxgi.dll"); /* loaded along with d3d11.dll */
++   auto openFromHdc = gdi32 ? (PFND3DKMT_OPENADAPTERFROMHDC)GetProcAddress(gdi32, "D3DKMTOpenAdapterFromHdc") : NULL;
++   auto closeAdapter = gdi32 ? (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32, "D3DKMTCloseAdapter") : NULL;
++   auto createFactory = dxgi ? (HRESULT(WINAPI *)(REFIID, void **))GetProcAddress(dxgi, "CreateDXGIFactory1") : NULL;
++   if (!openFromHdc || !closeAdapter || !createFactory)
++      return result;
++
++   D3DKMT_OPENADAPTERFROMHDC open;
++   memset(&open, 0, sizeof(open));
++   open.hDc = GetDC(hWnd);
++   NTSTATUS status = openFromHdc(&open);
++   ReleaseDC(hWnd, open.hDc);
++   if (status < 0)
++      return result;
++   D3DKMT_CLOSEADAPTER close;
++   close.hAdapter = open.hAdapter;
++   closeAdapter(&close);
++
++   ComPtr<IDXGIFactory1> factory;
++   if (FAILED(createFactory(__uuidof(IDXGIFactory1), &factory)))
++      return result;
++   ComPtr<IDXGIAdapter1> adapter;
++   for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
++      DXGI_ADAPTER_DESC1 desc;
++      if (SUCCEEDED(adapter->GetDesc1(&desc)) && desc.AdapterLuid.LowPart == open.AdapterLuid.LowPart &&
++          desc.AdapterLuid.HighPart == open.AdapterLuid.HighPart) {
++         result = adapter;
++         break;
++      }
++   }
++   return result;
++}
++
+ extern "C" {
+ struct stw_winsys_framebuffer *
+ wgl_create_dxgi_framebuffer(struct pipe_screen *screen, HWND hWnd,
+@@ -278,7 +315,44 @@ wgl_create_dxgi_framebuffer(struct pipe_screen *screen, HWND hWnd,
+    if (!fb)
+       return NULL;
+ 
++   /* Create the device now, so a failure falls back to presenting through GDI instead of a framebuffer that can
++    * never be shown. No D3D11_CREATE_DEVICE_DEBUG: it fails unless the optional Graphics Tools are installed. */
++   static const D3D_FEATURE_LEVEL FeatureLevels[] = {D3D_FEATURE_LEVEL_10_0};
+    fb->d3d11 = LoadLibraryA("d3d11.dll");
++   PFN_D3D11_CREATE_DEVICE createDevice =
++      fb->d3d11 ? (PFN_D3D11_CREATE_DEVICE)GetProcAddress(fb->d3d11, "D3D11CreateDevice") : NULL;
++   ComPtr<IDXGIAdapter> windowAdapter = wgl_dxgi_adapter_for_window(hWnd);
++   HRESULT hr = createDevice ? createDevice(windowAdapter.Get(),
++                                            windowAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, NULL,
++                                            0, FeatureLevels, _countof(FeatureLevels), D3D11_SDK_VERSION,
++                                            &fb->device, NULL, &fb->context)
++                             : E_FAIL;
++   ComPtr<IDXGIDevice> dxgiDevice;
++   ComPtr<IDXGIAdapter> adapter;
++   if (SUCCEEDED(hr))
++      hr = fb->device.As(&dxgiDevice);
++   if (SUCCEEDED(hr))
++      hr = dxgiDevice->GetAdapter(&adapter);
++   if (SUCCEEDED(hr))
++      hr = adapter->GetParent(__uuidof(IDXGIFactory), &fb->factory);
++   if (FAILED(hr)) {
++      _debug_printf("Failed to create framebuffer dxgi device: %x\n", hr);
++      fb->factory.Reset();
++      fb->context.Reset();
++      fb->device.Reset();
++      if (fb->d3d11)
++         FreeLibrary(fb->d3d11);
++      free(fb);
++      return NULL;
++   }
++
++   /* Tearing (for swap interval 0) needs DXGI 1.5 and OS support */
++   ComPtr<IDXGIFactory5> factory5;
++   BOOL tearing = FALSE;
++   fb->allow_tearing = SUCCEEDED(fb->factory.As(&factory5)) &&
++                       SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing,
++                                                               sizeof(tearing))) &&
++                       tearing;
+ 
+    fb->window = hWnd;
+    fb->screen = screen;
+diff --git a/src/gallium/targets/wgl/wgl.c b/src/gallium/targets/wgl/wgl.c
+index f11629e..7d2e830 100644
+--- a/src/gallium/targets/wgl/wgl.c
++++ b/src/gallium/targets/wgl/wgl.c
+@@ -65,6 +65,8 @@
+ 
+ #ifdef GALLIUM_VIRGL
+ #include "virgl/gdi/virgl_gdi_public.h"
++#include "util/format/u_format.h"
++#include "util/u_inlines.h"
+ static bool use_virgl = false;
+ #endif
+ 
+@@ -170,6 +172,54 @@ wgl_screen_create(HDC hDC)
+ }
+ 
+ 
++#ifdef GALLIUM_VIRGL
++/* Presents by reading the frame back and drawing it with GDI. Used when there is no DXGI swapchain (pixel formats
++ * with PFD_SUPPORT_GDI, or the swapchain couldn't be created): presenting through the kernel driver
++ * (gdikmt present) isn't implemented. */
++static void
++virgl_gdi_present(struct pipe_context *ctx, struct pipe_resource *res, HDC hDC)
++{
++   if (!ctx || !res)
++      return;
++
++   unsigned width = res->width0, height = res->height0;
++   struct pipe_transfer *transfer;
++   const uint8_t *map = pipe_texture_map(ctx, res, 0, 0, PIPE_MAP_READ, 0, 0, width, height, &transfer);
++   if (!map)
++      return;
++
++   const void *pixels = map;
++   unsigned stride = transfer->stride;
++   void *converted = NULL;
++   if (res->format != PIPE_FORMAT_B8G8R8A8_UNORM && res->format != PIPE_FORMAT_B8G8R8X8_UNORM) {
++      converted = malloc((size_t)width * height * 4);
++      if (!converted ||
++          !util_format_translate(PIPE_FORMAT_B8G8R8A8_UNORM, converted, width * 4, 0, 0, res->format, map,
++                                 transfer->stride, 0, 0, width, height)) {
++         free(converted);
++         pipe_texture_unmap(ctx, transfer);
++         return;
++      }
++      pixels = converted;
++      stride = width * 4;
++   }
++
++   BITMAPINFO bmi;
++   memset(&bmi, 0, sizeof(bmi));
++   bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++   bmi.bmiHeader.biWidth = stride / 4; /* rows can be padded; only the first width pixels are drawn */
++   bmi.bmiHeader.biHeight = -(LONG)height; /* top-down */
++   bmi.bmiHeader.biPlanes = 1;
++   bmi.bmiHeader.biBitCount = 32;
++   bmi.bmiHeader.biCompression = BI_RGB;
++   StretchDIBits(hDC, 0, 0, width, height, 0, 0, width, height, pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
++
++   free(converted);
++   pipe_texture_unmap(ctx, transfer);
++}
++#endif
++
++
+ static void
+ wgl_present(struct pipe_screen *screen,
+             struct pipe_context *ctx,
+@@ -193,7 +243,7 @@ wgl_present(struct pipe_screen *screen,
+ 
+ #ifdef GALLIUM_VIRGL
+    if (use_virgl) {
+-      screen->flush_frontbuffer(screen, ctx, res, 0, 0, hDC, 0, NULL);
++      virgl_gdi_present(ctx, res, hDC);
+       return;
+    }
+ #endif
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+index a1b9517..4360725 100644
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+@@ -373,6 +373,7 @@ virgl_gdi_winsys_resource_create_handle(struct virgl_winsys *qws,
+    NTSTATUS Status =
+       qdws->device->queryAllocation(qdws->device, &openAllocation);
+    if (!NT_SUCCESS(Status)) {
++      _debug_printf("Failed to query shared resource(D3DKMTQueryResourceInfo) with status code: %lx\n", Status);
+       return NULL;
+    }
+ 
+@@ -386,8 +387,10 @@ virgl_gdi_winsys_resource_create_handle(struct virgl_winsys *qws,
+ 
+    Status = qdws->device->openAllocation(qdws->device, &openAllocation);
+ 
+-   if (!NT_SUCCESS(Status))
++   if (!NT_SUCCESS(Status)) {
++      _debug_printf("Failed to open shared resource(D3DKMTOpenResource) with status code: %lx\n", Status);
+       goto free_buffers;
++   }
+ 
+    const VIOGPU_CREATE_ALLOCATION_EXCHANGE *AllocExchange =
+       openAllocationInfo[0].pPrivateDriverData;

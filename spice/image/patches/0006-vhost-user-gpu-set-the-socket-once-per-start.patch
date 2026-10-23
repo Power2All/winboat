@@ -1,0 +1,38 @@
+vhost-user-gpu: set the socket up once per start of the device
+
+set_status created a new GPU socket on every status write that had
+DRIVER_OK, also when the device was running already, and gave it to the
+backend, which then used the new one and closed the old one (patch 0003),
+while QEMU kept reading the old one: end of file on every main loop
+iteration ("failed to read msg header: 0"), a busy main loop, no display and
+a VM that wouldn't shut down. Keep the socket while the device runs, and stop
+reading a socket the backend closed.
+
+--- a/hw/display/vhost-user-gpu.c
++++ b/hw/display/vhost-user-gpu.c
+@@ -409,6 +409,10 @@
+                              (uint8_t *)&request, sizeof(uint32_t));
+     if (r != sizeof(uint32_t)) {
+         error_report("failed to read msg header: %d, %d", r, errno);
++        if (r == 0) {
++            /* The backend closed the socket: stop reading it */
++            vhost_user_gpu_update_blocked(g, true);
++        }
+         goto end;
+     }
+ 
+@@ -571,6 +575,14 @@
+     Error *err = NULL;
+ 
+     if (val & VIRTIO_CONFIG_S_DRIVER_OK && vdev->vm_running) {
++        /*
++         * Started already: a status write that keeps DRIVER_OK. Another
++         * socket would replace the one the backend uses (it closes the old
++         * one) while this side kept reading the old one
++         */
++        if (g->vhost_gpu_fd != -1) {
++            return 0;
++        }
+         if (!vhost_user_gpu_do_set_socket(g, &err)) {
+             error_report_err(err);
+             return 0;

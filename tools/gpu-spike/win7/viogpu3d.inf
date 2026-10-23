@@ -1,0 +1,99 @@
+; viogpu3d for Windows 7 (roadmap D): the kernel driver of build-driver.ps1 -Win7 (WDDM 1.3's offering WDDM 1.1) with
+; the Direct3D 9, Direct3D 10/11 and OpenGL user-mode drivers of the Windows 10 package; otherwise as Windows 8.1's
+; (tools/gpu-spike/win81: files in System32/SysWOW64, no Direct3D 12, Vulkan, AMF or Media Foundation encoders).
+; DriverVer is set by win7-package.sh.
+
+[Version]
+Signature="$Windows NT$"
+Class=Display
+ClassGUID={4d36e968-e325-11ce-bfc1-08002be10318}
+Provider=%RHEL%
+DriverVer=@DRIVERVER@
+CatalogFile=viogpu3d.cat
+
+[DestinationDirs]
+VioGpu3D_Files.Driver = 12        ; System32\drivers
+VioGpu3D_Files.Usermode = 11      ; System32
+VioGpu3D_Files.UsermodeWow = 10,SysWOW64
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+viogpu3d.sys = 1,,
+viogpu_d3d9.dll = 1,,
+viogpu_d3d10.dll = 1,,
+viogpu_wgl.dll = 1,,
+viogpu_d3d9_x86.dll = 1,,
+viogpu_d3d10_x86.dll = 1,,
+viogpu_wgl_x86.dll = 1,,
+
+[Manufacturer]
+%RHEL%=RHEL,NTamd64.6.1
+
+[RHEL.NTamd64.6.1]
+%VioGpu3D.DeviceDesc% = VioGpu3D_Inst, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01
+
+[VioGpu3D_Files.Driver]
+viogpu3d.sys
+
+[VioGpu3D_Files.Usermode]
+viogpu_d3d9.dll
+viogpu_d3d10.dll
+viogpu_wgl.dll
+
+[VioGpu3D_Files.UsermodeWow]
+viogpu_d3d9_x86.dll
+viogpu_d3d10_x86.dll
+viogpu_wgl_x86.dll
+
+[VioGpu3D_Inst]
+FeatureScore=F9
+CopyFiles=VioGpu3D_Files.Driver, VioGpu3D_Files.Usermode, VioGpu3D_Files.UsermodeWow
+AddReg=VioGpu3D_DeviceSettings
+
+[VioGpu3D_Inst.Services]
+AddService = VioGpu3D,0x00000002,VioGpu3D_Service_Inst, VioGpu3D_EventLog_Inst
+
+[VioGpu3D_Inst.HW]
+AddReg = VioGpu3D_PCI_MSIX
+
+[VioGpu3D_Service_Inst]
+ServiceType = 1     ; kernel driver
+StartType = 3       ; demand start
+ErrorControl = 0    ; ignore
+ServiceBinary = %12%\viogpu3d.sys
+
+[VioGpu3D_EventLog_Inst]
+AddReg = VioGpu3D_EventLog_Inst.AddReg
+
+[VioGpu3D_EventLog_Inst.AddReg]
+HKR,,EventMessageFile,0x00020000,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,0x00010001,7
+
+[VioGpu3D_DeviceSettings]
+HKR,, HWCursor,                    0x00010001, 1
+HKR,, FlexResolution,              0x00010001, 1
+HKR,, UsePhysicalMemory,           0x00010001, 0
+HKR,, UserModeDriverName,          0x00010000, viogpu_d3d9.dll,viogpu_d3d10.dll,viogpu_d3d10.dll
+HKR,, UserModeDriverNameWow,       0x00010000, viogpu_d3d9_x86.dll,viogpu_d3d10_x86.dll,viogpu_d3d10_x86.dll
+HKR,, OpenGLDriverName,            0x00010000, viogpu_wgl.dll
+HKR,, OpenGLDriverNameWow,         0x00010000, viogpu_wgl_x86.dll
+HKR,, OpenGLFlags,                 0x00010001, 3
+HKR,, OpenGLFlagsWow,              0x00010001, 3
+HKR,, OpenGLVersion,               0x00010001, 4096
+HKR,, OpenGLVersionWow,            0x00010001, 4096
+HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,0x00010001,0
+HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,0x00010001,2
+HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDelay,0x00010001,10
+
+[VioGpu3D_PCI_MSIX]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 0
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 4
+
+[Strings]
+DiskId1 = "Red Hat VirtIO GPU controller Installation Disk"
+VioGpu3D.DeviceDesc = "Red Hat VirtIO GPU 3D controller"
+RHEL = "Red Hat, Inc."

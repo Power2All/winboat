@@ -1,0 +1,844 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: WDDM 2.0 kernel driver with GPU virtual addresses
+
+Windows' Direct3D 12 runtime only takes adapters whose kernel driver is
+WDDM 2.0 or newer. The driver now reports WDDM 2.0 (DXGKDDI_WDDMv2) with
+GPU virtual addresses (GpuMmu); building with VIOGPU_WDDM1_3, or with a WDK
+older than WDDM 2.0 (Windows 8.1), keeps the WDDM 1.3 driver.
+
+- GpuMmu with page tables the CPU updates (DXGK_PAGETABLEUPDATE_CPU_VIRTUAL):
+  3 levels of 512 entries, 39-bit addresses, page tables in the system
+  memory segment. The virtual GPU never reads them (its commands name host
+  resources), so UPDATE_PAGE_TABLE copies the entries and FLUSH_TLB,
+  UPDATE_CONTEXT_ALLOCATION, NOTIFY_RESIDENCY and DISCARD_CONTENT do nothing.
+- QUERYSEGMENT4 (the WDDM 1.3 aperture segment), GPUMMUCAPS,
+  PAGETABLELEVELDESC; CreateProcess/DestroyProcess, SetRootPageTable,
+  GetRootPageTableSize, CalibrateGpuClock (the performance counter),
+  SetStablePowerState (required: StartAdapter fails without it) and
+  SubmitCommandVirtual.
+- The allocations the D3D/OpenGL drivers use are accessed physically and
+  stay in the aperture segment; DMA buffers too (in plain system memory the
+  memory manager crashed setting up the GDI context's pool).
+- Handle data through DxgkCbAcquireHandleData (DxgkCbGetHandleData returns
+  NULL under WDDM 2.0); OpenAllocation skips allocations it can't resolve.
+- VIOGPU_ADAPTERINFO::Flags.Wddm2 tells the user-mode drivers to make their
+  allocations resident (MakeResident), which WDDM 2.0 leaves to them.
+- Preemption (also a fix for WDDM 1.3): the driver said PreemptionAware but
+  DxgkDdiPreemptCommand did nothing, and the scheduler waits for
+  DXGK_INTERRUPT_DMA_PREEMPTED, so a preemption request stalled the whole
+  GPU (presents and context destruction hung). The host runs each submitted
+  command to its end, so the request completes once the commands submitted
+  before it are done, with nothing to resubmit.
+- VIOGPU_RES_BUSY waits are bounded (10 s): a command buffer Windows drops
+  after Render never completes, and an endless wait blocked every later
+  escape of the adapter.
+- A small diagnostic log in memory (VioGpuLog, also to DbgPrintEx), read
+  with the VIOGPU_GET_LOG escape; it records rare events only.
+
+DirectX test on the WDDM 2.0 driver: 514 passed, 1 failed (Direct3D 12, no
+user-mode driver yet), as on WDDM 1.3; the device restarts and updates
+in place.
+---
+diff --git a/viogpu/common/helper.h b/viogpu/common/helper.h
+--- a/viogpu/common/helper.h
++++ b/viogpu/common/helper.h
+@@ -100,6 +100,28 @@
+     }
+ #endif
+ 
++// WDDM 2.0 with GPU virtual addresses (GpuMmu): what Direct3D 12 needs. Building with VIOGPU_WDDM1_3 (or with a WDK
++// older than WDDM 2.0, for Windows 8.1) keeps the WDDM 1.3 driver
++#if !defined(VIOGPU_WDDM1_3) && (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_0)
++#define VIOGPU_WDDM2 1
++#else
++#define VIOGPU_WDDM2 0
++#endif
++
++// GPU page tables (VIOGPU_WDDM2): 3 levels of 512 entries (DXGK_PTE, 16 bytes: 8 KB a table) over 4 KB pages, a
++// 39-bit (512 GB) GPU virtual address space. The CPU updates them (DXGK_PAGETABLEUPDATE_CPU_VIRTUAL) and the virtual
++// GPU never reads them: its commands name host resources, not addresses
++#define VIOGPU_PAGE_TABLE_LEVELS     3
++#define VIOGPU_PAGE_TABLE_INDEX_BITS 9
++#define VIOGPU_PAGE_TABLE_SIZE       ((1 << VIOGPU_PAGE_TABLE_INDEX_BITS) * 16)
++#define VIOGPU_GPU_VA_BITS           (VIOGPU_PAGE_TABLE_LEVELS * VIOGPU_PAGE_TABLE_INDEX_BITS + 12)
++// The aperture segment is segment 1, so the system memory segment GpuMmu adds is segment 2
++#define VIOGPU_SYSMEM_SEGMENT_ID     2
++
++// A diagnostic log kept in memory (32 KB, oldest lines dropped), read with the VIOGPU_GET_LOG escape. Any IRQL up to
++// DISPATCH_LEVEL
++void VioGpuLog(_In_z_ _Printf_format_string_ const char *format, ...);
++
+ #define PAGED_CODE_SEG       __declspec(code_seg("PAGE"))
+ #define PAGED_CODE_SEG_BEGIN __pragma(code_seg(push)) __pragma(code_seg("PAGE"))
+ 
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -1027,6 +1027,13 @@
+         {
+             break;
+         }
++#ifdef VIOGPU_3D
++        static LONG fullLogged;
++        if (InterlockedIncrement(&fullLogged) % 1000 == 1)
++        {
++            VioGpuLog("QueueBuffer: control queue full, waiting (type 0x%x)", ((PGPU_CTRL_HDR)buf->buf)->type);
++        }
++#endif
+         LARGE_INTEGER delay;
+         delay.QuadPart = -10000; // 1 ms
+         KeDelayExecutionThread(KernelMode, FALSE, &delay);
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -53,7 +53,8 @@
+     {
+         UINT Supports3d : 1;
+         UINT SupportsBlob : 1; // Venus: blob resources with a host-visible memory window (VIOGPU_BLOB_*)
+-        UINT Reserved : 30;
++        UINT Wddm2 : 1;        // a WDDM 2.0 kernel driver: user-mode drivers make their allocations resident
++        UINT Reserved : 29;
+     } Flags;
+     ULONGLONG SupportedCapsetIDs;
+ } VIOGPU_ADAPTERINFO;
+@@ -63,6 +64,7 @@
+ #define VIOGPU_GET_CUSTOM_RESOLUTION 0x001
+ #define VIOGPU_GET_CAPS              0x002
+ #define VIOGPU_GET_STATS             0x003
++#define VIOGPU_GET_LOG               0x004
+ 
+ #define VIOGPU_RES_INFO              0x100
+ #define VIOGPU_RES_BUSY              0x101
+@@ -135,6 +137,16 @@
+ } VIOGPU_STATS_REQ;
+ #pragma pack()
+ 
++// The driver's diagnostic log (VioGpuLog), oldest line first, copied to Buffer (VIOGPU_GET_LOG)
++#pragma pack(1)
++typedef struct _VIOGPU_LOG_REQ
++{
++    UINT64 Buffer;   // user-mode address
++    ULONG Size;      // its size
++    ULONG Written;   // out: bytes copied
++} VIOGPU_LOG_REQ;
++#pragma pack()
++
+ // Venus (Vulkan): blob resources, mapped into the calling process, and command streams for a Venus context.
+ // The device (D3DKMTCreateDevice) owns its blobs: the driver destroys what is left when the device goes away.
+ #define VIOGPU_BLOB_MEM_GUEST         0x0001
+@@ -206,6 +218,7 @@
+         VIOGPU_EXECBUFFER_REQ ExecBuffer;
+ 
+         VIOGPU_STATS_REQ Stats;
++        VIOGPU_LOG_REQ Log;
+     } DUMMYUNIONNAME;
+ } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
+ #pragma pack()
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -80,7 +80,11 @@
+     DbgPrint(TRACE_LEVEL_FATAL, ("---> VIOGPU FULL build on on %s %s\n", __DATE__, __TIME__));
+     DRIVER_INITIALIZATION_DATA InitialData = {0};
+ 
++#if VIOGPU_WDDM2
++    InitialData.Version = DXGKDDI_INTERFACE_VERSION_WDDM2_0;
++#else
+     InitialData.Version = DXGKDDI_INTERFACE_VERSION_WDDM1_3;
++#endif
+ 
+     InitialData.DxgkDdiAddDevice = VioGpu3DAddDevice;
+     InitialData.DxgkDdiStartDevice = VioGpu3DStartDevice;
+@@ -149,6 +153,16 @@
+     InitialData.DxgkDdiControlInterrupt = VioGpu3DDdiControlInterrupt;
+     InitialData.DxgkDdiGetScanLine = VioGpu3DDdiGetScanLine;
+ 
++#if VIOGPU_WDDM2
++    InitialData.DxgkDdiSubmitCommandVirtual = VioGpu3DSubmitCommandVirtual;
++    InitialData.DxgkDdiSetRootPageTable = VioGpu3DSetRootPageTable;
++    InitialData.DxgkDdiGetRootPageTableSize = VioGpu3DGetRootPageTableSize;
++    InitialData.DxgkDdiCreateProcess = VioGpu3DCreateProcess;
++    InitialData.DxgkDdiDestroyProcess = VioGpu3DDestroyProcess;
++    InitialData.DxgkDdiCalibrateGpuClock = VioGpu3DCalibrateGpuClock;
++    InitialData.DxgkDdiSetStablePowerState = VioGpu3DSetStablePowerState;
++#endif
++
+     NTSTATUS Status = DxgkInitialize(pDriverObject, pRegistryPath, &InitialData);
+ 
+     if (!NT_SUCCESS(Status))
+@@ -353,10 +367,84 @@
+ 
+     pGetNodeMetadata->EngineType = DXGK_ENGINE_TYPE_3D;
+     pGetNodeMetadata->Flags.Value = 0;
++#if VIOGPU_WDDM2
++    pGetNodeMetadata->GpuMmuSupported = TRUE;
++    pGetNodeMetadata->IoMmuSupported = FALSE;
++#endif
+ 
+     return STATUS_SUCCESS;
+ };
+ 
++#if VIOGPU_WDDM2
++// WDDM 2.0: GPU virtual addresses. Windows keeps the page tables (VIOGPU_PAGE_TABLE_*); the virtual GPU has no MMU,
++// so there is nothing to program for a process or its root page table
++
++NTSTATUS
++APIENTRY
++VioGpu3DCreateProcess(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_CREATEPROCESS *pArgs)
++{
++    PAGED_CODE();
++    UNREFERENCED_PARAMETER(hAdapter);
++    pArgs->hKmdProcess = pArgs->hDxgkProcess;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS
++APIENTRY
++VioGpu3DDestroyProcess(_In_ CONST HANDLE hAdapter, _In_ CONST HANDLE hKmdProcess)
++{
++    PAGED_CODE();
++    UNREFERENCED_PARAMETER(hAdapter);
++    UNREFERENCED_PARAMETER(hKmdProcess);
++    return STATUS_SUCCESS;
++}
++
++VOID APIENTRY VioGpu3DSetRootPageTable(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETROOTPAGETABLE *pSetPageTable)
++{
++    PAGED_CODE();
++    UNREFERENCED_PARAMETER(hAdapter);
++    UNREFERENCED_PARAMETER(pSetPageTable);
++}
++
++SIZE_T
++APIENTRY
++VioGpu3DGetRootPageTableSize(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETROOTPAGETABLESIZE *pArgs)
++{
++    PAGED_CODE();
++    UNREFERENCED_PARAMETER(hAdapter);
++    return (SIZE_T)pArgs->NumberOfPte * sizeof(DXGK_PTE);
++}
++
++// Stable clocks for profiling: the virtual GPU has no clocks of its own
++VOID APIENTRY VioGpu3DSetStablePowerState(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETSTABLEPOWERSTATE *pArgs)
++{
++    PAGED_CODE();
++    UNREFERENCED_PARAMETER(hAdapter);
++    UNREFERENCED_PARAMETER(pArgs);
++}
++
++NTSTATUS
++APIENTRY
++VioGpu3DCalibrateGpuClock(_In_ CONST HANDLE hAdapter,
++                          _In_ UINT32 NodeOrdinal,
++                          _In_ UINT32 EngineOrdinal,
++                          _Out_ DXGKARG_CALIBRATEGPUCLOCK *pClockCalibration)
++{
++    PAGED_CODE();
++    UNREFERENCED_PARAMETER(hAdapter);
++    UNREFERENCED_PARAMETER(NodeOrdinal);
++    UNREFERENCED_PARAMETER(EngineOrdinal);
++    // The virtual GPU's timestamps are the guest's performance counter
++    LARGE_INTEGER frequency;
++    LARGE_INTEGER counter = KeQueryPerformanceCounter(&frequency);
++    RtlZeroMemory(pClockCalibration, sizeof(*pClockCalibration));
++    pClockCalibration->GpuFrequency = frequency.QuadPart;
++    pClockCalibration->GpuClockCounter = counter.QuadPart;
++    pClockCalibration->CpuClockCounter = counter.QuadPart;
++    return STATUS_SUCCESS;
++}
++#endif
++
+ NTSTATUS
+ APIENTRY
+ VioGpu3DSetPointerPosition(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition)
+@@ -557,6 +645,32 @@
+                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s (unmap aperture segment)\n", __FUNCTION__));
+                 return Status;
+             }
++#if VIOGPU_WDDM2
++        case DXGK_OPERATION_UPDATE_PAGE_TABLE:
++            {
++                // Page tables the CPU updates: copy the entries in. Nothing reads them but Windows itself (the
++                // virtual GPU's commands name host resources), so this is all a page table update takes
++                DXGK_PTE *pte = (DXGK_PTE *)pBuildPagingBuffer->UpdatePageTable.PageTableAddress.CpuVirtual;
++                const DXGK_PTE *src = pBuildPagingBuffer->UpdatePageTable.pPageTableEntries;
++                if (pte == NULL || src == NULL)
++                {
++                    return STATUS_SUCCESS;
++                }
++                const UINT step = pBuildPagingBuffer->UpdatePageTable.Flags.Repeat ? 0 : 1;
++                pte += pBuildPagingBuffer->UpdatePageTable.StartIndex;
++                for (UINT i = 0; i < pBuildPagingBuffer->UpdatePageTable.NumPageTableEntries; i++, src += step)
++                {
++                    pte[i] = *src;
++                }
++                return STATUS_SUCCESS;
++            }
++        case DXGK_OPERATION_FLUSH_TLB:
++        case DXGK_OPERATION_UPDATE_CONTEXT_ALLOCATION:
++        case DXGK_OPERATION_NOTIFY_RESIDENCY:
++        case DXGK_OPERATION_DISCARD_CONTENT:
++            // No TLB, no context allocations, nothing to do on residency changes or discards
++            return STATUS_SUCCESS;
++#endif
+         default:
+             {
+                 DbgPrint(TRACE_LEVEL_ERROR,
+@@ -599,6 +713,34 @@
+     return pAdapter->commander.SubmitCommand(pSubmitCommand);
+ };
+ 
++#if VIOGPU_WDDM2
++// A command buffer addressed by GPU virtual address (a user-mode driver that uses GPU virtual addresses, Direct3D 12).
++// Its private data is the user-mode driver's, not a VioGpuCommand: the submission completes in order with the
++// device's other work
++NTSTATUS
++APIENTRY
++VioGpu3DSubmitCommandVirtual(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommand)
++{
++    VIOGPU_ASSERT_CHK(hAdapter != NULL);
++
++    VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(hAdapter);
++    if (!pAdapter->IsDriverActive())
++    {
++        return STATUS_UNSUCCESSFUL;
++    }
++    DXGKARG_SUBMITCOMMAND submit = {};
++    submit.hContext = pSubmitCommand->hContext;
++    submit.DmaBufferSize = pSubmitCommand->DmaBufferSize;
++    submit.SubmissionFenceId = pSubmitCommand->SubmissionFenceId;
++    submit.VidPnSourceId = pSubmitCommand->VidPnSourceId;
++    submit.FlipInterval = pSubmitCommand->FlipInterval;
++    submit.Flags = pSubmitCommand->Flags;
++    submit.EngineOrdinal = pSubmitCommand->EngineOrdinal;
++    submit.NodeOrdinal = pSubmitCommand->NodeOrdinal;
++    return pAdapter->commander.SubmitCommand(&submit);
++}
++#endif
++
+ NTSTATUS
+ APIENTRY
+ VioGpu3DCreateDevice(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_CREATEDEVICE *pCreateDevice)
+@@ -654,7 +796,13 @@
+     // We currently don't have sepraration between context and device
+     pCreateContext->hContext = hDevice;
+ 
++#if VIOGPU_WDDM2
++    // With GPU virtual addresses, DMA buffers in plain system memory (segment set 0) crashed the memory manager when
++    // it set up the GDI (CDD) context's pool: keep them in the aperture segment
++    pCreateContext->ContextInfo.DmaBufferSegmentSet = 1;
++#else
+     pCreateContext->ContextInfo.DmaBufferSegmentSet = 0;
++#endif
+     pCreateContext->ContextInfo.DmaBufferSize = 256 * 1024;
+     pCreateContext->ContextInfo.DmaBufferPrivateDataSize = 40;
+ 
+@@ -995,15 +1143,8 @@
+ APIENTRY
+ VioGpu3DDdiPreemptCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PREEMPTCOMMAND *pPreemptCommand)
+ {
+-    UNREFERENCED_PARAMETER(hAdapter);
+-    UNREFERENCED_PARAMETER(pPreemptCommand);
+-
+-    DbgPrint(TRACE_LEVEL_ERROR,
+-             ("<---> %s UNSUPPORTED PREEMPTION FUNCTION fence_id=%d\n",
+-              __FUNCTION__,
+-              pPreemptCommand->PreemptionFenceId));
+-
+-    return STATUS_SUCCESS;
++    VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(hAdapter);
++    return pAdapter->commander.PreemptCommand(pPreemptCommand);
+ };
+ 
+ NTSTATUS
+diff --git a/viogpu/viogpu3d/driver.h b/viogpu/viogpu3d/driver.h
+--- a/viogpu/viogpu3d/driver.h
++++ b/viogpu/viogpu3d/driver.h
+@@ -260,6 +260,35 @@
+ APIENTRY
+ VioGpu3DDdiQueryCurrentFence(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYCURRENTFENCE *pCurrentFence);
+ 
++#if VIOGPU_WDDM2
++NTSTATUS
++APIENTRY
++VioGpu3DSubmitCommandVirtual(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommand);
++
++VOID APIENTRY VioGpu3DSetRootPageTable(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETROOTPAGETABLE *pSetPageTable);
++
++SIZE_T
++APIENTRY
++VioGpu3DGetRootPageTableSize(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETROOTPAGETABLESIZE *pArgs);
++
++NTSTATUS
++APIENTRY
++VioGpu3DCreateProcess(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_CREATEPROCESS *pArgs);
++
++NTSTATUS
++APIENTRY
++VioGpu3DDestroyProcess(_In_ CONST HANDLE hAdapter, _In_ CONST HANDLE hKmdProcess);
++
++VOID APIENTRY VioGpu3DSetStablePowerState(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETSTABLEPOWERSTATE *pArgs);
++
++NTSTATUS
++APIENTRY
++VioGpu3DCalibrateGpuClock(_In_ CONST HANDLE hAdapter,
++                          _In_ UINT32 NodeOrdinal,
++                          _In_ UINT32 EngineOrdinal,
++                          _Out_ DXGKARG_CALIBRATEGPUCLOCK *pClockCalibration);
++#endif
++
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiResetEngine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_RESETENGINE *pResetEngine);
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -38,6 +38,69 @@
+ #include "viogpudo.tmh"
+ #endif
+ 
++#include <ntstrsafe.h>
++
++#pragma code_seg(push)
++#pragma code_seg()
++static char g_LogRing[32768];
++static ULONG g_LogPos; // bytes written so far (the ring holds the last sizeof(g_LogRing))
++static KSPIN_LOCK g_LogLock;
++static LONG g_LogInit;
++
++void VioGpuLog(_In_z_ _Printf_format_string_ const char *format, ...)
++{
++    if (InterlockedCompareExchange(&g_LogInit, 1, 0) == 0)
++    {
++        KeInitializeSpinLock(&g_LogLock);
++        InterlockedExchange(&g_LogInit, 2);
++    }
++    while (g_LogInit != 2)
++    {
++    }
++    char line[256];
++    va_list args;
++    va_start(args, format);
++    RtlStringCbVPrintfA(line, sizeof(line) - 2, format, args);
++    va_end(args);
++    size_t length = 0;
++    RtlStringCbLengthA(line, sizeof(line), &length);
++    line[length++] = '\n';
++    line[length] = 0;
++
++    // also to the kernel debugger / DebugView (kernel capture), which still works when escapes are stuck
++    DbgPrintEx(DPFLTR_IHVVIDEO_ID, DPFLTR_ERROR_LEVEL, "viogpu: %s", line);
++
++    KIRQL irql;
++    KeAcquireSpinLock(&g_LogLock, &irql);
++    for (size_t i = 0; i < length; i++)
++    {
++        g_LogRing[(g_LogPos + i) % sizeof(g_LogRing)] = line[i];
++    }
++    g_LogPos += (ULONG)length;
++    KeReleaseSpinLock(&g_LogLock, irql);
++}
++
++// The log, oldest first, into a nonpaged copy (the caller copies it out at PASSIVE_LEVEL)
++static ULONG VioGpuLogSnapshot(char *out, ULONG size)
++{
++    if (g_LogInit != 2)
++    {
++        return 0;
++    }
++    KIRQL irql;
++    KeAcquireSpinLock(&g_LogLock, &irql);
++    ULONG available = min(g_LogPos, (ULONG)sizeof(g_LogRing));
++    ULONG count = min(available, size);
++    ULONG start = g_LogPos - count;
++    for (ULONG i = 0; i < count; i++)
++    {
++        out[i] = g_LogRing[(start + i) % sizeof(g_LogRing)];
++    }
++    KeReleaseSpinLock(&g_LogLock, irql);
++    return count;
++}
++#pragma code_seg(pop)
++
+ static UINT g_InstanceId = 0;
+ 
+ struct NOTIFY_CONTEXT
+@@ -548,6 +611,7 @@
+                 info->IamVioGPU = VIOGPU_IAM;
+                 info->Flags.Supports3d = virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_VIRGL);
+                 info->Flags.SupportsBlob = SupportsBlob();
++                info->Flags.Wddm2 = VIOGPU_WDDM2;
+                 info->Flags.Reserved = 0;
+                 info->SupportedCapsetIDs = m_supportedCapsetIDs;
+                 return STATUS_SUCCESS;
+@@ -570,7 +634,14 @@
+                           pDriverCaps->InterruptMessageNumber,
+                           pDriverCaps->WDDMVersion));
+                 RtlZeroMemory(pDriverCaps, pQueryAdapterInfo->OutputDataSize /*sizeof(DXGK_DRIVERCAPS)*/);
++#if VIOGPU_WDDM2
++                // GPU virtual addresses with page tables Windows keeps (see VIOGPU_PAGE_TABLE_*)
++                pDriverCaps->WDDMVersion = DXGKDDI_WDDMv2;
++                pDriverCaps->MemoryManagementCaps.VirtualAddressingSupported = TRUE;
++                pDriverCaps->MemoryManagementCaps.GpuMmuSupported = TRUE;
++#else
+                 pDriverCaps->WDDMVersion = DXGKDDI_WDDMv1_3;
++#endif
+                 pDriverCaps->HighestAcceptableAddress.QuadPart = (ULONG64)-1;
+ 
+                 pDriverCaps->FlipCaps.FlipOnVSyncMmIo = TRUE;
+@@ -659,6 +730,72 @@
+                 return STATUS_SUCCESS;
+             }
+ 
++#if VIOGPU_WDDM2
++        case DXGKQAITYPE_QUERYSEGMENT4:
++            {
++                // The same aperture segment as with WDDM 1.3 (QUERYSEGMENT3): the allocations the D3D/OpenGL drivers
++                // use are accessed physically and stay there. GpuMmu adds the system memory segment (2)
++                if (pQueryAdapterInfo->OutputDataSize < sizeof(DXGK_QUERYSEGMENTOUT4))
++                {
++                    return STATUS_BUFFER_TOO_SMALL;
++                }
++                DXGK_QUERYSEGMENTOUT4 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT4 *)pQueryAdapterInfo->pOutputData;
++                if (!pSegmentInfo->pSegmentDescriptor)
++                {
++                    pSegmentInfo->NbSegment = 1;
++                    return STATUS_SUCCESS;
++                }
++                // Paging buffers in system memory (segment 0): the CPU fills them, and the aperture isn't CPU-visible.
++                // Their private data is the size every context reports (VioGpu3DDdiCreateContext)
++                pSegmentInfo->PagingBufferPrivateDataSize = 40;
++                pSegmentInfo->PagingBufferSegmentId = 0;
++                pSegmentInfo->PagingBufferSize = 10 * PAGE_SIZE;
++
++                DXGK_SEGMENTDESCRIPTOR4 *pSegmentDesc = (DXGK_SEGMENTDESCRIPTOR4 *)pSegmentInfo->pSegmentDescriptor;
++                memset(pSegmentDesc, 0, pSegmentInfo->SegmentDescriptorStride ? pSegmentInfo->SegmentDescriptorStride
++                                                                               : sizeof(*pSegmentDesc));
++                pSegmentDesc->BaseAddress.QuadPart = 0xC0000000;
++                pSegmentDesc->Flags.Aperture = TRUE;
++                pSegmentDesc->Flags.CacheCoherent = TRUE;
++                pSegmentDesc->Flags.CpuVisible = FALSE;
++                pSegmentDesc->Flags.DirectFlip = TRUE;
++                pSegmentDesc->Size = 256 * 1024 * 4096;
++                pSegmentDesc->CommitLimit = 256 * 1024 * 4096;
++                return STATUS_SUCCESS;
++            }
++        case DXGKQAITYPE_GPUMMUCAPS:
++            {
++                if (pQueryAdapterInfo->OutputDataSize < sizeof(DXGK_GPUMMUCAPS))
++                {
++                    return STATUS_BUFFER_TOO_SMALL;
++                }
++                DXGK_GPUMMUCAPS *pCaps = (DXGK_GPUMMUCAPS *)pQueryAdapterInfo->pOutputData;
++                RtlZeroMemory(pCaps, sizeof(*pCaps));
++                pCaps->ZeroInPteSupported = 1;
++                pCaps->CacheCoherentMemorySupported = 1;
++                pCaps->PageTableUpdateMode = DXGK_PAGETABLEUPDATE_CPU_VIRTUAL;
++                pCaps->VirtualAddressBitCount = VIOGPU_GPU_VA_BITS;
++                pCaps->PageTableLevelCount = VIOGPU_PAGE_TABLE_LEVELS;
++                return STATUS_SUCCESS;
++            }
++        case DXGKQAITYPE_PAGETABLELEVELDESC:
++            {
++                if (pQueryAdapterInfo->OutputDataSize < sizeof(DXGK_PAGE_TABLE_LEVEL_DESC))
++                {
++                    return STATUS_BUFFER_TOO_SMALL;
++                }
++                // Every level alike: page tables in system memory, where the CPU writes them
++                DXGK_PAGE_TABLE_LEVEL_DESC *pDesc = (DXGK_PAGE_TABLE_LEVEL_DESC *)pQueryAdapterInfo->pOutputData;
++                RtlZeroMemory(pDesc, sizeof(*pDesc));
++                pDesc->PageTableIndexBitCount = VIOGPU_PAGE_TABLE_INDEX_BITS;
++                pDesc->PageTableSegmentId = VIOGPU_SYSMEM_SEGMENT_ID;
++                pDesc->PagingProcessPageTableSegmentId = VIOGPU_SYSMEM_SEGMENT_ID;
++                pDesc->PageTableSizeInBytes = VIOGPU_PAGE_TABLE_SIZE;
++                pDesc->PageTableAlignmentInBytes = 0;
++                return STATUS_SUCCESS;
++            }
++#endif
++
+         default:
+             {
+                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s unknown type %d\n", __FUNCTION__, pQueryAdapterInfo->Type));
+@@ -788,6 +925,33 @@
+                 ctrlQueue.GetStats(&pVioGpuEscape->Stats);
+                 break;
+             }
++        case VIOGPU_GET_LOG:
++            {
++                size = sizeof(VIOGPU_LOG_REQ);
++                if (pVioGpuEscape->DataLength < size ||
++                    pEscape->PrivateDriverDataSize < FIELD_OFFSET(VIOGPU_ESCAPE, Log) + size)
++                {
++                    return STATUS_INVALID_BUFFER_SIZE;
++                }
++                char *copy = new (NonPagedPoolNx) char[sizeof(g_LogRing)];
++                if (!copy)
++                {
++                    return STATUS_NO_MEMORY;
++                }
++                ULONG count = VioGpuLogSnapshot(copy, min(pVioGpuEscape->Log.Size, (ULONG)sizeof(g_LogRing)));
++                __try
++                {
++                    ProbeForWrite((PVOID)(ULONG_PTR)pVioGpuEscape->Log.Buffer, count, 1);
++                    memcpy((PVOID)(ULONG_PTR)pVioGpuEscape->Log.Buffer, copy, count);
++                    pVioGpuEscape->Log.Written = count;
++                }
++                __except (EXCEPTION_EXECUTE_HANDLER)
++                {
++                    status = STATUS_INVALID_PARAMETER;
++                }
++                delete[] copy;
++                break;
++            }
+         case VIOGPU_RES_INFO:
+             {
+                 size = sizeof(VIOGPU_RES_INFO_REQ);
+@@ -1995,20 +2159,40 @@
+     return m_CursorQueue.QueueCursor(vbuf) == 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+ }
+ 
+-VioGpuAllocation *VioGpuAdapter::AllocationFromHandle(D3DKMT_HANDLE handle)
++// The driver's object behind a kernel handle. WDDM 2.0 drivers get it with DxgkCbAcquireHandleData (released right
++// away: the objects live until Windows destroys them); DxgkCbGetHandleData returned NULL for every allocation
++static void *HandleData(DXGKRNL_INTERFACE &dxgk, D3DKMT_HANDLE handle, DXGK_HANDLE_TYPE type)
+ {
+     DXGKARGCB_GETHANDLEDATA getHandleData;
+     getHandleData.hObject = handle;
+-    getHandleData.Type = DXGK_HANDLE_ALLOCATION;
++    getHandleData.Type = type;
+     getHandleData.Flags.DeviceSpecific = 0;
+-    return reinterpret_cast<VioGpuAllocation *>(m_DxgkInterface.DxgkCbGetHandleData(&getHandleData));
++#if VIOGPU_WDDM2
++    DXGKARG_RELEASE_HANDLE release = NULL;
++    void *data = dxgk.DxgkCbAcquireHandleData(&getHandleData, &release);
++    if (!data)
++    {
++        VioGpuLog("AcquireHandleData(0x%x, type %d) = NULL", handle, type);
++    }
++    if (release)
++    {
++        DXGKARGCB_RELEASEHANDLEDATA releaseData;
++        releaseData.ReleaseHandle = release;
++        releaseData.Type = type;
++        dxgk.DxgkCbReleaseHandleData(releaseData);
++    }
++    return data;
++#else
++    return dxgk.DxgkCbGetHandleData(&getHandleData);
++#endif
++}
++
++VioGpuAllocation *VioGpuAdapter::AllocationFromHandle(D3DKMT_HANDLE handle)
++{
++    return reinterpret_cast<VioGpuAllocation *>(HandleData(m_DxgkInterface, handle, DXGK_HANDLE_ALLOCATION));
+ }
+ 
+ VioGpuResource *VioGpuAdapter::ResourceFromHandle(D3DKMT_HANDLE handle)
+ {
+-    DXGKARGCB_GETHANDLEDATA getHandleData;
+-    getHandleData.hObject = handle;
+-    getHandleData.Type = DXGK_HANDLE_RESOURCE;
+-    getHandleData.Flags.DeviceSpecific = 0;
+-    return reinterpret_cast<VioGpuResource *>(m_DxgkInterface.DxgkCbGetHandleData(&getHandleData));
++    return reinterpret_cast<VioGpuResource *>(HandleData(m_DxgkInterface, handle, DXGK_HANDLE_RESOURCE));
+ }
+\ No newline at end of file
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -320,6 +320,11 @@
+     allocationInfo->PreferredSegment.Direction0 = 0;
+ 
+     allocationInfo->Flags.CpuVisible = TRUE;
++#if VIOGPU_WDDM2
++    // With GPU virtual addresses, only allocations accessed physically live in the aperture segment: these do, the
++    // host keeps them up to date through the pages it is given when they are mapped there
++    allocationInfo->Flags.AccessedPhysically = TRUE;
++#endif
+ 
+     allocationInfo->HintedBank.Value = 0;
+     allocationInfo->MaximumRenamingListLength = 0;
+@@ -398,9 +403,23 @@
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d\n", __FUNCTION__, m_Id));
+ 
++    // Bounded: a command buffer Windows dropped after Render (WDDM 2.0 does when an allocation isn't resident) never
++    // completes, and an endless wait here blocked every later escape of the adapter
++    LARGE_INTEGER start;
++    KeQuerySystemTimePrecise(&start);
+     while (resBusy->Wait && m_busy != 0)
+     {
+-        KeWaitForSingleObject(&m_busyNotification, UserRequest, KernelMode, FALSE, NULL);
++        LARGE_INTEGER timeout;
++        timeout.QuadPart = -10000000LL; // 1 s
++        KeWaitForSingleObject(&m_busyNotification, UserRequest, KernelMode, FALSE, &timeout);
++
++        LARGE_INTEGER now;
++        KeQuerySystemTimePrecise(&now);
++        if (m_busy != 0 && now.QuadPart - start.QuadPart > 10 * 10000000LL)
++        {
++            VioGpuLog("RES_BUSY: resource %u still busy after 10 s (busy %d), giving up", m_Id, m_busy);
++            break;
++        }
+ 
+         LARGE_INTEGER wait;
+         wait.QuadPart = -10LL;
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -188,7 +188,7 @@
+     interrupt.DmaCompleted.EngineOrdinal = 0;
+     m_pAdapter->NotifyInterrupt(&interrupt, true);
+ 
+-    m_pCommander->CommandFinished();
++    m_pCommander->CommandFinished(m_FenceId);
+ 
+     delete this;
+ }
+@@ -206,6 +206,8 @@
+         if (deviceAllocation)
+         {
+             m_allocations[i] = deviceAllocation->GetAllocation();
++            // Busy from Render on: a map that waits for the resource must also wait for command buffers not
++            // submitted yet. One Windows drops after Render stays busy: VIOGPU_RES_BUSY waits are bounded
+             m_allocations[i]->MarkBusy();
+         }
+         else
+@@ -250,6 +252,9 @@
+     KeInitializeSpinLock(&m_Lock);
+ 
+     m_running = 0;
++    m_pending = 0;
++    m_lastCompletedFence = 0;
++    m_preemptionFence = 0;
+ }
+ 
+ NTSTATUS VioGpuCommander::Start()
+@@ -345,18 +350,54 @@
+             }
+             command->Run();
+         }
++
++        NotifyPreemptionIfIdle();
+     }
+ }
+ 
+-void VioGpuCommander::CommandFinished()
++void VioGpuCommander::CommandFinished(UINT fenceId)
+ {
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+ 
+     m_running--;
++    KIRQL oldIrql;
++    LockQueue(&oldIrql);
++    m_pending--;
++    m_lastCompletedFence = fenceId;
++    UnlockQueue(oldIrql);
+     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
+ }
+ 
++// On the worker thread, after the completions it notified
++void VioGpuCommander::NotifyPreemptionIfIdle()
++{
++    PAGED_CODE();
++
++    KIRQL oldIrql;
++    LockQueue(&oldIrql);
++    UINT preemptionFence = 0;
++    UINT lastCompletedFence = m_lastCompletedFence;
++    if (m_preemptionFence != 0 && m_pending == 0)
++    {
++        preemptionFence = m_preemptionFence;
++        m_preemptionFence = 0;
++    }
++    UnlockQueue(oldIrql);
++    if (preemptionFence == 0)
++    {
++        return;
++    }
++
++    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
++    interrupt.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
++    interrupt.DmaPreempted.PreemptionFenceId = preemptionFence;
++    interrupt.DmaPreempted.LastCompletedFenceId = lastCompletedFence;
++    interrupt.DmaPreempted.NodeOrdinal = 0;
++    interrupt.DmaPreempted.EngineOrdinal = 0;
++    m_pAdapter->NotifyInterrupt(&interrupt, true);
++}
++
+ NTSTATUS VioGpuCommander::Patch(const DXGKARG_PATCH *pPatch)
+ {
+     PAGED_CODE();
+@@ -400,6 +441,18 @@
+     return STATUS_SUCCESS;
+ }
+ 
++// Called at DISPATCH_LEVEL: the worker thread notifies it
++NTSTATUS VioGpuCommander::PreemptCommand(const DXGKARG_PREEMPTCOMMAND *pPreemptCommand)
++{
++    KIRQL oldIrql;
++    LockQueue(&oldIrql);
++    m_preemptionFence = pPreemptCommand->PreemptionFenceId;
++    UnlockQueue(oldIrql);
++
++    KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
++    return STATUS_SUCCESS;
++}
++
+ _IRQL_requires_max_(DISPATCH_LEVEL) _IRQL_saves_global_(OldIrql,
+                                                         Irql) _IRQL_raises_(DISPATCH_LEVEL) void VioGpuCommander::
+                                                                                                     LockQueue(KIRQL *Irql)
+@@ -489,6 +542,7 @@
+     KIRQL oldIrql;
+     LockQueue(&oldIrql);
+     InsertTailList(&m_SubmittedQueue, &cmd->list_entry);
++    m_pending++;
+     UnlockQueue(oldIrql);
+ 
+     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -54,7 +54,8 @@
+     NTSTATUS Start();
+     void Stop();
+ 
+-    void CommandFinished();
++    void CommandFinished(UINT fenceId);
++    NTSTATUS PreemptCommand(const DXGKARG_PREEMPTCOMMAND *pPreemptCommand);
+ 
+     NTSTATUS Patch(const DXGKARG_PATCH *pPatch);
+     NTSTATUS SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitCommand);
+@@ -85,4 +86,11 @@
+     KSPIN_LOCK m_Lock;
+ 
+     UINT m_running;
++
++    // Preemption: the host runs a submitted command to its end, so a preemption request completes when the
++    // commands submitted before it are done (nothing to resubmit). The scheduler waits for that notification.
++    UINT m_pending;            // submitted and not completed
++    UINT m_lastCompletedFence;
++    UINT m_preemptionFence;    // a preemption request waiting for them, 0 for none
++    void NotifyPreemptionIfIdle();
+ };
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -654,6 +654,16 @@
+     {
+         DXGK_OPENALLOCATIONINFO *openAllocationInfo = &pOpenAllocation->pOpenAllocation[i];
+         VioGpuAllocation *allocation = m_pAdapter->AllocationFromHandle(openAllocationInfo->hAllocation);
++        if (allocation == NULL)
++        {
++            VioGpuLog("OpenAllocation: no allocation for handle 0x%x (flags 0x%x, %u allocations, device flags 0x%x)",
++                      openAllocationInfo->hAllocation,
++                      pOpenAllocation->Flags.Value,
++                      pOpenAllocation->NumAllocations,
++                      m_flags);
++            openAllocationInfo->hDeviceSpecificAllocation = NULL;
++            continue;
++        }
+         VioGpuDeviceAllocation *deviceAllocation = new (NonPagedPoolNx) VioGpuDeviceAllocation(this, allocation);
+         openAllocationInfo->hDeviceSpecificAllocation = deviceAllocation;
+ 

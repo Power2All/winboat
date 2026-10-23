@@ -1,0 +1,385 @@
+From: WinBoat
+Subject: [PATCH] vrend: persistent GL buffers on Vulkan memory, ARB_buffer_storage for the guest
+
+ARB_buffer_storage needs buffers the guest maps persistently (blob resources). vrend could only offer them where
+GL buffers get exported (GBM allocation: i915, amdgpu) or where the GPU process maps a GL pointer itself. A GPU
+process over vhost-user maps blobs by fd, and NVIDIA's GL has no GBM allocation, so the guest had no GL 4.4.
+
+Persistently mappable buffers now take host-visible, coherent Vulkan memory (cached if the GPU has it) on the GL
+driver's GPU (same UUID), exported as an opaque fd that GL imports as the buffer's storage (EXT_memory_object_fd)
+and as a dma-buf for the blob mapping. GL can't map or fill such buffers, so transfers go through the host's own
+mapping (after glFinish when synchronized). The Vulkan loader is opened at run time. With it, the capset offers
+VIRGL_CAP_ARB_BUFFER_STORAGE.
+---
+diff --git a/src/meson.build b/src/meson.build
+index 1086a61..261e663 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -201,6 +201,8 @@ if with_venus
+    virgl_sources += venus_sources
+    virgl_sources += venus_codegen
+    virgl_depends += [venus_dep]
++   # GL buffers on Vulkan memory (it loads the Vulkan loader itself)
++   virgl_sources += ['vrend/vrend_vk.c']
+ endif
+ 
+ if with_drm_renderers
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 5cec04e..f29cb9a 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -55,6 +55,9 @@
+ #include "vrend_blitter.h"
+ 
+ #include "virgl_util.h"
++#ifdef ENABLE_VENUS
++#include "vrend_vk.h"
++#endif
+ 
+ #include "virgl_hw.h"
+ #include "virgl_resource.h"
+@@ -7557,6 +7560,13 @@ static enum virgl_resource_fd_type vrend_pipe_resource_export_fd(UNUSED struct p
+                                                                  UNUSED int *fd,
+                                                                  UNUSED void *data)
+ {
++#ifdef ENABLE_VENUS
++   if (((struct vrend_resource *)pres)->vk_buffer) {
++      *fd = vrend_vk_buffer_export(((struct vrend_resource *)pres)->vk_buffer);
++      if (*fd >= 0)
++         return VIRGL_RESOURCE_FD_DMABUF;
++   }
++#endif
+ #if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+    struct vrend_resource *res = (struct vrend_resource *)pres;
+ 
+@@ -8362,6 +8372,18 @@ static void vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint3
+    glBindBufferARB(gr->target, gr->gl_id);
+ 
+    if (buffer_storage_flags) {
++#ifdef ENABLE_VENUS
++      int fd = -1;
++      uint64_t alloc_size = 0;
++      if (has_feature(feat_memory_object) && has_feature(feat_memory_object_fd) && vrend_vk_buffers_init() &&
++          (gr->vk_buffer = vrend_vk_buffer_create(width, &fd, &alloc_size))) {
++         glCreateMemoryObjectsEXT(1, &gr->memobj);
++         glImportMemoryFdEXT(gr->memobj, alloc_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
++         glBufferStorageMemEXT(gr->target, width, gr->memobj, 0);
++         gr->storage_bits |= VREND_STORAGE_GL_MEMOBJ;
++         gr->map_info = vrend_vk_map_info();
++      } else
++#endif
+       if (has_feature(feat_arb_buffer_storage) && !vrend_state.use_external_blob) {
+          glBufferStorage(gr->target, width, NULL, buffer_storage_flags);
+          gr->map_info = vrend_state.inferred_gl_caching_type;
+@@ -8975,6 +8997,10 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+    if (has_bit(res->storage_bits, VREND_STORAGE_GL_MEMOBJ)) {
+       glDeleteMemoryObjectsEXT(1, &res->memobj);
+    }
++#ifdef ENABLE_VENUS
++   if (res->vk_buffer)
++      vrend_vk_buffer_destroy(res->vk_buffer);
++#endif
+ 
+ #ifdef ENABLE_GBM
+    if (res->egl_image) {
+@@ -9401,6 +9427,17 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
+       return 0;
+    }
+ 
++#ifdef ENABLE_VENUS
++   /* Vulkan memory: GL can't map it (nor take data into it), the host's mapping can */
++   if (res->vk_buffer) {
++      if (info->synchronized)
++         glFinish();
++      vrend_read_from_iovec(iov, num_iovs, info->offset,
++                            (char *)vrend_vk_buffer_ptr(res->vk_buffer) + info->box->x, info->box->width);
++      return 0;
++   }
++#endif
++
+    if (has_bit(res->storage_bits, VREND_STORAGE_GL_BUFFER)) {
+       GLuint map_flags = GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_WRITE_BIT;
+       struct virgl_sub_upload_data d;
+@@ -10052,6 +10089,15 @@ static int vrend_renderer_transfer_send_iov(struct vrend_context *ctx,
+       return 0;
+    }
+ 
++#ifdef ENABLE_VENUS
++   if (res->vk_buffer) {
++      glFinish();
++      vrend_write_to_iovec(iov, num_iovs, info->offset,
++                           (char *)vrend_vk_buffer_ptr(res->vk_buffer) + info->box->x, info->box->width);
++      return 0;
++   }
++#endif
++
+    if (has_bit(res->storage_bits, VREND_STORAGE_GL_BUFFER)) {
+       glBindBufferARB(res->target, res->gl_id);
+       void *data = glMapBufferRange(res->target, info->box->x, info->box->width, GL_MAP_READ_BIT);
+@@ -12848,6 +12894,11 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+       if (vrend_state.inferred_gl_caching_type)
+          caps->v2.capability_bits |= VIRGL_CAP_ARB_BUFFER_STORAGE;
+    }
++#ifdef ENABLE_VENUS
++   /* persistent buffers on Vulkan memory, which the GPU process can map into the guest (vrend_create_buffer) */
++   if (has_feature(feat_memory_object) && has_feature(feat_memory_object_fd) && vrend_vk_buffers_init())
++      caps->v2.capability_bits |= VIRGL_CAP_ARB_BUFFER_STORAGE;
++#endif
+ 
+ #if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
+    if (gbm) {
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index ae9f716..70670c1 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -111,6 +111,8 @@ struct vrend_resource {
+    uint64_t size;
+    GLbitfield buffer_storage_flags;
+    GLuint memobj;
++   /* a persistently mappable buffer's storage, when it is Vulkan memory (vrend_vk.c) */
++   struct vrend_vk_buffer *vk_buffer;
+ 
+    uint32_t blob_id;
+    struct list_head head;
+diff --git a/src/vrend/vrend_vk.c b/src/vrend/vrend_vk.c
+new file mode 100644
+index 0000000..4899740
+--- /dev/null
++++ b/src/vrend/vrend_vk.c
+@@ -0,0 +1,202 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* GL buffers on Vulkan memory: the storage of persistently mappable GL buffers (ARB_buffer_storage) the guest maps.
++ * Where GL can't export a buffer itself (no GBM allocation: NVIDIA's driver), host-visible, coherent Vulkan memory
++ * is exported twice: as an opaque fd the GL driver imports as the buffer's storage (EXT_memory_object_fd), and as a
++ * dma-buf the GPU process maps into the guest (blob resources). The loader is opened at run time, so the library
++ * gains no dependency on it. */
++
++#include <dlfcn.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <epoxy/gl.h>
++#include <vulkan/vulkan.h>
++
++#include "virglrenderer.h"
++#include "virgl_util.h"
++#include "vrend_vk.h"
++
++#define VREND_VK_HANDLE_TYPES                                                                                      \
++   (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
++
++struct vrend_vk_buffer {
++   VkDeviceMemory memory;
++   uint64_t size;
++   void *ptr;
++};
++
++static struct {
++   bool tried, ok;
++   VkDevice device;
++   uint32_t memory_type;
++   uint32_t map_info;
++   PFN_vkAllocateMemory AllocateMemory;
++   PFN_vkFreeMemory FreeMemory;
++   PFN_vkMapMemory MapMemory;
++   PFN_vkGetMemoryFdKHR GetMemoryFdKHR;
++} vk;
++
++/* The Vulkan device of the GL driver's GPU (same UUID), and a memory type exportable buffers may use: host-visible
++ * and coherent, cached if there is one */
++static bool vrend_vk_setup(void)
++{
++   void *lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
++   if (!lib)
++      return false;
++   /* (dlsym's object pointer to a function pointer: ISO C has no cast for it) */
++   void *symbol = dlsym(lib, "vkGetInstanceProcAddr");
++   PFN_vkGetInstanceProcAddr gipa;
++   memcpy(&gipa, &symbol, sizeof(gipa));
++   PFN_vkCreateInstance CreateInstance = gipa ? (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance") : NULL;
++   if (!CreateInstance)
++      return false;
++   VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "virglrenderer",
++                             .apiVersion = VK_API_VERSION_1_1 };
++   VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
++   VkInstance instance;
++   if (CreateInstance(&ici, NULL, &instance) != VK_SUCCESS)
++      return false;
++#define VK_INSTANCE_PROC(name) PFN_vk##name name = (PFN_vk##name)gipa(instance, "vk" #name)
++   VK_INSTANCE_PROC(EnumeratePhysicalDevices);
++   VK_INSTANCE_PROC(GetPhysicalDeviceProperties2);
++   VK_INSTANCE_PROC(GetPhysicalDeviceMemoryProperties);
++   VK_INSTANCE_PROC(CreateDevice);
++   VK_INSTANCE_PROC(GetDeviceProcAddr);
++   if (!EnumeratePhysicalDevices || !GetPhysicalDeviceProperties2 || !GetPhysicalDeviceMemoryProperties ||
++       !CreateDevice || !GetDeviceProcAddr)
++      return false;
++
++   GLubyte uuid[GL_UUID_SIZE_EXT] = { 0 };
++   glGetUnsignedBytevEXT(GL_DEVICE_UUID_EXT, uuid);
++   VkPhysicalDevice devices[8], pd = VK_NULL_HANDLE;
++   uint32_t count = 8;
++   if (EnumeratePhysicalDevices(instance, &count, devices) < 0)
++      return false;
++   for (uint32_t i = 0; i < count && !pd; i++) {
++      VkPhysicalDeviceIDProperties id = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++      VkPhysicalDeviceProperties2 props = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &id };
++      GetPhysicalDeviceProperties2(devices[i], &props);
++      if (!memcmp(id.deviceUUID, uuid, VK_UUID_SIZE))
++         pd = devices[i];
++   }
++   if (!pd)
++      return false;
++
++   const float priority = 1.0f;
++   VkDeviceQueueCreateInfo queue = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1,
++                                     .pQueuePriorities = &priority };
++   const char *extensions[] = { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
++                                VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME };
++   VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
++                              .pQueueCreateInfos = &queue, .enabledExtensionCount = 2,
++                              .ppEnabledExtensionNames = extensions };
++   if (CreateDevice(pd, &dci, NULL, &vk.device) != VK_SUCCESS)
++      return false;
++#define VK_DEVICE_PROC(name) (PFN_vk##name)GetDeviceProcAddr(vk.device, "vk" #name)
++   PFN_vkCreateBuffer CreateBuffer = VK_DEVICE_PROC(CreateBuffer);
++   PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements = VK_DEVICE_PROC(GetBufferMemoryRequirements);
++   PFN_vkDestroyBuffer DestroyBuffer = VK_DEVICE_PROC(DestroyBuffer);
++   vk.AllocateMemory = VK_DEVICE_PROC(AllocateMemory);
++   vk.FreeMemory = VK_DEVICE_PROC(FreeMemory);
++   vk.MapMemory = VK_DEVICE_PROC(MapMemory);
++   vk.GetMemoryFdKHR = VK_DEVICE_PROC(GetMemoryFdKHR);
++   if (!CreateBuffer || !GetBufferMemoryRequirements || !DestroyBuffer || !vk.AllocateMemory || !vk.FreeMemory ||
++       !vk.MapMemory || !vk.GetMemoryFdKHR)
++      return false;
++
++   VkExternalMemoryBufferCreateInfo external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++                                                 .handleTypes = VREND_VK_HANDLE_TYPES };
++   VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &external, .size = 65536,
++                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
++   VkBuffer buffer;
++   if (CreateBuffer(vk.device, &bci, NULL, &buffer) != VK_SUCCESS)
++      return false;
++   VkMemoryRequirements requirements;
++   GetBufferMemoryRequirements(vk.device, buffer, &requirements);
++   DestroyBuffer(vk.device, buffer, NULL);
++
++   VkPhysicalDeviceMemoryProperties memory;
++   GetPhysicalDeviceMemoryProperties(pd, &memory);
++   const VkMemoryPropertyFlags needed = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++   int found = -1;
++   for (uint32_t t = 0; t < memory.memoryTypeCount; t++) {
++      VkMemoryPropertyFlags flags = memory.memoryTypes[t].propertyFlags;
++      if (!(requirements.memoryTypeBits & (1u << t)) || (flags & needed) != needed)
++         continue;
++      if (found < 0 || (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
++         found = t;
++   }
++   if (found < 0)
++      return false;
++   vk.memory_type = found;
++   vk.map_info = (memory.memoryTypes[found].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
++                    ? VIRGL_RENDERER_MAP_CACHE_CACHED
++                    : VIRGL_RENDERER_MAP_CACHE_WC;
++   virgl_info("vrend: GL buffers on Vulkan memory (type %d, %s)\n", found,
++              vk.map_info == VIRGL_RENDERER_MAP_CACHE_CACHED ? "cached" : "write-combined");
++   return true;
++}
++
++bool vrend_vk_buffers_init(void)
++{
++   if (!vk.tried) {
++      vk.tried = true;
++      vk.ok = vrend_vk_setup();
++   }
++   return vk.ok;
++}
++
++struct vrend_vk_buffer *vrend_vk_buffer_create(uint64_t size, int *opaque_fd, uint64_t *alloc_size)
++{
++   struct vrend_vk_buffer *buffer = calloc(1, sizeof(*buffer));
++   if (!buffer)
++      return NULL;
++   buffer->size = (size + 4095) & ~(uint64_t)4095;
++   VkExportMemoryAllocateInfo export = { .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++                                         .handleTypes = VREND_VK_HANDLE_TYPES };
++   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &export,
++                                .allocationSize = buffer->size, .memoryTypeIndex = vk.memory_type };
++   if (vk.AllocateMemory(vk.device, &mai, NULL, &buffer->memory) != VK_SUCCESS) {
++      free(buffer);
++      return NULL;
++   }
++   VkMemoryGetFdInfoKHR get = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = buffer->memory,
++                                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++   *opaque_fd = -1;
++   if (vk.MapMemory(vk.device, buffer->memory, 0, VK_WHOLE_SIZE, 0, &buffer->ptr) != VK_SUCCESS ||
++       vk.GetMemoryFdKHR(vk.device, &get, opaque_fd) != VK_SUCCESS) {
++      vrend_vk_buffer_destroy(buffer);
++      return NULL;
++   }
++   *alloc_size = buffer->size;
++   return buffer;
++}
++
++void vrend_vk_buffer_destroy(struct vrend_vk_buffer *buffer)
++{
++   /* freeing unmaps it */
++   vk.FreeMemory(vk.device, buffer->memory, NULL);
++   free(buffer);
++}
++
++int vrend_vk_buffer_export(struct vrend_vk_buffer *buffer)
++{
++   VkMemoryGetFdInfoKHR get = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = buffer->memory,
++                                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
++   int fd = -1;
++   return vk.GetMemoryFdKHR(vk.device, &get, &fd) == VK_SUCCESS ? fd : -1;
++}
++
++void *vrend_vk_buffer_ptr(struct vrend_vk_buffer *buffer)
++{
++   return buffer->ptr;
++}
++
++uint32_t vrend_vk_map_info(void)
++{
++   return vk.map_info;
++}
+diff --git a/src/vrend/vrend_vk.h b/src/vrend/vrend_vk.h
+new file mode 100644
+index 0000000..71bb495
+--- /dev/null
++++ b/src/vrend/vrend_vk.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright 2026 WinBoat contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef VREND_VK_H
++#define VREND_VK_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* GL buffers on Vulkan memory (vrend_vk.c) */
++struct vrend_vk_buffer;
++
++/* Whether Vulkan memory can back GL buffers here (the first call sets it up; the GL context must be current) */
++bool vrend_vk_buffers_init(void);
++/* Memory of at least size bytes; *opaque_fd (owned by the caller: GL's import takes it) and *alloc_size are what the
++ * GL driver imports */
++struct vrend_vk_buffer *vrend_vk_buffer_create(uint64_t size, int *opaque_fd, uint64_t *alloc_size);
++void vrend_vk_buffer_destroy(struct vrend_vk_buffer *buffer);
++/* A new dma-buf fd of the memory, for the guest's mapping */
++int vrend_vk_buffer_export(struct vrend_vk_buffer *buffer);
++/* The host's own mapping of it */
++void *vrend_vk_buffer_ptr(struct vrend_vk_buffer *buffer);
++/* VIRGL_RENDERER_MAP_CACHE_* of the memory */
++uint32_t vrend_vk_map_info(void);
++
++#endif

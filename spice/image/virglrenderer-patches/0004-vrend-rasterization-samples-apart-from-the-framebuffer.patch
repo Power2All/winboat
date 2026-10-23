@@ -1,0 +1,162 @@
+vrend: rasterization samples apart from the framebuffer's (WinBoat)
+
+Direct3D 11.1's target-independent rasterization (ForcedSampleCount)
+rasterizes with a sample count of its own, whatever the render targets have:
+Direct2D renders antialiased geometry with it at feature level 11_1. GL has
+it as GL_EXT_raster_multisample. A new command, VIRGL_CCMD_SET_RASTER_SAMPLES
+(after the last upstream one), sets the count; the host announces it with
+VIRGL_CAP_V2_RASTER_SAMPLES (bit 31: WinBoat's bits go from the top down).
+Raster multisample is enabled around the guest's draws only, so the
+renderer's own blits and clears don't get it.
+
+--- a/src/virgl_protocol.h
++++ b/src/virgl_protocol.h
+@@ -144,6 +144,8 @@
+ 
+    VIRGL_CCMD_CLEAR_SURFACE,
+    VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT,
++   /* WinBoat */
++   VIRGL_CCMD_SET_RASTER_SAMPLES,
+ 
+    VIRGL_MAX_COMMANDS
+ };
+@@ -790,4 +792,9 @@
+ #define VIRGL_RESOURCE_LAYOUT_HANDLE_OUT     1
+ #define VIRGL_RESOURCE_LAYOUT_HANDLE_TARGET  2
+ 
++/* VIRGL_CCMD_SET_RASTER_SAMPLES (WinBoat): rasterization samples apart from the framebuffer's, 0 for the
++ * framebuffer's (D3D 11.1's ForcedSampleCount) */
++#define VIRGL_SET_RASTER_SAMPLES_SIZE 1
++#define VIRGL_SET_RASTER_SAMPLES_COUNT 1
++
+ #endif
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -628,6 +628,8 @@
+ #define VIRGL_CAP_V2_MIRROR_CLAMP_TO_EDGE (1u << 16)
+ #define VIRGL_CAP_V2_MIRROR_CLAMP         (1u << 17)
+ #define VIRGL_CAP_V2_RESOURCE_LAYOUT      (1u << 18)
++/* WinBoat's patches (from the top down, away from upstream's bits) */
++#define VIRGL_CAP_V2_RASTER_SAMPLES       (1u << 31)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+--- a/src/vrend/vrend_debug.c
++++ b/src/vrend/vrend_debug.c
+@@ -97,6 +97,7 @@
+    "END_FRAME",
+    "CLEAR_SURFACE",
+    "GET_PIPE_RESOURCE_LAYOUT",
++   "SET_RASTER_SAMPLES",
+ };
+ 
+ static const char *object_type_names[VIRGL_MAX_OBJECTS] = {
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1056,6 +1056,14 @@
+    return 0;
+ }
+ 
++static int vrend_decode_set_raster_samples(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
++{
++   if (length != VIRGL_SET_RASTER_SAMPLES_SIZE)
++      return EINVAL;
++   vrend_set_raster_samples(ctx, get_buf_entry(buf, VIRGL_SET_RASTER_SAMPLES_COUNT));
++   return 0;
++}
++
+ static int vrend_decode_resource_copy_region(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
+ {
+    struct pipe_box box;
+@@ -2031,6 +2039,7 @@
+    [VIRGL_CCMD_END_FRAME] = vrend_unsupported,
+ #endif
+    [VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT] = vrend_decode_get_pipe_resource_layout,
++   [VIRGL_CCMD_SET_RASTER_SAMPLES] = vrend_decode_set_raster_samples,
+ };
+ 
+ static void dump_command_stream_to_file(const void *buffer, size_t size)
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -229,6 +229,7 @@
+    feat_seamless_cubemap_per_texture,
+    feat_vs_layer_viewport,
+    feat_vs_viewport_index,
++   feat_raster_multisample,
+    feat_last,
+ };
+ 
+@@ -342,6 +343,7 @@
+    FEAT(seamless_cubemap_per_texture, UNAVAIL, UNAVAIL,  "GL_AMD_seamless_cubemap_per_texture" ),
+    FEAT(vs_layer_viewport, UNAVAIL, UNAVAIL, "GL_AMD_vertex_shader_layer"),
+    FEAT(vs_viewport_index, UNAVAIL, UNAVAIL, "GL_AMD_vertex_shader_viewport_index"),
++   FEAT(raster_multisample, UNAVAIL, UNAVAIL, "GL_EXT_raster_multisample"),
+ };
+ 
+ struct global_renderer_state {
+@@ -789,6 +791,7 @@
+    struct list_head streamout_list;
+    struct vrend_streamout_object *current_so;
+    uint64_t so_captures;
++   unsigned raster_samples;   /* VIRGL_CCMD_SET_RASTER_SAMPLES, 0: the framebuffer's */
+ 
+    struct pipe_blend_color blend_color;
+ 
+@@ -6138,6 +6141,11 @@
+       glEnable(GL_BLEND);
+    }
+ 
++   if (sub_ctx->raster_samples) {
++      glEnable(GL_RASTER_MULTISAMPLE_EXT);
++      glRasterSamplesEXT(sub_ctx->raster_samples, GL_FALSE);
++   }
++
+    /* set the vertex state up now on a delay */
+    if (!info->indexed) {
+       GLenum mode = info->mode;
+@@ -6209,6 +6217,9 @@
+          glDrawElements(mode, info->count, elsz, (void *)(uintptr_t)sub_ctx->ib.offset);
+    }
+ 
++   if (sub_ctx->raster_samples)
++      glDisable(GL_RASTER_MULTISAMPLE_EXT);
++
+    if (info->primitive_restart) {
+       if (vrend_state.use_gles) {
+          glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+@@ -10401,6 +10412,15 @@
+       glSampleMaski(0, sample_mask);
+ }
+ 
++/* Rasterization samples apart from the framebuffer's (GL_EXT_raster_multisample), for the guest's draws only:
++ * enabled around them in vrend_draw_vbo, so that the renderer's own blits and clears don't get them */
++void vrend_set_raster_samples(struct vrend_context *ctx, unsigned samples)
++{
++   if (!has_feature(feat_raster_multisample))
++      return;
++   ctx->sub->raster_samples = samples > 1 ? samples : 0;
++}
++
+ void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples)
+ {
+    float min_sample_shading = (float)min_samples;
+@@ -12939,6 +12959,9 @@
+    if (has_feature(feat_vs_viewport_index))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_VS_VIEWPORT_INDEX;
+ 
++   if (has_feature(feat_raster_multisample))
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_RASTER_SAMPLES;
++
+    if (has_feature(feat_pipeline_statistics_query))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY;
+ 
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -433,6 +433,7 @@
+ void vrend_set_clip_state(struct vrend_context *ctx, struct pipe_clip_state *ucp);
+ void vrend_set_sample_mask(struct vrend_context *ctx, unsigned sample_mask);
+ void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples);
++void vrend_set_raster_samples(struct vrend_context *ctx, unsigned samples);
+ 
+ void vrend_set_constants(struct vrend_context *ctx,
+                          uint32_t shader,

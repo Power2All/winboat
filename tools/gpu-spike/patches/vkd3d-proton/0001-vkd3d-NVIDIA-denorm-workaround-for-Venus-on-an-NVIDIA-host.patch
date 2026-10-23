@@ -1,0 +1,38 @@
+From: WinBoat
+Subject: [PATCH] vkd3d: NVIDIA's denorm workarounds for Venus on an NVIDIA host
+
+Shader model 6.2 needs denormal controls, which NVIDIA's driver doesn't
+advertise although they work, and double-precision shader ops need FP64
+denormals preserved, which it doesn't advertise either: vkd3d-proton assumes
+both work on NVIDIA's proprietary driver. Mesa's Venus (a virtual GPU)
+forwards the host driver's properties with a driver ID of its own: Venus on
+an NVIDIA GPU gets the same assumptions, so it gets shader model 6.2 and
+later, and DoublePrecisionFloatShaderOps.
+---
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9337,7 +9337,10 @@ static void d3d12_device_caps_init_feature_options(struct d3d12_device *device)
+     bool supports_denorm_fp64;
+ 
+     /* NV driver does not expose it, yet it seems to work. Similar story as FP32. */
+-    if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
++    /* NVIDIA's GPU under Mesa's Venus too (see the shader model's denorm check) */
++    if (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
++            (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_VENUS &&
++            device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_NVIDIA))
+         supports_denorm_fp64 = true;
+     else
+         supports_denorm_fp64 = device->device_info.vulkan_1_2_properties.shaderDenormPreserveFloat64;
+@@ -9865,7 +9868,10 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
+                 VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+         if (denorm_behavior)
+         {
+-            if (device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_NVIDIA_PROPRIETARY)
++            /* NVIDIA's GPU under another driver too: Mesa's Venus, which forwards the host driver's properties */
++            if (device->device_info.vulkan_1_2_properties.driverID != VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
++                    !(device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_VENUS &&
++                    device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_NVIDIA))
+             {
+                 denorm_behavior = device->device_info.vulkan_1_2_properties.shaderDenormFlushToZeroFloat32 &&
+                         device->device_info.vulkan_1_2_properties.shaderDenormPreserveFloat32;

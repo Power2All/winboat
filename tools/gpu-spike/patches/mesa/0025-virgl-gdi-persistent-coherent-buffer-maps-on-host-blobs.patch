@@ -1,0 +1,300 @@
+From: WinBoat
+Subject: [PATCH] virgl/gdi: persistent, coherent buffer maps on host blobs (ARB_buffer_storage)
+
+The GDI winsys had no blob resources, so virgl offered no ARB_buffer_storage and
+stopped at OpenGL 4.3. Persistently or coherently mapped buffers are now host
+blobs where the kernel driver has a host-visible window (SupportsBlob): a
+VIRGL_CCMD_PIPE_RESOURCE_CREATE in the context names the blob (submitted and
+waited for first), the driver's VIOGPU_BLOB_CREATE makes it, attached to the
+context, and VIOGPU_BLOB_MAP maps the host's memory into the process. Blobs are
+no allocations: commands name their resource id alone, they skip the resource
+cache, busy checks and waits (the application synchronizes persistent maps), and
+are destroyed after the context's commands reached the host. With the host's
+VIRGL_CAP_ARB_BUFFER_STORAGE (virglrenderer: buffers on Vulkan memory) the
+driver offers OpenGL 4.6.
+
+Also fixes the fence wait's timeout: it computed milliseconds but passed the
+nanoseconds (truncated) to WaitForSingleObject.
+---
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+index 0040a1c..57811a2 100644
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+@@ -34,9 +34,11 @@
+ #include "gdikmt/gdikmt.h"
+ #include "pipe/p_state.h"
+ #include "util/format/u_formats.h"
++#include "util/os_time.h"
+ #include "util/simple_mtx.h"
+ #include "util/u_debug.h"
+ #include "util/u_inlines.h"
++#include "util/u_math.h"
+ #include "util/u_memory.h"
+ 
+ #include "frontend/winsys_handle.h"
+@@ -48,6 +50,7 @@
+ 
+ #include "virgl/virgl_winsys.h"
+ #include "virtio-gpu/virgl_hw.h"
++#include "virtio-gpu/virgl_protocol.h"
+ #include "wddm/viogpu_wddm_driver.h"
+ #include "virgl_gdi_public.h"
+ #include "virgl_gdi_winsys.h"
+@@ -125,6 +128,9 @@ static inline unsigned virgl_to_pipe_flags(unsigned pflags)
+    return out_flags;
+ }
+ 
++static void
++virgl_gdi_blob_destroy(struct virgl_gdi_winsys *qdws, struct virgl_hw_res *res);
++
+ static void
+ virgl_hw_res_destroy(struct virgl_gdi_winsys *qdws, struct virgl_hw_res *res)
+ {
+@@ -132,7 +138,9 @@ virgl_hw_res_destroy(struct virgl_gdi_winsys *qdws, struct virgl_hw_res *res)
+       return;
+    }
+ 
+-   if (!p_atomic_read(&res->shared)) {
++   if (res->blob) {
++      virgl_gdi_blob_destroy(qdws, res);
++   } else if (!p_atomic_read(&res->shared)) {
+       NTSTATUS Status = qdws->device->destroyAllocation(
+          qdws->device, res->hResource, res->hAllocation);
+       if (!NT_SUCCESS(Status)) {
+@@ -147,7 +155,8 @@ virgl_hw_res_destroy(struct virgl_gdi_winsys *qdws, struct virgl_hw_res *res)
+ static boolean
+ virgl_gdi_resource_is_busy(struct virgl_winsys *vws, struct virgl_hw_res *res)
+ {
+-   if (!p_atomic_read(&res->maybe_busy) && !p_atomic_read(&res->shared))
++   /* blobs: the application synchronizes persistent maps itself (fences), as GL has it */
++   if (res->blob || (!p_atomic_read(&res->maybe_busy) && !p_atomic_read(&res->shared)))
+       return false;
+ 
+    struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(vws);
+@@ -181,7 +190,7 @@ virgl_gdi_resource_reference(struct virgl_winsys *qws,
+    struct virgl_hw_res *old = *dres;
+ 
+    if (pipe_reference(&(*dres)->reference, &sres->reference)) {
+-      if (!can_cache_resource(old->bind) || p_atomic_read(&old->shared)) {
++      if (!can_cache_resource(old->bind) || p_atomic_read(&old->shared) || old->blob) {
+          virgl_hw_res_destroy(qdws, old);
+       } else {
+          mtx_lock(&qdws->cacheMtx);
+@@ -299,6 +308,105 @@ virgl_gdi_winsys_resource_create(struct virgl_winsys *qws,
+    return res;
+ }
+ 
++static int virgl_gdi_winsys_submit_cmd(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
++                                       struct pipe_fence_handle **fence);
++static bool virgl_gdi_fence_wait(struct virgl_winsys *vws, struct pipe_fence_handle *_fence, uint64_t timeout);
++static void virgl_gdi_fence_reference(struct virgl_winsys *vws, struct pipe_fence_handle **dst,
++                                      struct pipe_fence_handle *src);
++
++/* A host blob for a persistently mapped buffer: the host's resource first (a command in the context, which names the
++ * blob, done before the driver's escape makes the blob), then the blob, attached to the context. Mapped on first use
++ * (virgl_gdi_resource_map) */
++static struct virgl_hw_res *
++virgl_gdi_winsys_resource_create_blob(struct virgl_winsys *qws, enum pipe_texture_target target, uint32_t format,
++                                      uint32_t bind, uint32_t width, uint32_t height, uint32_t depth,
++                                      uint32_t array_size, uint32_t last_level, uint32_t nr_samples, uint32_t flags,
++                                      uint32_t size)
++{
++   struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
++   const uint32_t page = 4096;
++   width = align(width, page);
++   size = align(size, page);
++   uint32_t blob_id = p_atomic_inc_return(&qdws->blob_id);
++
++   mtx_lock(&qdws->coreMtx);
++   struct virgl_cmd_buf *cbuf = qdws->coreCtx;
++   uint32_t *cmd = cbuf->buf;
++   memset(cmd, 0, 4 * (VIRGL_PIPE_RES_CREATE_SIZE + 1));
++   cmd[0] = VIRGL_CMD0(VIRGL_CCMD_PIPE_RESOURCE_CREATE, 0, VIRGL_PIPE_RES_CREATE_SIZE);
++   cmd[VIRGL_PIPE_RES_CREATE_FORMAT] = format;
++   cmd[VIRGL_PIPE_RES_CREATE_BIND] = bind;
++   cmd[VIRGL_PIPE_RES_CREATE_TARGET] = target;
++   cmd[VIRGL_PIPE_RES_CREATE_WIDTH] = width;
++   cmd[VIRGL_PIPE_RES_CREATE_HEIGHT] = height;
++   cmd[VIRGL_PIPE_RES_CREATE_DEPTH] = depth;
++   cmd[VIRGL_PIPE_RES_CREATE_ARRAY_SIZE] = array_size;
++   cmd[VIRGL_PIPE_RES_CREATE_LAST_LEVEL] = last_level;
++   cmd[VIRGL_PIPE_RES_CREATE_NR_SAMPLES] = nr_samples;
++   cmd[VIRGL_PIPE_RES_CREATE_FLAGS] = flags;
++   cmd[VIRGL_PIPE_RES_CREATE_BLOB_ID] = blob_id;
++   cbuf->cdw = VIRGL_PIPE_RES_CREATE_SIZE + 1;
++   virgl_gdi_cmd_buf(cbuf)->driver_length = 0;
++   struct pipe_fence_handle *fence = NULL;
++   int ret = virgl_gdi_winsys_submit_cmd(qws, cbuf, &fence);
++   mtx_unlock(&qdws->coreMtx);
++   if (ret || !fence)
++      return NULL;
++   virgl_gdi_fence_wait(qws, fence, OS_TIMEOUT_INFINITE);
++   virgl_gdi_fence_reference(qws, &fence, NULL);
++
++   VIOGPU_ESCAPE escape;
++   memset(&escape, 0, sizeof(escape));
++   escape.Type = VIOGPU_BLOB_CREATE;
++   escape.DataLength = sizeof(VIOGPU_BLOB_CREATE_REQ);
++   escape.BlobCreate.BlobMem = VIOGPU_BLOB_MEM_HOST3D;
++   escape.BlobCreate.BlobFlags = VIOGPU_BLOB_FLAG_USE_MAPPABLE;
++   escape.BlobCreate.BlobId = blob_id;
++   escape.BlobCreate.Size = size;
++   NTSTATUS Status = qdws->device->escape(qdws->device, &escape, sizeof(escape));
++   if (!NT_SUCCESS(Status)) {
++      _debug_printf("Failed to create blob %u with status code: %lx\n", blob_id, Status);
++      return NULL;
++   }
++
++   struct virgl_hw_res *res = CALLOC_STRUCT(virgl_hw_res);
++   if (!res)
++      return NULL;
++   res->blob = true;
++   res->blob_mem = VIRGL_BLOB_MEM_HOST3D;
++   res->bind = bind;
++   res->res_handle = escape.BlobCreate.ResId;
++   res->size = size;
++   res->flags = flags;
++   res->target = target;
++   pipe_reference_init(&res->reference, 1);
++   return res;
++}
++
++/* Commands still on their way may name it: the host gets the context's commands first */
++static void
++virgl_gdi_blob_destroy(struct virgl_gdi_winsys *qdws, struct virgl_hw_res *res)
++{
++   mtx_lock(&qdws->coreMtx);
++   struct pipe_fence_handle *fence = NULL;
++   qdws->coreCtx->cdw = 0;
++   virgl_gdi_cmd_buf(qdws->coreCtx)->driver_length = 0;
++   if (!virgl_gdi_winsys_submit_cmd(&qdws->base, qdws->coreCtx, &fence) && fence) {
++      virgl_gdi_fence_wait(&qdws->base, fence, OS_TIMEOUT_INFINITE);
++      virgl_gdi_fence_reference(&qdws->base, &fence, NULL);
++   }
++   mtx_unlock(&qdws->coreMtx);
++
++   VIOGPU_ESCAPE escape;
++   memset(&escape, 0, sizeof(escape));
++   escape.Type = VIOGPU_BLOB_DESTROY;
++   escape.DataLength = sizeof(VIOGPU_BLOB_DESTROY_REQ);
++   escape.BlobDestroy.ResId = res->res_handle;
++   NTSTATUS Status = qdws->device->escape(qdws->device, &escape, sizeof(escape));
++   if (!NT_SUCCESS(Status))
++      _debug_printf("Failed to destroy blob %u with status code: %lx\n", res->res_handle, Status);
++}
++
+ static struct virgl_hw_res *
+ virgl_gdi_winsys_resource_cache_create(
+    struct virgl_winsys *qws, enum pipe_texture_target target,
+@@ -321,6 +429,10 @@ virgl_gdi_winsys_resource_cache_create(
+                                           .last_level = last_level,
+                                           .target = target};
+ 
++   if (flags & (VIRGL_RESOURCE_FLAG_MAP_PERSISTENT | VIRGL_RESOURCE_FLAG_MAP_COHERENT))
++      return virgl_gdi_winsys_resource_create_blob(qws, target, format, bind, width, height, depth, array_size,
++                                                   last_level, nr_samples, flags, size);
++
+    if (can_cache_resource(bind)) {
+       mtx_lock(&qdws->cacheMtx);
+ 
+@@ -483,16 +595,16 @@ virgl_gdi_fence_wait(struct virgl_winsys *vws, struct pipe_fence_handle *_fence,
+    struct virgl_gdi_fence *fence = virgl_gdi_fence(_fence);
+    DWORD timeout_ms;
+ 
+-   if (timeout > INFINITE) {
+-      timeout = INFINITE;
++   /* nanoseconds to milliseconds, rounded up (INFINITE, 0xffffffff ms, is the longest) */
++   if (timeout >= (uint64_t)INFINITE * 1000000) {
++      timeout_ms = INFINITE;
+    } else {
+       timeout_ms = timeout / 1000000;
+-      /* round up */
+-      if (timeout_ms * 1000000 < timeout)
++      if ((uint64_t)timeout_ms * 1000000 < timeout)
+          timeout_ms++;
+    }
+ 
+-   return WaitForSingleObject(fence->handle, timeout) == STATUS_WAIT_0;
++   return WaitForSingleObject(fence->handle, timeout_ms) == STATUS_WAIT_0;
+ }
+ 
+ static void
+@@ -544,6 +656,22 @@ virgl_gdi_resource_map(struct virgl_winsys *qws, struct virgl_hw_res *res)
+ 
+    struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
+ 
++   if (res->blob) {
++      /* the host's memory, mapped into the process by the driver */
++      VIOGPU_ESCAPE escape;
++      memset(&escape, 0, sizeof(escape));
++      escape.Type = VIOGPU_BLOB_MAP;
++      escape.DataLength = sizeof(VIOGPU_BLOB_MAP_REQ);
++      escape.BlobMap.ResId = res->res_handle;
++      NTSTATUS Status = qdws->device->escape(qdws->device, &escape, sizeof(escape));
++      if (!NT_SUCCESS(Status)) {
++         _debug_printf("Failed to map blob %u with status code: %lx\n", res->res_handle, Status);
++         return NULL;
++      }
++      res->ptr = (void *)(uintptr_t)escape.BlobMap.Address;
++      return res->ptr;
++   }
++
+    D3DDDICB_LOCKFLAGS flags;
+    flags.Value = 0;
+    flags.IgnoreSync = true;
+@@ -564,7 +692,7 @@ static void
+ virgl_gdi_resource_wait(struct virgl_winsys *qws, struct virgl_hw_res *res)
+ {
+ 
+-   if (!p_atomic_read(&res->maybe_busy) && !p_atomic_read(&res->shared))
++   if (res->blob || (!p_atomic_read(&res->maybe_busy) && !p_atomic_read(&res->shared)))
+       return;
+ 
+    struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
+@@ -596,6 +724,14 @@ virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
+    struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
+    struct virgl_gdi_cmd_buf *cbuf = virgl_gdi_cmd_buf(_cbuf);
+    boolean already_in_list = false;
++
++   /* a blob is the host resource alone: attached to the context since it was made */
++   if (res->blob) {
++      if (write_buf)
++         cbuf->base.buf[cbuf->base.cdw++] = res->res_handle;
++      return;
++   }
++
+    for (int i = 0; i < cbuf->alloc_count; i++) {
+       if (cbuf->ctx->pAllocationList[i].hAllocation == res->hAllocation) {
+          already_in_list = true;
+@@ -1073,7 +1209,8 @@ virgl_gdi_winsys_create(struct gdikmt_device *device)
+ 
+    qdws->base.supports_fences = 0;
+    qdws->base.supports_encoded_transfers = 1;
+-   qdws->base.supports_coherent = 0;
++   /* persistent and coherent buffer maps (ARB_buffer_storage): host blobs in the driver's host-visible window */
++   qdws->base.supports_coherent = qdws->adapterInfo.Flags.SupportsBlob;
+ 
+    return &qdws->base;
+ }
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
+index db1b535..a068155 100644
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
+@@ -63,6 +63,8 @@ struct virgl_hw_res {
+    /* false when the resource is known to be idle */
+    int maybe_busy;
+    uint32_t blob_mem;
++   /* a host blob (persistently mapped buffers): no allocation, mapped and destroyed through the driver's escapes */
++   bool blob;
+ };
+ 
+ struct virgl_gdi_winsys
+@@ -77,6 +79,8 @@ struct virgl_gdi_winsys
+ 
+    struct virgl_resource_cache cache;
+    mtx_t cacheMtx;
++
++   uint32_t blob_id;
+ };
+ 
+ struct virgl_gdi_fence {

@@ -1,0 +1,240 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: resources shared with Venus (VIOGPU_RES_ATTACH)
+
+The D3D12 driver's swap chain buffers are Venus images on the memory of their own kernel allocation's host texture
+(VIRGL_BIND_VK_SHARED, virglrenderer image patch 0012). Venus imports that memory by resource id, and the host looks
+the id up in the Venus context, which runs on a kernel device of its own that never opens the allocation. An escape
+on that device, VIOGPU_RES_ATTACH, attaches the resource to its context - only resources created with
+VIRGL_BIND_VK_SHARED (the adapter keeps their ids), anything else would hand another process's textures over.
+---
+diff --git a/viogpu/common/virgl_hw.h b/viogpu/common/virgl_hw.h
+index 7055564..6ef0d2b 100644
+--- a/viogpu/common/virgl_hw.h
++++ b/viogpu/common/virgl_hw.h
+@@ -7,6 +7,8 @@
+ #define VIRGL_BIND_DISPLAY_TARGET           (1 << 7)
+ #define VIRGL_BIND_DISPLAY_TARGET           (1 << 7)
+ #define VIRGL_BIND_SCANOUT                  (1 << 18)
++// WinBoat (virglrenderer image patch 0012): a texture the guest also renders to through Venus
++#define VIRGL_BIND_VK_SHARED                (1 << 13)
+ 
+ // Blt command specification for kernel BLTs
+ #define VIRGL_CMD0(cmd, obj, len)           ((cmd) | ((obj) << 8) | ((len) << 16))
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+index c5cba39..3d02a33 100644
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -75,6 +75,7 @@ typedef struct _VIOGPU_ADAPTERINFO
+ #define VIOGPU_BLOB_MAP              0x301
+ #define VIOGPU_BLOB_DESTROY          0x302
+ #define VIOGPU_EXECBUFFER            0x303
++#define VIOGPU_RES_ATTACH            0x304
+ 
+ #pragma pack(1)
+ typedef struct _VIOGPU_DISP_MODE
+@@ -196,6 +197,15 @@ typedef struct _VIOGPU_EXECBUFFER_REQ
+ #pragma pack()
+ #define VIOGPU_EXECBUFFER_MAX_SIZE (512 * 1024)
+ 
++// A resource made to be shared with Venus (bind VIRGL_BIND_VK_SHARED: the D3D12 driver's swap chain buffers), attached
++// to the context of the device the escape names (Venus' own), which can then import its memory
++#pragma pack(1)
++typedef struct _VIOGPU_RES_ATTACH_REQ
++{
++    ULONG ResId;
++} VIOGPU_RES_ATTACH_REQ;
++#pragma pack()
++
+ #pragma pack(1)
+ typedef struct _VIOGPU_ESCAPE
+ {
+@@ -216,6 +226,7 @@ typedef struct _VIOGPU_ESCAPE
+         VIOGPU_BLOB_MAP_REQ BlobMap;
+         VIOGPU_BLOB_DESTROY_REQ BlobDestroy;
+         VIOGPU_EXECBUFFER_REQ ExecBuffer;
++        VIOGPU_RES_ATTACH_REQ ResAttach;
+ 
+         VIOGPU_STATS_REQ Stats;
+         VIOGPU_LOG_REQ Log;
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 8d06d5a..f5060c7 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -183,6 +183,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
+     m_HostmemSize = 0;
+     ExInitializeFastMutex(&m_HostmemLock);
+     InitializeListHead(&m_HostmemRanges);
++    ExInitializeFastMutex(&m_SharedLock);
++    InitializeListHead(&m_SharedResources);
+ }
+ 
+ // A range of the host-visible memory window in use
+@@ -1037,10 +1039,14 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+         case VIOGPU_BLOB_MAP:
+         case VIOGPU_BLOB_DESTROY:
+         case VIOGPU_EXECBUFFER:
++        case VIOGPU_RES_ATTACH:
+             {
+                 // Venus, on the device the caller created (it owns its blobs)
+                 switch (pVioGpuEscape->Type)
+                 {
++                    case VIOGPU_RES_ATTACH:
++                        size = sizeof(VIOGPU_RES_ATTACH_REQ);
++                        break;
+                     case VIOGPU_BLOB_CREATE:
+                         size = sizeof(VIOGPU_BLOB_CREATE_REQ);
+                         break;
+@@ -1085,6 +1091,9 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                     case VIOGPU_BLOB_DESTROY:
+                         status = device->BlobDestroy(pVioGpuEscape->BlobDestroy.ResId);
+                         break;
++                    case VIOGPU_RES_ATTACH:
++                        status = device->ResAttach(pVioGpuEscape->ResAttach.ResId);
++                        break;
+                     default:
+                         status = device->ExecBuffer(&pVioGpuEscape->ExecBuffer);
+                         break;
+@@ -2218,4 +2227,58 @@ VioGpuAllocation *VioGpuAdapter::AllocationFromHandle(D3DKMT_HANDLE handle)
+ VioGpuResource *VioGpuAdapter::ResourceFromHandle(D3DKMT_HANDLE handle)
+ {
+     return reinterpret_cast<VioGpuResource *>(HandleData(m_DxgkInterface, handle, DXGK_HANDLE_RESOURCE));
+-}
+\ No newline at end of file
++}
++
++// The shared resources' ids (a short list: a process's swap chain buffers)
++struct SharedResource
++{
++    LIST_ENTRY entry;
++    ULONG resId;
++};
++
++void VioGpuAdapter::AddSharedResource(ULONG resId)
++{
++    PAGED_CODE();
++
++    SharedResource *shared = new (NonPagedPoolNx) SharedResource;
++    if (!shared)
++    {
++        return;
++    }
++    shared->resId = resId;
++    ExAcquireFastMutex(&m_SharedLock);
++    InsertTailList(&m_SharedResources, &shared->entry);
++    ExReleaseFastMutex(&m_SharedLock);
++}
++
++void VioGpuAdapter::RemoveSharedResource(ULONG resId)
++{
++    PAGED_CODE();
++
++    ExAcquireFastMutex(&m_SharedLock);
++    for (LIST_ENTRY *e = m_SharedResources.Flink; e != &m_SharedResources; e = e->Flink)
++    {
++        SharedResource *shared = CONTAINING_RECORD(e, SharedResource, entry);
++        if (shared->resId == resId)
++        {
++            RemoveEntryList(e);
++            delete shared;
++            break;
++        }
++    }
++    ExReleaseFastMutex(&m_SharedLock);
++}
++
++bool VioGpuAdapter::IsSharedResource(ULONG resId)
++{
++    PAGED_CODE();
++
++    bool found = false;
++    ExAcquireFastMutex(&m_SharedLock);
++    for (LIST_ENTRY *e = m_SharedResources.Flink; e != &m_SharedResources && !found; e = e->Flink)
++    {
++        found = CONTAINING_RECORD(e, SharedResource, entry)->resId == resId;
++    }
++    ExReleaseFastMutex(&m_SharedLock);
++    return found;
++}
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index e954764..252ab99 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -145,6 +145,15 @@ class VioGpuAdapter : IVioGpuPCI
+     FAST_MUTEX m_HostmemLock;
+     LIST_ENTRY m_HostmemRanges;
+ 
++    // Resources made to be shared with Venus (VIRGL_BIND_VK_SHARED): the only ones VIOGPU_RES_ATTACH attaches
++    FAST_MUTEX m_SharedLock;
++    LIST_ENTRY m_SharedResources;
++
++  public:
++    void AddSharedResource(ULONG resId);
++    void RemoveSharedResource(ULONG resId);
++    bool IsSharedResource(ULONG resId);
++
+   public:
+     VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject);
+     ~VioGpuAdapter(void);
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index 279605b..edd53eb 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -15,6 +15,10 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIO
+ 
+     // m_adapter->ctrlQueue.CreateResource(m_Id, m_options.format, m_options.width, m_options.height);
+     m_adapter->ctrlQueue.CreateResource3D(m_Id, options);
++    if (options->bind & VIRGL_BIND_VK_SHARED)
++    {
++        m_adapter->AddSharedResource(m_Id);
++    }
+ 
+     m_pMDL = NULL;
+     m_pageCount = 0;
+@@ -30,6 +34,10 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIO
+ VioGpuAllocation::~VioGpuAllocation(void)
+ {
+     DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s res_id=%d\n", __FUNCTION__, m_Id));
++    if (m_options.bind & VIRGL_BIND_VK_SHARED)
++    {
++        m_adapter->RemoveSharedResource(m_Id);
++    }
+     m_adapter->ctrlQueue.DestroyResource(m_Id);
+     m_adapter->resourceIdr.PutId(m_Id);
+     m_adapter->UnchargeAllocation(m_ChargedSize);
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index 858463b..e9ea05a 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -281,6 +281,20 @@ void VioGpuDevice::DestroyBlob(Blob *blob)
+     delete blob;
+ }
+ 
++// A shared resource (VIOGPU_RES_ATTACH_REQ) to this device's context; only those: any other would hand another
++// process's textures to this one
++NTSTATUS VioGpuDevice::ResAttach(ULONG resId)
++{
++    PAGED_CODE();
++
++    if (!m_pAdapter->IsSharedResource(resId))
++    {
++        return STATUS_ACCESS_DENIED;
++    }
++    m_pAdapter->ctrlQueue.AttachResource(m_id, resId);
++    return STATUS_SUCCESS;
++}
++
+ NTSTATUS VioGpuDevice::BlobDestroy(ULONG resId)
+ {
+     PAGED_CODE();
+diff --git a/viogpu/viogpu3d/viogpu_device.h b/viogpu/viogpu3d/viogpu_device.h
+index be4cf09..acfe122 100644
+--- a/viogpu/viogpu3d/viogpu_device.h
++++ b/viogpu/viogpu3d/viogpu_device.h
+@@ -35,6 +35,7 @@ class VioGpuDevice
+     NTSTATUS BlobCreate(_Inout_ VIOGPU_BLOB_CREATE_REQ *req);
+     NTSTATUS BlobMap(_Inout_ VIOGPU_BLOB_MAP_REQ *req);
+     NTSTATUS BlobDestroy(ULONG resId);
++    NTSTATUS ResAttach(ULONG resId);
+     NTSTATUS ExecBuffer(_In_ VIOGPU_EXECBUFFER_REQ *req);
+ 
+   private:

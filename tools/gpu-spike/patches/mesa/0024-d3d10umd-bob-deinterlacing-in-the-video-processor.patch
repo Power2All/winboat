@@ -1,0 +1,326 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: bob deinterlacing in the video processor
+
+The video processor offered no deinterlacing: interlaced video through it
+(Media Foundation's playback, players using the D3D11 video processor)
+came out combed. It now offers bob (the rate conversion caps), and
+VideoProcessorSetStreamFrameFormat takes the stream's field order.
+
+Gallium's compositor bobs interlaced video buffers only; ours are frames
+with the fields' rows interleaved. So for an interlaced stream a draw on
+the video context first copies the field the output index names (0 the
+first field, 1 the second) into a picture of half the height, every
+other row of each plane (4:2:0 chroma rows alternate between the fields
+too), and the compositor scales that one.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index 2ba6b23..384fce0 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -31,6 +31,7 @@
+ #include "util/os_time.h"
+ #include "util/u_inlines.h"
+ #include "util/u_sampler.h"
++#include "util/u_draw.h"
+ #include "util/u_surface.h"
+ #include "util/vl_zscan_data.h"
+ /* (C headers without C++ guards) */
+@@ -38,6 +39,7 @@ extern "C" {
+ #include "vl/vl_compositor.h"
+ #include "vl/vl_csc.h"
+ #include "vl/vl_video_buffer.h"
++#include "tgsi/tgsi_text.h"
+ }
+ 
+ #include <stdarg.h>
+@@ -837,6 +839,8 @@ VideoDecoderEndFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder)
+ struct VideoCompositor {
+    struct vl_compositor compositor;
+    struct vl_compositor_state state;
++   /* bob deinterlacing: one field's rows of a picture into a picture of half the height (FieldPicture) */
++   void *field_vs, *field_fs, *blend, *dsa, *rasterizer, *sampler, *velems;
+ };
+ 
+ struct VideoProcessorEnum {
+@@ -852,7 +856,10 @@ struct VideoProcessor {
+       D3D11_1DDI_VIDEO_PROCESSOR_COLOR_SPACE color_space;
+       BOOL src_enabled, dst_enabled;
+       RECT src, dst;
++      D3D11_1DDI_VIDEO_FRAME_FORMAT frame_format;
+    } stream;
++   /* bob deinterlacing's field picture (the input's width, half its height) */
++   struct pipe_video_buffer *field;
+ };
+ 
+ struct VideoProcessorInputView {
+@@ -905,8 +912,8 @@ static void APIENTRY
+ GetVideoProcessorCaps(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum,
+                       D3D11_1DDI_VIDEO_PROCESSOR_CAPS *pCaps)
+ {
+-   /* one stream, color conversion (BT.601/709, both ranges) and scaling: no filters, deinterlacing or rate
+-    * conversion */
++   /* one stream, color conversion (BT.601/709, both ranges), scaling and bob deinterlacing (the rate conversion
++    * caps): no filters or other rate conversion */
+    memset(pCaps, 0, sizeof *pCaps);
+    pCaps->DeviceCaps = D3D11_1DDI_VIDEO_PROCESSOR_DEVICE_CAPS_YCbCr_MATRIX_CONVERSION |
+                        D3D11_1DDI_VIDEO_PROCESSOR_DEVICE_CAPS_NOMINAL_RANGE;
+@@ -920,6 +927,8 @@ GetVideoProcessorRateConversionCaps(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOP
+                                     D3D11_1DDI_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS *pCaps)
+ {
+    memset(pCaps, 0, sizeof *pCaps);
++   /* bob: each field on its own, line-doubled (no past or future frames) */
++   pCaps->ConversionCaps = D3D11_1DDI_VIDEO_PROCESSOR_CONVERSION_CAPS_DEINTERLACE_BOB;
+ }
+ 
+ static void APIENTRY
+@@ -956,6 +965,20 @@ CreateVideoProcessor(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEOPR
+ static void APIENTRY
+ DestroyVideoProcessor(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor)
+ {
++   VideoProcessor *vp = CastProcessor(hProcessor);
++   if (vp->field) {
++      vp->field->destroy(vp->field);
++      vp->field = NULL;
++   }
++}
++
++static void APIENTRY
++VideoProcessorSetStreamFrameFormat(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor, UINT Stream,
++                                   D3D11_1DDI_VIDEO_FRAME_FORMAT Format)
++{
++   if (Stream == 0) {
++      CastProcessor(hProcessor)->stream.frame_format = Format;
++   }
+ }
+ 
+ static void APIENTRY
+@@ -1136,6 +1159,159 @@ Compositor(Device *pDevice)
+    return pDevice->compositor;
+ }
+ 
++/*
++ * Bob deinterlacing: an interlaced picture's field (every other row of each plane: 4:2:0 chroma rows alternate
++ * between the fields too) into a picture of half the height, which the compositor then scales like any picture
++ */
++
++/* A triangle over the whole target, from the vertex index alone */
++static const char FIELD_VS[] = "VERT\n"
++                               "DCL SV[0], VERTEXID\n"
++                               "DCL OUT[0], POSITION\n"
++                               "DCL TEMP[0]\n"
++                               "IMM[0] FLT32 {-1.0, 3.0, 0.0, 1.0}\n"
++                               "IMM[1] INT32 {1, 2, 0, 0}\n"
++                               "USEQ TEMP[0].x, SV[0].xxxx, IMM[1].xxxx\n"
++                               "USEQ TEMP[0].y, SV[0].xxxx, IMM[1].yyyy\n"
++                               "UCMP TEMP[0].xy, TEMP[0].xyyy, IMM[0].yyyy, IMM[0].xxxx\n"
++                               "MOV TEMP[0].zw, IMM[0].zzzw\n"
++                               "MOV OUT[0], TEMP[0]\n"
++                               "END\n";
++
++/* Row y of the field picture: row 2y + field (CONST[0].x) of the plane */
++static const char FIELD_FS[] = "FRAG\n"
++                               "PROPERTY FS_COORD_ORIGIN UPPER_LEFT\n"
++                               "PROPERTY FS_COORD_PIXEL_CENTER HALF_INTEGER\n"
++                               "DCL IN[0], POSITION, LINEAR\n"
++                               "DCL OUT[0], COLOR\n"
++                               "DCL CONST[0]\n"
++                               "DCL SAMP[0]\n"
++                               "DCL SVIEW[0], 2D, FLOAT\n"
++                               "DCL TEMP[0]\n"
++                               "IMM[0] INT32 {0, 1, 0, 0}\n"
++                               "MOV TEMP[0], IMM[0].xxxx\n"
++                               "F2I TEMP[0].xy, IN[0].xyyy\n"
++                               "SHL TEMP[0].y, TEMP[0].yyyy, IMM[0].yyyy\n"
++                               "UADD TEMP[0].y, TEMP[0].yyyy, CONST[0].xxxx\n"
++                               "TXF TEMP[0], TEMP[0], SAMP[0], 2D\n"
++                               "MOV OUT[0], TEMP[0]\n"
++                               "END\n";
++
++static void *
++FieldShader(struct pipe_context *pipe, const char *text, bool vertex)
++{
++   struct tgsi_token tokens[512];
++   if (!tgsi_text_translate(text, tokens, ARRAY_SIZE(tokens))) {
++      VideoLog("bob: the %s shader doesn't translate\n", vertex ? "vertex" : "fragment");
++      return NULL;
++   }
++   struct pipe_shader_state state = {};
++   pipe_shader_state_from_tgsi(&state, tokens);
++   return vertex ? pipe->create_vs_state(pipe, &state) : pipe->create_fs_state(pipe, &state);
++}
++
++static bool
++FieldPassReady(struct pipe_context *pipe, VideoCompositor *c)
++{
++   if (c->field_fs) {
++      return true;
++   }
++   c->field_vs = FieldShader(pipe, FIELD_VS, true);
++   struct pipe_blend_state blend = {};
++   blend.rt[0].colormask = PIPE_MASK_RGBA;
++   c->blend = pipe->create_blend_state(pipe, &blend);
++   struct pipe_depth_stencil_alpha_state dsa = {};
++   c->dsa = pipe->create_depth_stencil_alpha_state(pipe, &dsa);
++   struct pipe_rasterizer_state rast = {};
++   rast.half_pixel_center = 1;
++   rast.bottom_edge_rule = 1;
++   rast.depth_clip_near = rast.depth_clip_far = 1;
++   c->rasterizer = pipe->create_rasterizer_state(pipe, &rast);
++   struct pipe_sampler_state samp = {};
++   samp.wrap_s = samp.wrap_t = samp.wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
++   samp.min_img_filter = samp.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
++   samp.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
++   c->sampler = pipe->create_sampler_state(pipe, &samp);
++   c->velems = pipe->create_vertex_elements_state(pipe, 0, NULL);
++   c->field_fs = c->field_vs && c->blend && c->dsa && c->rasterizer && c->sampler ? FieldShader(pipe, FIELD_FS, false)
++                                                                                   : NULL;
++   return c->field_fs != NULL;
++}
++
++/* The field (0: top, 1: bottom) of picture src (width x height) into vp->field */
++static struct pipe_video_buffer *
++FieldPicture(Device *pDevice, VideoCompositor *c, VideoProcessor *vp, struct pipe_video_buffer *src, unsigned width,
++             unsigned height, unsigned field)
++{
++   struct pipe_context *pipe = pDevice->video_pipe;
++   if (!FieldPassReady(pipe, c)) {
++      return NULL;
++   }
++   unsigned field_height = (height + 1) / 2;
++   if (vp->field && (vp->field->width != width || vp->field->height != field_height ||
++                     vp->field->buffer_format != src->buffer_format)) {
++      vp->field->destroy(vp->field);
++      vp->field = NULL;
++   }
++   if (!vp->field) {
++      struct pipe_video_buffer tmpl = {};
++      tmpl.buffer_format = src->buffer_format;
++      tmpl.width = width;
++      tmpl.height = field_height;
++      vp->field = CreatePlaneBuffer(pDevice, &tmpl, PIPE_USAGE_DEFAULT);
++      if (!vp->field) {
++         return NULL;
++      }
++   }
++   struct vl_video_buffer *in = (struct vl_video_buffer *)src, *out = (struct vl_video_buffer *)vp->field;
++   uint32_t consts[4] = {field, 0, 0, 0};
++   struct pipe_constant_buffer cb = {};
++   cb.user_buffer = consts;
++   cb.buffer_size = sizeof(consts);
++   pipe->bind_blend_state(pipe, c->blend);
++   pipe->bind_depth_stencil_alpha_state(pipe, c->dsa);
++   pipe->bind_rasterizer_state(pipe, c->rasterizer);
++   pipe->bind_vertex_elements_state(pipe, c->velems);
++   pipe->bind_vs_state(pipe, c->field_vs);
++   pipe->bind_fs_state(pipe, c->field_fs);
++   pipe->bind_sampler_states(pipe, PIPE_SHADER_FRAGMENT, 0, 1, &c->sampler);
++   pipe->set_constant_buffer(pipe, PIPE_SHADER_FRAGMENT, 0, false, &cb);
++   for (unsigned p = 0; p < 2; p++) {
++      struct pipe_resource *from = in->resources[p], *to = out->resources[p];
++      struct pipe_sampler_view vtmpl;
++      u_sampler_view_default_template(&vtmpl, from, from->format);
++      struct pipe_sampler_view *view = pipe->create_sampler_view(pipe, from, &vtmpl);
++      struct pipe_surface stmpl;
++      u_surface_default_template(&stmpl, to);
++      struct pipe_surface *surface = pipe->create_surface(pipe, to, &stmpl);
++      if (view && surface) {
++         struct pipe_framebuffer_state fb = {};
++         fb.width = to->width0;
++         fb.height = to->height0;
++         fb.nr_cbufs = 1;
++         fb.cbufs[0] = surface;
++         pipe->set_framebuffer_state(pipe, &fb);
++         struct pipe_viewport_state viewport = {};
++         viewport.scale[0] = fb.width / 2.0f;
++         viewport.scale[1] = fb.height / 2.0f;
++         viewport.scale[2] = 1.0f;
++         viewport.translate[0] = fb.width / 2.0f;
++         viewport.translate[1] = fb.height / 2.0f;
++         viewport.swizzle_x = PIPE_VIEWPORT_SWIZZLE_POSITIVE_X;
++         viewport.swizzle_y = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Y;
++         viewport.swizzle_z = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Z;
++         viewport.swizzle_w = PIPE_VIEWPORT_SWIZZLE_POSITIVE_W;
++         pipe->set_viewport_states(pipe, 0, 1, &viewport);
++         pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 1, 0, false, &view);
++         util_draw_arrays(pipe, MESA_PRIM_TRIANGLES, 0, 3);
++      }
++      pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 0, 1, false, NULL);
++      pipe_sampler_view_reference(&view, NULL);
++      pipe_surface_reference(&surface, NULL);
++   }
++   return vp->field;
++}
++
+ static HRESULT APIENTRY
+ VideoProcessorBlt(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcessor,
+                   D3D11_1DDI_HVIDEOPROCESSOROUTPUTVIEW hOutputView, UINT OutputFrame, UINT StreamCount,
+@@ -1178,6 +1354,18 @@ VideoProcessorBlt(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcesso
+          src = Rect(vp->stream.src);
+       }
+       struct u_rect dst_area = vp->stream.dst_enabled ? Rect(vp->stream.dst) : target;
++      struct pipe_video_buffer *picture = v ? v->buffers[in->slice] : NULL;
++      if (v && vp->stream.frame_format != D3D11_1DDI_VIDEO_FRAME_FORMAT_PROGRESSIVE) {
++         /* bob: OutputIndex 0 the first field, 1 the second (the frame rate doubled); its rows halved */
++         unsigned field = (pStreams[i].OutputIndex & 1) ^
++                          (vp->stream.frame_format == D3D11_1DDI_VIDEO_FRAME_FORMAT_INTERLACED_BOTTOM_FIELD_FIRST);
++         struct pipe_video_buffer *f = FieldPicture(pDevice, c, vp, picture, v->width, v->height, field);
++         if (f) {
++            picture = f;
++            src.y0 /= 2;
++            src.y1 = (src.y1 + 1) / 2;
++         }
++      }
+       if (v) {
+          /* YCbCr_Matrix: 0 BT.601, 1 BT.709; Nominal_Range 2: full range (0-255) input */
+          vl_csc_matrix csc;
+@@ -1185,9 +1373,8 @@ VideoProcessorBlt(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcesso
+                                                                                   : VL_CSC_COLOR_STANDARD_BT_601;
+          vl_csc_get_matrix(standard, NULL, vp->stream.color_space.Nominal_Range != 2, &csc);
+          vl_compositor_set_csc_matrix(&c->state, (const vl_csc_matrix *)&csc, 1.0f, 0.0f);
+-         ComponentViews(vpipe, v->buffers[in->slice]);
+-         vl_compositor_set_buffer_layer(&c->state, &c->compositor, layers, v->buffers[in->slice], &src, NULL,
+-                                        VL_COMPOSITOR_NONE);
++         ComponentViews(vpipe, picture);
++         vl_compositor_set_buffer_layer(&c->state, &c->compositor, layers, picture, &src, NULL, VL_COMPOSITOR_NONE);
+       } else {
+          vl_compositor_set_rgba_layer(&c->state, &c->compositor, layers, in->rgb, &src, NULL, NULL);
+       }
+@@ -1253,7 +1440,6 @@ VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize
+    STUB_ALL(pfnVideoProcessorSetOutputStereoMode)
+    STUB_ALL(pfnVideoProcessorSetOutputExtension)
+    STUB_ALL(pfnVideoProcessorGetOutputExtension)
+-   STUB_ALL(pfnVideoProcessorSetStreamFrameFormat)
+    STUB_ALL(pfnVideoProcessorSetStreamOutputRate)
+    STUB_ALL(pfnVideoProcessorSetStreamAlpha)
+    STUB_ALL(pfnVideoProcessorSetStreamPalette)
+@@ -1318,6 +1504,7 @@ VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize
+    f->pfnCalcPrivateVideoProcessorSize = CalcPrivateVideoProcessorSize;
+    f->pfnCreateVideoProcessor = CreateVideoProcessor;
+    f->pfnDestroyVideoProcessor = DestroyVideoProcessor;
++   f->pfnVideoProcessorSetStreamFrameFormat = VideoProcessorSetStreamFrameFormat;
+    f->pfnVideoProcessorSetOutputTargetRect = VideoProcessorSetOutputTargetRect;
+    f->pfnVideoProcessorSetOutputBackgroundColor = VideoProcessorSetOutputBackgroundColor;
+    f->pfnVideoProcessorSetStreamColorSpace = VideoProcessorSetStreamColorSpace;
+@@ -1338,6 +1525,22 @@ VideoDestroyDevice(D3D10DDI_HDEVICE hDevice)
+ {
+    Device *pDevice = CastDevice(hDevice);
+    if (pDevice->compositor) {
++      VideoCompositor *c = pDevice->compositor;
++      struct pipe_context *pipe = pDevice->video_pipe;
++      if (c->field_vs)
++         pipe->delete_vs_state(pipe, c->field_vs);
++      if (c->field_fs)
++         pipe->delete_fs_state(pipe, c->field_fs);
++      if (c->blend)
++         pipe->delete_blend_state(pipe, c->blend);
++      if (c->dsa)
++         pipe->delete_depth_stencil_alpha_state(pipe, c->dsa);
++      if (c->rasterizer)
++         pipe->delete_rasterizer_state(pipe, c->rasterizer);
++      if (c->sampler)
++         pipe->delete_sampler_state(pipe, c->sampler);
++      if (c->velems)
++         pipe->delete_vertex_elements_state(pipe, c->velems);
+       vl_compositor_cleanup_state(&pDevice->compositor->state);
+       vl_compositor_cleanup(&pDevice->compositor->compositor);
+       delete pDevice->compositor;

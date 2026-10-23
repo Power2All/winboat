@@ -232,6 +232,9 @@
                         </template>
                     </div>
                 </x-card>
+
+                <!-- Virtual GPU -->
+                <VirtualGPU @applied="assignValues" />
             </div>
         </div>
         <div v-show="wbConfig.config.advancedFeatures">
@@ -354,6 +357,29 @@
                     </template>
                 </ConfigCard>
 
+                <!-- Windows Color Mode -->
+                <ConfigCard
+                    class="relative z-10"
+                    icon="mdi:theme-light-dark"
+                    title="Windows Color Mode"
+                    desc="Light or dark mode for Windows and its apps. Follow Linux switches along with your desktop's light or dark preference."
+                    type="custom"
+                >
+                    <x-select class="w-36" @change="(e: any) => (wbConfig.config.windowsTheme = e.detail.newValue)">
+                        <x-menu>
+                            <x-menuitem value="follow" :toggled="wbConfig.config.windowsTheme === 'follow'">
+                                <x-label>Follow Linux</x-label>
+                            </x-menuitem>
+                            <x-menuitem value="light" :toggled="wbConfig.config.windowsTheme === 'light'">
+                                <x-label>Light</x-label>
+                            </x-menuitem>
+                            <x-menuitem value="dark" :toggled="wbConfig.config.windowsTheme === 'dark'">
+                                <x-label>Dark</x-label>
+                            </x-menuitem>
+                        </x-menu>
+                    </x-select>
+                </ConfigCard>
+
                 <!-- Smartcard Passthrough -->
                 <ConfigCard
                     icon="game-icons:swipe-card"
@@ -363,6 +389,15 @@
                     v-model:value="wbConfig.config.smartcardEnabled"
                 >
                 </ConfigCard>
+
+                <!-- Legacy RemoteApp -->
+                <ConfigCard
+                    icon="mdi:speedometer"
+                    title="Faster App Window Updates"
+                    desc="Uses the older RemoteApp mode for app windows: about 35-40 instead of 30 frames per second in our tests, but window shadows and some window effects may look or behave differently. Applies to apps opened afterwards"
+                    type="switch"
+                    v-model:value="wbConfig.config.legacyRemoteApp"
+                />
 
                 <!-- RDP Monitoring -->
                 <ConfigCard
@@ -437,6 +472,7 @@
 
 <script setup lang="ts">
 import ConfigCard from "../components/ConfigCard.vue";
+import VirtualGPU from "../components/VirtualGPU.vue";
 import { computed, onMounted, ref, watch, reactive } from "vue";
 import { Winboat } from "../lib/winboat";
 import { ContainerRuntimes, ContainerStatus } from "../lib/containers/common";

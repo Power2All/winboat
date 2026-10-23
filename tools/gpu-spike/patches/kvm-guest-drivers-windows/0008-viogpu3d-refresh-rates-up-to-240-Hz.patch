@@ -1,0 +1,295 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: refresh rates up to 240 Hz
+
+The driver offered one 60 Hz timing and ran its vblank timer at 60 Hz, so Windows composed at most 60 frames per
+second even where the display behind it (a SPICE client on a faster monitor) shows more. Offer every mode at 60, 75,
+90, 100, 120, 144, 165, 180 and 240 Hz (target and monitor modes; 60 Hz stays preferred), and run the vblank timer at
+the rate of the target mode Windows commits. QEMU's EDID limits the monitor to 50-125 Hz and 30-160 kHz, and Windows
+drops the modes outside it: widen the range limits descriptor. DescribeAllocation reported 60 Hz for every
+allocation, and Windows flips only between primaries made for the current mode: at any other rate DWM stopped
+presenting. Report the committed rate.
+---
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index 515c4c4..349ed37 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -307,8 +307,10 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
+     pDescribeAllocation->MultisampleMethod.NumQualityLevels = 2;
+     pDescribeAllocation->MultisampleMethod.NumSamples = 2;
+ 
+-    pDescribeAllocation->RefreshRate.Numerator = 148500000;
+-    pDescribeAllocation->RefreshRate.Denominator = 2475000;
++    // The committed mode's: Windows flips only between primaries made for the current mode, and DWM stopped
++    // presenting at any other rate when this was always 60 Hz
++    pDescribeAllocation->RefreshRate.Numerator = m_adapter->vidpn.GetRefreshRate();
++    pDescribeAllocation->RefreshRate.Denominator = 1;
+ 
+     return STATUS_SUCCESS;
+ };
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index 34fb147..d366fac 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -336,6 +336,8 @@ NTSTATUS VioGpuVidPN::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitV
+             goto CommitVidPnExit;
+         }
+ 
++        UpdateRefreshRate(pVidPnInterface, pCommitVidPn->hFunctionalVidPn, TargetId);
++
+         Status = SetSourceModeAndPath(pPinnedVidPnSourceModeInfo, pVidPnPresentPath);
+         if (!NT_SUCCESS(Status))
+         {
+@@ -382,6 +384,39 @@ CommitVidPnExit:
+     return Status;
+ }
+ 
++// The vblank timer follows the refresh rate of the target mode Windows pinned
++void VioGpuVidPN::UpdateRefreshRate(CONST DXGK_VIDPN_INTERFACE *pVidPnInterface,
++                                    D3DKMDT_HVIDPN hVidPn,
++                                    D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId)
++{
++    PAGED_CODE();
++
++    D3DKMDT_HVIDPNTARGETMODESET hTargetModeSet = 0;
++    CONST DXGK_VIDPNTARGETMODESET_INTERFACE *pTargetModeSetInterface = NULL;
++    CONST D3DKMDT_VIDPN_TARGET_MODE *pPinnedTargetMode = NULL;
++
++    if (!NT_SUCCESS(pVidPnInterface->pfnAcquireTargetModeSet(hVidPn, TargetId, &hTargetModeSet, &pTargetModeSetInterface)))
++    {
++        return;
++    }
++    if (NT_SUCCESS(pTargetModeSetInterface->pfnAcquirePinnedModeInfo(hTargetModeSet, &pPinnedTargetMode)) &&
++        pPinnedTargetMode != NULL)
++    {
++        CONST D3DDDI_RATIONAL *VSync = &pPinnedTargetMode->VideoSignalInfo.VSyncFreq;
++        if (VSync->Denominator != 0 && VSync->Denominator != D3DKMDT_FREQUENCY_NOTSPECIFIED)
++        {
++            LONG Rate = (LONG)((VSync->Numerator + VSync->Denominator / 2) / VSync->Denominator);
++            if (Rate >= 24 && Rate <= 480)
++            {
++                InterlockedExchange(&m_RefreshRate, Rate);
++                DbgPrint(TRACE_LEVEL_INFORMATION, ("%s: %d Hz\n", __FUNCTION__, Rate));
++            }
++        }
++        pTargetModeSetInterface->pfnReleaseModeInfo(hTargetModeSet, pPinnedTargetMode);
++    }
++    pVidPnInterface->pfnReleaseTargetModeSet(hVidPn, hTargetModeSet);
++}
++
+ NTSTATUS VioGpuVidPN::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
+                                            CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath)
+ {
+@@ -970,7 +1005,14 @@ NTSTATUS VioGpuVidPN::AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INT
+     return STATUS_SUCCESS;
+ }
+ 
+-VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo)
++// The refresh rates every mode is offered at: the vblank timer runs at the one Windows commits, so a SPICE client
++// on a faster monitor can get the frames it shows (WinBoat picks the rate of the monitor the viewer is on)
++static const UINT g_RefreshRates[] = {60, 75, 90, 100, 120, 144, 165, 180, 240};
++#define DEFAULT_REFRESH_RATE 60
++
++VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo,
++                                       PVIDEO_MODE_INFORMATION pModeInfo,
++                                       UINT RefreshRate)
+ {
+     PAGED_CODE();
+ 
+@@ -979,11 +1021,11 @@ VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalIn
+     pVideoSignalInfo->TotalSize.cy = pModeInfo->VisScreenHeight;
+ 
+ #if 1
+-    pVideoSignalInfo->VSyncFreq.Numerator = 148500000;
+-    pVideoSignalInfo->VSyncFreq.Denominator = 2475000;
+-    pVideoSignalInfo->HSyncFreq.Numerator = 67500;
++    pVideoSignalInfo->VSyncFreq.Numerator = RefreshRate;
++    pVideoSignalInfo->VSyncFreq.Denominator = 1;
++    pVideoSignalInfo->HSyncFreq.Numerator = RefreshRate * pModeInfo->VisScreenHeight;
+     pVideoSignalInfo->HSyncFreq.Denominator = 1;
+-    pVideoSignalInfo->PixelRate = 148500000;
++    pVideoSignalInfo->PixelRate = (SIZE_T)RefreshRate * pModeInfo->VisScreenWidth * pModeInfo->VisScreenHeight;
+ #else
+ 
+     pVideoSignalInfo->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+@@ -1008,7 +1050,7 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
+     D3DKMDT_VIDPN_TARGET_MODE *pVidPnTargetModeInfo = NULL;
+     NTSTATUS Status = STATUS_SUCCESS;
+ 
+-    for (UINT ModeIndex = 0; ModeIndex < GetModeCount(); ++ModeIndex)
++    for (UINT RateIndex = 0; RateIndex < ARRAYSIZE(g_RefreshRates); ++RateIndex)
+     {
+         PVIDEO_MODE_INFORMATION pModeInfo = &m_ModeInfo[SourceId];
+         pVidPnTargetModeInfo = NULL;
+@@ -1022,10 +1064,11 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
+             return Status;
+         }
+         pVidPnTargetModeInfo->VideoSignalInfo.ActiveSize = pVidPnTargetModeInfo->VideoSignalInfo.TotalSize;
+-        BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo);
++        BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo, g_RefreshRates[RateIndex]);
+ 
+-        pVidPnTargetModeInfo->Preference = D3DKMDT_MP_NOTPREFERRED; // TODO: another logic for prefferred mode. Maybe
+-                                                                    // the pinned source mode
++        // 60 Hz unless a faster rate is asked for
++        pVidPnTargetModeInfo->Preference = g_RefreshRates[RateIndex] == DEFAULT_REFRESH_RATE ? D3DKMDT_MP_PREFERRED
++                                                                                              : D3DKMDT_MP_NOTPREFERRED;
+ 
+         Status = pVidPnTargetModeSetInterface->pfnAddMode(hVidPnTargetModeSet, pVidPnTargetModeInfo);
+         if (!NT_SUCCESS(Status))
+@@ -1071,7 +1114,7 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
+ 
+     pVbeModeInfo = &m_ModeInfo[m_CurrentModeIndex];
+ 
+-    BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pVbeModeInfo);
++    BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pVbeModeInfo, DEFAULT_REFRESH_RATE);
+ 
+     pMonitorSourceMode->Origin = D3DKMDT_MCO_DRIVER;
+     pMonitorSourceMode->Preference = D3DKMDT_MP_PREFERRED;
+@@ -1106,8 +1149,9 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
+         return Status;
+     }
+ 
+-    for (UINT Idx = 0; Idx < GetModeCount(); ++Idx)
++    for (UINT ModeRate = 0; ModeRate < GetModeCount() * ARRAYSIZE(g_RefreshRates); ++ModeRate)
+     {
++        UINT Idx = ModeRate / ARRAYSIZE(g_RefreshRates);
+         pVbeModeInfo = &m_ModeInfo[Idx];
+ 
+         Status = pRecommendMonitorModes->pMonitorSourceModeSetInterface->pfnCreateNewModeInfo(pRecommendMonitorModes->hMonitorSourceModeSet,
+@@ -1127,7 +1171,9 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
+                   pVbeModeInfo->VisScreenWidth,
+                   pVbeModeInfo->VisScreenHeight));
+ 
+-        BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pVbeModeInfo);
++        BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo,
++                             pVbeModeInfo,
++                             g_RefreshRates[ModeRate % ARRAYSIZE(g_RefreshRates)]);
+ 
+         pMonitorSourceMode->Origin = D3DKMDT_MCO_DRIVER;
+         pMonitorSourceMode->Preference = D3DKMDT_MP_NOTPREFERRED;
+@@ -1696,14 +1742,47 @@ int VioGpuVidPN::ProcessEdid(void)
+     if (virtio_is_feature_enabled(m_pAdapter->m_u64HostFeatures, VIRTIO_GPU_F_EDID))
+     {
+         GetEdids();
++        for (UINT32 i = 0; m_bEDID && i < m_pAdapter->m_u32NumScanouts && i < MAX_CHILDREN; i++)
++        {
++            WidenEdidRanges(m_EDIDs[i]);
++        }
+     }
+     else
+     {
+         FixEdid();
++        WidenEdidRanges(GetEdidData(0));
+     }
+     return AddEdidModes();
+ }
+ 
++// Windows drops the modes outside the monitor's range limits, and QEMU's EDID allows 50-125 Hz and 30-160 kHz: the
++// faster refresh rates this driver offers (g_RefreshRates) need 24-240 Hz and, at 2160 lines, up to 518 kHz
++void VioGpuVidPN::WidenEdidRanges(PUCHAR Edid)
++{
++    PAGED_CODE();
++
++    for (ULONG Offset = 54; Offset <= 108; Offset += 18)
++    {
++        PUCHAR Desc = Edid + Offset;
++        // A display descriptor (no pixel clock) of type 0xFD: display range limits
++        if (Desc[0] == 0 && Desc[1] == 0 && Desc[3] == 0xFD)
++        {
++            Desc[4] = 0x08;  // EDID 1.4 offsets: maximum horizontal rate + 255 kHz
++            Desc[5] = 24;    // vertical Hz
++            Desc[6] = 240;
++            Desc[7] = 1;     // horizontal kHz
++            Desc[8] = 255;   // 510 kHz with the offset
++            Desc[9] = 255;   // maximum pixel clock: 2550 MHz
++        }
++    }
++    UCHAR Sum = 0;
++    for (ULONG i = 0; i < EDID_V1_BLOCK_SIZE - 1; i++)
++    {
++        Sum += Edid[i];
++    }
++    Edid[EDID_V1_BLOCK_SIZE - 1] = -Sum;
++}
++
+ BOOLEAN VioGpuVidPN::UpdateModes(USHORT xres, USHORT yres, int &cnt)
+ {
+     int idx = 0;
+@@ -2015,21 +2094,27 @@ void VioGpuVidPN::FlipThread(void *ctx)
+ 
+     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
+     LARGE_INTEGER interval;
+-    interval.QuadPart = -166666LL;
++    LONG rate = 0;
+ 
+-    // A vblank every 1/60 s. A plain delay is rounded up to the system timer tick (15.6 ms by default), so it lasted
+-    // two ticks: 32 Hz, and DWM composed at that rate. A high-resolution periodic timer keeps 60 Hz.
++    // A vblank at the committed mode's refresh rate. A plain delay is rounded up to the system timer tick (15.6 ms by
++    // default), so at 60 Hz it lasted two ticks: 32 Hz, and DWM composed at that rate. A high-resolution periodic
++    // timer keeps the rate; it is set again when a mode with another rate is committed.
+     KeInitializeEvent(&vidpn->m_flipEvent, SynchronizationEvent, FALSE);
+     PEX_TIMER timer = ExAllocateTimer(VioGpuVidPN::FlipTimerCallback, vidpn, EX_TIMER_HIGH_RESOLUTION);
+-    if (timer != NULL)
+-    {
+-        ExSetTimer(timer, interval.QuadPart, -interval.QuadPart, NULL);
+-    }
+     // A new frame goes to the host as soon as Windows flips to it, not at the next vblank: that saved up to a frame
+     // of latency. Windows still learns at the vblank that the flip completed, so it composes once per vblank.
+     PVOID events[] = {&vidpn->m_flipNowEvent, &vidpn->m_flipEvent};
+     while (true)
+     {
++        if (vidpn->m_RefreshRate != rate)
++        {
++            rate = vidpn->m_RefreshRate;
++            interval.QuadPart = -10000000LL / rate;
++            if (timer != NULL)
++            {
++                ExSetTimer(timer, interval.QuadPart, -interval.QuadPart, NULL);
++            }
++        }
+         bool vsync = true;
+         if (timer != NULL)
+         {
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index 8a811cd..b28bc55 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -71,6 +71,7 @@ class VioGpuVidPN
+     BOOLEAN GetDisplayInfo(void);
+     int ProcessEdid(void);
+     void FixEdid(void);
++    void WidenEdidRanges(PUCHAR Edid);
+     BOOLEAN GetEdids(void);
+     int AddEdidModes(void);
+     BOOLEAN UpdateModes(USHORT xres, USHORT yres, int &cnt);
+@@ -104,6 +105,10 @@ class VioGpuVidPN
+     static KDEFERRED_ROUTINE FlipNowDpc;
+ 
+     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
++    UINT GetRefreshRate() const
++    {
++        return (UINT)m_RefreshRate;
++    }
+ 
+   private:
+     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
+@@ -117,7 +122,12 @@ class VioGpuVidPN
+                                  _In_opt_ CONST D3DKMDT_VIDPN_SOURCE_MODE *pVidPnPinnedSourceModeInfo,
+                                  D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId);
+     D3DDDI_VIDEO_PRESENT_SOURCE_ID FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId, BOOLEAN DefaultToZero);
+-    VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo);
++    VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo,
++                              PVIDEO_MODE_INFORMATION pModeInfo,
++                              UINT RefreshRate);
++    void UpdateRefreshRate(CONST DXGK_VIDPN_INTERFACE *pVidPnInterface,
++                           D3DKMDT_HVIDPN hVidPn,
++                           D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId);
+ 
+     VioGpuAdapter *m_pAdapter;
+     DXGKRNL_INTERFACE *m_pDxgkInterface;
+@@ -148,4 +158,6 @@ class VioGpuVidPN
+     // that completes it stays on the timer
+     KEVENT m_flipNowEvent;
+     KDPC m_flipNowDpc;
++    // The committed mode's refresh rate (Hz): the vblank timer runs at it
++    volatile LONG m_RefreshRate = 60;
+ };

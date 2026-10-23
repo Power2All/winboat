@@ -1,0 +1,485 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: video memory, a GPU memory limit and timeout recovery
+
+- Dedicated video memory: with a host-visible memory window, a second, local memory segment over it (WDDM 2.0),
+  which DXGI reports as dedicated video memory. Programs pick GPUs by it (Topaz Video AI took a GPU with none for
+  unusable and ran on the CPU). No allocation is placed there, and it is not CPU-visible: most of the window has
+  nothing mapped until Venus maps blobs, and Windows touching it hung every Direct3D program. The system memory
+  segment GpuMmu adds moves to 3 (VioGpuAdapter::SysmemSegmentId).
+- A GPU memory limit per VM: every resource is charged by its size (computed from its description: textures the CPU
+  never maps have no guest memory but live on the host) against GpuMemoryLimitMB (driver key, default 8192, 512 to
+  65536); over it CreateAllocation answers STATUS_NO_MEMORY, as a full graphics card does. Without it one program
+  creating resources without end (Topaz Video AI's upgrade pop-up keeps a texture per animation frame) takes the
+  host's memory until its kernel kills the GPU process.
+- GPU timeout recovery: DxgkDdiResetFromTimeout was a stub and the INF turned timeouts off (TdrDebugMode=1), so a
+  hung host froze the VM for good. The commander now numbers its work by generation: a reset starts a new one,
+  older work is abandoned (never sent on, never reported complete, its allocations no longer busy), late host
+  replies included; running commands are counted under the lock the reset takes. The INF sets TdrDebugMode=2 and
+  TdrDelay=10 (host-side work, shader compiles and large uploads, can take seconds). Tested by freezing the GPU
+  process on the host under a rendering program: 15 and 25 s freezes recover with one and two resets.
+---
+diff --git a/viogpu/common/helper.h b/viogpu/common/helper.h
+index 29d60be..22c678b 100644
+--- a/viogpu/common/helper.h
++++ b/viogpu/common/helper.h
+@@ -115,8 +115,8 @@ extern "C"
+ #define VIOGPU_PAGE_TABLE_INDEX_BITS 9
+ #define VIOGPU_PAGE_TABLE_SIZE       ((1 << VIOGPU_PAGE_TABLE_INDEX_BITS) * 16)
+ #define VIOGPU_GPU_VA_BITS           (VIOGPU_PAGE_TABLE_LEVELS * VIOGPU_PAGE_TABLE_INDEX_BITS + 12)
+-// The aperture segment is segment 1, so the system memory segment GpuMmu adds is segment 2
+-#define VIOGPU_SYSMEM_SEGMENT_ID     2
++// The aperture segment is segment 1; with a host-visible memory window, segment 2 reports it as the adapter's local
++// (dedicated) memory. The system memory segment GpuMmu adds comes after them: VioGpuAdapter::SysmemSegmentId()
+ 
+ // A diagnostic log kept in memory (32 KB, oldest lines dropped), read with the VIOGPU_GET_LOG escape. Any IRQL up to
+ // DISPATCH_LEVEL
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index 2ff0a37..076f95b 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -1151,9 +1151,8 @@ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiRestartFromTimeout(_In_ CONST HANDLE hAdapter)
+ {
++    // Nothing to restart: the reset left the commander running
+     UNREFERENCED_PARAMETER(hAdapter);
+-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
+-
+     return STATUS_SUCCESS;
+ };
+ 
+@@ -1221,10 +1220,9 @@ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiResetFromTimeout(_In_ CONST HANDLE hAdapter)
+ {
+-    UNREFERENCED_PARAMETER(hAdapter);
+-
+-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
+-
++    // A GPU timeout (TDR): what was submitted is abandoned, and the commander takes new work at once. Commands the
++    // host still holds complete into the void; Windows recreates the devices it had
++    reinterpret_cast<VioGpuAdapter *>(hAdapter)->commander.Reset();
+     return STATUS_SUCCESS;
+ };
+ 
+diff --git a/viogpu/viogpu3d/viogpu3d.inx b/viogpu/viogpu3d/viogpu3d.inx
+index 7591255..4ec3e70 100644
+--- a/viogpu/viogpu3d/viogpu3d.inx
++++ b/viogpu/viogpu3d/viogpu3d.inx
+@@ -123,7 +123,10 @@ HKR,, OpenGLFlagsWow,              %REG_DWORD%, 3
+ HKR,, OpenGLVersionWow,            %REG_DWORD%, 4096
+ HKR,, VulkanDriverNameWow,         %REG_MULTI_SZ%, %13%\viogpu_vk_x86.json
+ HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,%REG_DWORD%,0
+-HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,1
++; GPU timeouts recover (2, Windows' default; this driver used to set 1, ignore them, so the value is set explicitly):
++; after 10 s rather than 2, as host-side work (shader compiles, large uploads) can take seconds
++HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,2
++HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDelay,%REG_DWORD%,10
+ 
+ [VioGpu3D_PCI_MSIX]
+ HKR, "Interrupt Management",, 0x00000010
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 8ed5175..8d06d5a 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -734,7 +734,10 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+         case DXGKQAITYPE_QUERYSEGMENT4:
+             {
+                 // The same aperture segment as with WDDM 1.3 (QUERYSEGMENT3): the allocations the D3D/OpenGL drivers
+-                // use are accessed physically and stay there. GpuMmu adds the system memory segment (2)
++                // use are accessed physically and stay there. With a host-visible memory window, a local memory
++                // segment over it (2): what DXGI reports as dedicated video memory, which programs pick GPUs by (Topaz
++                // Video AI took a GPU without any for unusable). No allocation lists it, so nothing is placed there.
++                // GpuMmu adds the system memory segment after them (SysmemSegmentId)
+                 if (pQueryAdapterInfo->OutputDataSize < sizeof(DXGK_QUERYSEGMENTOUT4))
+                 {
+                     return STATUS_BUFFER_TOO_SMALL;
+@@ -742,7 +745,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 DXGK_QUERYSEGMENTOUT4 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT4 *)pQueryAdapterInfo->pOutputData;
+                 if (!pSegmentInfo->pSegmentDescriptor)
+                 {
+-                    pSegmentInfo->NbSegment = 1;
++                    pSegmentInfo->NbSegment = m_HostmemSize ? 2 : 1;
+                     return STATUS_SUCCESS;
+                 }
+                 // Paging buffers in system memory (segment 0): the CPU fills them, and the aperture isn't CPU-visible.
+@@ -761,6 +764,18 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 pSegmentDesc->Flags.DirectFlip = TRUE;
+                 pSegmentDesc->Size = 256 * 1024 * 4096;
+                 pSegmentDesc->CommitLimit = 256 * 1024 * 4096;
++                if (m_HostmemSize)
++                {
++                    SIZE_T stride = pSegmentInfo->SegmentDescriptorStride ? pSegmentInfo->SegmentDescriptorStride
++                                                                          : sizeof(*pSegmentDesc);
++                    DXGK_SEGMENTDESCRIPTOR4 *pLocal = (DXGK_SEGMENTDESCRIPTOR4 *)((BYTE *)pSegmentDesc + stride);
++                    memset(pLocal, 0, stride);
++                    // Not CPU-visible: most of the window has nothing mapped until Venus maps blobs there
++                    pLocal->BaseAddress.QuadPart = 0x100000000; // after the aperture's GPU addresses
++                    pLocal->Flags.LocalBudgetGroup = TRUE;
++                    pLocal->Size = m_HostmemSize;
++                    pLocal->CommitLimit = m_HostmemSize;
++                }
+                 return STATUS_SUCCESS;
+             }
+         case DXGKQAITYPE_GPUMMUCAPS:
+@@ -788,8 +803,8 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 DXGK_PAGE_TABLE_LEVEL_DESC *pDesc = (DXGK_PAGE_TABLE_LEVEL_DESC *)pQueryAdapterInfo->pOutputData;
+                 RtlZeroMemory(pDesc, sizeof(*pDesc));
+                 pDesc->PageTableIndexBitCount = VIOGPU_PAGE_TABLE_INDEX_BITS;
+-                pDesc->PageTableSegmentId = VIOGPU_SYSMEM_SEGMENT_ID;
+-                pDesc->PagingProcessPageTableSegmentId = VIOGPU_SYSMEM_SEGMENT_ID;
++                pDesc->PageTableSegmentId = SysmemSegmentId();
++                pDesc->PagingProcessPageTableSegmentId = SysmemSegmentId();
+                 pDesc->PageTableSizeInBytes = VIOGPU_PAGE_TABLE_SIZE;
+                 pDesc->PageTableAlignmentInBytes = 0;
+                 return STATUS_SUCCESS;
+@@ -1392,6 +1407,14 @@ NTSTATUS VioGpuAdapter::GetRegisterInfo(void)
+         SetPointerEnabled(!!value);
+     }
+ 
++    // GpuMemoryLimitMB: the most the VM's GPU resources may hold together (default 8 GB). Each resource is backed on
++    // the host too, so without a limit one program creating resources without end takes the host's memory with it
++    value = 0;
++    if (NT_SUCCESS(ReadRegistryDWORD(DevInstRegKeyHandle, L"GpuMemoryLimitMB", &value)) && value)
++    {
++        m_AllocationLimit = (ULONGLONG)min(max(value, 512UL), 65536UL) << 20;
++    }
++
+     value = 0;
+     Status = ReadRegistryDWORD(DevInstRegKeyHandle, L"FlexResolution", &value);
+     if (NT_SUCCESS(Status))
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 53b7947..e954764 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -110,6 +110,38 @@ class VioGpuAdapter : IVioGpuPCI
+     // HOSTMEM_RANGEs, sorted by offset
+     PHYSICAL_ADDRESS m_HostmemPA;
+     ULONGLONG m_HostmemSize;
++
++    // GPU resource memory in use, and its limit (GpuMemoryLimitMB)
++    volatile LONG64 m_AllocatedBytes = 0;
++    ULONGLONG m_AllocationLimit = 8192ULL << 20;
++
++  public:
++    // Charges a new resource's size to the limit; false (nothing charged) when it would go over
++    bool ChargeAllocation(ULONGLONG size)
++    {
++        if ((ULONGLONG)InterlockedAdd64(&m_AllocatedBytes, (LONG64)size) > m_AllocationLimit)
++        {
++            InterlockedAdd64(&m_AllocatedBytes, -(LONG64)size);
++            return false;
++        }
++        return true;
++    }
++    void UnchargeAllocation(ULONGLONG size)
++    {
++        InterlockedAdd64(&m_AllocatedBytes, -(LONG64)size);
++    }
++    ULONGLONG AllocationLimit() const
++    {
++        return m_AllocationLimit;
++    }
++
++    // The system memory segment GpuMmu adds, after ours (helper.h)
++    UINT SysmemSegmentId() const
++    {
++        return m_HostmemSize ? 3 : 2;
++    }
++
++  private:
+     FAST_MUTEX m_HostmemLock;
+     LIST_ENTRY m_HostmemRanges;
+ 
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index 65cf64e..e7fcfb7 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -32,6 +32,7 @@ VioGpuAllocation::~VioGpuAllocation(void)
+     DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s res_id=%d\n", __FUNCTION__, m_Id));
+     m_adapter->ctrlQueue.DestroyResource(m_Id);
+     m_adapter->resourceIdr.PutId(m_Id);
++    m_adapter->UnchargeAllocation(m_ChargedSize);
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ }
+@@ -270,6 +271,20 @@ NTSTATUS VioGpuAllocation::GetStandardAllocationDriverData(DXGKARG_GETSTANDARDAL
+     }
+ }
+ 
++// A resource's size on the host, estimated from its description: 4 bytes a texel (most formats; wider ones are
++// undercounted), all layers, samples and mip levels (a full chain adds a third); buffers are their width in bytes.
++// ponytail: a per-format texel size table if wide formats (RGBA16F/32F) need counting exactly
++static ULONGLONG HostSize(const VIOGPU_RESOURCE_OPTIONS *o)
++{
++    if (o->target == 0) // PIPE_BUFFER
++    {
++        return o->width;
++    }
++    ULONGLONG size = (ULONGLONG)o->width * max(o->height, 1UL) * max(o->depth, 1UL) * max(o->array_size, 1UL) *
++                     max(o->nr_samples, 1UL) * 4;
++    return o->last_level ? size + size / 3 : size;
++}
++
+ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_CREATEALLOCATION *pCreateAllocation)
+ {
+     PAGED_CODE();
+@@ -291,10 +306,29 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+         resourceExchange = (VIOGPU_CREATE_ALLOCATION_EXCHANGE *)pCreateAllocation->pPrivateDriverData;
+     }
+ 
++    // Over the VM's GPU memory limit: out of memory, as a full graphics card answers. Charged by the resource's own
++    // size: textures the CPU never maps have no guest memory (Size 0) and live on the host only
++    ULONGLONG charge = HostSize(&resourceExchange->ResourceOptions);
++    if (charge < resourceExchange->Size)
++    {
++        charge = resourceExchange->Size;
++    }
++    if (!adapter->ChargeAllocation(charge))
++    {
++        static LONG logged;
++        if (!InterlockedExchange(&logged, 1))
++        {
++            VioGpuLog("GPU memory limit reached (%I64u MB): resources over it fail with out-of-memory\n",
++                      adapter->AllocationLimit() >> 20);
++        }
++        return STATUS_NO_MEMORY;
++    }
++
+     VIOGPU_RESOURCE_OPTIONS options = resourceExchange->ResourceOptions;
+     bool gdiSurface = (options.flags & VIOGPU_RESOURCE_FLAG_GDI_SURFACE) != 0;
+     options.flags &= ~VIOGPU_RESOURCE_FLAG_GDI_SURFACE;
+     VioGpuAllocation *allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &options);
++    allocation->m_ChargedSize = charge;
+     allocationInfo->hAllocation = allocation;
+     if (gdiSurface)
+     {
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+index 8b1f1c6..8fcb63f 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -42,6 +42,8 @@ class VioGpuAllocation
+     // Open by GDI's device (GDI draws on it with the CPU, between StartDxInterop and EndDxInterop, which we don't see):
+     // its pages and the host texture are kept the same around every submission that uses it
+     volatile LONG m_gdiOpen = 0;
++    // The size charged to the adapter's GPU memory limit (VioGpuAdapter::ChargeAllocation)
++    ULONGLONG m_ChargedSize = 0;
+ 
+     // GDI drew on the pages: the host texture needs them before D3D uses it next
+     void SetGdiDirty()
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index d997368..4c43b3f 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -48,6 +48,13 @@ void VioGpuCommand::Run()
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+ 
++    // Submitted before a GPU timeout reset: nothing more goes to the host for it
++    if (m_generation != m_pCommander->m_generation)
++    {
++        Discard();
++        return;
++    }
++
+     // Surfaces GDI draws on with the CPU (see VioGpuDevice::OpenAllocation): what it drew to the host before this
+     // submission (the control queue keeps the order), and what the submission did back to the pages after it
+     if (m_allocations && m_pContext && !m_gdiUploaded)
+@@ -186,13 +193,45 @@ void VioGpuCommand::Run()
+     interrupt.DmaCompleted.SubmissionFenceId = m_FenceId;
+     interrupt.DmaCompleted.NodeOrdinal = 0;
+     interrupt.DmaCompleted.EngineOrdinal = 0;
+-    m_pAdapter->NotifyInterrupt(&interrupt, true);
++    // Reported only if no reset came in between (the reset takes the same lock)
++    KIRQL irql;
++    m_pCommander->LockQueue(&irql);
++    bool stale = m_generation != m_pCommander->m_generation;
++    if (!stale)
++    {
++        m_pAdapter->NotifyInterrupt(&interrupt, true);
++    }
++    m_pCommander->UnlockQueue(irql);
++    if (stale)
++    {
++        m_allocations = NULL; // released above
++        Discard();
++        return;
++    }
+ 
+     m_pCommander->CommandFinished(m_FenceId);
+ 
+     delete this;
+ }
+ 
++// An abandoned command: its allocations are no longer busy for it, and it is gone
++void VioGpuCommand::Discard()
++{
++    PAGED_CODE();
++    if (m_allocations)
++    {
++        for (UINT i = 0; i < m_allocationsLength; i++)
++        {
++            if (m_allocations[i])
++            {
++                m_allocations[i]->UnmarkBusy();
++            }
++        }
++        delete m_allocations;
++    }
++    delete this;
++}
++
+ void VioGpuCommand::AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, UINT allocationListLength)
+ {
+     PAGED_CODE();
+@@ -329,15 +368,31 @@ void VioGpuCommander::ThreadWorkRoutine(void)
+             break;
+         }
+ 
+-        while (m_running < VIOGPU_MAX_RUNNING)
++        // Counted as running under the lock a reset takes: commands from before a reset are discarded uncounted
++        for (;;)
+         {
+-            VioGpuCommand *command = DequeueSubmitted();
+-            if (command == NULL)
++            KIRQL irql;
++            LockQueue(&irql);
++            if (m_running >= VIOGPU_MAX_RUNNING || IsListEmpty(&m_SubmittedQueue))
+             {
++                UnlockQueue(irql);
+                 break;
+             }
+-            QueueRunning(command);
+-            m_running++;
++            VioGpuCommand *command = CONTAINING_RECORD(RemoveHeadList(&m_SubmittedQueue), VioGpuCommand, list_entry);
++            bool stale = command->m_generation != m_generation;
++            if (!stale)
++            {
++                m_running++;
++            }
++            UnlockQueue(irql);
++            if (stale)
++            {
++                command->Discard();
++            }
++            else
++            {
++                QueueRunning(command);
++            }
+         }
+ 
+         DbgPrint(TRACE_LEVEL_VERBOSE, ("%s Running command\n", __FUNCTION__));
+@@ -360,9 +415,9 @@ void VioGpuCommander::CommandFinished(UINT fenceId)
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+ 
+-    m_running--;
+     KIRQL oldIrql;
+     LockQueue(&oldIrql);
++    m_running--;
+     m_pending--;
+     m_lastCompletedFence = fenceId;
+     UnlockQueue(oldIrql);
+@@ -441,6 +496,21 @@ NTSTATUS VioGpuCommander::SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitComm
+     return STATUS_SUCCESS;
+ }
+ 
++// GPU timeout recovery: a new generation, with nothing running or pending. Nonpaged and without waits: what was
++// queued is discarded by the worker thread, a command the host still holds when its reply comes (or never)
++void VioGpuCommander::Reset()
++{
++    KIRQL oldIrql;
++    LockQueue(&oldIrql);
++    m_generation++;
++    m_running = 0;
++    m_pending = 0;
++    m_preemptionFence = 0;
++    UnlockQueue(oldIrql);
++    VioGpuLog("GPU timeout: reset, the work submitted so far is abandoned\n");
++    KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
++}
++
+ // Called at DISPATCH_LEVEL: the worker thread notifies it
+ NTSTATUS VioGpuCommander::PreemptCommand(const DXGKARG_PREEMPTCOMMAND *pPreemptCommand)
+ {
+@@ -520,29 +590,13 @@ void VioGpuCommander::QueueRunning(VioGpuCommand *cmd)
+     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
+ }
+ 
+-VioGpuCommand *VioGpuCommander::DequeueSubmitted()
+-{
+-    KIRQL oldIrql;
+-    LockQueue(&oldIrql);
+-    PLIST_ENTRY result = NULL;
+-    if (!IsListEmpty(&m_SubmittedQueue))
+-    {
+-        result = RemoveHeadList(&m_SubmittedQueue);
+-    }
+-    UnlockQueue(oldIrql);
+-    if (!result)
+-    {
+-        return NULL;
+-    }
+-    return CONTAINING_RECORD(result, VioGpuCommand, list_entry);
+-}
+-
+ void VioGpuCommander::QueueSubmitted(VioGpuCommand *cmd)
+ {
+     KIRQL oldIrql;
+     LockQueue(&oldIrql);
+     InsertTailList(&m_SubmittedQueue, &cmd->list_entry);
+     m_pending++;
++    cmd->m_generation = m_generation;
+     UnlockQueue(oldIrql);
+ 
+     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+index 47ea81a..d93ef69 100644
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -28,6 +28,7 @@ class VioGpuCommand
+     void AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, UINT allocationListLength);
+ 
+     LIST_ENTRY list_entry;
++    LONG m_generation = 0; // the commander's generation when submitted: a reset (TDR) makes it stale
+ 
+   private:
+     VioGpuAdapter *m_pAdapter;
+@@ -44,6 +45,9 @@ class VioGpuCommand
+     UINT m_allocationsLength;
+     bool m_gdiUploaded = false; // GDI-dirty surfaces sent to the host (once, before the first command)
+     bool m_gdiReadBack = false; // and surfaces GDI has open to read back when done
++
++  public:
++    void Discard();
+ };
+ 
+ class VioGpuCommander
+@@ -59,6 +63,10 @@ class VioGpuCommander
+ 
+     NTSTATUS Patch(const DXGKARG_PATCH *pPatch);
+     NTSTATUS SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitCommand);
++    // GPU timeout recovery (DxgkDdiResetFromTimeout): everything submitted so far is abandoned (never sent on, never
++    // reported complete); the worker discards it as it comes by, late host replies included
++    void Reset();
++    LONG m_generation = 0;
+ 
+     _IRQL_requires_max_(DISPATCH_LEVEL) _IRQL_saves_global_(OldIrql, Irql) _IRQL_raises_(DISPATCH_LEVEL) void LockQueue(
+                                                                                                         KIRQL *Irql);
+@@ -67,7 +75,6 @@ class VioGpuCommander
+     VioGpuCommand *DequeueRunning();
+     void QueueRunning(VioGpuCommand *cmd);
+ 
+-    VioGpuCommand *DequeueSubmitted();
+     void QueueSubmitted(VioGpuCommand *cmd);
+ 
+   private:
+@@ -85,7 +92,7 @@ class VioGpuCommander
+ 
+     KSPIN_LOCK m_Lock;
+ 
+-    UINT m_running;
++    LONG m_running; // under m_Lock
+ 
+     // Preemption: the host runs a submitted command to its end, so a preemption request completes when the
+     // commands submitted before it are done (nothing to resubmit). The scheduler waits for that notification.

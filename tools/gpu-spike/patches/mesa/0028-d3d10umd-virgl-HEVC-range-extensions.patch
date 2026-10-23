@@ -1,0 +1,460 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd, virgl: HEVC range extensions (12-bit, 4:4:4)
+
+Microsoft's DXVA HEVC range extension profiles in the Direct3D 11 driver: HEVC_VLD_Main12 (P016),
+HEVC_VLD_Main_444 (AYUV), Main10_444 (Y410) and Main12_444 (Y416), as Chromium's D3D11 decoder (Chrome, Edge) picks
+them. Through virgl to the host's VA-API (virglrenderer 0015, nvidia-vaapi-driver 0006 on NVDEC):
+- DxvaDecode: DXVA_PicParams_HEVC_RangeExt (the SDK's layout: 16-bit flags, persistent_rice and
+  high_precision_offsets in the other order than VA's) into fields appended to pipe_h265_picture_desc and
+  virgl_h265_picture_desc (VA's flag order; the union's size stays AV1's). One gallium profile for 4:4:4
+  (HEVC_MAIN_444): the output format names the depth
+- P016 textures as NV12/P010 ones (two planes, 16-bit)
+- AYUV/Y410/Y416 textures are RGBA textures (R8G8B8A8, R10G10B10A2, R16G16B16A16; the D3D layouts: AYUV V, U, Y, A,
+  Y410/Y416 U, Y, V, A), so views, maps and copies are the ordinary ones. The decoder gives each array slice a video
+  buffer of that RGBA format (the host packs the picture into it), copied into the slice after each frame; the codec
+  is created 4:4:4. The video processor takes them as YUV: the slice wrapped as a video buffer whose Y, U and V
+  component views are swizzles of it
+Tested in the spike with an ffmpeg patched for these GUIDs (upstream's DXVA code has only HEVC Main/Main10): the
+FATE suite's 4:4:4 RExt clips (QMATRIX_A, IPCM_B, PERSIST_RPARAM_A, SAO_A) and x265 encodes (4:4:4 8/10/12-bit,
+4:2:0 12-bit) bit-exact against libavcodec through d3d11va.
+ponytail: D3D11 only (the D3D9/DXVA2 path offers NV12 profiles); 4:4:4 progressive only in the video processor.
+
+diff --git a/src/gallium/drivers/virgl/virgl_video.c b/src/gallium/drivers/virgl/virgl_video.c
+index db61809..1915918 100644
+--- a/src/gallium/drivers/virgl/virgl_video.c
++++ b/src/gallium/drivers/virgl/virgl_video.c
+@@ -407,6 +407,16 @@ static int fill_h265_picture_desc(const struct pipe_picture_desc *desc,
+     ITEM_SET(vh265, h265, UseRefPicList);
+     ITEM_SET(vh265, h265, UseStRpsBits);
+ 
++    /* range extensions (WinBoat) */
++    ITEM_SET(vh265, h265, rext_flags);
++    ITEM_SET(vh265, h265, diff_cu_chroma_qp_offset_depth);
++    ITEM_SET(vh265, h265, chroma_qp_offset_list_len_minus1);
++    ITEM_SET(vh265, h265, log2_sao_offset_scale_luma);
++    ITEM_SET(vh265, h265, log2_sao_offset_scale_chroma);
++    ITEM_SET(vh265, h265, log2_max_transform_skip_block_size_minus2);
++    ITEM_CPY(vh265, h265, cb_qp_offset_list);
++    ITEM_CPY(vh265, h265, cr_qp_offset_list);
++
+     return 0;
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/DxvaDecode.cpp b/src/gallium/frontends/d3d10umd/DxvaDecode.cpp
+index 5da429d..19388d7 100644
+--- a/src/gallium/frontends/d3d10umd/DxvaDecode.cpp
++++ b/src/gallium/frontends/d3d10umd/DxvaDecode.cpp
+@@ -381,6 +381,25 @@ HEVCPicture(DxvaDecoder *dec)
+    d->NumPocTotalCurr = d->NumPocStCurrBefore + d->NumPocStCurrAfter + d->NumPocLtCurr;
+    /* ponytail: no per-slice reference lists (the short slice format has none): NVIDIA's VA-API driver builds them
+     * from the reference sets, Mesa's (AMD) read RefPicList - those need the slice headers parsed */
++
++   /* The range extension profiles' parameters after the base ones, the flags into VA's order */
++   static_assert(sizeof(DxvaPicParams_HEVC_RangeExt) == sizeof(DxvaPicParams_HEVC) + 21, "DXVA_PicParams_HEVC_RangeExt");
++   if (dec->pic_params.size() >= sizeof(DxvaPicParams_HEVC_RangeExt)) {
++      const DxvaPicParams_HEVC_RangeExt *r = (const DxvaPicParams_HEVC_RangeExt *)dec->pic_params.data();
++      d->rext_flags = r->transform_skip_rotation_enabled_flag << 0 | r->transform_skip_context_enabled_flag << 1 |
++                      r->implicit_rdpcm_enabled_flag << 2 | r->explicit_rdpcm_enabled_flag << 3 |
++                      r->extended_precision_processing_flag << 4 | r->intra_smoothing_disabled_flag << 5 |
++                      r->high_precision_offsets_enabled_flag << 6 | r->persistent_rice_adaptation_enabled_flag << 7 |
++                      r->cabac_bypass_alignment_enabled_flag << 8 | r->cross_component_prediction_enabled_flag << 9 |
++                      r->chroma_qp_offset_list_enabled_flag << 10;
++      d->diff_cu_chroma_qp_offset_depth = r->diff_cu_chroma_qp_offset_depth;
++      d->chroma_qp_offset_list_len_minus1 = r->chroma_qp_offset_list_len_minus1;
++      d->log2_sao_offset_scale_luma = r->log2_sao_offset_scale_luma;
++      d->log2_sao_offset_scale_chroma = r->log2_sao_offset_scale_chroma;
++      d->log2_max_transform_skip_block_size_minus2 = r->log2_max_transform_skip_block_size_minus2;
++      memcpy(d->cb_qp_offset_list, r->cb_qp_offset_list, sizeof d->cb_qp_offset_list);
++      memcpy(d->cr_qp_offset_list, r->cr_qp_offset_list, sizeof d->cr_qp_offset_list);
++   }
+    return true;
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/DxvaDecode.h b/src/gallium/frontends/d3d10umd/DxvaDecode.h
+index 9c8adb4..283267f 100644
+--- a/src/gallium/frontends/d3d10umd/DxvaDecode.h
++++ b/src/gallium/frontends/d3d10umd/DxvaDecode.h
+@@ -212,6 +212,32 @@ struct DxvaPicParams_HEVC {
+    uint32_t StatusReportFeedbackNumber;
+ };
+ 
++/* DXVA_PicParams_HEVC_RangeExt (the range extension profiles: Main12, Main_444, Main10_444, Main12_444): the base
++ * parameters, then these. The flags' bit order isn't VA's: persistent_rice (6) and high_precision_offsets (7) swap */
++struct DxvaPicParams_HEVC_RangeExt {
++   DxvaPicParams_HEVC params;
++   uint16_t transform_skip_rotation_enabled_flag : 1;
++   uint16_t transform_skip_context_enabled_flag : 1;
++   uint16_t implicit_rdpcm_enabled_flag : 1;
++   uint16_t explicit_rdpcm_enabled_flag : 1;
++   uint16_t extended_precision_processing_flag : 1;
++   uint16_t intra_smoothing_disabled_flag : 1;
++   uint16_t persistent_rice_adaptation_enabled_flag : 1;
++   uint16_t high_precision_offsets_enabled_flag : 1;
++   uint16_t cabac_bypass_alignment_enabled_flag : 1;
++   uint16_t cross_component_prediction_enabled_flag : 1;
++   uint16_t chroma_qp_offset_list_enabled_flag : 1;
++   uint16_t ReservedBits8 : 5;
++   uint8_t diff_cu_chroma_qp_offset_depth;
++   uint8_t log2_sao_offset_scale_luma;
++   uint8_t log2_sao_offset_scale_chroma;
++   uint8_t log2_max_transform_skip_block_size_minus2;
++   int8_t cb_qp_offset_list[6];
++   int8_t cr_qp_offset_list[6];
++   uint8_t chroma_qp_offset_list_len_minus1;
++   uint16_t ReservedBits9;
++};
++
+ struct DxvaQmatrix_HEVC {
+    uint8_t ucScalingLists0[6][16];
+    uint8_t ucScalingLists1[6][64];
+@@ -584,6 +610,16 @@ static const VideoProfileInfo PROFILES[] = {
+     PIPE_VIDEO_PROFILE_HEVC_MAIN, DXGI_FORMAT_NV12, CODEC_HEVC},
+    {{0x107af0e0, 0xef1a, 0x4d19, {0xab, 0xa8, 0x67, 0xa1, 0x63, 0x07, 0x3d, 0x13}}, /* HEVC_VLD_MAIN10 */
+     PIPE_VIDEO_PROFILE_HEVC_MAIN_10, DXGI_FORMAT_P010, CODEC_HEVC},
++   /* the range extensions (DXVA_ModeHEVC_VLD_*, as d3d12video.h's D3D12_VIDEO_DECODE_PROFILE_HEVC_*): 12-bit 4:2:0
++    * and 4:4:4 at 8, 10 and 12 bits (one gallium profile, the output format names the depth) */
++   {{0x1a72925f, 0x0c2c, 0x4f15, {0x96, 0xfb, 0xb1, 0x7d, 0x14, 0x73, 0x60, 0x3f}}, /* HEVC_VLD_MAIN12 */
++    PIPE_VIDEO_PROFILE_HEVC_MAIN_12, DXGI_FORMAT_P016, CODEC_HEVC},
++   {{0x4008018f, 0xf537, 0x4b36, {0x98, 0xcf, 0x61, 0xaf, 0x8a, 0x2c, 0x1a, 0x33}}, /* HEVC_VLD_MAIN_444 */
++    PIPE_VIDEO_PROFILE_HEVC_MAIN_444, DXGI_FORMAT_AYUV, CODEC_HEVC},
++   {{0x0dabeffa, 0x4458, 0x4602, {0xbc, 0x03, 0x07, 0x95, 0x65, 0x9d, 0x61, 0x7c}}, /* HEVC_VLD_MAIN10_444 */
++    PIPE_VIDEO_PROFILE_HEVC_MAIN_444, DXGI_FORMAT_Y410, CODEC_HEVC},
++   {{0x9798634d, 0xfe9d, 0x48e5, {0xb4, 0xda, 0xdb, 0xec, 0x45, 0xb3, 0xdf, 0x01}}, /* HEVC_VLD_MAIN12_444 */
++    PIPE_VIDEO_PROFILE_HEVC_MAIN_444, DXGI_FORMAT_Y416, CODEC_HEVC},
+    {{0x463707f8, 0xa1d0, 0x4585, {0x87, 0x6d, 0x83, 0xaa, 0x6d, 0x60, 0xb8, 0x9e}}, /* VP9_VLD_PROFILE0 */
+     PIPE_VIDEO_PROFILE_VP9_PROFILE0, DXGI_FORMAT_NV12, CODEC_VP9},
+    {{0xa4c749ef, 0x6ecf, 0x48aa, {0x84, 0x48, 0x50, 0xa7, 0xa1, 0x16, 0x5f, 0xf7}}, /* VP9_VLD_10BIT_PROFILE2 */
+diff --git a/src/gallium/frontends/d3d10umd/Format.cpp b/src/gallium/frontends/d3d10umd/Format.cpp
+index 0b6ed42..cd966f2 100644
+--- a/src/gallium/frontends/d3d10umd/Format.cpp
++++ b/src/gallium/frontends/d3d10umd/Format.cpp
+@@ -225,6 +225,15 @@ FormatTranslate(DXGI_FORMAT Format, BOOL depth)
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return PIPE_FORMAT_R10G10B10A2_UNORM;
++
++   /* the packed 4:4:4 video formats: the RGBA textures their views see (AYUV: V, U, Y, A; Y410 and Y416: U, Y, V,
++    * A), Video.cpp decodes into them and reads them as YUV */
++   case DXGI_FORMAT_AYUV:
++      return PIPE_FORMAT_R8G8B8A8_UNORM;
++   case DXGI_FORMAT_Y410:
++      return PIPE_FORMAT_R10G10B10A2_UNORM;
++   case DXGI_FORMAT_Y416:
++      return PIPE_FORMAT_R16G16B16A16_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+       return PIPE_FORMAT_R10G10B10A2_UINT;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+index 7c40cdd..bfb2824 100644
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -217,7 +217,8 @@ struct Resource
+    struct pipe_transfer **transfers;
+    struct pipe_stream_output_target *so_target;
+    struct ResourceShadow *shadows;   /* 3D read maps, slice by slice (ResourceMap); NV12/P010 maps (Video.cpp) */
+-   struct VideoSurface *video;       /* NV12/P010 textures: each array slice's planes (Video.cpp) */
++   struct VideoSurface *video;       /* NV12/P010/P016 textures: each array slice's planes (Video.cpp) */
++   struct pipe_video_buffer **decoded; /* AYUV/Y410/Y416 decoder output: each array slice's picture (Video.cpp) */
+    void *sysmem;                     /* decoder buffers: the memory programs fill and the decoder reads */
+    UINT sysmem_size;
+ };
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index 4683381..f35ea15 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -6,7 +6,8 @@
+  *    Decoding: programs (players, browsers, ffmpeg's d3d11va, Media Foundation) hand the decoder DXVA picture
+  *    parameters and bitstream buffers. They become gallium picture descriptions for virgl's video codec, which runs
+  *    them on the host's VA-API driver (NVDEC through nvidia-vaapi-driver, or Mesa's). H.264, HEVC Main and Main 10 and
+- *    VP9 profiles 0 and 2, as far as the host decodes them: only those are listed. Short slice formats only (no slice
++ *    VP9 profiles 0 and 2, HEVC's range extensions (Main 12, Main 4:4:4 at 8, 10 and 12 bits), as far as the host decodes them:
++ *    only those are listed. Short slice formats only (no slice
+  *    headers to parse).
+  *
+  *    NV12 and P010 textures: each array slice is a gallium video buffer whose planes are separate R8 and R8G8 (R16,
+@@ -100,7 +101,7 @@ FlushVideo(Device *pDevice)
+  */
+ 
+ struct VideoSurface {
+-   enum pipe_format format;          /* PIPE_FORMAT_NV12 or P010 */
++   enum pipe_format format;          /* PIPE_FORMAT_NV12, P010 or P016 */
+    unsigned width, height;           /* the texture's (decoder output planes are macroblock-aligned: larger) */
+    unsigned slices;
+    unsigned bpp;                     /* bytes per luma sample */
+@@ -118,7 +119,17 @@ Plane(const VideoSurface *v, unsigned slice, unsigned plane)
+ static bool
+ IsVideoFormat(DXGI_FORMAT Format)
+ {
+-   return Format == DXGI_FORMAT_NV12 || Format == DXGI_FORMAT_P010;
++   return Format == DXGI_FORMAT_NV12 || Format == DXGI_FORMAT_P010 || Format == DXGI_FORMAT_P016;
++}
++
++/* The packed 4:4:4 formats (AYUV, Y410, Y416): plain RGBA textures (Format.cpp); the decoder's pictures are video
++ * buffers of that RGBA format the host fills (packed from its planes), copied into the texture's slice. Their
++ * format, PIPE_FORMAT_NONE for the others */
++static enum pipe_format
++PackedFormat(DXGI_FORMAT Format)
++{
++   return Format == DXGI_FORMAT_AYUV || Format == DXGI_FORMAT_Y410 || Format == DXGI_FORMAT_Y416
++             ? FormatTranslate(Format, false) : PIPE_FORMAT_NONE;
+ }
+ 
+ static enum pipe_resource_usage
+@@ -138,7 +149,7 @@ PipeUsage(D3D10_DDI_RESOURCE_USAGE usage)
+ static struct pipe_video_buffer *
+ CreatePlaneBuffer(Device *pDevice, const struct pipe_video_buffer *tmpl, enum pipe_resource_usage usage)
+ {
+-   bool ten = tmpl->buffer_format == PIPE_FORMAT_P010;
++   bool ten = tmpl->buffer_format != PIPE_FORMAT_NV12;   /* P010, P016 */
+    const enum pipe_format formats[2] = {ten ? PIPE_FORMAT_R16_UNORM : PIPE_FORMAT_R8_UNORM,
+                                         ten ? PIPE_FORMAT_R16G16_UNORM : PIPE_FORMAT_R8G8_UNORM};
+    struct pipe_resource *resources[VL_NUM_COMPONENTS] = {};
+@@ -217,11 +228,13 @@ VideoCreateResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_CREATERESOURCE *
+       return true;
+    }
+    VideoLog("CreateResource: %s %ux%u, %u slices, bind 0x%x usage %u, initial data %p\n",
+-            pCreateResource->Format == DXGI_FORMAT_P010 ? "P010" : "NV12", pCreateResource->pMipInfoList[0].TexelWidth,
++            pCreateResource->Format == DXGI_FORMAT_P010 ? "P010" : pCreateResource->Format == DXGI_FORMAT_P016 ? "P016" : "NV12",
++            pCreateResource->pMipInfoList[0].TexelWidth,
+             pCreateResource->pMipInfoList[0].TexelHeight, pCreateResource->ArraySize, pCreateResource->BindFlags,
+             pCreateResource->Usage, pCreateResource->pInitialDataUP);
+-   v->format = pCreateResource->Format == DXGI_FORMAT_P010 ? PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
+-   v->bpp = v->format == PIPE_FORMAT_P010 ? 2 : 1;
++   v->format = pCreateResource->Format == DXGI_FORMAT_P010 ? PIPE_FORMAT_P010
++             : pCreateResource->Format == DXGI_FORMAT_P016 ? PIPE_FORMAT_P016 : PIPE_FORMAT_NV12;
++   v->bpp = v->format == PIPE_FORMAT_NV12 ? 1 : 2;
+    v->width = pCreateResource->pMipInfoList[0].TexelWidth;
+    v->height = pCreateResource->pMipInfoList[0].TexelHeight;
+    v->slices = slices;
+@@ -260,6 +273,13 @@ VideoDestroyResource(Resource *pResource)
+ {
+    free(pResource->sysmem);
+    pResource->sysmem = NULL;
++   for (unsigned s = 0; pResource->decoded && s < pResource->resource->array_size; s++) {
++      if (pResource->decoded[s]) {
++         pResource->decoded[s]->destroy(pResource->decoded[s]);
++      }
++   }
++   free(pResource->decoded);
++   pResource->decoded = NULL;
+    VideoSurface *v = pResource->video;
+    if (!v) {
+       return;
+@@ -507,7 +527,7 @@ ProcessorFormat(DXGI_FORMAT Format)
+ bool
+ VideoFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps)
+ {
+-   if (!IsVideoFormat(Format)) {
++   if (!IsVideoFormat(Format) && PackedFormat(Format) == PIPE_FORMAT_NONE) {
+       return false;
+    }
+    /* shader views of the planes, the video processor's input, and decoder output for the profiles in this format */
+@@ -687,7 +707,8 @@ CreateVideoDecoder(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREATEVIDEODECO
+    struct pipe_video_codec templat = {};
+    templat.profile = p->profile;
+    templat.entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+-   templat.chroma_format = PIPE_VIDEO_CHROMA_FORMAT_420;
++   templat.chroma_format = PackedFormat(p->format) != PIPE_FORMAT_NONE ? PIPE_VIDEO_CHROMA_FORMAT_444
++                                                                     : PIPE_VIDEO_CHROMA_FORMAT_420;
+    templat.width = pCreate->Desc.SampleWidth;
+    templat.height = pCreate->Desc.SampleHeight;
+    templat.max_references = 16;
+@@ -727,7 +748,10 @@ CreateVideoDecoderOutputView(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREAT
+                              D3D11_1DDI_HVIDEODECODEROUTPUTVIEW hView, D3D11_1DDI_HRTVIDEODECODEROUTPUTVIEW hRTView)
+ {
+    Resource *pResource = CastResource(pCreate->hDrvResource);
+-   if (!pResource->video || pCreate->FirstArraySlice >= pResource->video->slices) {
++   unsigned slices = pResource->video ? pResource->video->slices
++                   : PackedFormat(pResource->Format) != PIPE_FORMAT_NONE && pResource->resource
++                      ? pResource->resource->array_size : 0;
++   if (pCreate->FirstArraySlice >= slices) {
+       return E_INVALIDARG;
+    }
+    VideoDecoderOutputView *view = static_cast<VideoDecoderOutputView *>(hView.pDrvPrivate);
+@@ -801,13 +825,32 @@ VideoDecoderSubmitBuffers(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder,
+    return S_OK;
+ }
+ 
+-/* The picture a DXVA surface index names: in D3D11 the decoder output texture's array slice */
++/* The picture a DXVA surface index names: in D3D11 the decoder output texture's array slice (AYUV/Y410/Y416: the
++ * slice's own video buffer, made on its first use) */
+ static struct pipe_video_buffer *
+ Surface(DxvaDecoder *d, unsigned index)
+ {
+    VideoDecoder *dec = static_cast<VideoDecoder *>(d);
+-   VideoSurface *v = dec->target->video;
+-   return index < v->slices ? v->buffers[index] : NULL;
++   Resource *r = dec->target;
++   VideoSurface *v = r->video;
++   if (v) {
++      return index < v->slices ? v->buffers[index] : NULL;
++   }
++   if (index >= r->resource->array_size) {
++      return NULL;
++   }
++   if (!r->decoded) {
++      r->decoded = (struct pipe_video_buffer **)calloc(r->resource->array_size, sizeof *r->decoded);
++   }
++   if (r->decoded && !r->decoded[index]) {
++      struct pipe_context *vpipe = dec->codec->context;
++      struct pipe_video_buffer tmpl = {};
++      tmpl.buffer_format = r->resource->format;
++      tmpl.width = r->resource->width0;
++      tmpl.height = r->resource->height0;
++      r->decoded[index] = vpipe->create_video_buffer(vpipe, &tmpl);
++   }
++   return r->decoded ? r->decoded[index] : NULL;
+ }
+ 
+ static void APIENTRY
+@@ -827,6 +870,15 @@ VideoDecoderEndFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder)
+    }
+    FlushDevice(pDevice);
+    DxvaDecode(dec, target);
++   /* AYUV/Y410/Y416: the picture into the texture's slice */
++   if (!dec->target->video) {
++      struct pipe_resource *res[VL_NUM_COMPONENTS] = {};
++      target->get_resources(target, res);
++      struct pipe_resource *dst = dec->target->resource;
++      struct pipe_box box;
++      u_box_3d(0, 0, 0, MIN2(dst->width0, res[0]->width0), MIN2(dst->height0, res[0]->height0), 1, &box);
++      dec->codec->context->resource_copy_region(dec->codec->context, dst, 0, 0, 0, dec->slice, res[0], 0, &box);
++   }
+    FlushVideo(pDevice);
+    dec->target = NULL;
+ }
+@@ -867,6 +919,7 @@ struct VideoProcessorInputView {
+    Resource *resource;
+    unsigned slice;
+    struct pipe_sampler_view *rgb;   /* RGB input (on the video context) */
++   struct pipe_video_buffer *packed; /* AYUV/Y410/Y416 input: the slice as a video buffer, Y, U, V swizzled out */
+ };
+ 
+ struct VideoProcessorOutputView {
+@@ -903,7 +956,7 @@ static void APIENTRY
+ CheckVideoProcessorFormat(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSORENUM hEnum, DXGI_FORMAT Format,
+                           UINT *pSupport)
+ {
+-   *pSupport = IsVideoFormat(Format) ? D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT
++   *pSupport = IsVideoFormat(Format) || PackedFormat(Format) != PIPE_FORMAT_NONE ? D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT
+              : ProcessorFormat(Format) ? D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT |
+                                              D3D11_1DDI_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT
+                                        : 0;
+@@ -1064,6 +1117,35 @@ CreateVideoProcessorInputView(D3D10DDI_HDEVICE hDevice, const D3D11_1DDIARG_CREA
+       return view->slice < pResource->video->slices ? S_OK : E_INVALIDARG;
+    }
+    struct pipe_context *vpipe = VideoPipe(pDevice);
++   enum pipe_format packed = PackedFormat(pResource->Format);
++   if (vpipe && packed != PIPE_FORMAT_NONE && pResource->resource && view->slice < pResource->resource->array_size) {
++      struct pipe_resource *res[VL_NUM_COMPONENTS] = {};
++      pipe_resource_reference(&res[0], pResource->resource);
++      struct pipe_video_buffer tmpl = {};
++      tmpl.buffer_format = packed;
++      tmpl.width = res[0]->width0;
++      tmpl.height = res[0]->height0;
++      view->packed = vl_video_buffer_create_ex2(vpipe, &tmpl, res);
++      if (!view->packed) {
++         pipe_resource_reference(&res[0], NULL);
++         return E_OUTOFMEMORY;
++      }
++      /* the components in the texture: AYUV V, U, Y, A; Y410/Y416 U, Y, V, A */
++      static const unsigned char ayuv[3] = {PIPE_SWIZZLE_Z, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_X};
++      static const unsigned char uyva[3] = {PIPE_SWIZZLE_Y, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Z};
++      const unsigned char *swizzle = pResource->Format == DXGI_FORMAT_AYUV ? ayuv : uyva;
++      struct vl_video_buffer *buf = (struct vl_video_buffer *)view->packed;
++      for (unsigned c = 0; c < 3; c++) {
++         struct pipe_sampler_view templat;
++         u_sampler_view_default_template(&templat, res[0], res[0]->format);
++         templat.target = PIPE_TEXTURE_2D_ARRAY;
++         templat.u.tex.first_layer = templat.u.tex.last_layer = view->slice;
++         templat.swizzle_r = templat.swizzle_g = templat.swizzle_b = swizzle[c];
++         templat.swizzle_a = PIPE_SWIZZLE_1;
++         buf->sampler_view_components[c] = vpipe->create_sampler_view(vpipe, res[0], &templat);
++      }
++      return S_OK;
++   }
+    if (!vpipe || !ProcessorFormat(pResource->Format) || !pResource->resource) {
+       VideoLog("CreateVideoProcessorInputView: format %u isn't one of ours\n", pResource->Format);
+       return E_INVALIDARG;
+@@ -1082,6 +1164,9 @@ DestroyVideoProcessorInputView(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCES
+ {
+    VideoProcessorInputView *view = static_cast<VideoProcessorInputView *>(hView.pDrvPrivate);
+    pipe_sampler_view_reference(&view->rgb, NULL);
++   if (view->packed) {
++      view->packed->destroy(view->packed);
++   }
+ }
+ 
+ static SIZE_T APIENTRY
+@@ -1443,7 +1528,7 @@ VideoProcessorBlt(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcesso
+          src = Rect(vp->stream.src);
+       }
+       struct u_rect dst_area = vp->stream.dst_enabled ? Rect(vp->stream.dst) : target;
+-      struct pipe_video_buffer *picture = v ? v->buffers[in->slice] : NULL;
++      struct pipe_video_buffer *picture = v ? v->buffers[in->slice] : in->packed;
+       if (v && vp->stream.frame_format != D3D11_1DDI_VIDEO_FRAME_FORMAT_PROGRESSIVE) {
+          /* OutputIndex 0 the first field, 1 the second (the frame rate doubled). Motion-adaptive with the opposite
+           * fields around it: the first field's are the frame before's second and its own, the second's its own
+@@ -1474,14 +1559,16 @@ VideoProcessorBlt(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCESSOR hProcesso
+             picture = f;
+          }
+       }
+-      if (v) {
++      if (picture) {
+          /* YCbCr_Matrix: 0 BT.601, 1 BT.709; Nominal_Range 2: full range (0-255) input */
+          vl_csc_matrix csc;
+          enum VL_CSC_COLOR_STANDARD standard = vp->stream.color_space.YCbCr_Matrix ? VL_CSC_COLOR_STANDARD_BT_709
+                                                                                   : VL_CSC_COLOR_STANDARD_BT_601;
+          vl_csc_get_matrix(standard, NULL, vp->stream.color_space.Nominal_Range != 2, &csc);
+          vl_compositor_set_csc_matrix(&c->state, (const vl_csc_matrix *)&csc, 1.0f, 0.0f);
+-         ComponentViews(vpipe, picture);
++         if (v) {
++            ComponentViews(vpipe, picture);
++         }
+          vl_compositor_set_buffer_layer(&c->state, &c->compositor, layers, picture, &src, NULL, VL_COMPOSITOR_NONE);
+       } else {
+          vl_compositor_set_rgba_layer(&c->state, &c->compositor, layers, in->rgb, &src, NULL, NULL);
+diff --git a/src/gallium/include/pipe/p_video_state.h b/src/gallium/include/pipe/p_video_state.h
+index 0b04393..38523d9 100644
+--- a/src/gallium/include/pipe/p_video_state.h
++++ b/src/gallium/include/pipe/p_video_state.h
+@@ -1266,6 +1266,17 @@ struct pipe_h265_picture_desc
+       uint32_t slice_data_offset[PIPE_H265_MAX_SLICES];
+       enum pipe_slice_buffer_placement_type slice_data_flag[PIPE_H265_MAX_SLICES];
+    } slice_parameter;
++
++   /* Range extensions (4:4:4, 12 bits; DXVA's DXVA_PicParams_HEVC_RangeExt, WinBoat): the flags in VA's
++    * VAPictureParameterBufferHEVCRext bit order */
++   uint32_t rext_flags;
++   uint8_t diff_cu_chroma_qp_offset_depth;
++   uint8_t chroma_qp_offset_list_len_minus1;
++   uint8_t log2_sao_offset_scale_luma;
++   uint8_t log2_sao_offset_scale_chroma;
++   uint8_t log2_max_transform_skip_block_size_minus2;
++   int8_t cb_qp_offset_list[6];
++   int8_t cr_qp_offset_list[6];
+ };
+ 
+ struct pipe_mjpeg_picture_desc
+diff --git a/src/virtio/virtio-gpu/virgl_video_hw.h b/src/virtio/virtio-gpu/virgl_video_hw.h
+index 242ebed..b5d2c64 100644
+--- a/src/virtio/virtio-gpu/virgl_video_hw.h
++++ b/src/virtio/virtio-gpu/virgl_video_hw.h
+@@ -394,6 +394,17 @@ struct virgl_h265_picture_desc
+ 
+    uint8_t RefPicList[2][15];
+    uint8_t reserved[2];
++
++   /* Range extensions (4:4:4, 12 bits; WinBoat): the flags in VAPictureParameterBufferHEVCRext's bit order */
++   uint32_t rext_flags;
++   uint8_t diff_cu_chroma_qp_offset_depth;
++   uint8_t chroma_qp_offset_list_len_minus1;
++   uint8_t log2_sao_offset_scale_luma;
++   uint8_t log2_sao_offset_scale_chroma;
++   uint8_t log2_max_transform_skip_block_size_minus2;
++   int8_t cb_qp_offset_list[6];
++   int8_t cr_qp_offset_list[6];
++   uint8_t reserved_rext[3];
+ };
+ 
+ struct virgl_h265_enc_seq_param

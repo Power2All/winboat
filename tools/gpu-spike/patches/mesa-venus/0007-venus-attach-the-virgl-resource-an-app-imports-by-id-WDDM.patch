@@ -1,0 +1,144 @@
+From: WinBoat
+Subject: [PATCH] venus: attach the virgl resource an app imports by id (WDDM)
+
+An app can allocate memory of a host virgl resource it names (VkImportMemoryResourceInfoMESA: WinBoat's D3D12 driver
+for its swap chain buffers, whose host textures are Vulkan memory). The host looks the resource up in the Venus
+context, and on Linux the kernel driver attaches it there; the WDDM kernel driver doesn't. A renderer op,
+attach_resource, does it first (WDDM: the kernel driver's VIOGPU_RES_ATTACH escape, which takes only resources made
+to be shared, kvm-guest-drivers-windows 0022), then a ring roundtrip has the renderer see the attach (it goes the
+way submissions do, the ring's commands don't) before the import, as for dma-buf imports. Such an allocation is
+waited for rather than sent asynchronously, so the app learns whether the renderer could import it (virglrenderer
+image patch 0012 answers an unknown id with an error, not a lost context) and can do without.
+---
+diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
+index 8b6eb4c..5039267 100644
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -391,7 +391,27 @@ vn_AllocateMemory(VkDevice device,
+       result = vn_device_memory_import_dma_buf(dev, mem, pAllocateInfo,
+                                                import_fd_info->fd);
+    } else {
+-      result = vn_device_memory_alloc(dev, mem, pAllocateInfo);
++      /* memory of a virgl resource the app names (WinBoat's D3D12 swap chain buffers): the resource joins the
++       * context first */
++      const VkImportMemoryResourceInfoMESA *import_res_info =
++         (const VkImportMemoryResourceInfoMESA *)__vk_find_struct(
++            (void *)pAllocateInfo->pNext,
++            VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
++      result = import_res_info ? vn_renderer_attach_resource(
++                                    dev->renderer, import_res_info->resourceId)
++                               : VK_SUCCESS;
++      /* the attach goes to the renderer the way submissions do, the ring's commands don't: a roundtrip (a
++       * submission) has it seen before the import, as with dma-buf imports */
++      if (import_res_info && result == VK_SUCCESS)
++         vn_ring_roundtrip(dev->primary_ring);
++      /* and waited for: the app learns whether the renderer could import it (and can do without) */
++      if (import_res_info && result == VK_SUCCESS) {
++         VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
++         result = vn_call_vkAllocateMemory(dev->primary_ring, device,
++                                           pAllocateInfo, NULL, &mem_handle);
++      } else if (result == VK_SUCCESS) {
++         result = vn_device_memory_alloc(dev, mem, pAllocateInfo);
++      }
+       if (result == VK_SUCCESS)
+          vn_wsi_memory_info_init(mem, pAllocateInfo);
+    }
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index 836ec52..cb94ef1 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -153,6 +153,10 @@ struct vn_renderer_bo_ops {
+ 
+    bool (*destroy)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
+ 
++   /* A virgl resource the app names (VkImportMemoryResourceInfoMESA) to the renderer's context, where the kernel
++    * driver doesn't attach it itself (WDDM); NULL: nothing to do */
++   VkResult (*attach_resource)(struct vn_renderer *renderer, uint32_t res_id);
++
+    int (*export_dma_buf)(struct vn_renderer *renderer,
+                          struct vn_renderer_bo *bo);
+ 
+@@ -334,6 +338,14 @@ vn_renderer_bo_create_from_device_memory(
+    return VK_SUCCESS;
+ }
+ 
++static inline VkResult
++vn_renderer_attach_resource(struct vn_renderer *renderer, uint32_t res_id)
++{
++   return renderer->bo_ops.attach_resource
++             ? renderer->bo_ops.attach_resource(renderer, res_id)
++             : VK_SUCCESS;
++}
++
+ static inline VkResult
+ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
+                                    VkDeviceSize size,
+diff --git a/src/virtio/vulkan/vn_renderer_wddm.c b/src/virtio/vulkan/vn_renderer_wddm.c
+index 47cc49e..a7f3122 100644
+--- a/src/virtio/vulkan/vn_renderer_wddm.c
++++ b/src/virtio/vulkan/vn_renderer_wddm.c
+@@ -137,6 +137,21 @@ wddm_blob_map(struct wddm *gpu, uint32_t res_id)
+    return (void *)(uintptr_t)esc.BlobMap.Address;
+ }
+ 
++/* the kernel driver attaches only resources made to be shared with Venus */
++static VkResult
++wddm_attach_resource(struct vn_renderer *renderer, uint32_t res_id)
++{
++   struct wddm *gpu = (struct wddm *)renderer;
++   VIOGPU_ESCAPE esc = {
++      .ResAttach = {
++         .ResId = res_id,
++      },
++   };
++   return NT_SUCCESS(wddm_escape(gpu, &esc, VIOGPU_RES_ATTACH, sizeof(esc.ResAttach)))
++             ? VK_SUCCESS
++             : VK_ERROR_INVALID_EXTERNAL_HANDLE;
++}
++
+ static void
+ wddm_blob_destroy(struct wddm *gpu, uint32_t res_id)
+ {
+@@ -907,6 +922,7 @@ wddm_init(struct wddm *gpu)
+       wddm_bo_create_from_device_memory;
+    gpu->base.bo_ops.create_from_dma_buf = wddm_bo_create_from_dma_buf;
+    gpu->base.bo_ops.destroy = wddm_bo_destroy;
++   gpu->base.bo_ops.attach_resource = wddm_attach_resource;
+    gpu->base.bo_ops.export_dma_buf = wddm_bo_export_dma_buf;
+    gpu->base.bo_ops.export_sync_file = wddm_bo_export_sync_file;
+    gpu->base.bo_ops.map = wddm_bo_map;
+diff --git a/src/virtio/wddm/viogpu_wddm_driver.h b/src/virtio/wddm/viogpu_wddm_driver.h
+index ae1261e..53c8c29 100644
+--- a/src/virtio/wddm/viogpu_wddm_driver.h
++++ b/src/virtio/wddm/viogpu_wddm_driver.h
+@@ -71,6 +71,7 @@ typedef struct _VIOGPU_ADAPTERINFO {
+ #define VIOGPU_BLOB_MAP              0x301
+ #define VIOGPU_BLOB_DESTROY          0x302
+ #define VIOGPU_EXECBUFFER            0x303
++#define VIOGPU_RES_ATTACH            0x304
+ 
+ 
+ #pragma pack(1)
+@@ -172,6 +173,14 @@ typedef struct _VIOGPU_EXECBUFFER_REQ
+ #pragma pack()
+ #define VIOGPU_EXECBUFFER_MAX_SIZE (512 * 1024)
+ 
++// A resource made to be shared with Venus (the D3D12 driver's swap chain buffers) to this device's context
++#pragma pack(1)
++typedef struct _VIOGPU_RES_ATTACH_REQ
++{
++    ULONG ResId;
++} VIOGPU_RES_ATTACH_REQ;
++#pragma pack()
++
+ #pragma pack(1)
+ typedef struct  _VIOGPU_ESCAPE{
+     USHORT      Type;
+@@ -191,6 +200,7 @@ typedef struct  _VIOGPU_ESCAPE{
+         VIOGPU_BLOB_MAP_REQ BlobMap;
+         VIOGPU_BLOB_DESTROY_REQ BlobDestroy;
+         VIOGPU_EXECBUFFER_REQ ExecBuffer;
++        VIOGPU_RES_ATTACH_REQ ResAttach;
+     } DUMMYUNIONNAME;
+ } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
+ #pragma pack()

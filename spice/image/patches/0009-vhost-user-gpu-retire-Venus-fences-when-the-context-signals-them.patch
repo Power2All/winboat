@@ -1,0 +1,96 @@
+vhost-user-gpu: retire Venus fences when the context signals them
+
+A fence on a Venus context's ring (a Vulkan queue's timeline) retires when
+virglrenderer polls the context. vhost-user-gpu only polled on virgl's own
+poll fd, which signals for virgl's GL fences: with no OpenGL work going on, a
+Vulkan queue's fence waited for the next one (an idle desktop: forever).
+Mesa's Venus from 25.x on signals every VkFence that way (renderer syncs on
+the queue's ring), so vkWaitForFences timed out.
+
+Watch each Venus context's own poll fd (virgl_renderer_context_get_poll_fd,
+an eventfd its render server thread signals) and poll that context when it
+fires; the source goes with the context, or with all of them on a reset.
+---
+diff --git a/contrib/vhost-user-gpu/virgl.c b/contrib/vhost-user-gpu/virgl.c
+index a5d96e733..cd585278e 100644
+--- a/contrib/vhost-user-gpu/virgl.c
++++ b/contrib/vhost-user-gpu/virgl.c
+@@ -34,6 +34,13 @@ vg_virgl_update_cursor_data(VuGpu *g, uint32_t resource_id,
+     free(cursor);
+ }
+ 
++/* A Venus context's fences retire when virglrenderer polls the context; its eventfd says when */
++static void
++vg_virgl_ctx_poll(VuDev *dev, int condition, void *data)
++{
++    virgl_renderer_context_poll(GPOINTER_TO_UINT(data));
++}
++
+ static void
+ virgl_cmd_context_create(VuGpu *g,
+                          struct virtio_gpu_ctrl_command *cmd)
+@@ -48,9 +55,24 @@ virgl_cmd_context_create(VuGpu *g,
+             cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+             return;
+         }
+-        virgl_renderer_context_create_with_flags(cc.hdr.ctx_id,
+-                                                 cc.context_init,
+-                                                 cc.nlen, cc.debug_name);
++        if (virgl_renderer_context_create_with_flags(cc.hdr.ctx_id,
++                                                     cc.context_init,
++                                                     cc.nlen, cc.debug_name)) {
++            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++            return;
++        }
++        /*
++         * Its fences (on its rings) retire on virgl_renderer_poll() too, but
++         * that only runs when virgl's own GL fences signal: watch the
++         * context's eventfd, or a Vulkan queue's fence waits for GL work.
++         */
++        int fd = virgl_renderer_context_get_poll_fd(cc.hdr.ctx_id);
++        if (fd >= 0) {
++            g_hash_table_replace(g->ctx_sources, GUINT_TO_POINTER(cc.hdr.ctx_id),
++                                 vug_source_new(&g->dev, fd, G_IO_IN,
++                                                vg_virgl_ctx_poll,
++                                                GUINT_TO_POINTER(cc.hdr.ctx_id)));
++        }
+         return;
+     }
+ 
+@@ -66,6 +88,7 @@ virgl_cmd_context_destroy(VuGpu *g,
+ 
+     VUGPU_FILL_CMD(cd);
+ 
++    g_hash_table_remove(g->ctx_sources, GUINT_TO_POINTER(cd.hdr.ctx_id));
+     virgl_renderer_context_destroy(cd.hdr.ctx_id);
+ }
+ 
+@@ -797,6 +820,7 @@ vg_virgl_reset(VuGpu *g)
+         g->inflight--;
+     }
+     g_hash_table_remove_all(g->blobs); /* the frontend unmapped them */
++    g_hash_table_remove_all(g->ctx_sources);
+     virgl_renderer_reset();
+ }
+ 
+@@ -887,6 +911,8 @@ vg_virgl_init(VuGpu *g)
+     }
+ 
+     g->blobs = g_hash_table_new_full(NULL, NULL, NULL, g_free);
++    g->ctx_sources = g_hash_table_new_full(NULL, NULL, NULL,
++                                           (GDestroyNotify)vug_source_destroy);
+ 
+     /* Venus runs in virglrenderer's render server, a process of its own */
+     ret = virgl_renderer_init(g,
+diff --git a/contrib/vhost-user-gpu/vugpu.h b/contrib/vhost-user-gpu/vugpu.h
+index 6cd92237c..3f9093616 100644
+--- a/contrib/vhost-user-gpu/vugpu.h
++++ b/contrib/vhost-user-gpu/vugpu.h
+@@ -142,6 +142,7 @@ typedef struct VuGpu {
+     bool virgl_inited;
+     bool venus;        /* Venus (Vulkan) contexts, blob resources and the host-visible memory window */
+     GHashTable *blobs; /* resource id -> struct vg_blob */
++    GHashTable *ctx_sources; /* Venus context id -> GSource of its fence eventfd */
+     bool edid_inited;
+     bool use_modifiers;
+     uint32_t inflight;

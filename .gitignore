@@ -15,3 +15,16 @@ package-lock.json
 temp
 # Guest server build output (both binaries + update payload)
 guest_server/dist/
+# Built virtual GPU driver package (tools/gpu-spike/export-driver-package.sh)
+guest_server/drivers/
+# Built SPICE viewer (spice/build-viewer.sh)
+spice/viewer/
+# Standalone driver setup (tools/standalone-installer/build.sh)
+tools/standalone-installer/dist/
+# its Windows 8.1 and 7 parts (the spike's win81-package.sh, win7-package.sh) and the Universal CRT for both
+tools/standalone-installer/win81/
+tools/standalone-installer/win7/
+tools/standalone-installer/ucrt/
+# The GPU spike's test harness output (tools/gpu-spike/deploy)
+tools/gpu-spike/deploy/tools/results/
+# Release files to upload (the standalone setup and its checksums): dist/ at the top, ignored by "dist" above

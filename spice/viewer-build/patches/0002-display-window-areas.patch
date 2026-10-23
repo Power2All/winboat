@@ -1,0 +1,143 @@
+spice-widget: show a part of the display (seamless app windows)
+
+WinBoat's seamless mode shows each window of a Windows app in a Linux window of its own, like RDP's RemoteApp: every
+window is a SpiceDisplay of the same display channel that shows only that window's rectangle. Add
+spice_display_set_window_area(), which replaces the monitor's area with the given one (drawing, size and input),
+and send pointer positions for the whole display from such a widget (also outside it, clamped to the display:
+dragging the guest window by its title bar leaves the widget).
+
+Several widgets then draw every gl-draw, and each acknowledged it: the server counts one acknowledgement per client.
+Send one GL_DRAW_DONE per gl-draw.
+
+--- a/src/spice-widget.c
+--- a/src/spice-widget.c
++++ b/src/spice-widget.c
+@@ -314,6 +314,11 @@
+     int i;
+ 
+     DISPLAY_DEBUG(display, "update monitor area");
++    if (d->window_area_set) {
++        update_area(display, d->window_area.x, d->window_area.y,
++                    d->window_area.width, d->window_area.height);
++        return;
++    }
+     if (d->monitor_id < 0)
+         goto whole;
+ 
+@@ -359,6 +364,29 @@
+     set_monitor_ready(display, true);
+ }
+ 
++/**
++ * spice_display_set_window_area:
++ * @display: a #SpiceDisplay
++ * @x: left edge, in display pixels
++ * @y: top edge
++ * @width: width
++ * @height: height
++ *
++ * Shows only this part of the display, like a guest window of its own (several widgets of one display channel
++ * can each show a part). Pointer positions are sent for the whole display. Sizes of 0 show the monitor again.
++ **/
++void spice_display_set_window_area(SpiceDisplay *display, gint x, gint y, gint width, gint height)
++{
++    SpiceDisplayPrivate *d;
++
++    g_return_if_fail(SPICE_IS_DISPLAY(display));
++    d = display->priv;
++    d->window_area_set = width > 0 && height > 0;
++    d->window_area = (GdkRectangle) { .x = x, .y = y, .width = width, .height = height };
++    if (d->display)
++        spice_display_widget_update_monitor_area(display);
++}
++
+ static void
+ spice_display_set_keypress_delay(SpiceDisplay *display, guint delay)
+ {
+@@ -2164,7 +2192,21 @@
+ 
+     switch (d->mouse_mode) {
+     case SPICE_MOUSE_MODE_CLIENT:
+-        if (x >= 0 && x < d->area.width &&
++        if (d->window_area_set) {
++            /* A window area is a part of the display: positions are the display's, also outside the widget
++             * (dragging the guest window's title bar moves the pointer out of it) */
++            int width = d->canvas.width, height = d->canvas.height;
++#ifdef HAVE_EGL
++            if (egl_enabled(d)) {
++                width = d->egl.scanout.width;
++                height = d->egl.scanout.height;
++            }
++#endif
++            x = CLAMP(x + d->area.x, 0, MAX(width - 1, 0));
++            y = CLAMP(y + d->area.y, 0, MAX(height - 1, 0));
++            spice_inputs_channel_position(d->inputs, x, y, get_display_id(display),
++                                          button_mask_gdk_to_spice(motion->state));
++        } else if (x >= 0 && x < d->area.width &&
+             y >= 0 && y < d->area.height) {
+             spice_inputs_channel_position(d->inputs, x, y, get_display_id(display),
+                                           button_mask_gdk_to_spice(motion->state));
+--- a/src/spice-widget.h
++++ b/src/spice-widget.h
+@@ -89,6 +89,8 @@
+                              int nkeyvals, SpiceDisplayKeyEvent kind);
+ SPICE_GTK_AVAILABLE_IN_ALL
+ GdkPixbuf *spice_display_get_pixbuf(SpiceDisplay *display);
++SPICE_GTK_AVAILABLE_IN_ALL
++void spice_display_set_window_area(SpiceDisplay *display, gint x, gint y, gint width, gint height);
+ 
+ G_END_DECLS
+ 
+--- a/src/spice-widget-priv.h
++++ b/src/spice-widget-priv.h
+@@ -70,6 +70,9 @@
+     /* state */
+     gboolean                ready;
+     gboolean                monitor_ready;
++    /* spice_display_set_window_area(): shows this part of the display instead of the monitor's */
++    gboolean                window_area_set;
++    GdkRectangle            window_area;
+     struct {
+         enum SpiceSurfaceFmt    format;
+         gint                    width, height, stride;
+--- a/src/map-file-gtk
++++ b/src/map-file-gtk
+@@ -10,6 +10,7 @@
+ spice_display_new_with_monitor;
+ spice_display_send_keys;
+ spice_display_set_grab_keys;
++spice_display_set_window_area;
+ spice_grab_sequence_as_string;
+ spice_grab_sequence_copy;
+ spice_grab_sequence_free;
+--- a/src/channel-display.c
++++ b/src/channel-display.c
+@@ -68,6 +68,8 @@
+     int                         nstreams;
+     gboolean                    mark;
+     guint                       mark_false_event_id;
++    /* a gl-draw not acknowledged yet (several widgets may draw it) */
++    gboolean                    gl_draw_pending;
+     GArray                      *monitors;
+     guint                       monitors_max;
+     gboolean                    enable_adaptive_streaming;
+@@ -2190,6 +2192,7 @@
+ 
+     CHANNEL_DEBUG(channel, "gl draw %ux%u+%u+%u",
+                   draw->w, draw->h, draw->x, draw->y);
++    SPICE_DISPLAY_CHANNEL(channel)->priv->gl_draw_pending = TRUE;
+ 
+     g_coroutine_signal_emit(channel, signals[SPICE_DISPLAY_GL_DRAW], 0,
+                             draw->x, draw->y,
+@@ -2232,6 +2235,11 @@
+     g_return_if_fail(SPICE_IS_DISPLAY_CHANNEL(display));
+     channel = SPICE_CHANNEL(display);
+ 
++    /* The first widget that drew it acknowledges it: the server counts one per client */
++    if (!display->priv->gl_draw_pending)
++        return;
++    display->priv->gl_draw_pending = FALSE;
++
+     out = spice_msg_out_new(channel, SPICE_MSGC_DISPLAY_GL_DRAW_DONE);
+     out->marshallers->msgc_display_gl_draw_done(out->marshaller, NULL);
+     spice_msg_out_send_internal(out);

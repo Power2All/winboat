@@ -1,0 +1,73 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: skip extended operand tokens on destinations and declarations
+
+Shaders that come through the D3D11.1 DDI (patch 0007) carry minimum precision (min16float and the like) in extended
+operand tokens, also on destination operands and declarations, where the parser asserted there were none and then
+misread the instruction stream (Direct2D's pixel shaders crashed the driver). Skip them there, and walk a chain of
+extended tokens on source operands. Minimum precision is a hint; everything runs at full precision.
+---
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.c b/src/gallium/frontends/d3d10umd/ShaderParse.c
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.c
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.c
+@@ -185,6 +185,21 @@
+ 
+ #undef _
+ 
++/*
++ * Extended operand tokens follow an operand token that has the extended bit, each with the bit of a further one.
++ * Shaders through the D3D11.1 DDI have them on destination operands and declarations too: minimum precision
++ * (min16float and the like), a hint that is ignored (everything runs at full precision). Skips them.
++ */
++static void
++skip_extended_operand_tokens(const unsigned **curr, unsigned operand_token)
++{
++   bool extended = DECODE_IS_D3D10_SB_OPERAND_EXTENDED(operand_token);
++   while (extended) {
++      extended = DECODE_IS_D3D10_SB_OPERAND_EXTENDED(**curr);
++      (*curr)++;
++   }
++}
++
+ static void
+ parse_operand(const unsigned **curr,
+               struct Shader_operand *operand)
+@@ -426,8 +441,7 @@
+    /* Destination operands. */
+    for (i = 0; i < info->num_dst; i++) {
+       D3D10_SB_OPERAND_NUM_COMPONENTS num_components;
+-
+-      assert(!DECODE_IS_D3D10_SB_OPERAND_EXTENDED(*curr));
++      unsigned operand_token = *curr;
+ 
+       num_components = DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(*curr);
+       if (num_components == D3D10_SB_OPERAND_4_COMPONENT) {
+@@ -445,6 +459,7 @@
+       }
+ 
+       parse_operand(&curr, &opcode->dst[i].base);
++      skip_extended_operand_tokens(&curr, operand_token);
+       parse_operand_index(&curr, &opcode->dst[i].base);
+    }
+ 
+@@ -506,11 +521,8 @@
+       parse_operand(&curr, &opcode->src[i].base);
+ 
+       opcode->src[i].modifier = D3D10_SB_OPERAND_MODIFIER_NONE;
+-      if (extended) {
+-         /* NOTE: DECODE_IS_D3D10_SB_OPERAND_DOUBLE_EXTENDED is broken.
+-          */
+-         assert(!((*curr & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >> D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT));
+-
++      while (extended) {
++         /* The modifier (neg/abs); minimum precision bits (D3D11.1 DDI) are a hint, ignored */
+          switch (DECODE_D3D10_SB_EXTENDED_OPERAND_TYPE(*curr)) {
+          case D3D10_SB_EXTENDED_OPERAND_EMPTY:
+             break;
+@@ -523,6 +535,7 @@
+             assert(0);
+          }
+ 
++         extended = DECODE_IS_D3D10_SB_OPERAND_EXTENDED(*curr);
+          curr++;
+       }
+ 

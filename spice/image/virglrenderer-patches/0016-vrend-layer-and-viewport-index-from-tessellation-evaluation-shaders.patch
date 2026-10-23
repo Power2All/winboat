@@ -1,0 +1,125 @@
+From: WinBoat
+Subject: [PATCH] vrend: layer and viewport index from tessellation evaluation shaders
+
+Direct3D 11.3 lets any shader feeding the rasterizer write SV_RenderTargetArrayIndex and SV_ViewportArrayIndex
+(D3D11_FEATURE_DATA_D3D11_OPTIONS3), domain shaders included. Vertex shaders already have them here
+(GL_AMD_vertex_shader_layer and _viewport_index); with GL_ARB_shader_viewport_layer_array tessellation evaluation
+shaders write gl_Layer and gl_ViewportIndex too, which the new VIRGL_CAP_V2_TES_LAYER_VIEWPORT (bit 30, WinBoat's
+like RASTER_SAMPLES on bit 31) tells the guest.
+---
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -630,6 +630,9 @@
+ #define VIRGL_CAP_V2_RESOURCE_LAYOUT      (1u << 18)
+ /* WinBoat's patches (from the top down, away from upstream's bits) */
+ #define VIRGL_CAP_V2_RASTER_SAMPLES       (1u << 31)
++/* WinBoat: gl_Layer and gl_ViewportIndex written by tessellation evaluation shaders too
++ * (GL_ARB_shader_viewport_layer_array) */
++#define VIRGL_CAP_V2_TES_LAYER_VIEWPORT   (1u << 30)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -233,6 +233,7 @@
+    feat_vs_layer_viewport,
+    feat_vs_viewport_index,
+    feat_raster_multisample,
++   feat_viewport_layer_array,
+    feat_last,
+ };
+ 
+@@ -347,6 +348,7 @@
+    FEAT(vs_layer_viewport, UNAVAIL, UNAVAIL, "GL_AMD_vertex_shader_layer"),
+    FEAT(vs_viewport_index, UNAVAIL, UNAVAIL, "GL_AMD_vertex_shader_viewport_index"),
+    FEAT(raster_multisample, UNAVAIL, UNAVAIL, "GL_EXT_raster_multisample"),
++   FEAT(viewport_layer_array, UNAVAIL, UNAVAIL, "GL_ARB_shader_viewport_layer_array"),
+ };
+ 
+ struct global_renderer_state {
+@@ -8100,6 +8102,7 @@
+    grctx->shader_cfg.has_texture_shadow_lod = has_feature(feat_texture_shadow_lod);
+    grctx->shader_cfg.has_vs_layer = has_feature(feat_vs_layer_viewport);
+    grctx->shader_cfg.has_vs_viewport_index = has_feature(feat_vs_viewport_index);
++   grctx->shader_cfg.has_viewport_layer_array = has_feature(feat_viewport_layer_array);
+ 
+    vrend_renderer_create_sub_ctx(grctx, 0);
+    vrend_renderer_set_sub_ctx(grctx, 0);
+@@ -13053,6 +13056,9 @@
+    if (has_feature(feat_vs_viewport_index))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_VS_VIEWPORT_INDEX;
+ 
++   if (has_feature(feat_viewport_layer_array))
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_TES_LAYER_VIEWPORT;
++
+    if (has_feature(feat_raster_multisample))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_RASTER_SAMPLES;
+ 
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -84,6 +84,7 @@
+ #define SHADER_REQ_SHADER_DRAW_PARAMETERS (1ULL << 39)
+ #define SHADER_REQ_SHADER_GROUP_VOTE      (1ULL << 40)
+ #define SHADER_REQ_EXPLICIT_UNIFORM_LOCATION (1ULL << 41)
++#define SHADER_REQ_VIEWPORT_LAYER_ARRAY   (1ULL << 42)
+ 
+ #define FRONT_COLOR_EMITTED (1 << 0)
+ #define BACK_COLOR_EMITTED  (1 << 1);
+@@ -361,6 +362,7 @@
+     { SHADER_REQ_SHADER_DRAW_PARAMETERS, "ARB_shader_draw_parameters"},
+     { SHADER_REQ_SHADER_GROUP_VOTE, "ARB_shader_group_vote"},
+     { SHADER_REQ_EXPLICIT_UNIFORM_LOCATION, "ARB_explicit_uniform_location"},
++    { SHADER_REQ_VIEWPORT_LAYER_ARRAY, "ARB_shader_viewport_layer_array"},
+ };
+ 
+ enum vrend_type_qualifier {
+@@ -1780,7 +1782,9 @@
+       case TGSI_SEMANTIC_LAYER:
+          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY ||
+              (iter->processor.Processor == TGSI_PROCESSOR_VERTEX &&
+-              ctx->cfg->has_vs_layer)) {
++              ctx->cfg->has_vs_layer) ||
++             (iter->processor.Processor == TGSI_PROCESSOR_TESS_EVAL &&
++              ctx->cfg->has_viewport_layer_array)) {
+             ctx->outputs[i].glsl_predefined_no_emit = true;
+             ctx->outputs[i].glsl_no_index = true;
+             ctx->outputs[i].override_no_wm = true;
+@@ -1788,6 +1792,8 @@
+             name_prefix = "gl_Layer";
+             if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX)
+                ctx->shader_req_bits |= SHADER_REQ_AMD_VS_LAYER;
++            else if (iter->processor.Processor == TGSI_PROCESSOR_TESS_EVAL)
++               ctx->shader_req_bits |= SHADER_REQ_VIEWPORT_LAYER_ARRAY;
+          }
+          break;
+       case TGSI_SEMANTIC_PRIMID:
+@@ -1802,7 +1808,9 @@
+       case TGSI_SEMANTIC_VIEWPORT_INDEX:
+          if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY ||
+              (iter->processor.Processor == TGSI_PROCESSOR_VERTEX &&
+-              !ctx->cfg->use_gles && ctx->cfg->has_vs_viewport_index)) {
++              !ctx->cfg->use_gles && ctx->cfg->has_vs_viewport_index) ||
++             (iter->processor.Processor == TGSI_PROCESSOR_TESS_EVAL &&
++              ctx->cfg->has_viewport_layer_array)) {
+             ctx->outputs[i].glsl_predefined_no_emit = true;
+             ctx->outputs[i].glsl_no_index = true;
+             ctx->outputs[i].override_no_wm = true;
+@@ -1811,6 +1819,8 @@
+             if (iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY) {
+                ctx->shader_req_bits |= SHADER_REQ_VIEWPORT_IDX;
+                ctx->glsl_ver_required = require_glsl_ver(ctx, 140);
++            } else if (iter->processor.Processor == TGSI_PROCESSOR_TESS_EVAL) {
++               ctx->shader_req_bits |= SHADER_REQ_VIEWPORT_LAYER_ARRAY;
+             } else {
+                ctx->shader_req_bits |= SHADER_REQ_AMD_VIEWPORT_IDX;
+             }
+--- a/src/vrend/vrend_shader.h
++++ b/src/vrend/vrend_shader.h
+@@ -259,6 +259,7 @@
+    uint32_t has_texture_shadow_lod : 1;
+    uint32_t has_vs_layer : 1;
+    uint32_t has_vs_viewport_index : 1;
++   uint32_t has_viewport_layer_array : 1;
+ };
+ 
+ struct vrend_context;

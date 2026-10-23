@@ -1,0 +1,194 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: Windows 8.1 (the WDDM 1.3 build)
+
+The WDDM 1.3 build (VIOGPU_WDDM1_3, build-driver.ps1 -Win81 at the Windows 8.1 API level) started on Windows 8.1 and
+was stopped again (Code 43), then bugchecked. Found with the driver's trace on COM1 (COM_DEBUG, the new
+VIOGPU_TRACE_LEVEL) and Windows 8.1's dxgkrnl (watchdog log callers through QEMU's gdbstub, KiBugCheckData):
+- QueryAdapterInfo DXGKQAITYPE_HISTORYBUFFERPRECISION (WDDM 1.3) wasn't answered: one entry per node, 0 or 32..64
+  (ADAPTER_RENDER::Initialize); 64 for all
+- dxgkrnl's ADAPTER_DISPLAY::CreateDisplayCore wants DxgkDdiSetPalette from a display driver (STATUS_REVISION_MISMATCH):
+  a no-op (no palettized modes); DxgkDdiQueryDependentEngineGroup too, with engine reset (none depend on another)
+- DXGADAPTER::DdiControlInterrupt2 calls DxgkDdiControlInterrupt2 unchecked: a null call, bugcheck 0x3B; a no-op like
+  ControlInterrupt (the vsync interrupts come from a timer), in the WDDM 1.3 build
+- MmMapIoSpaceEx (host memory blobs) is Windows 10's: looked up, MmMapIoSpace otherwise
+- DxgkDdiGetScanLine broke into the debugger (a bugcheck without one): it reports line 0 outside the vertical blank
+Windows 10/11 (the WDDM 2.0 build) answer the same, minus ControlInterrupt2.
+---
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index 7911688..1b24965 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -60,6 +60,9 @@ void InitializeDebugPrints(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Re
+     virtioDebugLevel = 0x5;
+     bBreakAlways = 1;
+     nDebugLevel = TRACE_LEVEL_WARNING;
++#ifdef VIOGPU_TRACE_LEVEL
++    nDebugLevel = VIOGPU_TRACE_LEVEL; // diagnostic builds (build-driver.ps1 -ExtraDefines)
++#endif
+ #if defined(COM_DEBUG)
+     VirtioDebugPrintProc = DebugPrintFuncSerial;
+ #elif defined(PRINT_DEBUG)
+@@ -146,11 +149,19 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
+     InitialData.DxgkDdiQueryCurrentFence = VioGpu3DDdiQueryCurrentFence;
+ 
+     InitialData.DxgkDdiQueryEngineStatus = VioGpu3DDdiQueryEngineStatus;
++    // Windows 8.1 doesn't start a display driver with engine reset (ResetEngine) without it
++    InitialData.DxgkDdiQueryDependentEngineGroup = VioGpu3DDdiQueryDependentEngineGroup;
++    // nor without SetPalette (dxgkrnl's ADAPTER_DISPLAY::CreateDisplayCore; no palettized modes here)
++    InitialData.DxgkDdiSetPalette = VioGpu3DDdiSetPalette;
+     InitialData.DxgkDdiResetEngine = VioGpu3DDdiResetEngine;
+     InitialData.DxgkDdiCancelCommand = VioGpu3DDdiCancelCommand;
+ 
+     InitialData.DxgkDdiGetNodeMetadata = VioGpu3DDdiGetNodeMetadata;
+     InitialData.DxgkDdiControlInterrupt = VioGpu3DDdiControlInterrupt;
++#if !VIOGPU_WDDM2
++    // Windows 8.1's dxgkrnl calls it unchecked (DXGADAPTER::DdiControlInterrupt2): a null pointer bugchecked (0x3B)
++    InitialData.DxgkDdiControlInterrupt2 = VioGpu3DDdiControlInterrupt2;
++#endif
+     InitialData.DxgkDdiGetScanLine = VioGpu3DDdiGetScanLine;
+ 
+ #if VIOGPU_WDDM2
+@@ -1059,17 +1070,31 @@ VioGpu3DDdiControlInterrupt(_In_ CONST HANDLE hAdapter,
+     return STATUS_SUCCESS;
+ };
+ 
++#if !VIOGPU_WDDM2
++// Like ControlInterrupt: the vsync interrupts come from a timer whether asked for or not
++NTSTATUS
++APIENTRY
++VioGpu3DDdiControlInterrupt2(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CONTROLINTERRUPT2 InterruptControl)
++{
++    PAGED_CODE();
++    UNREFERENCED_PARAMETER(hAdapter);
++    UNREFERENCED_PARAMETER(InterruptControl);
++    return STATUS_SUCCESS;
++}
++#endif
++
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiGetScanLine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETSCANLINE *pGetScanLine)
+ {
+     PAGED_CODE();
+     UNREFERENCED_PARAMETER(hAdapter);
+-    UNREFERENCED_PARAMETER(pGetScanLine);
+ 
+-    DbgBreakPoint();
+-    DbgPrint(TRACE_LEVEL_ERROR, ("Not imp %s\n", __FUNCTION__));
+-    return STATUS_NO_MEMORY;
++    // No scan-out position to report (the host presents): line 0, outside the vertical blank. It used to break into
++    // the debugger, which bugchecks without one attached
++    pGetScanLine->InVerticalBlank = FALSE;
++    pGetScanLine->ScanLine = 0;
++    return STATUS_SUCCESS;
+ }
+ 
+ // END: Paged Code
+@@ -1224,6 +1249,27 @@ VioGpu3DDdiQueryEngineStatus(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYEN
+     return STATUS_SUCCESS;
+ };
+ 
++// No palettized (8-bit) modes: nothing to set
++NTSTATUS
++APIENTRY
++VioGpu3DDdiSetPalette(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPALETTE *pSetPalette)
++{
++    UNREFERENCED_PARAMETER(hAdapter);
++    UNREFERENCED_PARAMETER(pSetPalette);
++    return STATUS_SUCCESS;
++}
++
++// The engines reset on their own: no node depends on another's
++NTSTATUS
++APIENTRY
++VioGpu3DDdiQueryDependentEngineGroup(_In_ CONST HANDLE hAdapter,
++                                     _Inout_ DXGKARG_QUERYDEPENDENTENGINEGROUP *pQueryDependentEngineGroup)
++{
++    UNREFERENCED_PARAMETER(hAdapter);
++    pQueryDependentEngineGroup->DependentNodeOrdinalMask = 0;
++    return STATUS_SUCCESS;
++}
++
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiCollectDbgInfo(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_COLLECTDBGINFO *pCollectDbgInfo)
+diff --git a/viogpu/viogpu3d/driver.h b/viogpu/viogpu3d/driver.h
+index ba25474..d4c1529 100644
+--- a/viogpu/viogpu3d/driver.h
++++ b/viogpu/viogpu3d/driver.h
+@@ -217,6 +217,10 @@ VioGpu3DDdiControlInterrupt(_In_ CONST HANDLE hAdapter,
+                             _In_ CONST DXGK_INTERRUPT_TYPE InterruptType,
+                             _In_ BOOLEAN EnableInterrupt);
+ 
++NTSTATUS
++APIENTRY
++VioGpu3DDdiControlInterrupt2(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CONTROLINTERRUPT2 InterruptControl);
++
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiGetScanLine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETSCANLINE *pGetScanLine);
+@@ -297,6 +301,15 @@ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiQueryEngineStatus(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYENGINESTATUS *pQueryEngineStatus);
+ 
++NTSTATUS
++APIENTRY
++VioGpu3DDdiSetPalette(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPALETTE *pSetPalette);
++
++NTSTATUS
++APIENTRY
++VioGpu3DDdiQueryDependentEngineGroup(_In_ CONST HANDLE hAdapter,
++                                     _Inout_ DXGKARG_QUERYDEPENDENTENGINEGROUP *pQueryDependentEngineGroup);
++
+ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiCollectDbgInfo(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_COLLECTDBGINFO *pCollectDbgInfo);
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index cbb2505..5d7ec48 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -624,6 +624,22 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 info->SupportedCapsetIDs = m_supportedCapsetIDs;
+                 return STATUS_SUCCESS;
+             }
++        case DXGKQAITYPE_HISTORYBUFFERPRECISION:
++            {
++                // WDDM 1.3 asks (Windows 8.1 removed the device when it wasn't answered), one entry per node, each 0 or
++                // 32..64 (dxgkrnl's ADAPTER_RENDER::Initialize): our history buffers would hold the GPU clock's 64-bit
++                // timestamps
++                if (pQueryAdapterInfo->OutputDataSize < sizeof(DXGKARG_HISTORYBUFFERPRECISION))
++                {
++                    return STATUS_BUFFER_TOO_SMALL;
++                }
++                DXGKARG_HISTORYBUFFERPRECISION *precision = (DXGKARG_HISTORYBUFFERPRECISION *)pQueryAdapterInfo->pOutputData;
++                for (UINT i = 0; i < pQueryAdapterInfo->OutputDataSize / sizeof(*precision); i++)
++                {
++                    precision[i].PrecisionBits = 64;
++                }
++                return STATUS_SUCCESS;
++            }
+         case DXGKQAITYPE_DRIVERCAPS:
+             {
+                 if (!pQueryAdapterInfo->OutputDataSize)
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index 737342b..f6165cd 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -188,7 +188,16 @@ NTSTATUS VioGpuDevice::BlobMap(_Inout_ VIOGPU_BLOB_MAP_REQ *req)
+             protect = PAGE_READWRITE | PAGE_NOCACHE;
+             break;
+     }
+-    blob->kernelVa = MmMapIoSpaceEx(m_pAdapter->HostmemAddress(blob->offset), (SIZE_T)blob->size, protect);
++    // MmMapIoSpaceEx (a no-execute mapping) from Windows 10 on, looked up so the driver also loads on Windows 8.1
++    typedef PVOID(NTAPI * MapIoSpaceEx)(PHYSICAL_ADDRESS, SIZE_T, ULONG);
++    static MapIoSpaceEx mapEx;
++    if (!mapEx)
++    {
++        UNICODE_STRING name = RTL_CONSTANT_STRING(L"MmMapIoSpaceEx");
++        mapEx = (MapIoSpaceEx)MmGetSystemRoutineAddress(&name);
++    }
++    blob->kernelVa = mapEx ? mapEx(m_pAdapter->HostmemAddress(blob->offset), (SIZE_T)blob->size, protect)
++                           : MmMapIoSpace(m_pAdapter->HostmemAddress(blob->offset), (SIZE_T)blob->size, caching);
+     if (blob->kernelVa)
+     {
+         blob->mdl = IoAllocateMdl(blob->kernelVa, (ULONG)blob->size, FALSE, FALSE, NULL);

@@ -1,0 +1,28 @@
+vhost-user-gpu: answer updates a display draws without blocking
+
+The backend waits for an answer to each DMABUF_UPDATE, which QEMU sends when
+the console reports the frame as flushed: when the display unblocks it. With
+patch 0001, SPICE draws a local client's updates without blocking the console,
+so that never happens and the backend (and the guest's GPU) would stop after
+the first frame. Answer right away when the update left the console unblocked
+and wasn't answered already.
+
+--- a/hw/display/vhost-user-gpu.c
++++ b/hw/display/vhost-user-gpu.c
+@@ -338,6 +338,16 @@
+         }
+         g->backend_blocked = true;
+         qemu_console_gl_update(con, m->x, m->y, m->width, m->height);
++        /*
++         * A display that draws without blocking the console (SPICE, local
++         * client) never reports the frame as flushed: answer right away,
++         * unless it was answered meanwhile (a display that reports the flush
++         * from within the update)
++         */
++        if (g->backend_blocked && !qemu_console_is_gl_blocked(con)) {
++            vhost_user_gpu_unblock(g);
++            g->backend_blocked = false;
++        }
+         break;
+     }
+ #ifdef CONFIG_PIXMAN

@@ -1,0 +1,83 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: Windows 10's Direct3D 12 runtime (DDI interface R7)
+
+Windows 10 20H1-22H2's runtime speaks interface R7 (builds 0070-0076); the driver offered only R8's 0082 and up, so
+D3D12CreateDevice failed with DXGI_ERROR_UNSUPPORTED there. It offers 0070-0076 too and accepts R7 in CreateDevice:
+feature level 12_1 and shader model 6.5 (what that runtime knows). Build numbers start again with each interface
+release, so device_ddi only compares R8's. 3DPIPELINESUPPORT reports at most 12_1, as the DDI header requires
+(runtimes before 0081 turn anything higher into 1_0); 12_2 goes through 3DPIPELINESUPPORT1. GetSupportedVersions logs.
+---
+diff --git a/libs/viogpu_umd/umd_ddi.cpp b/libs/viogpu_umd/umd_ddi.cpp
+index 65f0c83f..0776dddc 100644
+--- a/libs/viogpu_umd/umd_ddi.cpp
++++ b/libs/viogpu_umd/umd_ddi.cpp
+@@ -14,8 +14,8 @@
+  *
+  * DDI versions: D3D12DDI_SUPPORTED_0110 (interface R8, build 110: 0102's Vulkan-on-12 caps and line rasterization
+  * modes, 0110's ExecuteIndirect tier and shader model 6.8 caps; 0108's work graphs in umd_raytracing.cpp), 0100 (shader
+- * models 6.7 and 6.8) and, for older runtimes, 0082 (shader model 6.6). The tables are 0110's; an older runtime's are a
+- * prefix of them, and the arguments that changed meaning on the way go by the build the runtime chose (device_ddi,
++ * models 6.7 and 6.8) and, for older runtimes, 0082 (shader model 6.6) and interface R7's 0070-0076 (Windows 10 20H1-22H2's
++ * runtime, shader model 6.5). The tables are 0110's; an older runtime's are a prefix of them, and the arguments that changed meaning on the way go by the build the runtime chose (device_ddi,
+  * umd_private.h). 0110 only where the device has the sampler heaps of 4096 descriptors and the UAV-only rendering at
+  * every sample count up to 16 the runtimes of 0102 on insist on (adapter_offers_0110).
+  */
+@@ -522,7 +522,10 @@ adapter_caps(viogpu_adapter *adapter)
+    return adapter->caps;
+ }
+ 
+-static const UINT64 supported_versions[] = { D3D12DDI_SUPPORTED_0110, D3D12DDI_SUPPORTED_0100, D3D12DDI_SUPPORTED_0082 };
++static const UINT64 supported_versions[] = { D3D12DDI_SUPPORTED_0110, D3D12DDI_SUPPORTED_0100, D3D12DDI_SUPPORTED_0082,
++                                             D3D12DDI_SUPPORTED_0076, D3D12DDI_SUPPORTED_0075, D3D12DDI_SUPPORTED_0074,
++                                             D3D12DDI_SUPPORTED_0073, D3D12DDI_SUPPORTED_0072, D3D12DDI_SUPPORTED_0071,
++                                             D3D12DDI_SUPPORTED_0070 };
+ 
+ /* 0110 where the device has what the runtimes of 0102 on insist on (they refuse the device otherwise, saying nothing):
+  * sampler heaps of 4096 descriptors and UAV-only rendering at 1, 2, 4, 8 and 16 samples */
+@@ -543,6 +546,7 @@ adapter_get_supported_versions(D3D12DDI_HADAPTER hAdapter, UINT32 *entries, UINT
+       offered++;
+       count--;
+    }
++   viogpu_log("GetSupportedVersions: %u offered, newest 0x%llx", count, (unsigned long long)offered[0]);
+    if (versions && *entries < count)
+       return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    *entries = count;
+@@ -571,7 +575,8 @@ adapter_get_caps_answer(viogpu_adapter *adapter, const D3D12DDIARG_GETCAPS *caps
+ 
+    switch (caps->Type) {
+    case D3D12DDICAPS_TYPE_3DPIPELINESUPPORT:
+-      return answer(caps, dev->level);
++      /* at most 12_1 here: runtimes before 0081 take anything higher for 1_0 (12_2 goes through 3DPIPELINESUPPORT1) */
++      return answer(caps, dev->level < D3D12DDI_3DPIPELINELEVEL_12_1 ? dev->level : D3D12DDI_3DPIPELINELEVEL_12_1);
+ 
+    case D3D12DDICAPS_TYPE_0081_3DPIPELINESUPPORT1: {
+       D3D12DDI_3DPIPELINESUPPORT1_DATA_0081 *data = (D3D12DDI_3DPIPELINESUPPORT1_DATA_0081 *)caps->pData;
+@@ -740,7 +745,8 @@ adapter_create_device(D3D12DDI_HADAPTER hAdapter, const D3D12DDIARG_CREATEDEVICE
+       return adapter->vkd3dResult;
+    viogpu_log("CreateDevice: interface 0x%x version 0x%x flags 0x%x", args->Interface, args->Version,
+               (UINT)args->Flags);
+-   if (args->Interface != D3D12DDI_INTERFACE_VERSION_R5 && args->Interface != D3D12DDI_INTERFACE_VERSION_R8)
++   if (args->Interface != D3D12DDI_INTERFACE_VERSION_R5 && args->Interface != D3D12DDI_INTERFACE_VERSION_R7 &&
++       args->Interface != D3D12DDI_INTERFACE_VERSION_R8)
+       return E_INVALIDARG;
+    ID3D12Device11 *vkd3d11 = NULL;
+    HRESULT hr = vkd3d->QueryInterface(IID_PPV_ARGS(&vkd3d11));
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+index 688162c3..1aae9ea4 100644
+--- a/libs/viogpu_umd/umd_private.h
++++ b/libs/viogpu_umd/umd_private.h
+@@ -63,11 +63,12 @@ device_from(D3D12DDI_HDEVICE h)
+ }
+ 
+ /* The DDI build the runtime chose is at least build (D3D12DDI_BUILD_VERSION_0088...): some arguments changed meaning
+- * (CreateDevice's Version is the build << 16) */
++ * (CreateDevice's Version is the build << 16). Builds count from 0 again with each interface release: only R8's
++ * compare (R7's 0076 is build 6) */
+ static inline bool
+ device_ddi(const viogpu_device *device, UINT build)
+ {
+-   return (device->version >> 16) >= build;
++   return device->interfaceVersion >= D3D12DDI_INTERFACE_VERSION_R8 && (device->version >> 16) >= build;
+ }
+ 
+ /* Enhanced barriers (umd_command.cpp) and resources made in a layout (umd_resource.cpp): the DDI's layouts, syncs and

@@ -1,0 +1,443 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: GDI drawing on Direct3D surfaces
+
+IDXGISurface1::GetDC drew nothing: UxTheme draws the caption buttons of packaged apps (Settings, Calculator) that way
+into DirectComposition surfaces, and they stayed empty. CDD only creates device bitmaps on Direct3D surfaces when
+the driver supports GDI acceleration or software device bitmaps; without either, NtGdiCreateBitmapFromDxSurface2
+fails before the driver is asked anything.
+
+- Report PresentationCaps.SupportSoftwareDeviceBitmaps (pitch alignment 4 bytes, textures up to 16384).
+- OpenAllocation on GDI's device returns the linear layout (offset 0, pitch width * 4) of 2D BGRA/BGRX allocations;
+  CDD then draws on their pages with the CPU through the aperture. The pages are only virgl's staging copy of the
+  host texture, so the texture is read into them when GDI opens the allocation, and while GDI has it open (as
+  long as the surface lives) they are kept the same around every submission that uses it: the pages go to the
+  host before it, the texture comes back after it, before the submission counts as done.
+- GetStandardAllocationDriverData answers GDI surfaces, except DWM's CPU-visible redirection surfaces of GDI
+  windows: virgl would need whole windows sent to the host on every composed frame, and refusing them keeps DWM's
+  system memory redirection, which uploads only what changed. GDI surfaces go to the host before each submission.
+- DescribeAllocation said every allocation was 2x multisampled; it reports the real sample count.
+- Present no longer dereferences a missing destination allocation.
+
+GDI drawing is lost when the app has Direct3D/Direct2D drawing on the same surface it hasn't flushed before GetDC
+(it executes after GDI's): the runtime doesn't flush at GetDC, and the driver isn't told.
+---
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -174,6 +174,9 @@
+ #pragma pack()
+ 
+ #pragma pack(1)
++// Kernel driver only, never sent to the host: a GDI surface (GetStandardAllocationDriverData), drawn by GDI with the CPU
++#define VIOGPU_RESOURCE_FLAG_GDI_SURFACE 0x80000000
++
+ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
+ {
+     VIOGPU_RESOURCE_OPTIONS ResourceOptions;
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -615,7 +615,7 @@
+         return STATUS_UNSUCCESSFUL;
+     }
+ 
+-    pCreateDevice->hDevice = new (NonPagedPoolNx) VioGpuDevice(pAdapter);
++    pCreateDevice->hDevice = new (NonPagedPoolNx) VioGpuDevice(pAdapter, pCreateDevice->Flags.Value);
+     if (!pCreateDevice->hDevice)
+     {
+         DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s failed to allocate VioGpuDevice\n", __FUNCTION__));
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -501,6 +501,13 @@
+                 pDriverCaps->MemoryManagementCaps.SectionBackedPrimary = TRUE;
+ 
+                 pDriverCaps->SupportDirectFlip = 1;
++                // GDI device bitmaps drawn by GDI with the CPU (CDD), on GDI surfaces and on GDI-compatible D3D
++                // surfaces: without it NtGdiCreateBitmapFromDxSurface2 fails (IDXGISurface1::GetDC draws nothing,
++                // so the caption buttons of packaged apps, which UxTheme draws that way, stayed empty)
++                pDriverCaps->PresentationCaps.SupportSoftwareDeviceBitmaps = 1;
++                pDriverCaps->PresentationCaps.AlignmentShift = 2;        // pitch = width * 4
++                pDriverCaps->PresentationCaps.MaxTextureWidthShift = 3;  // 16384
++                pDriverCaps->PresentationCaps.MaxTextureHeightShift = 3;
+                 pDriverCaps->SchedulingCaps.MultiEngineAware = 1;
+                 pDriverCaps->SchedulingCaps.PreemptionAware = 1;
+ 
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -226,6 +226,42 @@
+                 return STATUS_SUCCESS;
+             }
+ 
++        case D3DKMDT_STANDARDALLOCATION_GDISURFACE:
++            {
++                // GDI surfaces (asked for since we support software device bitmaps): GDI draws them with the CPU,
++                // linear with the pitch we return, and they go to the host before each submission using them
++                // (VioGpuCommand::Run)
++                D3DKMDT_GDISURFACEDATA *surfaceData = pStandardAllocation->pCreateGdiSurfaceData;
++
++                // Not DWM's redirection surfaces of GDI windows: GDI draws them with the CPU, and virgl would need the
++                // whole window sent to the host on every frame DWM composes it; refused, DWM keeps them in system
++                // memory and uploads only what changed
++                if (surfaceData->Type == D3DKMDT_GDISURFACE_TEXTURE_CPUVISIBLE)
++                {
++                    return STATUS_NOT_SUPPORTED;
++                }
++
++                allocationExchange->ResourceOptions.width = max(surfaceData->Width, 1);
++                allocationExchange->ResourceOptions.height = max(surfaceData->Height, 1);
++                allocationExchange->ResourceOptions.format = surfaceData->Format == D3DDDIFMT_X8R8G8B8
++                                                                 ? VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM
++                                                                 : VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
++                allocationExchange->ResourceOptions.bind = VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW;
++                allocationExchange->ResourceOptions.flags |= VIRGL_RESOURCE_FLAG_MAP_COHERENT | VIOGPU_RESOURCE_FLAG_GDI_SURFACE;
++                allocationExchange->Size = (ULONGLONG)allocationExchange->ResourceOptions.width *
++                                           (ULONGLONG)allocationExchange->ResourceOptions.height * 4;
++
++                surfaceData->Pitch = allocationExchange->ResourceOptions.width * 4;
++                DbgPrint(TRACE_LEVEL_ERROR,
++                         ("<--- %s gdi surface: type=%d width=%d, height=%d, format=%d\n",
++                          __FUNCTION__,
++                          surfaceData->Type,
++                          surfaceData->Width,
++                          surfaceData->Height,
++                          surfaceData->Format));
++                return STATUS_SUCCESS;
++            }
++
+         default:
+             {
+                 DbgPrint(TRACE_LEVEL_FATAL, ("<--- Unknown standard allocation type \n"));
+@@ -255,8 +291,15 @@
+         resourceExchange = (VIOGPU_CREATE_ALLOCATION_EXCHANGE *)pCreateAllocation->pPrivateDriverData;
+     }
+ 
+-    VioGpuAllocation *allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->ResourceOptions);
++    VIOGPU_RESOURCE_OPTIONS options = resourceExchange->ResourceOptions;
++    bool gdiSurface = (options.flags & VIOGPU_RESOURCE_FLAG_GDI_SURFACE) != 0;
++    options.flags &= ~VIOGPU_RESOURCE_FLAG_GDI_SURFACE;
++    VioGpuAllocation *allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &options);
+     allocationInfo->hAllocation = allocation;
++    if (gdiSurface)
++    {
++        allocation->SetGdiSurface();
++    }
+ 
+     if (pCreateAllocation->Flags.Resource)
+     {
+@@ -303,9 +346,9 @@
+ 
+     pDescribeAllocation->Format = VioGpuToD3DDDIColorFormat((virtio_gpu_formats)m_options.format);
+ 
+-    // this values are RANDOM
+-    pDescribeAllocation->MultisampleMethod.NumQualityLevels = 2;
+-    pDescribeAllocation->MultisampleMethod.NumSamples = 2;
++    // What the allocation really is (it said 2x multisampled for all of them)
++    pDescribeAllocation->MultisampleMethod.NumSamples = m_options.nr_samples > 1 ? m_options.nr_samples : 1;
++    pDescribeAllocation->MultisampleMethod.NumQualityLevels = 0;
+ 
+     // The committed mode's: Windows flips only between primaries made for the current mode, and DWM stopped
+     // presenting at any other rate when this was always 60 Hz
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -35,6 +35,35 @@
+         return m_DxPhysicalAddress;
+     };
+ 
++    const VIOGPU_RESOURCE_OPTIONS &GetOptions()
++    {
++        return m_options;
++    }
++    // Open by GDI's device (GDI draws on it with the CPU, between StartDxInterop and EndDxInterop, which we don't see):
++    // its pages and the host texture are kept the same around every submission that uses it
++    volatile LONG m_gdiOpen = 0;
++
++    // GDI drew on the pages: the host texture needs them before D3D uses it next
++    void SetGdiDirty()
++    {
++        InterlockedExchange(&m_gdiDirty, 1);
++    }
++    BOOL TakeGdiDirty()
++    {
++        return InterlockedExchange(&m_gdiDirty, 0) != 0 || m_gdiSurface;
++    }
++    // A GDI surface (device bitmaps, DWM's redirection surfaces of GDI windows): GDI draws on it whenever it likes
++    void SetGdiSurface()
++    {
++        m_gdiSurface = true;
++    }
++    bool m_gdiSurface = false;
++    volatile LONG m_gdiDirty = 0;
++
++    BOOL HasBacking()
++    {
++        return m_pMDL != NULL;
++    }
+     BOOL IsCoherent()
+     {
+         return (m_options.flags & VIRGL_RESOURCE_FLAG_MAP_COHERENT) != 0;
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -48,6 +48,38 @@
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+ 
++    // Surfaces GDI draws on with the CPU (see VioGpuDevice::OpenAllocation): what it drew to the host before this
++    // submission (the control queue keeps the order), and what the submission did back to the pages after it
++    if (m_allocations && m_pContext && !m_gdiUploaded)
++    {
++        m_gdiUploaded = true;
++        for (UINT i = 0; i < m_allocationsLength; i++)
++        {
++            VioGpuAllocation *allocation = m_allocations[i];
++            if (allocation == NULL || !allocation->HasBacking())
++            {
++                continue;
++            }
++            bool gdiOpen = allocation->m_gdiOpen > 0;
++            if (!allocation->TakeGdiDirty() && !gdiOpen)
++            {
++                continue;
++            }
++            const VIOGPU_RESOURCE_OPTIONS &options = allocation->GetOptions();
++            VIOGPU_TRANSFER_CMD transfer = {};
++            transfer.res_id = allocation->GetId();
++            transfer.box.width = options.width;
++            transfer.box.height = options.height;
++            transfer.box.depth = 1;
++            transfer.stride = options.width * 4;
++            m_pAdapter->ctrlQueue.TransferHostCmd(true, m_pContext->GetId(), &transfer, NULL, NULL);
++            if (gdiOpen)
++            {
++                m_gdiReadBack = true;
++            }
++        }
++    }
++
+     while (m_pCommand < m_pEnd)
+     {
+ 
+@@ -98,6 +130,45 @@
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("%s finished fence_id=%d", __FUNCTION__, m_FenceId));
+ 
++    // The submission's results on surfaces GDI has open, to their pages before it counts as done (GDI waits for
++    // that before drawing): queued after it, and the submission completes when the last one is done
++    if (m_gdiReadBack && m_allocations && m_pContext)
++    {
++        m_gdiReadBack = false;
++        int last = -1;
++        for (UINT i = 0; i < m_allocationsLength; i++)
++        {
++            if (m_allocations[i] && m_allocations[i]->m_gdiOpen > 0 && m_allocations[i]->HasBacking())
++            {
++                last = (int)i;
++            }
++        }
++        for (int i = 0; i <= last; i++)
++        {
++            VioGpuAllocation *allocation = m_allocations[i];
++            if (allocation == NULL || allocation->m_gdiOpen <= 0 || !allocation->HasBacking())
++            {
++                continue;
++            }
++            const VIOGPU_RESOURCE_OPTIONS &options = allocation->GetOptions();
++            VIOGPU_TRANSFER_CMD transfer = {};
++            transfer.res_id = allocation->GetId();
++            transfer.box.width = options.width;
++            transfer.box.height = options.height;
++            transfer.box.depth = 1;
++            transfer.stride = options.width * 4;
++            m_pAdapter->ctrlQueue.TransferHostCmd(false,
++                                                  m_pContext->GetId(),
++                                                  &transfer,
++                                                  i == last ? VioGpuCommand::QueueRunningCb : NULL,
++                                                  i == last ? this : NULL);
++        }
++        if (last >= 0)
++        {
++            return;
++        }
++    }
++
+     if (m_allocations)
+     {
+         for (UINT i = 0; i < m_allocationsLength; i++)
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -42,6 +42,8 @@
+ 
+     VioGpuAllocation **m_allocations;
+     UINT m_allocationsLength;
++    bool m_gdiUploaded = false; // GDI-dirty surfaces sent to the host (once, before the first command)
++    bool m_gdiReadBack = false; // and surfaces GDI has open to read back when done
+ };
+ 
+ class VioGpuCommander
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -3,14 +3,24 @@
+ #include "baseobj.h"
+ #include "virgl_hw.h"
+ 
++#pragma code_seg(push)
++#pragma code_seg()
++// Called when the host finished a transfer TransferSync waits for (from the DPC: not paged)
++static void TransferSyncDone(void *event)
++{
++    KeSetEvent((KEVENT *)event, IO_NO_INCREMENT, FALSE);
++}
++#pragma code_seg(pop)
++
+ PAGED_CODE_SEG_BEGIN
+ 
+-VioGpuDevice::VioGpuDevice(VioGpuAdapter *pAdapter)
++VioGpuDevice::VioGpuDevice(VioGpuAdapter *pAdapter, UINT flags)
+ {
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s", __FUNCTION__));
+ 
+     m_pAdapter = pAdapter;
++    m_flags = flags;
+     m_id = pAdapter->ctxIdr.GetId();
+     pAdapter->ctrlQueue.CreateCtx(m_id, 0);
+ }
+@@ -201,7 +211,8 @@
+         }
+     }
+ 
+-    if (dxgk_dst != NULL)
++    // A present without a destination (the allocation list's entry is there, its allocation isn't)
++    if (dxgk_dst->hDeviceSpecificAllocation != NULL)
+     {
+         dst = reinterpret_cast<VioGpuDeviceAllocation *>(dxgk_dst->hDeviceSpecificAllocation)->GetAllocation();
+         if (pPresent->pDmaBuffer)
+@@ -318,7 +329,34 @@
+     {
+         DXGK_OPENALLOCATIONINFO *openAllocationInfo = &pOpenAllocation->pOpenAllocation[i];
+         VioGpuAllocation *allocation = m_pAdapter->AllocationFromHandle(openAllocationInfo->hAllocation);
+-        openAllocationInfo->hDeviceSpecificAllocation = new (NonPagedPoolNx) VioGpuDeviceAllocation(this, allocation);
++        VioGpuDeviceAllocation *deviceAllocation = new (NonPagedPoolNx) VioGpuDeviceAllocation(this, allocation);
++        openAllocationInfo->hDeviceSpecificAllocation = deviceAllocation;
++
++        // GDI on GDI-compatible shared D3D surfaces (IDXGISurface1::GetDC, how UxTheme draws the caption buttons of
++        // packaged apps): GDI's device opens the allocation and draws on it with the CPU through the aperture, at
++        // the offset and pitch we return here (else NtGdiCreateBitmapFromDxSurface2 fails and the drawing is lost).
++        // The pages are only virgl's staging copy of the host texture: the texture's content goes into them now, and
++        // while GDI has the allocation open they and the texture are kept the same around every submission using it
++        // (VioGpuCommand::Run); GDI keeps it open as long as the surface lives.
++        if (allocation == NULL)
++        {
++            continue;
++        }
++        const VIOGPU_RESOURCE_OPTIONS &options = allocation->GetOptions();
++        if ((m_flags & 2 /* GdiDevice */) && options.target == 2 /* PIPE_TEXTURE_2D */ && options.last_level == 0 &&
++            options.array_size <= 1 && options.nr_samples <= 1 &&
++            (options.format == VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM || options.format == VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM))
++        {
++            DXGKARG_OPENALLOCATION *out = const_cast<DXGKARG_OPENALLOCATION *>(pOpenAllocation);
++            out->SubresourceOffset = 0;
++            out->Pitch = options.width * 4;
++            if (allocation->HasBacking())
++            {
++                TransferSync(false, allocation);
++            }
++            deviceAllocation->SetGdiMapped();
++            InterlockedIncrement(&allocation->m_gdiOpen);
++        }
+     }
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+@@ -332,6 +370,24 @@
+     return &m_pAdapter->ctrlQueue;
+ }
+ 
++void VioGpuDevice::TransferSync(bool to_host, VioGpuAllocation *allocation)
++{
++    PAGED_CODE();
++
++    const VIOGPU_RESOURCE_OPTIONS &options = allocation->GetOptions();
++    VIOGPU_TRANSFER_CMD transfer = {};
++    transfer.res_id = allocation->GetId();
++    transfer.box.width = options.width;
++    transfer.box.height = options.height;
++    transfer.box.depth = 1;
++    transfer.stride = options.width * 4;
++
++    KEVENT done;
++    KeInitializeEvent(&done, NotificationEvent, FALSE);
++    m_pAdapter->ctrlQueue.TransferHostCmd(to_host, m_id, &transfer, TransferSyncDone, &done);
++    KeWaitForSingleObject(&done, Executive, KernelMode, FALSE, NULL);
++}
++
+ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAllocation *allocation)
+ {
+     PAGED_CODE();
+@@ -351,6 +407,20 @@
+     DbgPrint(TRACE_LEVEL_VERBOSE,
+              ("<---> %s res_id=%d ctx_id=%d\n", __FUNCTION__, m_pAllocation->GetId(), m_pDevice->GetId()));
+ 
++    // What GDI drew last, to the host texture D3D uses (now, or with the next submission using it)
++    if (m_gdiMapped)
++    {
++        InterlockedDecrement(&m_pAllocation->m_gdiOpen);
++        if (m_pAllocation->HasBacking())
++        {
++            m_pDevice->TransferSync(true, m_pAllocation);
++        }
++        else
++        {
++            m_pAllocation->SetGdiDirty();
++        }
++    }
++
+     m_pDevice->GetCtrlQueue()->CtxResource(false, m_pDevice->GetId(), m_pAllocation->GetId());
+ }
+ 
+diff --git a/viogpu/viogpu3d/viogpu_device.h b/viogpu/viogpu3d/viogpu_device.h
+--- a/viogpu/viogpu3d/viogpu_device.h
++++ b/viogpu/viogpu3d/viogpu_device.h
+@@ -10,7 +10,7 @@
+ class VioGpuDevice
+ {
+   public:
+-    VioGpuDevice(VioGpuAdapter *pAdapter);
++    VioGpuDevice(VioGpuAdapter *pAdapter, UINT flags);
+     ~VioGpuDevice();
+ 
+     NTSTATUS Init(VIOGPU_CTX_INIT_REQ *pOptions);
+@@ -27,9 +27,13 @@
+ 
+     CtrlQueue *GetCtrlQueue();
+ 
++    // Copies an allocation's texture between the host and its pages and waits for it
++    void TransferSync(bool to_host, VioGpuAllocation *allocation);
++
+   private:
+     VioGpuAdapter *m_pAdapter;
+     ULONG m_id;
++    UINT m_flags; // DXGK_CREATEDEVICEFLAGS
+ };
+ 
+ class VioGpuDeviceAllocation
+@@ -40,7 +44,14 @@
+ 
+     VioGpuAllocation *GetAllocation();
+ 
++    // Opened by GDI to draw on it with the CPU: its pages hold the content while GDI has it open
++    void SetGdiMapped()
++    {
++        m_gdiMapped = true;
++    }
++
+   private:
+     VioGpuAllocation *m_pAllocation;
+     VioGpuDevice *m_pDevice;
++    bool m_gdiMapped = false;
+ };
+\ No newline at end of file

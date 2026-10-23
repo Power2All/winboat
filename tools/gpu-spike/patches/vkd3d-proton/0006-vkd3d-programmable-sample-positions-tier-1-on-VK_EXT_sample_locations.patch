@@ -1,0 +1,327 @@
+From: WinBoat
+Subject: [PATCH] vkd3d: programmable sample positions (tier 1) on VK_EXT_sample_locations
+
+Microsoft's Direct3D 12 runtime lets ResolveSubresourceRegion through (MSAA
+region resolves, and sampler feedback's decode and encode) only on a device
+with programmable sample positions, so the viogpu driver needs them for
+sampler feedback and feature level 12_2.
+
+SetSamplePositions (one pixel's positions, tier 1) keeps the positions in the
+command list's dynamic state; while it has some, a multisampled draw uses a
+pipeline variant (the key's sample_locations) with sampleLocationsEnable and
+VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT, and vkCmdSetSampleLocationsEXT sets
+them (D3D12's 1/16ths from the pixel center as Vulkan's 0..1 from its corner).
+Draws without positions keep the pipelines they always had: no MSAA pipeline
+changes unless an application sets positions. Variants are whole pipelines
+(not linked from the libraries, whose multisample states have no sample
+locations); multisampled PSOs keep their code for them (no "fully dynamic"
+PSO when the tier is there). The tier is reported where the device has
+custom locations at every multisampled color sample count. Not done: depth
+buffers' sample locations at layout transitions (rendering depth with moved
+positions and then sampling it with others is undefined in both APIs).
+---
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 24aa0c85..b29db9b7 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7652,6 +7652,8 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+         if (new_active_flags & ~list->dynamic_state.active_flags & VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE)
+             list->dynamic_state.dirty_vbos = ~0u;
+         list->dynamic_state.dirty_flags |= new_active_flags & ~list->dynamic_state.active_flags;
++        /* Sample locations go with the variant's sample count */
++        list->dynamic_state.dirty_flags |= new_active_flags & VKD3D_DYNAMIC_STATE_SAMPLE_LOCATIONS;
+         list->command_buffer_pipeline = vk_pipeline;
+     }
+ 
+@@ -8422,6 +8424,35 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
+         VK_CALL(vkCmdSetRasterizationSamplesEXT(list->cmd.vk_command_buffer, rasterization_samples));
+     }
+ 
++    if ((dyn_state->dirty_flags & (VKD3D_DYNAMIC_STATE_SAMPLE_LOCATIONS | VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES)) &&
++            (list->dynamic_state.active_flags & VKD3D_DYNAMIC_STATE_SAMPLE_LOCATIONS) && dyn_state->sample_position_count)
++    {
++        VkSampleLocationEXT locations[ARRAY_SIZE(dyn_state->sample_positions)];
++        VkSampleLocationsInfoEXT locations_info;
++
++        rasterization_samples = dyn_state->rasterization_samples;
++        if (!rasterization_samples)
++            rasterization_samples = list->state->graphics.ms_desc.rasterizationSamples;
++
++        /* D3D12: 1/16ths of a pixel from its center, -8 to 7; Vulkan: from its corner, 0 to 1. A mismatching sample
++         * count (undefined in D3D12) reuses the positions. */
++        for (i = 0; i < (unsigned int)rasterization_samples && i < ARRAY_SIZE(locations); i++)
++        {
++            const D3D12_SAMPLE_POSITION *p = &dyn_state->sample_positions[i % dyn_state->sample_position_count];
++            locations[i].x = (p->X + 8) / 16.0f;
++            locations[i].y = (p->Y + 8) / 16.0f;
++        }
++
++        memset(&locations_info, 0, sizeof(locations_info));
++        locations_info.sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
++        locations_info.sampleLocationsPerPixel = rasterization_samples;
++        locations_info.sampleLocationGridSize.width = 1;
++        locations_info.sampleLocationGridSize.height = 1;
++        locations_info.sampleLocationsCount = i;
++        locations_info.pSampleLocations = locations;
++        VK_CALL(vkCmdSetSampleLocationsEXT(list->cmd.vk_command_buffer, &locations_info));
++    }
++
+     dyn_state->dirty_flags = 0;
+ }
+ 
+@@ -17416,8 +17447,30 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetDepthBounds(d3d12_command_
+ static void STDMETHODCALLTYPE d3d12_command_list_SetSamplePositions(d3d12_command_list_iface *iface,
+         UINT sample_count, UINT pixel_count, D3D12_SAMPLE_POSITION *sample_positions)
+ {
+-    FIXME("iface %p, sample_count %u, pixel_count %u, sample_positions %p stub!\n",
++    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
++    struct vkd3d_dynamic_state *dyn_state = &list->dynamic_state;
++
++    TRACE("iface %p, sample_count %u, pixel_count %u, sample_positions %p.\n",
+             iface, sample_count, pixel_count, sample_positions);
++
++    /* Tier 1: one pixel's positions; 0 samples go back to the standard positions */
++    if (!d3d12_device_supports_programmable_sample_positions(list->device))
++        return;
++    if (sample_count > ARRAY_SIZE(dyn_state->sample_positions) || (sample_count && (pixel_count != 1 || !sample_positions)))
++    {
++        WARN("Ignoring %u positions for %u pixels.\n", sample_count, pixel_count);
++        return;
++    }
++    if (sample_count == dyn_state->sample_position_count &&
++            !memcmp(dyn_state->sample_positions, sample_positions, sample_count * sizeof(*sample_positions)))
++        return;
++
++    dyn_state->sample_position_count = sample_count;
++    if (sample_count)
++        memcpy(dyn_state->sample_positions, sample_positions, sample_count * sizeof(*sample_positions));
++    /* the pipeline (with or without the sample locations variant) is picked again */
++    d3d12_command_list_invalidate_current_pipeline(list, false);
++    dyn_state->dirty_flags |= VKD3D_DYNAMIC_STATE_SAMPLE_LOCATIONS;
+ }
+ 
+ static bool d3d12_command_list_validate_sampler_feedback_transcode(
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index ee7f306c..bd0ba46d 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -130,6 +130,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION(EXT_MEMORY_BUDGET, EXT_memory_budget),
+     VK_EXTENSION_COND(EXT_DEVICE_ADDRESS_BINDING_REPORT, EXT_device_address_binding_report, VKD3D_CONFIG_FLAG_FAULT),
+     VK_EXTENSION(EXT_DEPTH_BIAS_CONTROL, EXT_depth_bias_control),
++    VK_EXTENSION(EXT_SAMPLE_LOCATIONS, EXT_sample_locations),
+     VK_EXTENSION(EXT_ZERO_INITIALIZE_DEVICE_MEMORY, EXT_zero_initialize_device_memory),
+     VK_EXTENSION_COND(EXT_OPACITY_MICROMAP, EXT_opacity_micromap, VKD3D_CONFIG_FLAG_DXR_1_2),
+     VK_EXTENSION(EXT_SHADER_FLOAT8, EXT_shader_float8),
+@@ -2167,6 +2168,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         vk_prepend_struct(&info->features2, &info->ray_tracing_maintenance1_features);
+     }
+ 
++    if (vulkan_info->EXT_sample_locations)
++    {
++        info->sample_locations_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT;
++        vk_prepend_struct(&info->properties2, &info->sample_locations_properties);
++    }
++
+     if (vulkan_info->KHR_fragment_shading_rate)
+     {
+         info->fragment_shading_rate_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR;
+@@ -9462,8 +9469,10 @@ static void d3d12_device_caps_init_feature_options2(struct d3d12_device *device)
+     D3D12_FEATURE_DATA_D3D12_OPTIONS2 *options2 = &device->d3d12_caps.options2;
+ 
+     options2->DepthBoundsTestSupported = features->depthBounds;
+-    /* Requires VK_EXT_sample_locations */
+-    options2->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
++    /* Tier 1 (one pixel's positions) through VK_EXT_sample_locations: a pipeline variant with dynamic sample
++     * locations while the command list has positions set */
++    options2->ProgrammableSamplePositionsTier = d3d12_device_supports_programmable_sample_positions(device)
++            ? D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_1 : D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
+ }
+ 
+ static void d3d12_device_caps_init_feature_options3(struct d3d12_device *device)
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index ce7f54ec..f03c9fa0 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3960,6 +3960,7 @@ vkd3d_dynamic_state_list[] =
+     { VKD3D_DYNAMIC_STATE_DEPTH_BIAS,            VK_DYNAMIC_STATE_DEPTH_BIAS },
+     { VKD3D_DYNAMIC_STATE_DEPTH_BIAS,            VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE },
+     { VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES, VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT },
++    { VKD3D_DYNAMIC_STATE_SAMPLE_LOCATIONS,      VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT },
+ };
+ 
+ uint32_t vkd3d_init_dynamic_state_array(VkDynamicState *dynamic_states, uint32_t dynamic_state_flags)
+@@ -4331,6 +4332,9 @@ uint32_t d3d12_graphics_pipeline_state_get_dynamic_state_flags(struct d3d12_pipe
+             state->device->device_info.extended_dynamic_state3_features.extendedDynamicState3RasterizationSamples)
+         dynamic_state_flags |= VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES;
+ 
++    if (key && key->sample_locations)
++        dynamic_state_flags |= VKD3D_DYNAMIC_STATE_SAMPLE_LOCATIONS;
++
+     return dynamic_state_flags;
+ }
+ 
+@@ -5712,6 +5716,11 @@ static HRESULT d3d12_pipeline_state_finish_graphics(struct d3d12_pipeline_state
+     if (graphics->multiview.dynamic_mask)
+         state->pso_is_fully_dynamic = false;
+ 
++    /* Multisampled pipelines may need a variant with programmable sample positions. */
++    if (graphics->ms_desc.rasterizationSamples > VK_SAMPLE_COUNT_1_BIT &&
++            d3d12_device_supports_programmable_sample_positions(state->device))
++        state->pso_is_fully_dynamic = false;
++
+     if (!state->pso_is_fully_dynamic)
+     {
+         /* If we got here successfully without SPIR-V code,
+@@ -6290,6 +6299,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     VkPipelineTessellationStateCreateInfo tessellation_info;
+     bool has_vertex_input_state, has_fragment_output_state;
+     VkPipelineCreationFeedbackCreateInfoEXT feedback_info;
++    VkPipelineSampleLocationsStateCreateInfoEXT sample_locations_info;
+     VkPipelineMultisampleStateCreateInfo multisample_info;
+     VkPipelineDynamicStateCreateInfo dynamic_create_info;
+     struct vkd3d_queue_timeline_trace_cookie cookie;
+@@ -6306,7 +6316,8 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     *dynamic_state_flags = d3d12_graphics_pipeline_state_init_dynamic_state(state, &dynamic_create_info,
+             dynamic_state_buffer, key);
+ 
+-    if (!library_flags && graphics->library)
++    /* Sample location variants are whole pipelines: the libraries' multisample states have no sample locations */
++    if (!library_flags && graphics->library && !(key && key->sample_locations))
+     {
+         if (d3d12_pipeline_state_link_pipeline_variant(state, key, dsv_format,
+                 vk_cache, *dynamic_state_flags, &vk_pipeline) == VK_SUCCESS)
+@@ -6374,6 +6385,17 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+         if (key && key->rasterization_samples)
+             multisample_info.rasterizationSamples = key->rasterization_samples;
+ 
++        if (key && key->sample_locations)
++        {
++            /* the locations themselves are dynamic state */
++            memset(&sample_locations_info, 0, sizeof(sample_locations_info));
++            sample_locations_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT;
++            sample_locations_info.pNext = multisample_info.pNext;
++            sample_locations_info.sampleLocationsEnable = VK_TRUE;
++            sample_locations_info.sampleLocationsInfo.sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
++            multisample_info.pNext = &sample_locations_info;
++        }
++
+         pipeline_desc.pMultisampleState = &multisample_info;
+     }
+ 
+@@ -6549,6 +6571,17 @@ err:
+     return vk_pipeline;
+ }
+ 
++/* Whether a draw needs the variant with SetSamplePositions' positions */
++static bool d3d12_pipeline_state_uses_sample_positions(struct d3d12_pipeline_state *state,
++        const struct vkd3d_dynamic_state *dyn_state)
++{
++    VkSampleCountFlagBits samples = dyn_state->rasterization_samples
++            ? dyn_state->rasterization_samples : state->graphics.ms_desc.rasterizationSamples;
++
++    return dyn_state->sample_position_count && samples > VK_SAMPLE_COUNT_1_BIT && !state->pso_is_fully_dynamic &&
++            d3d12_device_supports_programmable_sample_positions(state->device);
++}
++
+ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
+         const struct vkd3d_dynamic_state *dyn_state, const struct vkd3d_format *dsv_format,
+         uint32_t *dynamic_state_flags)
+@@ -6558,6 +6591,10 @@ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
+     if (!graphics->pipeline)
+         return VK_NULL_HANDLE;
+ 
++    /* Programmable sample positions: a variant */
++    if (d3d12_pipeline_state_uses_sample_positions(state, dyn_state))
++        return VK_NULL_HANDLE;
++
+     if (d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics) && dsv_format)
+     {
+         TRACE("Applying unknown DSV workaround with format %u buggy application!\n", dsv_format->vk_format);
+@@ -6639,6 +6676,7 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
+ 
+     pipeline_key.dsv_format = dsv_format ? dsv_format->vk_format : VK_FORMAT_UNDEFINED;
+     pipeline_key.view_mask = graphics->multiview.dynamic_mask ? dyn_state->view_mask : 0;
++    pipeline_key.sample_locations = d3d12_pipeline_state_uses_sample_positions(state, dyn_state);
+ 
+     if (!(graphics->pipeline_dynamic_states & VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES))
+     {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index d49affa9..83cfc4b8 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -186,6 +186,7 @@ struct vkd3d_vulkan_info
+     bool EXT_memory_budget;
+     bool EXT_device_address_binding_report;
+     bool EXT_depth_bias_control;
++    bool EXT_sample_locations;
+     bool EXT_zero_initialize_device_memory;
+     bool EXT_opacity_micromap;
+     bool EXT_shader_float8;
+@@ -2071,6 +2072,7 @@ enum vkd3d_dynamic_state_flag
+     VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK    = (1 << 11),
+     VKD3D_DYNAMIC_STATE_DEPTH_BIAS            = (1 << 12),
+     VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES = (1 << 13),
++    VKD3D_DYNAMIC_STATE_SAMPLE_LOCATIONS      = (1 << 14),
+ };
+ 
+ struct vkd3d_shader_debug_ring_spec_constants
+@@ -2403,6 +2405,8 @@ struct vkd3d_pipeline_key
+     uint32_t view_mask;
+ 
+     bool dynamic_topology;
++    /* SetSamplePositions' positions (a variant with dynamic sample locations) */
++    bool sample_locations;
+ };
+ 
+ bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state);
+@@ -2784,6 +2788,10 @@ struct vkd3d_dynamic_state
+     } fragment_shading_rate;
+ 
+     uint32_t pipeline_stack_size;
++
++    /* SetSamplePositions (tier 1: one pixel's); 0 for the standard positions */
++    uint32_t sample_position_count;
++    D3D12_SAMPLE_POSITION sample_positions[16];
+ };
+ 
+ /* ID3D12CommandList */
+@@ -5111,6 +5119,7 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceImageAlignmentControlFeaturesMESA image_alignment_control_features;
+     VkPhysicalDeviceImageAlignmentControlPropertiesMESA image_alignment_control_properties;
+     VkPhysicalDeviceDepthBiasControlFeaturesEXT depth_bias_control_features;
++    VkPhysicalDeviceSampleLocationsPropertiesEXT sample_locations_properties;
+     VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow_nv_features;
+     VkPhysicalDeviceVideoMaintenance1FeaturesKHR video_maintenance1_features;
+     VkPhysicalDeviceVideoMaintenance2FeaturesKHR video_maintenance2_features;
+@@ -5699,6 +5708,16 @@ static inline bool d3d12_device_uses_descriptor_buffers(const struct d3d12_devic
+     return device->global_descriptor_buffer.resource.va != 0;
+ }
+ 
++/* Programmable sample positions (tier 1): custom sample locations at every multisampled color sample count */
++static inline bool d3d12_device_supports_programmable_sample_positions(const struct d3d12_device *device)
++{
++    VkSampleCountFlags counts = device->device_info.properties2.properties.limits.framebufferColorSampleCounts &
++            ~VK_SAMPLE_COUNT_1_BIT;
++
++    return device->vk_info.EXT_sample_locations &&
++            (device->device_info.sample_locations_properties.sampleLocationSampleCounts & counts) == counts;
++}
++
+ static inline bool is_cpu_accessible_heap(const D3D12_HEAP_PROPERTIES *properties)
+ {
+     if (properties->Type == D3D12_HEAP_TYPE_DEFAULT)
+diff --git a/libs/vkd3d/vulkan_procs.h b/libs/vkd3d/vulkan_procs.h
+index 3dbb37de..c25c081c 100644
+--- a/libs/vkd3d/vulkan_procs.h
++++ b/libs/vkd3d/vulkan_procs.h
+@@ -255,6 +255,9 @@ VK_DEVICE_EXT_PFN(vkCmdInsertDebugUtilsLabelEXT)
+ /* VK_EXT_depth_bias_control */
+ VK_DEVICE_EXT_PFN(vkCmdSetDepthBias2EXT)
+ 
++/* VK_EXT_sample_locations */
++VK_DEVICE_EXT_PFN(vkCmdSetSampleLocationsEXT)
++
+ /* VK_EXT_transform_feedback */
+ VK_DEVICE_EXT_PFN(vkCmdBeginQueryIndexedEXT)
+ VK_DEVICE_EXT_PFN(vkCmdBeginTransformFeedbackEXT)

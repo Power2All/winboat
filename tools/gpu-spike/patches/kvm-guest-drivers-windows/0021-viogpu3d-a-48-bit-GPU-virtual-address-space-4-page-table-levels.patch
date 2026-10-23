@@ -1,0 +1,26 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: a 48-bit GPU virtual address space (4 page table levels)
+
+Direct3D feature level 12_2 wants at least 40 bits of GPU virtual address a
+process; 3 levels of 512-entry page tables over 4 KB pages were 39. Four
+levels give 48, as real GPUs have. The page tables stay what they were:
+written by the CPU, read by nobody but Windows.
+---
+diff --git a/viogpu/common/helper.h b/viogpu/common/helper.h
+index 22c678b..acb4d55 100644
+--- a/viogpu/common/helper.h
++++ b/viogpu/common/helper.h
+@@ -108,10 +108,10 @@ extern "C"
+ #define VIOGPU_WDDM2 0
+ #endif
+ 
+-// GPU page tables (VIOGPU_WDDM2): 3 levels of 512 entries (DXGK_PTE, 16 bytes: 8 KB a table) over 4 KB pages, a
+-// 39-bit (512 GB) GPU virtual address space. The CPU updates them (DXGK_PAGETABLEUPDATE_CPU_VIRTUAL) and the virtual
++// GPU page tables (VIOGPU_WDDM2): 4 levels of 512 entries (DXGK_PTE, 16 bytes: 8 KB a table) over 4 KB pages, a
++// 48-bit GPU virtual address space (Direct3D feature level 12_2 wants at least 40 bits a process). The CPU updates them (DXGK_PAGETABLEUPDATE_CPU_VIRTUAL) and the virtual
+ // GPU never reads them: its commands name host resources, not addresses
+-#define VIOGPU_PAGE_TABLE_LEVELS     3
++#define VIOGPU_PAGE_TABLE_LEVELS     4
+ #define VIOGPU_PAGE_TABLE_INDEX_BITS 9
+ #define VIOGPU_PAGE_TABLE_SIZE       ((1 << VIOGPU_PAGE_TABLE_INDEX_BITS) * 16)
+ #define VIOGPU_GPU_VA_BITS           (VIOGPU_PAGE_TABLE_LEVELS * VIOGPU_PAGE_TABLE_INDEX_BITS + 12)

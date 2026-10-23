@@ -1,0 +1,217 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: interrupt notifications zeroed, the current fence, timeout diagnostics
+
+The vsync and DMA-completed notifications left DXGKARGCB_NOTIFY_INTERRUPT_DATA's Flags and PhysicalAdapterMask as
+stack garbage: with ValidPhysicalAdapterMask set by chance, Windows 10 dropped them as meant for another adapter.
+Flips completed about twice a second (D3D11 vsync presents at 2/s, Vulkan swap chains at 2 fps, DWM barely flipped),
+and on a stock host most boots had a GPU timeout ~20 s in, with nothing outstanding in the driver (Windows then
+deadlocked: DWM exiting held the adapter lock the reset waited for). Both are zero-initialized now.
+DxgkDdiQueryCurrentFence answers the node's last completed fence (it left it 0: no progress at all, for a scheduler
+that checks for a missed interrupt). At a timeout the log (VIOGPU_GET_LOG) also gets the display's flips and vsyncs;
+a flip that took over 100 ms is logged. VIOGPU_SCHED_LOG (helper.h, 0 by default) logs every submission, completion,
+preemption and fence query there, outside spinlocks (paged code's strings are paged).
+---
+diff --git a/viogpu/common/helper.h b/viogpu/common/helper.h
+index acb4d55..322fb9c 100644
+--- a/viogpu/common/helper.h
++++ b/viogpu/common/helper.h
+@@ -121,6 +121,16 @@ extern "C"
+ // A diagnostic log kept in memory (32 KB, oldest lines dropped), read with the VIOGPU_GET_LOG escape. Any IRQL up to
+ // DISPATCH_LEVEL
+ void VioGpuLog(_In_z_ _Printf_format_string_ const char *format, ...);
++// Every submission, completion, preemption and fence query in that log (diagnostics: the scheduler's view of each node
++// when it times out). Off: the log would only hold the last few hundred
++#ifndef VIOGPU_SCHED_LOG
++#define VIOGPU_SCHED_LOG 0
++#endif
++#if VIOGPU_SCHED_LOG
++#define VioGpuSchedLog(...) VioGpuLog(__VA_ARGS__)
++#else
++#define VioGpuSchedLog(...) ((void)0)
++#endif
+ 
+ #define PAGED_CODE_SEG       __declspec(code_seg("PAGE"))
+ #define PAGED_CODE_SEG_BEGIN __pragma(code_seg(push)) __pragma(code_seg("PAGE"))
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index b9f7dcf..7911688 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -1190,11 +1190,13 @@ NTSTATUS
+ APIENTRY
+ VioGpu3DDdiQueryCurrentFence(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYCURRENTFENCE *pCurrentFence)
+ {
+-    UNREFERENCED_PARAMETER(hAdapter);
+-    UNREFERENCED_PARAMETER(pCurrentFence);
+-
+-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
+-
++    // The node's last completed fence: it said 0 (nothing done), which a scheduler that checks for a missed interrupt
++    // before declaring a timeout takes for no progress at all
++    VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(hAdapter);
++    VioGpuCommander &commander =
++        pCurrentFence->NodeOrdinal == VIOGPU_VENUS_NODE ? pAdapter->venusCommander : pAdapter->commander;
++    pCurrentFence->CurrentFence = commander.LastCompletedFence();
++    VioGpuSchedLog("query fence n%u: %u", pCurrentFence->NodeOrdinal, pCurrentFence->CurrentFence);
+     return STATUS_SUCCESS;
+ };
+ 
+@@ -1240,6 +1242,7 @@ VioGpu3DDdiResetFromTimeout(_In_ CONST HANDLE hAdapter)
+ {
+     // A GPU timeout (TDR): what was submitted is abandoned, and the commander takes new work at once. Commands the
+     // host still holds complete into the void; Windows recreates the devices it had
++    reinterpret_cast<VioGpuAdapter *>(hAdapter)->vidpn.LogFlipState();
+     reinterpret_cast<VioGpuAdapter *>(hAdapter)->commander.Reset();
+     reinterpret_cast<VioGpuAdapter *>(hAdapter)->venusCommander.Reset();
+     return STATUS_SUCCESS;
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index 7292380..79aadd9 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -188,7 +188,7 @@ void VioGpuCommand::Run()
+         delete m_allocations;
+     }
+ 
+-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt;
++    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {}; // Flags and PhysicalAdapterMask zero: this adapter
+     interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
+     interrupt.DmaCompleted.SubmissionFenceId = m_FenceId;
+     interrupt.DmaCompleted.NodeOrdinal = m_pCommander->m_node;
+@@ -202,6 +202,8 @@ void VioGpuCommand::Run()
+         m_pAdapter->NotifyInterrupt(&interrupt, true);
+     }
+     m_pCommander->UnlockQueue(irql);
++    // not under the lock: paged code and strings
++    VioGpuSchedLog("done n%u f%u%s", m_pCommander->m_node, m_FenceId, stale ? " stale" : "");
+     if (stale)
+     {
+         m_allocations = NULL; // released above
+@@ -491,6 +493,7 @@ bool VioGpuCommander::CompleteMarkers()
+         m_pending--;
+         m_lastCompletedFence = marker->GetFenceId();
+         UnlockQueue(irql);
++        VioGpuSchedLog("done n%u f%u marker", m_node, marker->GetFenceId());
+         marker->Discard();
+         completed = true;
+     }
+@@ -558,6 +561,7 @@ void VioGpuCommander::NotifyPreemptionIfIdle()
+     }
+ 
+     DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
++    VioGpuSchedLog("preempted n%u f%u last %u", m_node, preemptionFence, lastCompletedFence);
+     interrupt.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
+     interrupt.DmaPreempted.PreemptionFenceId = preemptionFence;
+     interrupt.DmaPreempted.LastCompletedFenceId = lastCompletedFence;
+@@ -603,6 +607,12 @@ NTSTATUS VioGpuCommander::SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitComm
+     }
+ 
+     cmd->PrepareSubmit(pSubmitCommand);
++    VioGpuSchedLog("submit n%u f%u%s len %u%s",
++                   m_node,
++                   pSubmitCommand->SubmissionFenceId,
++                   pSubmitCommand->Flags.Paging ? " paging" : "",
++                   pSubmitCommand->DmaBufferSubmissionEndOffset - pSubmitCommand->DmaBufferSubmissionStartOffset,
++                   marker ? " marker" : "");
+     if (marker)
+     {
+         cmd->m_marker = true;
+@@ -649,6 +659,7 @@ NTSTATUS VioGpuCommander::PreemptCommand(const DXGKARG_PREEMPTCOMMAND *pPreemptC
+     m_preemptionFence = pPreemptCommand->PreemptionFenceId;
+     LONG running = m_running, pending = (LONG)m_pending;
+     UnlockQueue(oldIrql);
++    VioGpuSchedLog("preempt n%u f%u (running %d, pending %d)", m_node, pPreemptCommand->PreemptionFenceId, running, pending);
+     if (m_node == VIOGPU_VENUS_NODE && m_logged < 64)
+     {
+         m_logged++;
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+index fe8af76..a97884e 100644
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -96,6 +96,12 @@ class VioGpuCommander
+ 
+     void QueueSubmitted(VioGpuCommand *cmd);
+ 
++    // The last fence reported complete (DxgkDdiQueryCurrentFence: the scheduler's check for a missed interrupt)
++    UINT LastCompletedFence() const
++    {
++        return *(volatile const UINT *)&m_lastCompletedFence;
++    }
++
+   private:
+     static void ThreadWork(PVOID Context);
+     void ThreadWorkRoutine(void);
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index b9bee27..e77f0ac 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -2068,6 +2068,7 @@ void VioGpuVidPN::Flip(bool vsync)
+ 
+     if (InterlockedExchange(&m_shouldFlip, 0))
+     {
++        ULONGLONG start = KeQueryInterruptTime();
+         if (m_sourceAddress.QuadPart != 0 && m_sourceRes != NULL)
+         {
+             m_sourceRes->FlushToScreen(0);
+@@ -2076,12 +2077,21 @@ void VioGpuVidPN::Flip(bool vsync)
+         {
+             m_pAdapter->ctrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
+         }
++        m_flips++;
++        m_lastFlip = KeQueryInterruptTime();
++        // the vsyncs wait for it
++        if (m_lastFlip - start > 1000000)
++        {
++            VioGpuLog("flip to %I64x took %I64u ms", m_sourceAddress.QuadPart, (m_lastFlip - start) / 10000);
++        }
+     }
+     if (!vsync)
+     {
+         return;
+     }
+-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt;
++    m_vsyncs++;
++    m_lastVsync = KeQueryInterruptTime();
++    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {}; // Flags and PhysicalAdapterMask zero: this adapter
+     interrupt.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
+ 
+     interrupt.CrtcVsync.VidPnTargetId = 0;
+@@ -2147,6 +2157,19 @@ PAGED_CODE_SEG_END
+ #pragma code_seg(push)
+ #pragma code_seg()
+ 
++// Up to DISPATCH_LEVEL (DxgkDdiResetFromTimeout)
++void VioGpuVidPN::LogFlipState()
++{
++    ULONGLONG now = KeQueryInterruptTime();
++    VioGpuLog("display: %lu flips (last %I64u ms ago), %lu vsyncs (last %I64u ms ago), %d Hz, flip pending %ld",
++              m_flips,
++              m_lastFlip ? (now - m_lastFlip) / 10000 : 0,
++              m_vsyncs,
++              m_lastVsync ? (now - m_lastVsync) / 10000 : 0,
++              (int)m_RefreshRate,
++              m_shouldFlip);
++}
++
+ // Runs at DISPATCH_LEVEL: wakes the flip thread
+ void VioGpuVidPN::FlipTimerCallback(PEX_TIMER Timer, PVOID ctx)
+ {
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index b28bc55..a0a1eb6 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -109,6 +109,8 @@ class VioGpuVidPN
+     {
+         return (UINT)m_RefreshRate;
+     }
++    // GPU timeout diagnostics: the flips and vsyncs so far, and how long ago the last ones were
++    void LogFlipState();
+ 
+   private:
+     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
+@@ -160,4 +162,7 @@ class VioGpuVidPN
+     KDPC m_flipNowDpc;
+     // The committed mode's refresh rate (Hz): the vblank timer runs at it
+     volatile LONG m_RefreshRate = 60;
++    // Flip thread only (read by LogFlipState): counts and interrupt times (100 ns) of the last ones
++    ULONG m_flips = 0, m_vsyncs = 0;
++    ULONGLONG m_lastFlip = 0, m_lastVsync = 0;
+ };

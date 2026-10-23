@@ -1,0 +1,53 @@
+spice-widget: let the window manager size a window area
+
+A widget that shows a window area (spice_display_set_window_area) is a guest window of its own, which the window
+manager moves and resizes; the guest window follows a moment later.
+
+- Request no size for it: with scaling off, the widget asks for the area's size, which becomes the window's minimum
+  size, so it could only grow.
+- Until the guest window has followed, the area is smaller or larger than the widget: draw it at the top left then,
+  like a native window's contents, instead of centered (which makes it jump around while resizing).
+
+diff --color -ru a/src/spice-widget.c b/src/spice-widget.c
+--- a/src/spice-widget.c
++++ b/src/spice-widget.c
+@@ -210,7 +210,11 @@
+     gint reqwidth, reqheight;
+     gint scale_factor;
+ 
+-    if (d->resize_guest_enable || d->allow_scaling) {
++    if (d->window_area_set) {
++        /* A guest window's size: the window manager can make it smaller too (the guest window follows) */
++        reqwidth = 1;
++        reqheight = 1;
++    } else if (d->resize_guest_enable || d->allow_scaling) {
+         reqwidth = 640;
+         reqheight = 480;
+     } else {
+@@ -3233,9 +3237,10 @@
+         s = 1.0;
+         x = 0;
+         y = 0;
+-        if (ww > d->area.width)
++        /* A window area stays at the top left, like a window's contents while it is resized */
++        if (ww > d->area.width && !d->window_area_set)
+             x = (ww - d->area.width) / 2;
+-        if (wh > d->area.height)
++        if (wh > d->area.height && !d->window_area_set)
+             y = (wh - d->area.height) / 2;
+         w = fbw;
+         h = fbh;
+diff --color -ru a/src/spice-widget-egl.c b/src/spice-widget-egl.c
+--- a/src/spice-widget-egl.c
++++ b/src/spice-widget-egl.c
+@@ -621,6 +621,10 @@
+     spice_egl_prepare_default_framebuffer();
+ 
+     spice_display_get_scaling(display, &s, &x, &y, &w, &h);
++    /* A window area stays at the top left (OpenGL counts from the bottom) */
++    if (d->window_area_set)
++        y = gtk_widget_get_allocated_height(GTK_WIDGET(display)) *
++            gtk_widget_get_scale_factor(GTK_WIDGET(display)) - h;
+ 
+     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+     glClear(GL_COLOR_BUFFER_BIT);

@@ -1,0 +1,155 @@
+spice-display: don't block the guest while a local client draws
+
+QEMU blocks the virtio-gpu queue after every scanout update until the SPICE
+client confirms it drew the frame (GL_DRAW_DONE). A local client draws at its
+next vblank, so the guest's next frame waited up to a frame for it, missed its
+own vblank, and Windows composed at 20 fps instead of 60 (every third vblank).
+
+For local clients, the update is drawn without blocking; updates arriving while
+a draw is pending are coalesced and drawn once the client is done. Remote
+clients (video encoding) keep the old behaviour. A client that doesn't confirm
+a draw within a second only gets a warning, as before: spice-server takes one
+draw at a time and aborts on another one while it waits.
+
+--- a/include/ui/spice-display.h
++++ b/include/ui/spice-display.h
+@@ -123,6 +123,13 @@
+     QemuGLShader *gls;
+     GLuint gl_surface_mem_obj;
+     int gl_updates;
++    /*
++     * Local clients: a gl_draw the client hasn't confirmed yet, and whether
++     * the guest updated the screen since (drawn once the client is done)
++     */
++    bool gl_draw_pending;
++    bool gl_draw_queued;
++    QXLRect gl_draw_rect;
+     bool have_scanout;
+     bool have_surface;
+ 
+--- a/ui/spice-display.c
++++ b/ui/spice-display.c
+@@ -822,27 +822,85 @@
+     qemu_console_hw_gl_block(ssd->dcl.con, block);
+ }
+ 
++static void spice_gl_draw(SimpleSpiceDisplay *ssd,
++                           uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++    uint64_t cookie;
++
++    cookie = (uintptr_t)qxl_cookie_new(QXL_COOKIE_TYPE_GL_DRAW_DONE, 0);
++    spice_qxl_gl_draw_async(&ssd->qxl, x, y, w, h, cookie);
++}
++
++/*
++ * Scanout updates for local clients don't block the guest while the client
++ * draws: blocking stalls the whole virtio-gpu queue until the client has
++ * painted the frame (at its next vblank), and the guest then misses its own
++ * vblanks (Windows composed at 20 fps instead of 60). The guest flips between
++ * buffers, so it renders the next frame into another one meanwhile; updates
++ * that arrive while a draw is pending are drawn together once it's done.
++ */
++static void spice_gl_draw_local(SimpleSpiceDisplay *ssd,
++                                uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++    QXLRect *r = &ssd->gl_draw_rect;
++
++    if (ssd->gl_draw_pending) {
++        if (!ssd->gl_draw_queued) {
++            r->left = x;
++            r->top = y;
++            r->right = x + w;
++            r->bottom = y + h;
++            ssd->gl_draw_queued = true;
++        } else {
++            r->left = MIN(r->left, x);
++            r->top = MIN(r->top, y);
++            r->right = MAX(r->right, x + w);
++            r->bottom = MAX(r->bottom, y + h);
++        }
++        return;
++    }
++    ssd->gl_draw_pending = true;
++    timer_mod(ssd->gl_unblock_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
++    spice_gl_draw(ssd, x, y, w, h);
++}
++
++static void spice_gl_draw_local_done(SimpleSpiceDisplay *ssd)
++{
++    QXLRect r = ssd->gl_draw_rect;
++
++    timer_del(ssd->gl_unblock_timer);
++    ssd->gl_draw_pending = false;
++    if (ssd->gl_draw_queued) {
++        ssd->gl_draw_queued = false;
++        if (ssd->have_scanout) {
++            spice_gl_draw_local(ssd, r.left, r.top,
++                                r.right - r.left, r.bottom - r.top);
++        }
++    }
++}
++
+ static void qemu_spice_gl_unblock_bh(void *opaque)
+ {
+     SimpleSpiceDisplay *ssd = opaque;
+ 
++    if (ssd->gl_draw_pending) {
++        spice_gl_draw_local_done(ssd);
++        return;
++    }
+     qemu_spice_gl_block(ssd, false);
+ }
+ 
++/*
++ * Only a warning: spice-server takes one gl_draw at a time (another one while
++ * it waits for the client aborts QEMU), and a local client's draw doesn't
++ * block the guest anyway. Updates are coalesced until the client is done.
++ */
+ static void qemu_spice_gl_block_timer(void *opaque)
+ {
+     warn_report("spice: no gl-draw-done within one second");
+ }
+ 
+-static void spice_gl_draw(SimpleSpiceDisplay *ssd,
+-                           uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+-{
+-    uint64_t cookie;
+-
+-    cookie = (uintptr_t)qxl_cookie_new(QXL_COOKIE_TYPE_GL_DRAW_DONE, 0);
+-    spice_qxl_gl_draw_async(&ssd->qxl, x, y, w, h, cookie);
+-}
+-
+ static void spice_gl_refresh(DisplayChangeListener *dcl)
+ {
+     SimpleSpiceDisplay *ssd = container_of(dcl, SimpleSpiceDisplay, dcl);
+@@ -864,7 +922,7 @@
+     }
+ 
+     qemu_console_hw_update(dcl->con);
+-    if (ssd->gl_updates && ssd->have_surface) {
++    if (ssd->gl_updates && ssd->have_surface && !ssd->gl_draw_pending) {
+         qemu_spice_gl_block(ssd, true);
+         glFlush();
+         spice_gl_draw(ssd, 0, 0,
+@@ -1064,6 +1122,7 @@
+             qemu_spice_gl_block(ssd, false);
+         }
+     }
++    ssd->gl_draw_queued = false;
+     spice_server_gl_scanout(&ssd->qxl, NULL, 0, 0, NULL, NULL, 0, DRM_FORMAT_INVALID,
+                             DRM_FORMAT_MOD_INVALID, false);
+     qemu_spice_gl_monitor_config(ssd, 0, 0, 0, 0);
+@@ -1333,6 +1392,11 @@
+     }
+ 
+     trace_qemu_spice_gl_update(ssd->qxl.id, w, h, x, y);
++    if (!spice_remote_client) {
++        glFlush();
++        spice_gl_draw_local(ssd, x, y, w, h);
++        return;
++    }
+     qemu_spice_gl_block(ssd, true);
+     glFlush();
+ 

@@ -1,0 +1,3291 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: shader model 5 (stage 1) and texture/control flow fixes for virgl
+
+Towards feature level 11_0 natively (TGSI through virgl). Stage 1: shader model 5 parsing and the instructions of
+vertex, geometry and pixel shaders. Found on the way, D3D10 bugs on virgl that this fixes too:
+
+- Control flow: virglrenderer has no TGSI CONT, SWITCH/CASE/DEFAULT/ENDSWITCH (it drops them), so HLSL continue and
+  switch ran wrong. Lowered: a loop with a continue runs its body in an inner loop that runs once, a switch is a
+  loop that runs once around if-regions per case label group (fall-through kept); flags carry break/continue out.
+- Textures: the virgl path sampled through the sampler register's slot (t3 with s0 read texture 0), ignored the
+  texture operand's swizzle (fxc writes single channels with it), texel offsets, the comparison of sample_c (no
+  shadow target), resinfo's return type and declared no sampler view types (integer textures). Now each (t#, s#,
+  comparison) combination gets a TGSI sampler of its own with the view's target and return type, bound at draw
+  time (Shader_tex_slots, ShaderBindTexSlots); results are swizzled; offsets, shadow targets (reference in .z/.w or
+  a second operand, level 0 through zero gradients), resinfo/bufinfo conversions, ld2dms' sample index.
+- New: gather4 (component select, _c, _po with register offsets), lod, sampleinfo, samplepos (standard patterns),
+  rcp, coarse/fine derivatives, countbits, firstbit_lo/hi/shi, bfrev, ubfe/ibfe/bfi (D3D's results past bit 31),
+  f32tof16 (round toward zero, like WARP)/f16tof32 by integer arithmetic (no half packing in virgl), uaddc, usubb,
+  swapc, emit/cut on streams, GS instance count/ID, SV_Coverage in/out, SV_SampleIndex, conservative depth outputs,
+  centroid/sample interpolation, eval_centroid/sample_index/snapped. The parser knows every shader model 5 opcode
+  (236, unknown ones are skipped instead of misparsed), 3D operand indices and the new declarations.
+- The translator's state (4096 temporaries) lives on the heap: on the stack it overflowed DWM's thread (crash loop,
+  black desktop) once the translator grew.
+- BC6H/BC7 formats (BPTC).
+- Development: WINBOAT_D3D_FL11=1 in a program's environment reports feature level 11_0 (with the compute cap the
+  runtime requires) to that program only, for testing while compute and tessellation are missing.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -211,11 +211,27 @@
+    }
+    memset(pData->pData, 0, pData->DataSize);
+    switch (pData->Type) {
++   case D3D11DDICAPS_SHADER: {
++      /* The runtime refuses feature level 11_0 without compute (and raw/structured buffers) in shader model 4.x
++       * too. XXX development: compute shaders are stage 2 of feature level 11_0; only with the switch below. */
++      char fl11[4] = "";
++      if (pData->DataSize >= sizeof(D3D11DDI_SHADER_CAPS) &&
++          GetEnvironmentVariableA("WINBOAT_D3D_FL11", fl11, sizeof fl11) && fl11[0] == '1') {
++         static_cast<D3D11DDI_SHADER_CAPS *>(pData->pData)->Caps =
++            D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X;
++      }
++      break;
++   }
+    case D3D11DDICAPS_3DPIPELINESUPPORT:
+-      /* The 11.x DDI runtime asks which feature levels the device has: 10_0 */
++      /* The 11.x DDI runtime asks which feature levels the device has: 10_0. Development: 11_0 for programs
++       * started with WINBOAT_D3D_FL11=1, while shader model 5 is being completed (test programs only). */
+       if (pData->DataSize >= sizeof(D3D11DDI_3DPIPELINESUPPORT_CAPS)) {
++         char fl11[4] = "";
++         bool dev_fl11 = GetEnvironmentVariableA("WINBOAT_D3D_FL11", fl11, sizeof fl11) && fl11[0] == '1';
+          static_cast<D3D11DDI_3DPIPELINESUPPORT_CAPS *>(pData->pData)->Caps =
+-            D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0);
++            D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0) |
++            (dev_fl11 ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1) |
++                        D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0) : 0);
+       }
+       break;
+    default:
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -533,6 +533,7 @@
+       }
+ #endif
+    }
++
+ }
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/Draw.cpp
+@@ -103,6 +103,7 @@
+       pipe->bind_gs_state(pipe, gs->handle);
+    }
+    update_velems(pDevice);
++   ShaderBindTexSlots(pDevice);
+ 
+    if (pDevice->vbuffers_changed) {
+       cso_set_vertex_buffers(pDevice->cso, PIPE_MAX_ATTRIBS, false, pDevice->vertex_buffers);
+diff --git a/src/gallium/frontends/d3d10umd/Format.cpp b/src/gallium/frontends/d3d10umd/Format.cpp
+--- a/src/gallium/frontends/d3d10umd/Format.cpp
++++ b/src/gallium/frontends/d3d10umd/Format.cpp
+@@ -240,6 +240,17 @@
+    case DXGI_FORMAT_BC5_SNORM:
+       return PIPE_FORMAT_RGTC2_SNORM;
+ 
++   case DXGI_FORMAT_BC6H_TYPELESS:
++   case DXGI_FORMAT_BC6H_UF16:
++      return PIPE_FORMAT_BPTC_RGB_UFLOAT;
++   case DXGI_FORMAT_BC6H_SF16:
++      return PIPE_FORMAT_BPTC_RGB_FLOAT;
++   case DXGI_FORMAT_BC7_TYPELESS:
++   case DXGI_FORMAT_BC7_UNORM:
++      return PIPE_FORMAT_BPTC_RGBA_UNORM;
++   case DXGI_FORMAT_BC7_UNORM_SRGB:
++      return PIPE_FORMAT_BPTC_SRGBA;
++
+    case DXGI_FORMAT_B5G6R5_UNORM:
+       return PIPE_FORMAT_B5G6R5_UNORM;
+    case DXGI_FORMAT_B5G5R5A1_UNORM:
+@@ -414,6 +425,15 @@
+       return DXGI_FORMAT_BC5_UNORM;
+    case PIPE_FORMAT_RGTC2_SNORM:
+       return DXGI_FORMAT_BC5_SNORM;
++
++   case PIPE_FORMAT_BPTC_RGB_UFLOAT:
++      return DXGI_FORMAT_BC6H_UF16;
++   case PIPE_FORMAT_BPTC_RGB_FLOAT:
++      return DXGI_FORMAT_BC6H_SF16;
++   case PIPE_FORMAT_BPTC_RGBA_UNORM:
++      return DXGI_FORMAT_BC7_UNORM;
++   case PIPE_FORMAT_BPTC_SRGBA:
++      return DXGI_FORMAT_BC7_UNORM_SRGB;
+ 
+    case PIPE_FORMAT_B5G6R5_UNORM:
+       return DXGI_FORMAT_B5G6R5_UNORM;
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -40,6 +40,63 @@
+ #include "Format.h"
+ 
+ #include "tgsi/tgsi_ureg.h"
++
++extern "C" bool use_old_tex_ops;
++
++/* virgl: shaders sample through slots of their own (Shader_tex_slots), bound at draw time */
++static bool
++UseTexSlots(void)
++{
++   return use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS);
++}
++
++
++/*
++ * ----------------------------------------------------------------------
++ *
++ * ShaderBindTexSlots --
++ *
++ *    virgl: binds each slot of the bound shaders to its view and sampler state, where a shader, view or sampler
++ *    changed since the last draw.
++ *
++ * ----------------------------------------------------------------------
++ */
++
++void
++ShaderBindTexSlots(Device *pDevice)
++{
++   static const enum pipe_shader_type stages[] = {
++      PIPE_SHADER_VERTEX, PIPE_SHADER_GEOMETRY, PIPE_SHADER_FRAGMENT
++   };
++   struct pipe_context *pipe = pDevice->pipe;
++
++   if (!UseTexSlots()) {
++      return;
++   }
++   for (unsigned s = 0; s < ARRAY_SIZE(stages); s++) {
++      enum pipe_shader_type type = stages[s];
++      const Shader *shader = pDevice->bound_shader[type];
++      struct pipe_sampler_view *views[PIPE_MAX_SAMPLERS];
++      void *samplers[PIPE_MAX_SAMPLERS];
++
++      if (!pDevice->tex_slots_dirty[type]) {
++         continue;
++      }
++      pDevice->tex_slots_dirty[type] = false;
++
++      memset(views, 0, sizeof views);
++      memset(samplers, 0, sizeof samplers);
++      for (unsigned i = 0; shader && i < shader->tex_slots.count; i++) {
++         const struct Shader_tex_slot *slot = &shader->tex_slots.slot[i];
++         views[i] = pDevice->sampler_views[type][slot->view];
++         if (slot->sampler != SHADER_TEX_SLOT_NO_SAMPLER) {
++            samplers[i] = pDevice->samplers[type][slot->sampler];
++         }
++      }
++      pipe->set_sampler_views(pipe, type, 0, PIPE_MAX_SAMPLERS, 0, false, views);
++      pipe->bind_sampler_states(pipe, type, 0, PIPE_MAX_SAMPLERS, samplers);
++   }
++}
+ #include "util/u_gen_mipmap.h"
+ #include "util/u_sampler.h"
+ #include "util/format/u_format.h"
+@@ -226,6 +283,10 @@
+       samplers[Offset + i] = CastPipeSamplerState(phSamplers[i]);
+    }
+ 
++   if (UseTexSlots()) {
++      pDevice->tex_slots_dirty[shader_type] = true;
++      return;
++   }
+    pipe->bind_sampler_states(pipe, shader_type, 0, PIPE_MAX_SAMPLERS, samplers);
+ }
+ 
+@@ -264,6 +325,11 @@
+             break;
+          }
+       }
++   }
++
++   if (UseTexSlots()) {
++      pDevice->tex_slots_dirty[shader_type] = true;
++      return;
+    }
+ 
+    /*
+@@ -568,7 +634,8 @@
+    pShader->output_resolved = true;
+ 
+    memset(&pShader->state, 0, sizeof pShader->state);
+-   pShader->state.tokens = Shader_tgsi_translate(pCode, pShader->output_mapping);
++   memset(&pShader->tex_slots, 0, sizeof pShader->tex_slots);
++   pShader->state.tokens = Shader_tgsi_translate(pCode, pShader->output_mapping, &pShader->tex_slots);
+ 
+    pShader->handle = pipe->create_vs_state(pipe, &pShader->state);
+ 
+@@ -598,6 +665,8 @@
+    void *state = CastPipeShader(hShader);
+ 
+    pDevice->bound_vs = pShader;
++   pDevice->bound_shader[PIPE_SHADER_VERTEX] = pShader;
++   pDevice->tex_slots_dirty[PIPE_SHADER_VERTEX] = true;
+    if (!state) {
+       state = pDevice->empty_vs;
+    }
+@@ -704,7 +773,8 @@
+    pShader->output_resolved = true;
+ 
+    memset(&pShader->state, 0, sizeof pShader->state);
+-   pShader->state.tokens = Shader_tgsi_translate(pShaderCode, pShader->output_mapping);
++   memset(&pShader->tex_slots, 0, sizeof pShader->tex_slots);
++   pShader->state.tokens = Shader_tgsi_translate(pShaderCode, pShader->output_mapping, &pShader->tex_slots);
+ 
+    pShader->handle = pipe->create_gs_state(pipe, &pShader->state);
+ }
+@@ -734,6 +804,8 @@
+ 
+    assert(pipe->bind_gs_state);
+ 
++   pDevice->bound_shader[PIPE_SHADER_GEOMETRY] = pShader;
++   pDevice->tex_slots_dirty[PIPE_SHADER_GEOMETRY] = true;
+    if (pShader && !pShader->state.tokens) {
+       pDevice->bound_empty_gs = pShader;
+    } else {
+@@ -867,9 +939,11 @@
+    pShader->type = PIPE_SHADER_GEOMETRY;
+ 
+    memset(&pShader->state, 0, sizeof pShader->state);
++   memset(&pShader->tex_slots, 0, sizeof pShader->tex_slots);
+    if (pData->pShaderCode) {
+       pShader->state.tokens = Shader_tgsi_translate(pData->pShaderCode,
+-                                                    pShader->output_mapping);
++                                                    pShader->output_mapping,
++                                                    &pShader->tex_slots);
+    }
+    pShader->output_resolved = (pShader->state.tokens != NULL);
+ 
+@@ -1020,8 +1094,10 @@
+    pShader->output_resolved = true;
+ 
+    memset(&pShader->state, 0, sizeof pShader->state);
++   memset(&pShader->tex_slots, 0, sizeof pShader->tex_slots);
+    pShader->state.tokens = Shader_tgsi_translate(pShaderCode,
+-                                                 pShader->output_mapping);
++                                                 pShader->output_mapping,
++                                                 &pShader->tex_slots);
+ 
+    pShader->handle = pipe->create_fs_state(pipe, &pShader->state);
+ 
+@@ -1049,6 +1125,8 @@
+    struct pipe_context *pipe = pDevice->pipe;
+    void *state = CastPipeShader(hShader);
+ 
++   pDevice->bound_shader[PIPE_SHADER_FRAGMENT] = CastShader(hShader);
++   pDevice->tex_slots_dirty[PIPE_SHADER_FRAGMENT] = true;
+    if (!state) {
+       state = pDevice->empty_fs;
+    }
+diff --git a/src/gallium/frontends/d3d10umd/Shader.h b/src/gallium/frontends/d3d10umd/Shader.h
+--- a/src/gallium/frontends/d3d10umd/Shader.h
++++ b/src/gallium/frontends/d3d10umd/Shader.h
+@@ -48,6 +48,9 @@
+ 
+ unsigned
+ ShaderFindOutputMapping(Shader *shader, unsigned registerIndex);
++
++void
++ShaderBindTexSlots(Device *pDevice);
+ 
+ SIZE_T APIENTRY
+ CalcPrivateShaderSize(D3D10DDI_HDEVICE hDevice,
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.c b/src/gallium/frontends/d3d10umd/ShaderParse.c
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.c
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.c
+@@ -56,6 +56,7 @@
+ #define OP_TEST_BOOLEAN (1 << 2) /* test boolean in opcode specific control */
+ #define OP_DCL (1 << 3) /* custom opcode specific control */
+ #define OP_RESINFO_RET_TYPE (1 << 4) /* return type for resinfo */
++#define OP_RETURN_TYPE (1 << 5) /* return type (float/uint) for sample_info */
+ 
+ struct dx10_opcode_info {
+    D3D10_SB_OPCODE_TYPE type;
+@@ -177,10 +178,136 @@
+    {_(D3D10_SB_OPCODE_DCL_INDEXABLE_TEMP),               0, 0, OP_DCL},
+    {_(D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS),                 0, 0, OP_DCL},
+    {_(D3D10_SB_OPCODE_RESERVED0),                        0, 0, OP_NOT_DONE},
+-   {_(D3D10_1_SB_OPCODE_LOD),                            0, 0, OP_NOT_DONE},
+-   {_(D3D10_1_SB_OPCODE_GATHER4),                        0, 0, OP_NOT_DONE},
+-   {_(D3D10_1_SB_OPCODE_SAMPLE_POS),                     0, 0, OP_NOT_DONE},
+-   {_(D3D10_1_SB_OPCODE_SAMPLE_INFO),                    0, 0, OP_NOT_DONE}
++   {_(D3D10_1_SB_OPCODE_LOD),                            1, 3, 0},
++   {_(D3D10_1_SB_OPCODE_GATHER4),                        1, 3, 0},
++   {_(D3D10_1_SB_OPCODE_SAMPLE_POS),                     1, 2, 0},
++   {_(D3D10_1_SB_OPCODE_SAMPLE_INFO),                    1, 1, OP_RETURN_TYPE},
++   {_(D3D10_1_SB_OPCODE_RESERVED1),                      0, 0, OP_NOT_DONE},
++   {_(D3D11_SB_OPCODE_HS_DECLS),                         0, 0, 0},
++   {_(D3D11_SB_OPCODE_HS_CONTROL_POINT_PHASE),           0, 0, 0},
++   {_(D3D11_SB_OPCODE_HS_FORK_PHASE),                    0, 0, 0},
++   {_(D3D11_SB_OPCODE_HS_JOIN_PHASE),                    0, 0, 0},
++   {_(D3D11_SB_OPCODE_EMIT_STREAM),                      1, 0, 0},
++   {_(D3D11_SB_OPCODE_CUT_STREAM),                       1, 0, 0},
++   {_(D3D11_SB_OPCODE_EMITTHENCUT_STREAM),               1, 0, 0},
++   {_(D3D11_SB_OPCODE_INTERFACE_CALL),                   0, 0, OP_NOT_DONE},
++   {_(D3D11_SB_OPCODE_BUFINFO),                          1, 1, 0},
++   {_(D3D11_SB_OPCODE_DERIV_RTX_COARSE),                 1, 1, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DERIV_RTX_FINE),                   1, 1, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DERIV_RTY_COARSE),                 1, 1, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DERIV_RTY_FINE),                   1, 1, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_GATHER4_C),                        1, 4, 0},
++   {_(D3D11_SB_OPCODE_GATHER4_PO),                       1, 4, 0},
++   {_(D3D11_SB_OPCODE_GATHER4_PO_C),                     1, 5, 0},
++   {_(D3D11_SB_OPCODE_RCP),                              1, 1, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_F32TOF16),                         1, 1, 0},
++   {_(D3D11_SB_OPCODE_F16TOF32),                         1, 1, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_UADDC),                            2, 2, 0},
++   {_(D3D11_SB_OPCODE_USUBB),                            2, 2, 0},
++   {_(D3D11_SB_OPCODE_COUNTBITS),                        1, 1, 0},
++   {_(D3D11_SB_OPCODE_FIRSTBIT_HI),                      1, 1, 0},
++   {_(D3D11_SB_OPCODE_FIRSTBIT_LO),                      1, 1, 0},
++   {_(D3D11_SB_OPCODE_FIRSTBIT_SHI),                     1, 1, 0},
++   {_(D3D11_SB_OPCODE_UBFE),                             1, 3, 0},
++   {_(D3D11_SB_OPCODE_IBFE),                             1, 3, 0},
++   {_(D3D11_SB_OPCODE_BFI),                              1, 4, 0},
++   {_(D3D11_SB_OPCODE_BFREV),                            1, 1, 0},
++   {_(D3D11_SB_OPCODE_SWAPC),                            2, 3, 0},
++   {_(D3D11_SB_OPCODE_DCL_STREAM),                       1, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_FUNCTION_BODY),                0, 0, OP_NOT_DONE},
++   {_(D3D11_SB_OPCODE_DCL_FUNCTION_TABLE),               0, 0, OP_NOT_DONE},
++   {_(D3D11_SB_OPCODE_DCL_INTERFACE),                    0, 0, OP_NOT_DONE},
++   {_(D3D11_SB_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT),    0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT),   0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_TESS_DOMAIN),                  0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_TESS_PARTITIONING),            0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE),        0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_HS_MAX_TESSFACTOR),            0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT), 0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT), 0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_THREAD_GROUP),                 0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED),  1, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW),    1, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED), 1, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_RAW), 1, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_STRUCTURED), 1, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_RESOURCE_RAW),                 1, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED),          1, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_LD_UAV_TYPED),                     1, 2, 0},
++   {_(D3D11_SB_OPCODE_STORE_UAV_TYPED),                  1, 2, 0},
++   {_(D3D11_SB_OPCODE_LD_RAW),                           1, 2, 0},
++   {_(D3D11_SB_OPCODE_STORE_RAW),                        1, 2, 0},
++   {_(D3D11_SB_OPCODE_LD_STRUCTURED),                    1, 3, 0},
++   {_(D3D11_SB_OPCODE_STORE_STRUCTURED),                 1, 3, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_AND),                       1, 2, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_OR),                        1, 2, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_XOR),                       1, 2, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_CMP_STORE),                 1, 3, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_IADD),                      1, 2, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_IMAX),                      1, 2, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_IMIN),                      1, 2, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_UMAX),                      1, 2, 0},
++   {_(D3D11_SB_OPCODE_ATOMIC_UMIN),                      1, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_ALLOC),                 1, 1, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_CONSUME),               1, 1, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_IADD),                  2, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_AND),                   2, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_OR),                    2, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_XOR),                   2, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_EXCH),                  2, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH),              2, 3, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_IMAX),                  2, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_IMIN),                  2, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_UMAX),                  2, 2, 0},
++   {_(D3D11_SB_OPCODE_IMM_ATOMIC_UMIN),                  2, 2, 0},
++   {_(D3D11_SB_OPCODE_SYNC),                             0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_DADD),                             1, 2, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DMAX),                             1, 2, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DMIN),                             1, 2, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DMUL),                             1, 2, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DEQ),                              1, 2, 0},
++   {_(D3D11_SB_OPCODE_DGE),                              1, 2, 0},
++   {_(D3D11_SB_OPCODE_DLT),                              1, 2, 0},
++   {_(D3D11_SB_OPCODE_DNE),                              1, 2, 0},
++   {_(D3D11_SB_OPCODE_DMOV),                             1, 1, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DMOVC),                            1, 3, OP_SATURATE},
++   {_(D3D11_SB_OPCODE_DTOF),                             1, 1, 0},
++   {_(D3D11_SB_OPCODE_FTOD),                             1, 1, 0},
++   {_(D3D11_SB_OPCODE_EVAL_SNAPPED),                     1, 2, 0},
++   {_(D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX),                1, 2, 0},
++   {_(D3D11_SB_OPCODE_EVAL_CENTROID),                    1, 1, 0},
++   {_(D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT),            0, 0, OP_DCL},
++   {_(D3D11_SB_OPCODE_ABORT),                            0, 0, 0},
++   {_(D3D11_SB_OPCODE_DEBUG_BREAK),                      0, 0, 0},
++   {_(D3D11_SB_OPCODE_RESERVED0),                        0, 0, OP_NOT_DONE},
++   /* D3D11.1 doubles (optional, not offered) and msad */
++   {_(D3D11_1_SB_OPCODE_DDIV),                           1, 2, OP_SATURATE},
++   {_(D3D11_1_SB_OPCODE_DFMA),                           1, 3, OP_SATURATE},
++   {_(D3D11_1_SB_OPCODE_DRCP),                           1, 1, OP_SATURATE},
++   {_(D3D11_1_SB_OPCODE_MSAD),                           1, 3, 0},
++   {_(D3D11_1_SB_OPCODE_DTOI),                           1, 1, 0},
++   {_(D3D11_1_SB_OPCODE_DTOU),                           1, 1, 0},
++   {_(D3D11_1_SB_OPCODE_ITOD),                           1, 1, 0},
++   {_(D3D11_1_SB_OPCODE_UTOD),                           1, 1, 0},
++   {_(D3D11_1_SB_OPCODE_RESERVED0),                      0, 0, OP_NOT_DONE},
++   /* Tiled resources' feedback variants (WDDM 1.3): not offered */
++   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_FEEDBACK),            0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_C_FEEDBACK),          0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_PO_FEEDBACK),         0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_PO_C_FEEDBACK),       0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_FEEDBACK),                 0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_MS_FEEDBACK),              0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_UAV_TYPED_FEEDBACK),       0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_RAW_FEEDBACK),             0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_STRUCTURED_FEEDBACK),      0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_L_FEEDBACK),           0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_C_LZ_FEEDBACK),        0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_CLAMP_FEEDBACK),       0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_B_CLAMP_FEEDBACK),     0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_D_CLAMP_FEEDBACK),     0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_C_CLAMP_FEEDBACK),     0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_CHECK_ACCESS_FULLY_MAPPED),   0, 0, OP_NOT_DONE},
++   {_(D3DWDDM1_3_SB_OPCODE_RESERVED0),                   0, 0, OP_NOT_DONE},
+ };
+ 
+ #undef _
+@@ -217,15 +344,15 @@
+    case D3D10_SB_OPERAND_INDEX_2D:
+       operand->index_dim = 2;
+       break;
++   case D3D10_SB_OPERAND_INDEX_3D:
++      operand->index_dim = 3;
++      break;
+    default:
+       assert(0);
+    }
+ 
+-   if (operand->index_dim >= 1) {
+-      operand->index[0].index_rep = DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(0, **curr);
+-      if (operand->index_dim >= 2) {
+-         operand->index[1].index_rep = DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(1, **curr);
+-      }
++   for (unsigned i = 0; i < operand->index_dim; i++) {
++      operand->index[i].index_rep = DECODE_D3D10_SB_OPERAND_INDEX_REPRESENTATION(i, **curr);
+    }
+ 
+    (*curr)++;
+@@ -288,11 +415,8 @@
+ parse_operand_index(const unsigned **curr,
+                     struct Shader_operand *operand)
+ {
+-   if (operand->index_dim >= 1) {
+-      parse_index(curr, &operand->index[0]);
+-      if (operand->index_dim >= 2) {
+-         parse_index(curr, &operand->index[1]);
+-      }
++   for (unsigned i = 0; i < operand->index_dim; i++) {
++      parse_index(curr, &operand->index[i]);
+    }
+ }
+ 
+@@ -362,6 +486,33 @@
+       break;
+    case D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS:
+       opcode->specific.global_flags.refactoring_allowed = DECODE_D3D10_SB_GLOBAL_FLAGS(*curr) ? 1 : 0;
++      break;
++   case D3D11_SB_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT:
++      opcode->specific.dcl_control_point_count = DECODE_D3D11_SB_INPUT_CONTROL_POINT_COUNT(*curr);
++      break;
++   case D3D11_SB_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT:
++      opcode->specific.dcl_control_point_count = DECODE_D3D11_SB_OUTPUT_CONTROL_POINT_COUNT(*curr);
++      break;
++   case D3D11_SB_OPCODE_DCL_TESS_DOMAIN:
++      opcode->specific.dcl_tess_domain = DECODE_D3D11_SB_TESS_DOMAIN(*curr);
++      break;
++   case D3D11_SB_OPCODE_DCL_TESS_PARTITIONING:
++      opcode->specific.dcl_tess_partitioning = DECODE_D3D11_SB_TESS_PARTITIONING(*curr);
++      break;
++   case D3D11_SB_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE:
++      opcode->specific.dcl_tess_output_primitive = DECODE_D3D11_SB_TESS_OUTPUT_PRIMITIVE(*curr);
++      break;
++   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
++      opcode->specific.dcl_uav.dimension = DECODE_D3D10_SB_RESOURCE_DIMENSION(*curr);
++      opcode->specific.dcl_uav.flags = DECODE_D3D11_SB_UAV_FLAGS(*curr);
++      break;
++   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW:
++   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED:
++      opcode->specific.dcl_uav.dimension = D3D10_SB_RESOURCE_DIMENSION_BUFFER;
++      opcode->specific.dcl_uav.flags = DECODE_D3D11_SB_UAV_FLAGS(*curr);
++      break;
++   case D3D11_SB_OPCODE_SYNC:
++      opcode->specific.sync_flags = DECODE_D3D11_SB_SYNC_FLAGS(*curr);
+       break;
+    default:
+       /* Parse opcode-specific control bits */
+@@ -376,6 +527,9 @@
+       } else if (info->flags & OP_RESINFO_RET_TYPE) {
+          opcode->specific.resinfo_ret_type =
+             DECODE_D3D10_SB_RESINFO_INSTRUCTION_RETURN_TYPE(*curr);
++      } else if (info->flags & OP_RETURN_TYPE) {
++         opcode->specific.instruction_return_type =
++            DECODE_D3D10_SB_INSTRUCTION_RETURN_TYPE(*curr);
+       } else {
+          /* Warn if there are bits set in the opcode-specific controls (bits 23:11 inclusive)*/
+          if (*curr & ((1 << 24) - (1 << 11))) {
+@@ -404,11 +558,9 @@
+ 
+    curr++;
+ 
+-   if (opcode_is_extended) {
+-      /* NOTE: DECODE_IS_D3D10_SB_OPCODE_DOUBLE_EXTENDED is broken.
+-       */
+-      assert(!((*curr & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >> D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT));
+-
++   /* Extended opcode tokens, each with the bit of a further one (SM5 resource instructions: sample controls,
++    * resource dimension, return type) */
++   while (opcode_is_extended) {
+       switch (DECODE_D3D10_SB_EXTENDED_OPCODE_TYPE(*curr)) {
+       case D3D10_SB_EXTENDED_OPCODE_EMPTY:
+          break;
+@@ -417,10 +569,20 @@
+          opcode->imm_texel_offset.v = DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_V, *curr);
+          opcode->imm_texel_offset.w = DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_W, *curr);
+          break;
++      case D3D11_SB_EXTENDED_OPCODE_RESOURCE_DIM:
++         opcode->ext_resource_dimension = DECODE_D3D11_SB_EXTENDED_RESOURCE_DIMENSION(*curr);
++         opcode->ext_structure_stride = DECODE_D3D11_SB_EXTENDED_RESOURCE_DIMENSION_STRUCTURE_STRIDE(*curr);
++         break;
++      case D3D11_SB_EXTENDED_OPCODE_RESOURCE_RETURN_TYPE:
++         for (unsigned c = 0; c < 4; c++) {
++            opcode->ext_return_type[c] = DECODE_D3D11_SB_EXTENDED_RESOURCE_RETURN_TYPE(*curr, c);
++         }
++         break;
+       default:
+          assert(0);
+       }
+ 
++      opcode_is_extended = DECODE_IS_D3D10_SB_OPCODE_EXTENDED(*curr);
+       curr++;
+    }
+ 
+@@ -599,6 +761,44 @@
+    case D3D10_SB_OPCODE_DCL_INDEX_RANGE:
+       opcode->specific.index_range_count = *curr++;
+       break;
++   case D3D11_SB_OPCODE_DCL_THREAD_GROUP:
++      opcode->specific.dcl_thread_group[0] = *curr++;
++      opcode->specific.dcl_thread_group[1] = *curr++;
++      opcode->specific.dcl_thread_group[2] = *curr++;
++      break;
++   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
++      opcode->dcl_resource_ret_type[0] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 0);
++      opcode->dcl_resource_ret_type[1] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 1);
++      opcode->dcl_resource_ret_type[2] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 2);
++      opcode->dcl_resource_ret_type[3] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 3);
++      curr++;
++      break;
++   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED:
++      opcode->specific.dcl_uav.stride = *curr++;
++      break;
++   case D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_RAW:
++      opcode->specific.dcl_tgsm.stride = 4;
++      opcode->specific.dcl_tgsm.count = *curr++ / 4;
++      break;
++   case D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_STRUCTURED:
++      opcode->specific.dcl_tgsm.stride = *curr++;
++      opcode->specific.dcl_tgsm.count = *curr++;
++      break;
++   case D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED:
++      opcode->specific.dcl_structure_stride = *curr++;
++      break;
++   case D3D11_SB_OPCODE_DCL_HS_MAX_TESSFACTOR: {
++      union { unsigned u; float f; } factor = { *curr++ };
++      opcode->specific.dcl_max_tessfactor = factor.f;
++      break;
++   }
++   case D3D11_SB_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT:
++   case D3D11_SB_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT:
++      opcode->specific.dcl_phase_instance_count = *curr++;
++      break;
++   case D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT:
++      opcode->specific.dcl_gs_instance_count = *curr++;
++      break;
+    default:
+       break;
+    }
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.h b/src/gallium/frontends/d3d10umd/ShaderParse.h
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.h
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.h
+@@ -86,7 +86,7 @@
+ 
+ struct Shader_operand {
+    D3D10_SB_OPERAND_TYPE type;
+-   struct Shader_index index[2];
++   struct Shader_index index[3];
+    unsigned index_dim;
+ };
+ 
+@@ -134,6 +134,26 @@
+       struct dx10_indexable_temp dcl_indexable_temp;
+       unsigned index_range_count;
+       struct dx10_global_flags global_flags;
++      D3D10_SB_INSTRUCTION_RETURN_TYPE instruction_return_type; /* sample_info */
++      unsigned dcl_thread_group[3];
++      struct {
++         D3D10_SB_RESOURCE_DIMENSION dimension; /* typed UAVs */
++         unsigned flags;                        /* D3D11_SB_UAV_FLAGS (globally coherent, has counter) */
++         unsigned stride;                       /* structured: bytes per element */
++      } dcl_uav;
++      struct {
++         unsigned stride;                       /* structured: bytes per element; raw: 4 */
++         unsigned count;                        /* elements (raw: bytes / 4) */
++      } dcl_tgsm;
++      unsigned dcl_structure_stride;            /* structured resources (t#) */
++      unsigned dcl_control_point_count;
++      D3D11_SB_TESSELLATOR_DOMAIN dcl_tess_domain;
++      D3D11_SB_TESSELLATOR_PARTITIONING dcl_tess_partitioning;
++      D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE dcl_tess_output_primitive;
++      float dcl_max_tessfactor;
++      unsigned dcl_phase_instance_count;        /* hs fork/join phases */
++      unsigned dcl_gs_instance_count;
++      unsigned sync_flags;                      /* D3D11_SB_SYNC_FLAGS */
+    } specific;
+    D3D10_SB_NAME dcl_siv_name;
+    D3D10_SB_RESOURCE_RETURN_TYPE dcl_resource_ret_type[4];
+@@ -146,6 +166,11 @@
+       int w:4;
+    } imm_texel_offset;
+ 
++   /* Extended opcode tokens of SM5 resource instructions (informational) */
++   D3D10_SB_RESOURCE_DIMENSION ext_resource_dimension;
++   unsigned ext_structure_stride;
++   D3D10_SB_RESOURCE_RETURN_TYPE ext_return_type[4];
++
+    struct dx10_customdata customdata;
+ };
+ 
+@@ -168,9 +193,27 @@
+ Shader_opcode_free(struct Shader_opcode *opcode);
+ 
+ 
++/* virgl: the shader samples through TGSI samplers of its own, one per texture (t#), sampler (s#) and comparison
++ * combination it uses; slot i is bound to view tex_slot[i].view and sampler state tex_slot[i].sampler at draw time.
++ */
++#define SHADER_MAX_TEX_SLOTS 32
++#define SHADER_TEX_SLOT_NO_SAMPLER 0xff
++
++struct Shader_tex_slot {
++   unsigned char view;
++   unsigned char sampler;     /* SHADER_TEX_SLOT_NO_SAMPLER: loads and queries */
++   unsigned char shadow;      /* sampled with a comparison */
++};
++
++struct Shader_tex_slots {
++   unsigned count;
++   struct Shader_tex_slot slot[SHADER_MAX_TEX_SLOTS];
++};
++
+ const struct tgsi_token *
+ Shader_tgsi_translate(const unsigned *code,
+-                      unsigned *output_mapping);
++                      unsigned *output_mapping,
++                      struct Shader_tex_slots *tex_slots);
+ 
+ 
+ #ifdef __cplusplus
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -64,119 +64,245 @@
+  */
+ #define TGSI_EXPAND          (TGSI_OPCODE_LAST+1)
+ 
++/* Every opcode, in D3D10_SB_OPCODE_TYPE order (indexed by it); shader model 5 ones not translated (yet) log
++ * as unsupported. */
+ static struct dx10_opcode_xlate opcode_xlate[D3D10_SB_NUM_OPCODES] = {
+-   {D3D10_SB_OPCODE_ADD,                              OF_FLOAT, TGSI_OPCODE_ADD},
+-   {D3D10_SB_OPCODE_AND,                              OF_UINT,  TGSI_OPCODE_AND},
+-   {D3D10_SB_OPCODE_BREAK,                            OF_FLOAT, TGSI_OPCODE_BRK},
+-   {D3D10_SB_OPCODE_BREAKC,                           OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_CALL,                             OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_CALLC,                            OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_CASE,                             OF_UINT,  TGSI_OPCODE_CASE},
+-   {D3D10_SB_OPCODE_CONTINUE,                         OF_FLOAT, TGSI_OPCODE_CONT},
+-   {D3D10_SB_OPCODE_CONTINUEC,                        OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_CUT,                              OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DEFAULT,                          OF_FLOAT, TGSI_OPCODE_DEFAULT},
+-   {D3D10_SB_OPCODE_DERIV_RTX,                        OF_FLOAT, TGSI_OPCODE_DDX},
+-   {D3D10_SB_OPCODE_DERIV_RTY,                        OF_FLOAT, TGSI_OPCODE_DDY},
+-   {D3D10_SB_OPCODE_DISCARD,                          OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DIV,                              OF_FLOAT, TGSI_OPCODE_DIV},
+-   {D3D10_SB_OPCODE_DP2,                              OF_FLOAT, TGSI_OPCODE_DP2},
+-   {D3D10_SB_OPCODE_DP3,                              OF_FLOAT, TGSI_OPCODE_DP3},
+-   {D3D10_SB_OPCODE_DP4,                              OF_FLOAT, TGSI_OPCODE_DP4},
+-   {D3D10_SB_OPCODE_ELSE,                             OF_FLOAT, TGSI_OPCODE_ELSE},
+-   {D3D10_SB_OPCODE_EMIT,                             OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_EMITTHENCUT,                      OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_ENDIF,                            OF_FLOAT, TGSI_OPCODE_ENDIF},
+-   {D3D10_SB_OPCODE_ENDLOOP,                          OF_FLOAT, TGSI_OPCODE_ENDLOOP},
+-   {D3D10_SB_OPCODE_ENDSWITCH,                        OF_FLOAT, TGSI_OPCODE_ENDSWITCH},
+-   {D3D10_SB_OPCODE_EQ,                               OF_FLOAT, TGSI_OPCODE_FSEQ},
+-   {D3D10_SB_OPCODE_EXP,                              OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_FRC,                              OF_FLOAT, TGSI_OPCODE_FRC},
+-   {D3D10_SB_OPCODE_FTOI,                             OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_FTOU,                             OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_GE,                               OF_FLOAT, TGSI_OPCODE_FSGE},
+-   {D3D10_SB_OPCODE_IADD,                             OF_INT,   TGSI_OPCODE_UADD},
+-   {D3D10_SB_OPCODE_IF,                               OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_IEQ,                              OF_INT,   TGSI_OPCODE_USEQ},
+-   {D3D10_SB_OPCODE_IGE,                              OF_INT,   TGSI_OPCODE_ISGE},
+-   {D3D10_SB_OPCODE_ILT,                              OF_INT,   TGSI_OPCODE_ISLT},
+-   {D3D10_SB_OPCODE_IMAD,                             OF_INT,   TGSI_OPCODE_UMAD},
+-   {D3D10_SB_OPCODE_IMAX,                             OF_INT,   TGSI_OPCODE_IMAX},
+-   {D3D10_SB_OPCODE_IMIN,                             OF_INT,   TGSI_OPCODE_IMIN},
+-   {D3D10_SB_OPCODE_IMUL,                             OF_INT,   TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_INE,                              OF_INT,   TGSI_OPCODE_USNE},
+-   {D3D10_SB_OPCODE_INEG,                             OF_INT,   TGSI_OPCODE_INEG},
+-   {D3D10_SB_OPCODE_ISHL,                             OF_INT,   TGSI_OPCODE_SHL},
+-   {D3D10_SB_OPCODE_ISHR,                             OF_INT,   TGSI_OPCODE_ISHR},
+-   {D3D10_SB_OPCODE_ITOF,                             OF_INT,   TGSI_OPCODE_I2F},
+-   {D3D10_SB_OPCODE_LABEL,                            OF_INT,   TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_LD,                               OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_LD_MS,                            OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_LOG,                              OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_LOOP,                             OF_FLOAT, TGSI_OPCODE_BGNLOOP},
+-   {D3D10_SB_OPCODE_LT,                               OF_FLOAT, TGSI_OPCODE_FSLT},
+-   {D3D10_SB_OPCODE_MAD,                              OF_FLOAT, TGSI_OPCODE_MAD},
+-   {D3D10_SB_OPCODE_MIN,                              OF_FLOAT, TGSI_OPCODE_MIN},
+-   {D3D10_SB_OPCODE_MAX,                              OF_FLOAT, TGSI_OPCODE_MAX},
+-   {D3D10_SB_OPCODE_CUSTOMDATA,                       OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_MOV,                              OF_UINT,  TGSI_OPCODE_MOV},
+-   {D3D10_SB_OPCODE_MOVC,                             OF_UINT,  TGSI_OPCODE_UCMP},
+-   {D3D10_SB_OPCODE_MUL,                              OF_FLOAT, TGSI_OPCODE_MUL},
+-   {D3D10_SB_OPCODE_NE,                               OF_FLOAT, TGSI_OPCODE_FSNE},
+-   {D3D10_SB_OPCODE_NOP,                              OF_FLOAT, TGSI_OPCODE_NOP},
+-   {D3D10_SB_OPCODE_NOT,                              OF_UINT,  TGSI_OPCODE_NOT},
+-   {D3D10_SB_OPCODE_OR,                               OF_UINT,  TGSI_OPCODE_OR},
+-   {D3D10_SB_OPCODE_RESINFO,                          OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_RET,                              OF_FLOAT, TGSI_OPCODE_RET},
+-   {D3D10_SB_OPCODE_RETC,                             OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_ROUND_NE,                         OF_FLOAT, TGSI_OPCODE_ROUND},
+-   {D3D10_SB_OPCODE_ROUND_NI,                         OF_FLOAT, TGSI_OPCODE_FLR},
+-   {D3D10_SB_OPCODE_ROUND_PI,                         OF_FLOAT, TGSI_OPCODE_CEIL},
+-   {D3D10_SB_OPCODE_ROUND_Z,                          OF_FLOAT, TGSI_OPCODE_TRUNC},
+-   {D3D10_SB_OPCODE_RSQ,                              OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_SAMPLE,                           OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_SAMPLE_C,                         OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_SAMPLE_C_LZ,                      OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_SAMPLE_L,                         OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_SAMPLE_D,                         OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_SAMPLE_B,                         OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_SQRT,                             OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_SWITCH,                           OF_UINT,  TGSI_OPCODE_SWITCH},
+-   {D3D10_SB_OPCODE_SINCOS,                           OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_UDIV,                             OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_ULT,                              OF_UINT,  TGSI_OPCODE_USLT},
+-   {D3D10_SB_OPCODE_UGE,                              OF_UINT,  TGSI_OPCODE_USGE},
+-   {D3D10_SB_OPCODE_UMUL,                             OF_UINT,  TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_UMAD,                             OF_UINT,  TGSI_OPCODE_UMAD},
+-   {D3D10_SB_OPCODE_UMAX,                             OF_UINT,  TGSI_OPCODE_UMAX},
+-   {D3D10_SB_OPCODE_UMIN,                             OF_UINT,  TGSI_OPCODE_UMIN},
+-   {D3D10_SB_OPCODE_USHR,                             OF_UINT,  TGSI_OPCODE_USHR},
+-   {D3D10_SB_OPCODE_UTOF,                             OF_UINT,  TGSI_OPCODE_U2F},
+-   {D3D10_SB_OPCODE_XOR,                              OF_UINT,  TGSI_OPCODE_XOR},
+-   {D3D10_SB_OPCODE_DCL_RESOURCE,                     OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER,              OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_SAMPLER,                      OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_INDEX_RANGE,                  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D10_SB_OPCODE_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY, OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_GS_INPUT_PRIMITIVE,           OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_MAX_OUTPUT_VERTEX_COUNT,      OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_INPUT,                        OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_INPUT_SGV,                    OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_INPUT_SIV,                    OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_INPUT_PS,                     OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_INPUT_PS_SGV,                 OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_INPUT_PS_SIV,                 OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_OUTPUT,                       OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_OUTPUT_SGV,                   OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_OUTPUT_SIV,                   OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_TEMPS,                        OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_INDEXABLE_TEMP,               OF_FLOAT, TGSI_EXPAND},
+-   {D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS,                 OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D10_SB_OPCODE_RESERVED0,                        OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D10_1_SB_OPCODE_LOD,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D10_1_SB_OPCODE_GATHER4,                        OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D10_1_SB_OPCODE_SAMPLE_POS,                     OF_FLOAT, TGSI_LOG_UNSUPPORTED},
+-   {D3D10_1_SB_OPCODE_SAMPLE_INFO,                    OF_FLOAT, TGSI_LOG_UNSUPPORTED}
++   {D3D10_SB_OPCODE_ADD,                               OF_FLOAT, TGSI_OPCODE_ADD},
++   {D3D10_SB_OPCODE_AND,                               OF_UINT,  TGSI_OPCODE_AND},
++   {D3D10_SB_OPCODE_BREAK,                             OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_BREAKC,                            OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_CALL,                              OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_CALLC,                             OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_CASE,                              OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_CONTINUE,                          OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_CONTINUEC,                         OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_CUT,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DEFAULT,                           OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DERIV_RTX,                         OF_FLOAT, TGSI_OPCODE_DDX},
++   {D3D10_SB_OPCODE_DERIV_RTY,                         OF_FLOAT, TGSI_OPCODE_DDY},
++   {D3D10_SB_OPCODE_DISCARD,                           OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DIV,                               OF_FLOAT, TGSI_OPCODE_DIV},
++   {D3D10_SB_OPCODE_DP2,                               OF_FLOAT, TGSI_OPCODE_DP2},
++   {D3D10_SB_OPCODE_DP3,                               OF_FLOAT, TGSI_OPCODE_DP3},
++   {D3D10_SB_OPCODE_DP4,                               OF_FLOAT, TGSI_OPCODE_DP4},
++   {D3D10_SB_OPCODE_ELSE,                              OF_FLOAT, TGSI_OPCODE_ELSE},
++   {D3D10_SB_OPCODE_EMIT,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_EMITTHENCUT,                       OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_ENDIF,                             OF_FLOAT, TGSI_OPCODE_ENDIF},
++   {D3D10_SB_OPCODE_ENDLOOP,                           OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_ENDSWITCH,                         OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_EQ,                                OF_FLOAT, TGSI_OPCODE_FSEQ},
++   {D3D10_SB_OPCODE_EXP,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_FRC,                               OF_FLOAT, TGSI_OPCODE_FRC},
++   {D3D10_SB_OPCODE_FTOI,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_FTOU,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_GE,                                OF_FLOAT, TGSI_OPCODE_FSGE},
++   {D3D10_SB_OPCODE_IADD,                              OF_INT,   TGSI_OPCODE_UADD},
++   {D3D10_SB_OPCODE_IF,                                OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_IEQ,                               OF_INT,   TGSI_OPCODE_USEQ},
++   {D3D10_SB_OPCODE_IGE,                               OF_INT,   TGSI_OPCODE_ISGE},
++   {D3D10_SB_OPCODE_ILT,                               OF_INT,   TGSI_OPCODE_ISLT},
++   {D3D10_SB_OPCODE_IMAD,                              OF_INT,   TGSI_OPCODE_UMAD},
++   {D3D10_SB_OPCODE_IMAX,                              OF_INT,   TGSI_OPCODE_IMAX},
++   {D3D10_SB_OPCODE_IMIN,                              OF_INT,   TGSI_OPCODE_IMIN},
++   {D3D10_SB_OPCODE_IMUL,                              OF_INT,   TGSI_EXPAND},
++   {D3D10_SB_OPCODE_INE,                               OF_INT,   TGSI_OPCODE_USNE},
++   {D3D10_SB_OPCODE_INEG,                              OF_INT,   TGSI_OPCODE_INEG},
++   {D3D10_SB_OPCODE_ISHL,                              OF_INT,   TGSI_OPCODE_SHL},
++   {D3D10_SB_OPCODE_ISHR,                              OF_INT,   TGSI_OPCODE_ISHR},
++   {D3D10_SB_OPCODE_ITOF,                              OF_INT,   TGSI_OPCODE_I2F},
++   {D3D10_SB_OPCODE_LABEL,                             OF_INT,   TGSI_EXPAND},
++   {D3D10_SB_OPCODE_LD,                                OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_LD_MS,                             OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_LOG,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_LOOP,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_LT,                                OF_FLOAT, TGSI_OPCODE_FSLT},
++   {D3D10_SB_OPCODE_MAD,                               OF_FLOAT, TGSI_OPCODE_MAD},
++   {D3D10_SB_OPCODE_MIN,                               OF_FLOAT, TGSI_OPCODE_MIN},
++   {D3D10_SB_OPCODE_MAX,                               OF_FLOAT, TGSI_OPCODE_MAX},
++   {D3D10_SB_OPCODE_CUSTOMDATA,                        OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_MOV,                               OF_UINT,  TGSI_OPCODE_MOV},
++   {D3D10_SB_OPCODE_MOVC,                              OF_UINT,  TGSI_OPCODE_UCMP},
++   {D3D10_SB_OPCODE_MUL,                               OF_FLOAT, TGSI_OPCODE_MUL},
++   {D3D10_SB_OPCODE_NE,                                OF_FLOAT, TGSI_OPCODE_FSNE},
++   {D3D10_SB_OPCODE_NOP,                               OF_FLOAT, TGSI_OPCODE_NOP},
++   {D3D10_SB_OPCODE_NOT,                               OF_UINT,  TGSI_OPCODE_NOT},
++   {D3D10_SB_OPCODE_OR,                                OF_UINT,  TGSI_OPCODE_OR},
++   {D3D10_SB_OPCODE_RESINFO,                           OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_RET,                               OF_FLOAT, TGSI_OPCODE_RET},
++   {D3D10_SB_OPCODE_RETC,                              OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_ROUND_NE,                          OF_FLOAT, TGSI_OPCODE_ROUND},
++   {D3D10_SB_OPCODE_ROUND_NI,                          OF_FLOAT, TGSI_OPCODE_FLR},
++   {D3D10_SB_OPCODE_ROUND_PI,                          OF_FLOAT, TGSI_OPCODE_CEIL},
++   {D3D10_SB_OPCODE_ROUND_Z,                           OF_FLOAT, TGSI_OPCODE_TRUNC},
++   {D3D10_SB_OPCODE_RSQ,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SAMPLE,                            OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SAMPLE_C,                          OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SAMPLE_C_LZ,                       OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SAMPLE_L,                          OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SAMPLE_D,                          OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SAMPLE_B,                          OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SQRT,                              OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SWITCH,                            OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_SINCOS,                            OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_UDIV,                              OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_ULT,                               OF_UINT,  TGSI_OPCODE_USLT},
++   {D3D10_SB_OPCODE_UGE,                               OF_UINT,  TGSI_OPCODE_USGE},
++   {D3D10_SB_OPCODE_UMUL,                              OF_UINT,  TGSI_EXPAND},
++   {D3D10_SB_OPCODE_UMAD,                              OF_UINT,  TGSI_OPCODE_UMAD},
++   {D3D10_SB_OPCODE_UMAX,                              OF_UINT,  TGSI_OPCODE_UMAX},
++   {D3D10_SB_OPCODE_UMIN,                              OF_UINT,  TGSI_OPCODE_UMIN},
++   {D3D10_SB_OPCODE_USHR,                              OF_UINT,  TGSI_OPCODE_USHR},
++   {D3D10_SB_OPCODE_UTOF,                              OF_UINT,  TGSI_OPCODE_U2F},
++   {D3D10_SB_OPCODE_XOR,                               OF_UINT,  TGSI_OPCODE_XOR},
++   {D3D10_SB_OPCODE_DCL_RESOURCE,                      OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER,               OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_SAMPLER,                       OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_INDEX_RANGE,                   OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY,  OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_GS_INPUT_PRIMITIVE,            OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_MAX_OUTPUT_VERTEX_COUNT,       OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_INPUT,                         OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_INPUT_SGV,                     OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_INPUT_SIV,                     OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_INPUT_PS,                      OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_INPUT_PS_SGV,                  OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_INPUT_PS_SIV,                  OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_OUTPUT,                        OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_OUTPUT_SGV,                    OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_OUTPUT_SIV,                    OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_TEMPS,                         OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_INDEXABLE_TEMP,                OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS,                  OF_FLOAT, TGSI_EXPAND},
++   {D3D10_SB_OPCODE_RESERVED0,                         OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D10_1_SB_OPCODE_LOD,                             OF_FLOAT, TGSI_EXPAND},
++   {D3D10_1_SB_OPCODE_GATHER4,                         OF_FLOAT, TGSI_EXPAND},
++   {D3D10_1_SB_OPCODE_SAMPLE_POS,                      OF_FLOAT, TGSI_EXPAND},
++   {D3D10_1_SB_OPCODE_SAMPLE_INFO,                     OF_FLOAT, TGSI_EXPAND},
++   {D3D10_1_SB_OPCODE_RESERVED1,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_HS_DECLS,                          OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_HS_CONTROL_POINT_PHASE,            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_HS_FORK_PHASE,                     OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_HS_JOIN_PHASE,                     OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_EMIT_STREAM,                       OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_CUT_STREAM,                        OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_EMITTHENCUT_STREAM,                OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_INTERFACE_CALL,                    OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_BUFINFO,                           OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DERIV_RTX_COARSE,                  OF_FLOAT, TGSI_OPCODE_DDX},
++   {D3D11_SB_OPCODE_DERIV_RTX_FINE,                    OF_FLOAT, TGSI_OPCODE_DDX_FINE},
++   {D3D11_SB_OPCODE_DERIV_RTY_COARSE,                  OF_FLOAT, TGSI_OPCODE_DDY},
++   {D3D11_SB_OPCODE_DERIV_RTY_FINE,                    OF_FLOAT, TGSI_OPCODE_DDY_FINE},
++   {D3D11_SB_OPCODE_GATHER4_C,                         OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_GATHER4_PO,                        OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_GATHER4_PO_C,                      OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_RCP,                               OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_F32TOF16,                          OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_F16TOF32,                          OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_UADDC,                             OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_USUBB,                             OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_COUNTBITS,                         OF_UINT,  TGSI_OPCODE_POPC},
++   {D3D11_SB_OPCODE_FIRSTBIT_HI,                       OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_FIRSTBIT_LO,                       OF_UINT,  TGSI_OPCODE_LSB},
++   {D3D11_SB_OPCODE_FIRSTBIT_SHI,                      OF_INT,   TGSI_EXPAND},
++   {D3D11_SB_OPCODE_UBFE,                              OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_IBFE,                              OF_INT,   TGSI_EXPAND},
++   {D3D11_SB_OPCODE_BFI,                               OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_BFREV,                             OF_UINT,  TGSI_OPCODE_BREV},
++   {D3D11_SB_OPCODE_SWAPC,                             OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DCL_STREAM,                        OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DCL_FUNCTION_BODY,                 OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_FUNCTION_TABLE,                OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_INTERFACE,                     OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT,     OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT,    OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_TESS_DOMAIN,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_TESS_PARTITIONING,             OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE,         OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_HS_MAX_TESSFACTOR,             OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT,  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT,  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_THREAD_GROUP,                  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED,   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW,     OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED, OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_RAW, OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_STRUCTURED, OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_RESOURCE_RAW,                  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DCL_RESOURCE_STRUCTURED,           OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_LD_UAV_TYPED,                      OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_STORE_UAV_TYPED,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_LD_RAW,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_STORE_RAW,                         OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_LD_STRUCTURED,                     OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_STORE_STRUCTURED,                  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_AND,                        OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_OR,                         OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_XOR,                        OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_CMP_STORE,                  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_IADD,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_IMAX,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_IMIN,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_UMAX,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_ATOMIC_UMIN,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_ALLOC,                  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_CONSUME,                OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_IADD,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_AND,                    OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_OR,                     OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_XOR,                    OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_EXCH,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH,               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_IMAX,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_IMIN,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_UMAX,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_IMM_ATOMIC_UMIN,                   OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_SYNC,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DADD,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DMAX,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DMIN,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DMUL,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DEQ,                               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DGE,                               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DLT,                               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DNE,                               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DMOV,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DMOVC,                             OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DTOF,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_FTOD,                              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_EVAL_SNAPPED,                      OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX,                 OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_EVAL_CENTROID,                     OF_FLOAT, TGSI_EXPAND},
++   {D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT,             OF_UINT,  TGSI_EXPAND},
++   {D3D11_SB_OPCODE_ABORT,                             OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_DEBUG_BREAK,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_SB_OPCODE_RESERVED0,                         OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_DDIV,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_DFMA,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_DRCP,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_MSAD,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_DTOI,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_DTOU,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_ITOD,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_UTOD,                            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3D11_1_SB_OPCODE_RESERVED0,                       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_GATHER4_FEEDBACK,             OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_GATHER4_C_FEEDBACK,           OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_GATHER4_PO_FEEDBACK,          OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_GATHER4_PO_C_FEEDBACK,        OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_LD_FEEDBACK,                  OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_LD_MS_FEEDBACK,               OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_LD_UAV_TYPED_FEEDBACK,        OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_LD_RAW_FEEDBACK,              OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_LD_STRUCTURED_FEEDBACK,       OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_SAMPLE_L_FEEDBACK,            OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_SAMPLE_C_LZ_FEEDBACK,         OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_SAMPLE_CLAMP_FEEDBACK,        OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_SAMPLE_B_CLAMP_FEEDBACK,      OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_SAMPLE_D_CLAMP_FEEDBACK,      OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_SAMPLE_C_CLAMP_FEEDBACK,      OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_CHECK_ACCESS_FULLY_MAPPED,    OF_FLOAT, TGSI_LOG_UNSUPPORTED},
++   {D3DWDDM1_3_SB_OPCODE_RESERVED0,                    OF_FLOAT, TGSI_LOG_UNSUPPORTED}
+ };
+ 
+ #define SHADER_MAX_TEMPS 4096
+@@ -200,6 +326,29 @@
+ 
+ struct Shader_resource {
+    uint target;   /* TGSI_TEXTURE_x */
++   enum tgsi_return_type ret[4];
++};
++
++/* Loops and switches. virglrenderer (TGSI to GLSL on the host) has no TGSI CONT, nor SWITCH/CASE/DEFAULT/ENDSWITCH:
++ * it drops them, so a shader with an HLSL continue or switch ran wrong (or never left its loop). Both are lowered to
++ * what it handles: a loop with a continue runs its body in an inner loop that runs once (continue leaves the inner
++ * loop, break sets a flag the outer loop checks), a switch becomes a loop that runs once around if-regions, one per
++ * case label group (break leaves it, falling through keeps the "matched" flag set). A continue inside a switch sets
++ * the loop's flag, leaves the switch, and the code after each switch passes it on.
++ */
++#define SHADER_MAX_CF_DEPTH 64
++
++struct Shader_switch_cases {
++   unsigned *values;
++   unsigned count;
++   bool has_default;
++};
++
++struct Shader_cf {
++   bool is_switch;
++   bool lowered;           /* loop: runs its body in an inner loop (it has a continue) */
++   bool case_open;         /* switch: the UIF of a case region is open */
++   struct ureg_dst flags;  /* loop: .x break, .y continue; switch: .x selector, .y matched, .z no case matches */
+ };
+ 
+ struct Shader_xlate {
+@@ -216,6 +365,9 @@
+    struct ureg_src samplers[SHADER_MAX_SAMPLERS];
+    struct ureg_src imms;
+    struct ureg_src prim_id;
++   struct ureg_src gs_instance_id;     /* vGSInstanceID */
++   struct ureg_src coverage;           /* vCoverage */
++   struct ureg_dst output_mask;        /* oMask */
+ 
+    uint addr_cur;
+    uint temp_offset;
+@@ -246,6 +398,15 @@
+    struct Shader_label *labels;
+    uint num_labels;
+    uint max_labels;
++
++   struct Shader_tex_slots tex_slots;
++
++   struct Shader_cf cf[SHADER_MAX_CF_DEPTH];
++   uint cf_depth;
++   bool *loop_has_continue;               /* by loop, in program order (Shader_scan_control_flow) */
++   uint num_loops, loops_seen;
++   struct Shader_switch_cases *switches;  /* by switch, in program order */
++   uint num_switches, switches_seen;
+ };
+ 
+ static uint
+@@ -263,19 +424,33 @@
+    case D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE:
+       return TGSI_INTERPOLATE_LINEAR;
+ 
++   /* centroid and sample: translate_interp_location */
+    case D3D10_SB_INTERPOLATION_LINEAR_CENTROID:
+    case D3D10_SB_INTERPOLATION_LINEAR_SAMPLE: // DX10.1
+-      LOG_UNSUPPORTED(true);
+       return TGSI_INTERPOLATE_PERSPECTIVE;
+ 
+    case D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE_CENTROID:
+    case D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE_SAMPLE: // DX10.1
+-      LOG_UNSUPPORTED(true);
+       return TGSI_INTERPOLATE_LINEAR;
+    }
+ 
+    assert(0);
+    return TGSI_INTERPOLATE_LINEAR;
++}
++
++static enum tgsi_interpolate_loc
++translate_interp_location(D3D10_SB_INTERPOLATION_MODE interpolation)
++{
++   switch (interpolation) {
++   case D3D10_SB_INTERPOLATION_LINEAR_CENTROID:
++   case D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE_CENTROID:
++      return TGSI_INTERPOLATE_LOC_CENTROID;
++   case D3D10_SB_INTERPOLATION_LINEAR_SAMPLE:
++   case D3D10_SB_INTERPOLATION_LINEAR_NOPERSPECTIVE_SAMPLE:
++      return TGSI_INTERPOLATE_LOC_SAMPLE;
++   default:
++      return TGSI_INTERPOLATE_LOC_CENTER;
++   }
+ }
+ 
+ static uint
+@@ -303,8 +478,7 @@
+    case D3D10_SB_NAME_IS_FRONT_FACE:
+       return TGSI_SEMANTIC_FACE;
+    case D3D10_SB_NAME_SAMPLE_INDEX:
+-      LOG_UNSUPPORTED(true);
+-      return TGSI_SEMANTIC_GENERIC;
++      return TGSI_SEMANTIC_SAMPLEID;
+    }
+ 
+    assert(0);
+@@ -413,6 +587,7 @@
+    case D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX:
+    case D3D10_SB_NAME_RENDER_TARGET_ARRAY_INDEX:
+    case D3D10_SB_NAME_IS_FRONT_FACE:
++   case D3D10_SB_NAME_SAMPLE_INDEX:
+       return ureg_scalar(src, TGSI_SWIZZLE_X);
+    default: {
+       const struct swizzle_mapping *swizzle =
+@@ -524,6 +699,9 @@
+          dcl_base_input(sx, ureg, dst, reg, dst->base.index[1].imm,
+                         D3D10_SB_NAME_UNDEFINED);
+       }
++   } else if (dst->base.type == D3D11_SB_OPERAND_TYPE_INPUT_GS_INSTANCE_ID) {
++      sx->gs_instance_id = ureg_scalar(ureg_DECL_system_value(ureg, TGSI_SEMANTIC_INVOCATIONID, 0),
++                                       TGSI_SWIZZLE_X);
+    } else {
+       assert(dst->base.type == D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID);
+       assert(dst->base.index_dim == 0);
+@@ -578,10 +756,12 @@
+    assert(dst->base.index_dim == 1);
+    assert(dst->base.index[0].imm < SHADER_MAX_INPUTS);
+ 
+-   reg = ureg_DECL_fs_input(ureg,
+-                            TGSI_SEMANTIC_GENERIC,
+-                            dst->base.index[0].imm,
+-                            translate_interpolation(dcl_in_ps_interp));
++   reg = ureg_DECL_fs_input_centroid(ureg,
++                                     TGSI_SEMANTIC_GENERIC,
++                                     dst->base.index[0].imm,
++                                     translate_interpolation(dcl_in_ps_interp),
++                                     translate_interp_location(dcl_in_ps_interp),
++                                     0, 1);
+ 
+    dcl_base_input(sx, ureg, dst, reg, dst->base.index[0].imm,
+                   D3D10_SB_NAME_UNDEFINED);
+@@ -606,10 +786,14 @@
+                     TGSI_FS_COORD_PIXEL_CENTER_HALF_INTEGER);
+    }
+ 
+-   reg = ureg_DECL_fs_input(ureg,
+-                            translate_system_name(dcl_siv_name),
+-                            0,
+-                            TGSI_INTERPOLATE_CONSTANT);
++   if (dcl_siv_name == D3D10_SB_NAME_SAMPLE_INDEX) {
++      reg = ureg_scalar(ureg_DECL_system_value(ureg, TGSI_SEMANTIC_SAMPLEID, 0), TGSI_SWIZZLE_X);
++   } else {
++      reg = ureg_DECL_fs_input(ureg,
++                               translate_system_name(dcl_siv_name),
++                               0,
++                               TGSI_INTERPOLATE_CONSTANT);
++   }
+ 
+    if (dcl_siv_name == D3D10_SB_NAME_IS_FRONT_FACE) {
+       /* We need to map gallium's front_face to the one expected
+@@ -638,10 +822,12 @@
+    assert(dst->base.index_dim == 1);
+    assert(dst->base.index[0].imm < SHADER_MAX_INPUTS);
+ 
+-   reg = ureg_DECL_fs_input(ureg,
+-                            translate_system_name(dcl_siv_name),
+-                            0,
+-                            translate_interpolation(dcl_in_ps_interp));
++   reg = ureg_DECL_fs_input_centroid(ureg,
++                                     translate_system_name(dcl_siv_name),
++                                     0,
++                                     translate_interpolation(dcl_in_ps_interp),
++                                     translate_interp_location(dcl_in_ps_interp),
++                                     0, 1);
+ 
+    if (dcl_siv_name == D3D10_SB_NAME_POSITION) {
+       /* D3D10 expects reciprocal of interpolated 1/w as 4th component,
+@@ -757,9 +943,15 @@
+       break;
+ 
+    case D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH:
++   case D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL:
++   case D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL:
+       assert(operand->index_dim == 0);
+ 
+       reg = sx->output_depth;
++      break;
++
++   case D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK:
++      reg = ureg_writemask(sx->output_mask, TGSI_WRITEMASK_X);
+       break;
+ 
+    case D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID:
+@@ -779,7 +971,7 @@
+    case D3D10_SB_OPERAND_TYPE_LABEL:
+    case D3D10_SB_OPERAND_TYPE_NULL:
+    case D3D10_SB_OPERAND_TYPE_RASTERIZER:
+-   case D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK:
++   default:
+       /* XXX: Translate more operands types.
+        */
+       LOG_UNSUPPORTED(true);
+@@ -852,8 +1044,11 @@
+       reg = translate_operand(sx, &operand->base, writemask);
+    }
+ 
+-   /* oDepth often has an empty writemask */
+-   if (operand->base.type != D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH) {
++   /* oDepth and oMask (scalars) often have an empty writemask */
++   if (operand->base.type != D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH &&
++       operand->base.type != D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL &&
++       operand->base.type != D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL &&
++       operand->base.type != D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK) {
+       reg = ureg_writemask(reg, writemask);
+    }
+ 
+@@ -1054,6 +1249,14 @@
+ 
+    case D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID:
+       reg = sx->prim_id;
++      break;
++
++   case D3D11_SB_OPERAND_TYPE_INPUT_GS_INSTANCE_ID:
++      reg = sx->gs_instance_id;
++      break;
++
++   case D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK:
++      reg = sx->coverage;
+       break;
+ 
+    default:
+@@ -1249,11 +1452,947 @@
+    ureg_release_temporary(ureg, tmp);
+ }
+ 
++/*
++ * Textures on virgl.
++ *
++ * virglrenderer turns TGSI's TEX-style instructions into GLSL texture calls on a sampler uniform per TGSI sampler,
++ * which the host binds to the view and sampler state of the same index. D3D samples texture t# with sampler s#, any
++ * pair, so each (t#, s#, comparison) combination a shader uses gets a TGSI sampler of its own (tex_slot), declared
++ * with the texture's target and return type (an integer texture needs an integer sampler in GLSL), and the driver
++ * binds view t# and sampler state s# to it (Shader_tex_slots). A comparison needs a shadow sampler in GLSL.
++ * D3D selects the result's components with the texture operand's swizzle, so the instructions write a temporary
++ * that is then moved to the destination swizzled.
++ */
++static bool
++virgl_tex_ops(void)
++{
++   return use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS);
++}
++
++static uint
++shadow_target(uint target)
++{
++   switch (target) {
++   case TGSI_TEXTURE_1D:
++      return TGSI_TEXTURE_SHADOW1D;
++   case TGSI_TEXTURE_2D:
++      return TGSI_TEXTURE_SHADOW2D;
++   case TGSI_TEXTURE_1D_ARRAY:
++      return TGSI_TEXTURE_SHADOW1D_ARRAY;
++   case TGSI_TEXTURE_2D_ARRAY:
++      return TGSI_TEXTURE_SHADOW2D_ARRAY;
++   case TGSI_TEXTURE_CUBE:
++      return TGSI_TEXTURE_SHADOWCUBE;
++   case TGSI_TEXTURE_CUBE_ARRAY:
++      return TGSI_TEXTURE_SHADOWCUBE_ARRAY;
++   default:
++      LOG_UNSUPPORTED(true);
++      return target;
++   }
++}
++
++/* Components of a texture's size that resinfo's rcpfloat inverts (not the array size) */
++static unsigned
++tex_size_dims(uint target)
++{
++   switch (target) {
++   case TGSI_TEXTURE_BUFFER:
++   case TGSI_TEXTURE_1D:
++   case TGSI_TEXTURE_1D_ARRAY:
++      return 1;
++   case TGSI_TEXTURE_3D:
++      return 3;
++   default:
++      return 2;
++   }
++}
++
++static struct ureg_src
++tex_slot(struct Shader_xlate *sx, unsigned view, unsigned sampler, bool shadow)
++{
++   struct Shader_tex_slots *slots = &sx->tex_slots;
++   const struct Shader_resource *res;
++   unsigned i;
++
++   for (i = 0; i < slots->count; i++) {
++      if (slots->slot[i].view == view && slots->slot[i].sampler == sampler && slots->slot[i].shadow == shadow) {
++         return ureg_src_register(TGSI_FILE_SAMPLER, i);
++      }
++   }
++   if (slots->count == SHADER_MAX_TEX_SLOTS || view >= SHADER_MAX_RESOURCES) {
++      LOG_UNSUPPORTED(true);
++      return ureg_src_register(TGSI_FILE_SAMPLER, 0);
++   }
++   i = slots->count++;
++   slots->slot[i].view = view;
++   slots->slot[i].sampler = sampler;
++   slots->slot[i].shadow = shadow;
++   res = &sx->resources[view];
++   ureg_DECL_sampler_view(sx->ureg, i, res->target, res->ret[0], res->ret[1], res->ret[2], res->ret[3]);
++   return ureg_DECL_sampler(sx->ureg, i);
++}
++
++/* The instruction's immediate texel offset (aoffimmi), if any */
++static unsigned
++tex_imm_offset(struct Shader_xlate *sx, const struct Shader_opcode *opcode, struct tgsi_texture_offset *off)
++{
++   struct ureg_src imm;
++
++   memset(off, 0, sizeof *off);
++   if (!opcode->imm_texel_offset.u && !opcode->imm_texel_offset.v && !opcode->imm_texel_offset.w) {
++      return 0;
++   }
++   imm = ureg_imm3i(sx->ureg, opcode->imm_texel_offset.u, opcode->imm_texel_offset.v, opcode->imm_texel_offset.w);
++   off->File = imm.File;
++   off->Index = imm.Index;
++   off->SwizzleX = imm.SwizzleX;
++   off->SwizzleY = imm.SwizzleY;
++   off->SwizzleZ = imm.SwizzleZ;
++   return 1;
++}
++
++static void
++tex_insn(struct Shader_xlate *sx, enum tgsi_opcode tgsi_opcode, uint target, struct ureg_dst dst,
++         const struct tgsi_texture_offset *off, unsigned num_off, const struct ureg_src *src, unsigned num_src)
++{
++   ureg_tex_insn(sx->ureg, tgsi_opcode, &dst, 1, target, TGSI_RETURN_TYPE_UNKNOWN, off, num_off, src, num_src);
++}
++
++/* dst = texel, its components selected by the texture operand's swizzle */
++static void
++tex_result(struct Shader_xlate *sx, const struct Shader_opcode *opcode, struct ureg_dst texel,
++           const struct Shader_src_operand *res)
++{
++   ureg_MOV(sx->ureg, translate_dst_operand(sx, &opcode->dst[0], opcode->saturate),
++            ureg_swizzle(ureg_src(texel), res->swizzle[0], res->swizzle[1], res->swizzle[2], res->swizzle[3]));
++}
++
++/* D3D's standard sample positions (D3D11_STANDARD_MULTISAMPLE_PATTERN) in 1/16 pixel, for 1, 2, 4, 8 and 16 samples:
++ * sample i of n at entry n - 1 + i */
++static const int standard_sample_positions[31][2] = {
++   {0, 0},
++   {4, 4}, {-4, -4},
++   {-2, -6}, {6, -2}, {-6, 2}, {2, 6},
++   {1, -3}, {-1, 3}, {5, 1}, {-3, -5}, {-5, 5}, {-7, -1}, {3, 7}, {7, -7},
++   {1, 1}, {-1, -3}, {-3, 2}, {4, -1}, {-5, -2}, {2, 5}, {5, 3}, {3, -5},
++   {-2, 6}, {0, -7}, {-4, -6}, {-6, 4}, {-8, 0}, {7, -4}, {6, 7}, {-7, -8},
++};
++
++/* Translates the texture instructions for virgl; false: not one of them */
++static bool
++translate_texture_virgl(struct Shader_xlate *sx, struct Shader_opcode *opcode)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct tgsi_texture_offset off;
++   unsigned num_off;
++   struct ureg_src src[4];
++   struct ureg_dst texel, c;
++   unsigned res_op, view, sampler;
++   uint target, st;
++   bool shadow = false;
++
++   switch (opcode->type) {
++   case D3D10_SB_OPCODE_SAMPLE:
++   case D3D10_SB_OPCODE_SAMPLE_B:
++   case D3D10_SB_OPCODE_SAMPLE_L:
++   case D3D10_SB_OPCODE_SAMPLE_D:
++   case D3D10_SB_OPCODE_SAMPLE_C:
++   case D3D10_SB_OPCODE_SAMPLE_C_LZ:
++   case D3D10_1_SB_OPCODE_GATHER4:
++   case D3D11_SB_OPCODE_GATHER4_C:
++   case D3D10_1_SB_OPCODE_LOD:
++   case D3D10_SB_OPCODE_LD:
++   case D3D10_SB_OPCODE_LD_MS:
++   case D3D10_SB_OPCODE_RESINFO:
++      res_op = 1;
++      break;
++   case D3D11_SB_OPCODE_GATHER4_PO:
++   case D3D11_SB_OPCODE_GATHER4_PO_C:
++      res_op = 2;
++      break;
++   case D3D10_1_SB_OPCODE_SAMPLE_INFO:
++   case D3D10_1_SB_OPCODE_SAMPLE_POS:
++   case D3D11_SB_OPCODE_BUFINFO:
++      res_op = 0;
++      break;
++   default:
++      return false;
++   }
++
++   if (opcode->src[res_op].base.type != D3D10_SB_OPERAND_TYPE_RESOURCE) {
++      /* sampleinfo/samplepos of the render target (rasterizer): single-sampled; bufinfo of UAVs: compute stage */
++      LOG_UNSUPPORTED(opcode->src[res_op].base.type != D3D10_SB_OPERAND_TYPE_RASTERIZER);
++      texel = ureg_DECL_temporary(ureg);
++      if (opcode->type == D3D10_1_SB_OPCODE_SAMPLE_INFO) {
++         ureg_MOV(ureg, texel, ureg_imm4u(ureg, 1, 0, 0, 0));
++         if (opcode->specific.instruction_return_type != D3D10_SB_INSTRUCTION_RETURN_UINT) {
++            ureg_U2F(ureg, texel, ureg_src(texel));
++         }
++      } else {
++         ureg_MOV(ureg, texel, ureg_imm1u(ureg, 0));
++      }
++      tex_result(sx, opcode, texel, &opcode->src[res_op]);
++      ureg_release_temporary(ureg, texel);
++      return true;
++   }
++
++   view = opcode->src[res_op].base.index[0].imm;
++   if (view >= SHADER_MAX_RESOURCES) {
++      LOG_UNSUPPORTED(true);
++      view = 0;
++   }
++   target = sx->resources[view].target;
++   sampler = res_op + 1 < opcode->num_src && opcode->src[res_op + 1].base.type == D3D10_SB_OPERAND_TYPE_SAMPLER ?
++             opcode->src[res_op + 1].base.index[0].imm : SHADER_TEX_SLOT_NO_SAMPLER;
++   shadow = opcode->type == D3D10_SB_OPCODE_SAMPLE_C || opcode->type == D3D10_SB_OPCODE_SAMPLE_C_LZ ||
++            opcode->type == D3D11_SB_OPCODE_GATHER4_C || opcode->type == D3D11_SB_OPCODE_GATHER4_PO_C;
++   st = shadow ? shadow_target(target) : target;
++   num_off = tex_imm_offset(sx, opcode, &off);
++
++   texel = ureg_DECL_temporary(ureg);
++   c = ureg_DECL_temporary(ureg);
++
++   switch (opcode->type) {
++   case D3D10_SB_OPCODE_SAMPLE:
++      src[0] = translate_src_operand(sx, &opcode->src[0], OF_FLOAT);
++      src[1] = tex_slot(sx, view, sampler, false);
++      tex_insn(sx, TGSI_OPCODE_TEX, target, texel, &off, num_off, src, 2);
++      break;
++
++   case D3D10_SB_OPCODE_SAMPLE_B:
++   case D3D10_SB_OPCODE_SAMPLE_L: {
++      /* the bias or LOD goes in .w, or (cube arrays, whose coordinate has 4 components) in a second operand */
++      bool bias = opcode->type == D3D10_SB_OPCODE_SAMPLE_B;
++      struct ureg_src value = ureg_scalar(translate_src_operand(sx, &opcode->src[3], OF_FLOAT), TGSI_SWIZZLE_X);
++      if (target == TGSI_TEXTURE_CUBE_ARRAY) {
++         src[0] = translate_src_operand(sx, &opcode->src[0], OF_FLOAT);
++         src[1] = value;
++         src[2] = tex_slot(sx, view, sampler, false);
++         tex_insn(sx, bias ? TGSI_OPCODE_TXB2 : TGSI_OPCODE_TXL2, target, texel, &off, num_off, src, 3);
++      } else {
++         ureg_MOV(ureg, c, translate_src_operand(sx, &opcode->src[0], OF_FLOAT));
++         ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_W), value);
++         src[0] = ureg_src(c);
++         src[1] = tex_slot(sx, view, sampler, false);
++         tex_insn(sx, bias ? TGSI_OPCODE_TXB : TGSI_OPCODE_TXL, target, texel, &off, num_off, src, 2);
++      }
++      break;
++   }
++
++   case D3D10_SB_OPCODE_SAMPLE_D:
++      src[0] = translate_src_operand(sx, &opcode->src[0], OF_FLOAT);
++      src[1] = translate_src_operand(sx, &opcode->src[3], OF_FLOAT);
++      src[2] = translate_src_operand(sx, &opcode->src[4], OF_FLOAT);
++      src[3] = tex_slot(sx, view, sampler, false);
++      tex_insn(sx, TGSI_OPCODE_TXD, target, texel, &off, num_off, src, 4);
++      break;
++
++   case D3D10_SB_OPCODE_SAMPLE_C:
++   case D3D10_SB_OPCODE_SAMPLE_C_LZ: {
++      /* the reference value goes in .z (1D, 2D, 1D arrays), .w (2D arrays, cubes) or a second operand (cube
++       * arrays); level 0 explicitly: textureLod has no 2D array and cube shadow forms in core GLSL, textureGrad
++       * with zero derivatives does the same */
++      bool lz = opcode->type == D3D10_SB_OPCODE_SAMPLE_C_LZ;
++      struct ureg_src ref = ureg_scalar(translate_src_operand(sx, &opcode->src[3], OF_FLOAT), TGSI_SWIZZLE_X);
++      struct ureg_src samp = tex_slot(sx, view, sampler, true);
++      if (st == TGSI_TEXTURE_SHADOWCUBE_ARRAY) {
++         src[0] = translate_src_operand(sx, &opcode->src[0], OF_FLOAT);
++         if (lz) {
++            ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_X), ref);
++            ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_Y), ureg_imm1f(ureg, 0.0f));
++            src[1] = ureg_src(c);
++         } else {
++            src[1] = ref;
++         }
++         src[2] = samp;
++         tex_insn(sx, lz ? TGSI_OPCODE_TXL2 : TGSI_OPCODE_TEX2, st, texel, &off, num_off, src, 3);
++         break;
++      }
++      ureg_MOV(ureg, c, translate_src_operand(sx, &opcode->src[0], OF_FLOAT));
++      if (st == TGSI_TEXTURE_SHADOW2D_ARRAY || st == TGSI_TEXTURE_SHADOWCUBE) {
++         ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_W), ref);
++      } else {
++         ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_Z), ref);
++      }
++      src[0] = ureg_src(c);
++      if (!lz) {
++         src[1] = samp;
++         tex_insn(sx, TGSI_OPCODE_TEX, st, texel, &off, num_off, src, 2);
++      } else if (st == TGSI_TEXTURE_SHADOW2D_ARRAY || st == TGSI_TEXTURE_SHADOWCUBE) {
++         src[1] = ureg_imm1f(ureg, 0.0f);
++         src[2] = ureg_imm1f(ureg, 0.0f);
++         src[3] = samp;
++         tex_insn(sx, TGSI_OPCODE_TXD, st, texel, &off, num_off, src, 4);
++      } else {
++         ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_W), ureg_imm1f(ureg, 0.0f));
++         src[1] = samp;
++         tex_insn(sx, TGSI_OPCODE_TXL, st, texel, &off, num_off, src, 2);
++      }
++      break;
++   }
++
++   case D3D10_1_SB_OPCODE_GATHER4:
++   case D3D11_SB_OPCODE_GATHER4_C:
++   case D3D11_SB_OPCODE_GATHER4_PO:
++   case D3D11_SB_OPCODE_GATHER4_PO_C: {
++      /* the component to gather is the sampler operand's swizzle (red before shader model 5); the programmable
++       * offset (_po) is a register */
++      bool po = opcode->type == D3D11_SB_OPCODE_GATHER4_PO || opcode->type == D3D11_SB_OPCODE_GATHER4_PO_C;
++      struct ureg_dst offset_reg = ureg_dst_undef();
++      unsigned component = opcode->src[res_op + 1].swizzle[0];
++      struct ureg_src samp = tex_slot(sx, view, sampler, shadow);
++
++      if (po) {
++         offset_reg = ureg_DECL_temporary(ureg);
++         ureg_MOV(ureg, offset_reg, translate_src_operand(sx, &opcode->src[1], OF_INT));
++         memset(&off, 0, sizeof off);
++         off.File = TGSI_FILE_TEMPORARY;
++         off.Index = offset_reg.Index;
++         off.SwizzleX = TGSI_SWIZZLE_X;
++         off.SwizzleY = TGSI_SWIZZLE_Y;
++         off.SwizzleZ = TGSI_SWIZZLE_Z;
++         num_off = 1;
++      }
++      if (shadow) {
++         struct ureg_src ref = ureg_scalar(translate_src_operand(sx, &opcode->src[res_op + 2], OF_FLOAT),
++                                           TGSI_SWIZZLE_X);
++         ureg_MOV(ureg, c, translate_src_operand(sx, &opcode->src[0], OF_FLOAT));
++         src[1] = ureg_imm1u(ureg, 0);
++         if (st == TGSI_TEXTURE_SHADOWCUBE_ARRAY) {
++            src[1] = ref;
++         } else if (st == TGSI_TEXTURE_SHADOW2D_ARRAY || st == TGSI_TEXTURE_SHADOWCUBE) {
++            ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_W), ref);
++         } else {
++            ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_Z), ref);
++         }
++         src[0] = ureg_src(c);
++      } else {
++         src[0] = translate_src_operand(sx, &opcode->src[0], OF_FLOAT);
++         src[1] = ureg_imm1u(ureg, component);
++      }
++      src[2] = samp;
++      tex_insn(sx, TGSI_OPCODE_TG4, st, texel, &off, num_off, src, 3);
++      if (po) {
++         ureg_release_temporary(ureg, offset_reg);
++      }
++      break;
++   }
++
++   case D3D10_1_SB_OPCODE_LOD:
++      /* .x clamped, .y unclamped LOD */
++      ureg_MOV(ureg, texel, ureg_imm1f(ureg, 0.0f));
++      src[0] = translate_src_operand(sx, &opcode->src[0], OF_FLOAT);
++      src[1] = tex_slot(sx, view, sampler, false);
++      tex_insn(sx, TGSI_OPCODE_LODQ, target, ureg_writemask(texel, TGSI_WRITEMASK_XY), NULL, 0, src, 2);
++      break;
++
++   case D3D10_SB_OPCODE_LD:
++      /* the mip level is in .w already, like TXF's */
++      src[0] = translate_src_operand(sx, &opcode->src[0], OF_INT);
++      src[1] = tex_slot(sx, view, SHADER_TEX_SLOT_NO_SAMPLER, false);
++      tex_insn(sx, TGSI_OPCODE_TXF, target, texel, &off, num_off, src, 2);
++      break;
++
++   case D3D10_SB_OPCODE_LD_MS:
++      /* the sample index goes in .w */
++      ureg_MOV(ureg, c, translate_src_operand(sx, &opcode->src[0], OF_INT));
++      ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_W),
++               ureg_scalar(translate_src_operand(sx, &opcode->src[2], OF_INT), TGSI_SWIZZLE_X));
++      src[0] = ureg_src(c);
++      src[1] = tex_slot(sx, view, SHADER_TEX_SLOT_NO_SAMPLER, false);
++      tex_insn(sx, TGSI_OPCODE_TXF, target, texel, &off, num_off, src, 2);
++      break;
++
++   case D3D10_SB_OPCODE_RESINFO: {
++      /* width, height, depth or array size, mip count; integers, floats, or (rcpfloat) the sizes inverted */
++      unsigned dims = tex_size_dims(target);
++      ureg_MOV(ureg, texel, ureg_imm1u(ureg, 0));
++      src[0] = ureg_scalar(translate_src_operand(sx, &opcode->src[0], OF_UINT), TGSI_SWIZZLE_X);
++      src[1] = tex_slot(sx, view, SHADER_TEX_SLOT_NO_SAMPLER, false);
++      tex_insn(sx, TGSI_OPCODE_TXQ, target, texel, NULL, 0, src, 2);
++      if (opcode->specific.resinfo_ret_type != D3D10_SB_RESINFO_INSTRUCTION_RETURN_UINT) {
++         ureg_U2F(ureg, texel, ureg_src(texel));
++      }
++      if (opcode->specific.resinfo_ret_type == D3D10_SB_RESINFO_INSTRUCTION_RETURN_RCPFLOAT) {
++         for (unsigned i = 0; i < dims; i++) {
++            ureg_RCP(ureg, ureg_writemask(texel, 1 << i), ureg_scalar(ureg_src(texel), i));
++         }
++      }
++      break;
++   }
++
++   case D3D10_1_SB_OPCODE_SAMPLE_INFO:
++      /* the sample count in .x */
++      if (target == TGSI_TEXTURE_2D_MSAA || target == TGSI_TEXTURE_2D_ARRAY_MSAA) {
++         ureg_MOV(ureg, texel, ureg_imm1u(ureg, 0));
++         src[0] = tex_slot(sx, view, SHADER_TEX_SLOT_NO_SAMPLER, false);
++         tex_insn(sx, TGSI_OPCODE_TXQS, target, ureg_writemask(texel, TGSI_WRITEMASK_X), NULL, 0, src, 1);
++      } else {
++         ureg_MOV(ureg, texel, ureg_imm4u(ureg, 1, 0, 0, 0));
++      }
++      if (opcode->specific.instruction_return_type != D3D10_SB_INSTRUCTION_RETURN_UINT) {
++         ureg_U2F(ureg, texel, ureg_src(texel));
++      }
++      break;
++
++   case D3D10_1_SB_OPCODE_SAMPLE_POS: {
++      /* the standard pattern's position of sample src1 of the texture's count, (0, 0) out of range */
++      unsigned table[32 * 4];
++      struct ureg_src positions;
++      struct ureg_dst addr = ureg_DECL_address(ureg);
++      struct ureg_src index = ureg_scalar(translate_src_operand(sx, &opcode->src[1], OF_UINT), TGSI_SWIZZLE_X);
++
++      memset(table, 0, sizeof table);
++      for (unsigned i = 0; i < 31; i++) {
++         float x = standard_sample_positions[i][0] / 16.0f, y = standard_sample_positions[i][1] / 16.0f;
++         memcpy(&table[i * 4 + 0], &x, 4);
++         memcpy(&table[i * 4 + 1], &y, 4);
++      }
++      positions = ureg_DECL_immediate_block_uint(ureg, table, 32 * 4);
++
++      /* c.x = count, c.y = count - 1 + index, c.z = index < count && count <= 16 */
++      ureg_MOV(ureg, ureg_writemask(c, TGSI_WRITEMASK_X), ureg_imm1u(ureg, 1));
++      if (target == TGSI_TEXTURE_2D_MSAA || target == TGSI_TEXTURE_2D_ARRAY_MSAA) {
++         src[0] = tex_slot(sx, view, SHADER_TEX_SLOT_NO_SAMPLER, false);
++         tex_insn(sx, TGSI_OPCODE_TXQS, target, ureg_writemask(c, TGSI_WRITEMASK_X), NULL, 0, src, 1);
++      }
++      ureg_UADD(ureg, ureg_writemask(c, TGSI_WRITEMASK_Y), ureg_scalar(ureg_src(c), TGSI_SWIZZLE_X), index);
++      ureg_UADD(ureg, ureg_writemask(c, TGSI_WRITEMASK_Y), ureg_scalar(ureg_src(c), TGSI_SWIZZLE_Y),
++                ureg_imm1i(ureg, -1));
++      ureg_USLT(ureg, ureg_writemask(c, TGSI_WRITEMASK_Z), index, ureg_scalar(ureg_src(c), TGSI_SWIZZLE_X));
++      ureg_USGE(ureg, ureg_writemask(c, TGSI_WRITEMASK_W), ureg_imm1u(ureg, 16),
++                ureg_scalar(ureg_src(c), TGSI_SWIZZLE_X));
++      ureg_AND(ureg, ureg_writemask(c, TGSI_WRITEMASK_Z), ureg_scalar(ureg_src(c), TGSI_SWIZZLE_Z),
++               ureg_scalar(ureg_src(c), TGSI_SWIZZLE_W));
++      ureg_UMIN(ureg, ureg_writemask(c, TGSI_WRITEMASK_Y), ureg_scalar(ureg_src(c), TGSI_SWIZZLE_Y),
++                ureg_imm1u(ureg, 31));
++      ureg_UARL(ureg, ureg_writemask(addr, TGSI_WRITEMASK_X), ureg_scalar(ureg_src(c), TGSI_SWIZZLE_Y));
++      ureg_UCMP(ureg, texel, ureg_scalar(ureg_src(c), TGSI_SWIZZLE_Z),
++                ureg_src_indirect(positions, ureg_scalar(ureg_src(addr), TGSI_SWIZZLE_X)), ureg_imm1u(ureg, 0));
++      break;
++   }
++
++   case D3D11_SB_OPCODE_BUFINFO:
++      /* typed buffer views: the element count in .x */
++      ureg_MOV(ureg, texel, ureg_imm1u(ureg, 0));
++      src[0] = ureg_imm1u(ureg, 0);
++      src[1] = tex_slot(sx, view, SHADER_TEX_SLOT_NO_SAMPLER, false);
++      tex_insn(sx, TGSI_OPCODE_TXQ, target, ureg_writemask(texel, TGSI_WRITEMASK_X), NULL, 0, src, 2);
++      break;
++
++   default:
++      assert(0);
++   }
++
++   tex_result(sx, opcode, texel, &opcode->src[res_op]);
++   ureg_release_temporary(ureg, c);
++   ureg_release_temporary(ureg, texel);
++   return true;
++}
++
++/*
++ * Shader model 5 instructions that take more than one TGSI instruction. D3D defines results where GLSL doesn't
++ * (bit fields reaching past bit 31), counts bits from the other end (firstbit_hi), or has no TGSI/virgl
++ * counterpart (half floats: integer arithmetic).
++ */
++static bool
++translate_sm5_alu(struct Shader_xlate *sx, struct Shader_opcode *opcode)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct ureg_dst t[4];
++   struct ureg_src a, b, c;
++   unsigned i;
++
++   switch (opcode->type) {
++   case D3D11_SB_OPCODE_RCP:
++      expand_unary_to_scalarf(ureg, ureg_RCP, sx, opcode);
++      return true;
++
++   case D3D11_SB_OPCODE_FIRSTBIT_HI:
++   case D3D11_SB_OPCODE_FIRSTBIT_SHI:
++      /* the bit's position counted from bit 31; ~0 when there is none */
++      t[0] = ureg_DECL_temporary(ureg);
++      t[1] = ureg_DECL_temporary(ureg);
++      if (opcode->type == D3D11_SB_OPCODE_FIRSTBIT_HI) {
++         ureg_UMSB(ureg, t[0], translate_src_operand(sx, &opcode->src[0], OF_UINT));
++      } else {
++         ureg_IMSB(ureg, t[0], translate_src_operand(sx, &opcode->src[0], OF_INT));
++      }
++      ureg_INEG(ureg, t[1], ureg_src(t[0]));
++      ureg_UADD(ureg, t[1], ureg_src(t[1]), ureg_imm1u(ureg, 31));
++      ureg_USEQ(ureg, t[0], ureg_src(t[0]), ureg_imm1u(ureg, ~0u));
++      ureg_UCMP(ureg, translate_dst_operand(sx, &opcode->dst[0], opcode->saturate), ureg_src(t[0]),
++                ureg_imm1u(ureg, ~0u), ureg_src(t[1]));
++      ureg_release_temporary(ureg, t[0]);
++      ureg_release_temporary(ureg, t[1]);
++      return true;
++
++   case D3D11_SB_OPCODE_UBFE:
++   case D3D11_SB_OPCODE_IBFE: {
++      /* width and offset are 5 bits; a field reaching past bit 31 is the value shifted down */
++      bool is_signed = opcode->type == D3D11_SB_OPCODE_IBFE;
++      for (i = 0; i < 4; i++) {
++         t[i] = ureg_DECL_temporary(ureg);
++      }
++      c = translate_src_operand(sx, &opcode->src[2], is_signed ? OF_INT : OF_UINT);
++      ureg_AND(ureg, t[0], translate_src_operand(sx, &opcode->src[0], OF_UINT), ureg_imm1u(ureg, 31));
++      ureg_AND(ureg, t[1], translate_src_operand(sx, &opcode->src[1], OF_UINT), ureg_imm1u(ureg, 31));
++      if (is_signed) {
++         ureg_IBFE(ureg, t[2], c, ureg_src(t[1]), ureg_src(t[0]));
++         ureg_ISHR(ureg, t[3], c, ureg_src(t[1]));
++      } else {
++         ureg_UBFE(ureg, t[2], c, ureg_src(t[1]), ureg_src(t[0]));
++         ureg_USHR(ureg, t[3], c, ureg_src(t[1]));
++      }
++      ureg_UADD(ureg, t[0], ureg_src(t[0]), ureg_src(t[1]));
++      ureg_USLT(ureg, t[0], ureg_imm1u(ureg, 32), ureg_src(t[0]));
++      ureg_UCMP(ureg, translate_dst_operand(sx, &opcode->dst[0], opcode->saturate), ureg_src(t[0]),
++                ureg_src(t[3]), ureg_src(t[2]));
++      for (i = 0; i < 4; i++) {
++         ureg_release_temporary(ureg, t[i]);
++      }
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_BFI:
++      /* bfi width, offset, insert, base: the inserted field is cut at bit 31 */
++      t[0] = ureg_DECL_temporary(ureg);
++      t[1] = ureg_DECL_temporary(ureg);
++      t[2] = ureg_DECL_temporary(ureg);
++      ureg_AND(ureg, t[0], translate_src_operand(sx, &opcode->src[0], OF_UINT), ureg_imm1u(ureg, 31));
++      ureg_AND(ureg, t[1], translate_src_operand(sx, &opcode->src[1], OF_UINT), ureg_imm1u(ureg, 31));
++      ureg_INEG(ureg, t[2], ureg_src(t[1]));
++      ureg_UADD(ureg, t[2], ureg_src(t[2]), ureg_imm1u(ureg, 32));
++      ureg_UMIN(ureg, t[0], ureg_src(t[0]), ureg_src(t[2]));
++      ureg_BFI(ureg, translate_dst_operand(sx, &opcode->dst[0], opcode->saturate),
++               translate_src_operand(sx, &opcode->src[3], OF_UINT), translate_src_operand(sx, &opcode->src[2], OF_UINT),
++               ureg_src(t[1]), ureg_src(t[0]));
++      for (i = 0; i < 3; i++) {
++         ureg_release_temporary(ureg, t[i]);
++      }
++      return true;
++
++   case D3D11_SB_OPCODE_F32TOF16: {
++      /* to half float bits (low 16), rounding toward zero (what WARP, the reference, does): too large finite
++       * values give the largest half, infinity infinity, NaN 0x7e00 */
++      struct ureg_dst f, sign, r, x, e;
++      f = ureg_DECL_temporary(ureg);
++      sign = ureg_DECL_temporary(ureg);
++      r = ureg_DECL_temporary(ureg);
++      x = ureg_DECL_temporary(ureg);
++      e = ureg_DECL_temporary(ureg);
++      ureg_MOV(ureg, f, translate_src_operand(sx, &opcode->src[0], OF_FLOAT));
++      ureg_AND(ureg, sign, ureg_src(f), ureg_imm1u(ureg, 0x80000000));
++      ureg_XOR(ureg, f, ureg_src(f), ureg_src(sign));
++      ureg_USHR(ureg, sign, ureg_src(sign), ureg_imm1u(ureg, 16));
++      /* normal: rebias the exponent, drop 13 bits */
++      ureg_UADD(ureg, r, ureg_src(f), ureg_imm1u(ureg, 0xc8000000));
++      ureg_USHR(ureg, r, ureg_src(r), ureg_imm1u(ureg, 13));
++      /* below 2^-14: the mantissa with its implicit bit, shifted down by 126 - exponent (all of it for zero and
++       * float denormals) */
++      ureg_AND(ureg, x, ureg_src(f), ureg_imm1u(ureg, 0x7fffff));
++      ureg_OR(ureg, x, ureg_src(x), ureg_imm1u(ureg, 0x800000));
++      ureg_USHR(ureg, e, ureg_src(f), ureg_imm1u(ureg, 23));
++      ureg_INEG(ureg, e, ureg_src(e));
++      ureg_UADD(ureg, e, ureg_src(e), ureg_imm1u(ureg, 126));
++      ureg_UMIN(ureg, e, ureg_src(e), ureg_imm1u(ureg, 31));
++      ureg_USHR(ureg, x, ureg_src(x), ureg_src(e));
++      ureg_USLT(ureg, e, ureg_src(f), ureg_imm1u(ureg, 0x38800000));
++      ureg_UCMP(ureg, r, ureg_src(e), ureg_src(x), ureg_src(r));
++      /* 65536 and above: the largest half; infinity; NaN */
++      ureg_USEQ(ureg, x, ureg_src(f), ureg_imm1u(ureg, 0x7f800000));
++      ureg_UCMP(ureg, x, ureg_src(x), ureg_imm1u(ureg, 0x7c00), ureg_imm1u(ureg, 0x7bff));
++      ureg_USLT(ureg, e, ureg_imm1u(ureg, 0x7f800000), ureg_src(f));
++      ureg_UCMP(ureg, x, ureg_src(e), ureg_imm1u(ureg, 0x7e00), ureg_src(x));
++      ureg_USGE(ureg, e, ureg_src(f), ureg_imm1u(ureg, 0x47800000));
++      ureg_UCMP(ureg, r, ureg_src(e), ureg_src(x), ureg_src(r));
++      ureg_OR(ureg, translate_dst_operand(sx, &opcode->dst[0], false), ureg_src(r), ureg_src(sign));
++      ureg_release_temporary(ureg, f);
++      ureg_release_temporary(ureg, sign);
++      ureg_release_temporary(ureg, r);
++      ureg_release_temporary(ureg, x);
++      ureg_release_temporary(ureg, e);
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_F16TOF32: {
++      /* from the low 16 bits */
++      struct ureg_dst h, o, e, x;
++      h = ureg_DECL_temporary(ureg);
++      o = ureg_DECL_temporary(ureg);
++      e = ureg_DECL_temporary(ureg);
++      x = ureg_DECL_temporary(ureg);
++      ureg_MOV(ureg, h, translate_src_operand(sx, &opcode->src[0], OF_UINT));
++      ureg_AND(ureg, o, ureg_src(h), ureg_imm1u(ureg, 0x7fff));
++      ureg_SHL(ureg, o, ureg_src(o), ureg_imm1u(ureg, 13));
++      ureg_AND(ureg, e, ureg_src(o), ureg_imm1u(ureg, 0x0f800000));
++      ureg_UADD(ureg, o, ureg_src(o), ureg_imm1u(ureg, 0x38000000));
++      /* infinity and NaN */
++      ureg_USEQ(ureg, x, ureg_src(e), ureg_imm1u(ureg, 0x0f800000));
++      ureg_AND(ureg, x, ureg_src(x), ureg_imm1u(ureg, 0x38000000));
++      ureg_UADD(ureg, o, ureg_src(o), ureg_src(x));
++      /* denormals: renormalized by the float adder */
++      ureg_UADD(ureg, x, ureg_src(o), ureg_imm1u(ureg, 0x00800000));
++      ureg_ADD(ureg, x, ureg_src(x), ureg_imm1f(ureg, -6.103515625e-05f));
++      ureg_USEQ(ureg, e, ureg_src(e), ureg_imm1u(ureg, 0));
++      ureg_UCMP(ureg, o, ureg_src(e), ureg_src(x), ureg_src(o));
++      ureg_AND(ureg, h, ureg_src(h), ureg_imm1u(ureg, 0x8000));
++      ureg_SHL(ureg, h, ureg_src(h), ureg_imm1u(ureg, 16));
++      ureg_OR(ureg, translate_dst_operand(sx, &opcode->dst[0], opcode->saturate), ureg_src(o), ureg_src(h));
++      ureg_release_temporary(ureg, h);
++      ureg_release_temporary(ureg, o);
++      ureg_release_temporary(ureg, e);
++      ureg_release_temporary(ureg, x);
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_UADDC:
++   case D3D11_SB_OPCODE_USUBB:
++      /* dst0 = sum or difference, dst1 = carry or borrow (1 or 0) */
++      t[0] = ureg_DECL_temporary(ureg);
++      t[1] = ureg_DECL_temporary(ureg);
++      a = translate_src_operand(sx, &opcode->src[0], OF_UINT);
++      b = translate_src_operand(sx, &opcode->src[1], OF_UINT);
++      if (opcode->type == D3D11_SB_OPCODE_UADDC) {
++         ureg_UADD(ureg, t[0], a, b);
++         ureg_USLT(ureg, t[1], ureg_src(t[0]), a);
++      } else {
++         ureg_INEG(ureg, t[0], b);
++         ureg_UADD(ureg, t[0], a, ureg_src(t[0]));
++         ureg_USLT(ureg, t[1], a, b);
++      }
++      ureg_AND(ureg, t[1], ureg_src(t[1]), ureg_imm1u(ureg, 1));
++      for (i = 0; i < 2; i++) {
++         if (opcode->dst[i].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
++            ureg_MOV(ureg, translate_dst_operand(sx, &opcode->dst[i], false), ureg_src(t[i]));
++         }
++      }
++      ureg_release_temporary(ureg, t[0]);
++      ureg_release_temporary(ureg, t[1]);
++      return true;
++
++   case D3D11_SB_OPCODE_SWAPC:
++      /* dst0 = cond ? src2 : src1, dst1 = cond ? src1 : src2 */
++      t[0] = ureg_DECL_temporary(ureg);
++      t[1] = ureg_DECL_temporary(ureg);
++      a = translate_src_operand(sx, &opcode->src[0], OF_UINT);
++      b = translate_src_operand(sx, &opcode->src[1], OF_UINT);
++      c = translate_src_operand(sx, &opcode->src[2], OF_UINT);
++      ureg_UCMP(ureg, t[0], a, c, b);
++      ureg_UCMP(ureg, t[1], a, b, c);
++      for (i = 0; i < 2; i++) {
++         if (opcode->dst[i].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
++            ureg_MOV(ureg, translate_dst_operand(sx, &opcode->dst[i], false), ureg_src(t[i]));
++         }
++      }
++      ureg_release_temporary(ureg, t[0]);
++      ureg_release_temporary(ureg, t[1]);
++      return true;
++
++   case D3D11_SB_OPCODE_EMIT_STREAM:
++   case D3D11_SB_OPCODE_CUT_STREAM:
++   case D3D11_SB_OPCODE_EMITTHENCUT_STREAM: {
++      unsigned stream = opcode->dst[0].base.index[0].imm;
++      if (opcode->type != D3D11_SB_OPCODE_CUT_STREAM) {
++         ureg_EMIT(ureg, ureg_imm1u(ureg, stream));
++      }
++      if (opcode->type != D3D11_SB_OPCODE_EMIT_STREAM) {
++         ureg_ENDPRIM(ureg, ureg_imm1u(ureg, stream));
++      }
++      return true;
++   }
++
++   case D3D11_SB_OPCODE_DCL_STREAM:
++      /* outputs of more than one stream need stream output support per stream */
++      LOG_UNSUPPORTED(opcode->dst[0].base.index[0].imm != 0);
++      return true;
++
++   case D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT:
++      ureg_property(ureg, TGSI_PROPERTY_GS_INVOCATIONS, opcode->specific.dcl_gs_instance_count);
++      return true;
++
++   case D3D11_SB_OPCODE_EVAL_CENTROID:
++   case D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX:
++   case D3D11_SB_OPCODE_EVAL_SNAPPED: {
++      /* an input attribute interpolated elsewhere in the pixel; virgl needs the input itself (not one packed
++       * into a temporary with another, see dcl_base_input) */
++      struct ureg_dst dst = translate_dst_operand(sx, &opcode->dst[0], opcode->saturate);
++      a = translate_src_operand(sx, &opcode->src[0], OF_FLOAT);
++      if (a.File != TGSI_FILE_INPUT) {
++         LOG_UNSUPPORTED(true);
++         ureg_MOV(ureg, dst, a);
++      } else if (opcode->type == D3D11_SB_OPCODE_EVAL_CENTROID) {
++         ureg_INTERP_CENTROID(ureg, dst, a);
++      } else if (opcode->type == D3D11_SB_OPCODE_EVAL_SAMPLE_INDEX) {
++         ureg_INTERP_SAMPLE(ureg, dst, a,
++                            ureg_scalar(translate_src_operand(sx, &opcode->src[1], OF_INT), TGSI_SWIZZLE_X));
++      } else {
++         /* offsets in 1/16 pixel */
++         t[0] = ureg_DECL_temporary(ureg);
++         ureg_I2F(ureg, t[0], translate_src_operand(sx, &opcode->src[1], OF_INT));
++         ureg_MUL(ureg, t[0], ureg_src(t[0]), ureg_imm1f(ureg, 1.0f / 16.0f));
++         ureg_INTERP_OFFSET(ureg, dst, a, ureg_src(t[0]));
++         ureg_release_temporary(ureg, t[0]);
++      }
++      return true;
++   }
++
++   default:
++      return false;
++   }
++}
++
++/* Finds the loops that have a continue and each switch's case values, ahead of the translation. */
++static void
++Shader_scan_control_flow(struct Shader_xlate *sx, const unsigned *code)
++{
++   struct Shader_parser parser;
++   struct Shader_opcode opcode;
++   struct {
++      bool is_switch;
++      uint index;
++   } stack[SHADER_MAX_CF_DEPTH];
++   uint depth = 0;
++
++   Shader_parse_init(&parser, code);
++   while (Shader_parse_opcode(&parser, &opcode)) {
++      switch (opcode.type) {
++      case D3D10_SB_OPCODE_LOOP:
++         sx->loop_has_continue = REALLOC(sx->loop_has_continue, sx->num_loops * sizeof(bool),
++                                         (sx->num_loops + 1) * sizeof(bool));
++         sx->loop_has_continue[sx->num_loops] = false;
++         if (depth < SHADER_MAX_CF_DEPTH) {
++            stack[depth].is_switch = false;
++            stack[depth].index = sx->num_loops;
++         }
++         depth++;
++         sx->num_loops++;
++         break;
++      case D3D10_SB_OPCODE_SWITCH:
++         sx->switches = REALLOC(sx->switches, sx->num_switches * sizeof(*sx->switches),
++                                (sx->num_switches + 1) * sizeof(*sx->switches));
++         memset(&sx->switches[sx->num_switches], 0, sizeof(*sx->switches));
++         if (depth < SHADER_MAX_CF_DEPTH) {
++            stack[depth].is_switch = true;
++            stack[depth].index = sx->num_switches;
++         }
++         depth++;
++         sx->num_switches++;
++         break;
++      case D3D10_SB_OPCODE_ENDLOOP:
++      case D3D10_SB_OPCODE_ENDSWITCH:
++         if (depth) {
++            depth--;
++         }
++         break;
++      case D3D10_SB_OPCODE_CONTINUE:
++      case D3D10_SB_OPCODE_CONTINUEC:
++         for (uint i = MIN2(depth, SHADER_MAX_CF_DEPTH); i-- > 0;) {
++            if (!stack[i].is_switch) {
++               sx->loop_has_continue[stack[i].index] = true;
++               break;
++            }
++         }
++         break;
++      case D3D10_SB_OPCODE_CASE:
++      case D3D10_SB_OPCODE_DEFAULT:
++         if (depth && depth <= SHADER_MAX_CF_DEPTH && stack[depth - 1].is_switch) {
++            struct Shader_switch_cases *cases = &sx->switches[stack[depth - 1].index];
++            if (opcode.type == D3D10_SB_OPCODE_DEFAULT) {
++               cases->has_default = true;
++            } else {
++               cases->values = REALLOC(cases->values, cases->count * sizeof(unsigned),
++                                       (cases->count + 1) * sizeof(unsigned));
++               cases->values[cases->count++] = opcode.src[0].imm[0].u32;
++            }
++         }
++         break;
++      default:
++         break;
++      }
++      Shader_opcode_free(&opcode);
++   }
++}
++
++static struct Shader_cf *
++cf_innermost_loop(struct Shader_xlate *sx)
++{
++   for (uint i = sx->cf_depth; i-- > 0;) {
++      if (!sx->cf[i].is_switch) {
++         return &sx->cf[i];
++      }
++   }
++   return NULL;
++}
++
++static void
++cf_loop(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct Shader_cf *cf;
++   unsigned label;
++
++   assert(sx->cf_depth < SHADER_MAX_CF_DEPTH);
++   cf = &sx->cf[sx->cf_depth++];
++   memset(cf, 0, sizeof *cf);
++   cf->lowered = sx->loops_seen < sx->num_loops && sx->loop_has_continue[sx->loops_seen];
++   sx->loops_seen++;
++
++   if (cf->lowered) {
++      cf->flags = ureg_DECL_temporary(ureg);
++      ureg_MOV(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_X), ureg_imm1u(ureg, 0));
++   }
++   ureg_BGNLOOP(ureg, &label);
++   if (cf->lowered) {
++      ureg_MOV(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, 0));
++      ureg_BGNLOOP(ureg, &label);
++   }
++}
++
++static void
++cf_endloop(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct Shader_cf *cf;
++   unsigned label;
++
++   assert(sx->cf_depth && !sx->cf[sx->cf_depth - 1].is_switch);
++   cf = &sx->cf[--sx->cf_depth];
++   if (cf->lowered) {
++      ureg_BRK(ureg);
++      ureg_ENDLOOP(ureg, &label);
++      ureg_UIF(ureg, ureg_scalar(ureg_src(cf->flags), TGSI_SWIZZLE_X), &label);
++      ureg_BRK(ureg);
++      ureg_ENDIF(ureg);
++   }
++   ureg_ENDLOOP(ureg, &label);
++   if (cf->lowered) {
++      ureg_release_temporary(ureg, cf->flags);
++   }
++}
++
++static void
++cf_break(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct Shader_cf *cf = sx->cf_depth ? &sx->cf[sx->cf_depth - 1] : NULL;
++
++   if (cf && !cf->is_switch && cf->lowered) {
++      ureg_MOV(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_X), ureg_imm1u(ureg, ~0u));
++   }
++   ureg_BRK(ureg);
++}
++
++static void
++cf_continue(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct Shader_cf *loop = cf_innermost_loop(sx);
++
++   if (!loop || !loop->lowered) {
++      /* the scan found every continue's loop */
++      assert(0);
++      return;
++   }
++   if (loop != &sx->cf[sx->cf_depth - 1]) {
++      /* inside a switch: leave it, the code after it continues */
++      ureg_MOV(ureg, ureg_writemask(loop->flags, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, ~0u));
++   }
++   ureg_BRK(ureg);
++}
++
++static void
++cf_switch(struct Shader_xlate *sx, struct ureg_src selector)
++{
++   struct ureg_program *ureg = sx->ureg;
++   const struct Shader_switch_cases *cases =
++      sx->switches_seen < sx->num_switches ? &sx->switches[sx->switches_seen] : NULL;
++   struct Shader_cf *cf;
++   unsigned label;
++
++   sx->switches_seen++;
++   assert(sx->cf_depth < SHADER_MAX_CF_DEPTH);
++   cf = &sx->cf[sx->cf_depth++];
++   memset(cf, 0, sizeof *cf);
++   cf->is_switch = true;
++   cf->flags = ureg_DECL_temporary(ureg);
++
++   ureg_MOV(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_X), ureg_scalar(selector, TGSI_SWIZZLE_X));
++   ureg_MOV(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_Y), ureg_imm1u(ureg, 0));
++   if (cases && cases->has_default) {
++      struct ureg_dst tmp = ureg_DECL_temporary(ureg);
++      ureg_MOV(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_Z), ureg_imm1u(ureg, ~0u));
++      for (uint i = 0; i < cases->count; i++) {
++         ureg_USNE(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_X),
++                   ureg_scalar(ureg_src(cf->flags), TGSI_SWIZZLE_X), ureg_imm1u(ureg, cases->values[i]));
++         ureg_AND(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_Z),
++                  ureg_scalar(ureg_src(cf->flags), TGSI_SWIZZLE_Z), ureg_scalar(ureg_src(tmp), TGSI_SWIZZLE_X));
++      }
++      ureg_release_temporary(ureg, tmp);
++   }
++   ureg_BGNLOOP(ureg, &label);
++}
++
++/* A case label (or default, is_default): the region after it runs if this or an earlier label matched */
++static void
++cf_case(struct Shader_xlate *sx, bool is_default, unsigned value)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct Shader_cf *cf;
++   unsigned label;
++
++   assert(sx->cf_depth && sx->cf[sx->cf_depth - 1].is_switch);
++   cf = &sx->cf[sx->cf_depth - 1];
++   if (cf->case_open) {
++      ureg_ENDIF(ureg);
++   }
++   if (is_default) {
++      ureg_OR(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_Y),
++              ureg_scalar(ureg_src(cf->flags), TGSI_SWIZZLE_Y), ureg_scalar(ureg_src(cf->flags), TGSI_SWIZZLE_Z));
++   } else {
++      struct ureg_dst tmp = ureg_DECL_temporary(ureg);
++      ureg_USEQ(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_X),
++                ureg_scalar(ureg_src(cf->flags), TGSI_SWIZZLE_X), ureg_imm1u(ureg, value));
++      ureg_OR(ureg, ureg_writemask(cf->flags, TGSI_WRITEMASK_Y),
++              ureg_scalar(ureg_src(cf->flags), TGSI_SWIZZLE_Y), ureg_scalar(ureg_src(tmp), TGSI_SWIZZLE_X));
++      ureg_release_temporary(ureg, tmp);
++   }
++   ureg_UIF(ureg, ureg_scalar(ureg_src(cf->flags), TGSI_SWIZZLE_Y), &label);
++   cf->case_open = true;
++}
++
++static void
++cf_endswitch(struct Shader_xlate *sx)
++{
++   struct ureg_program *ureg = sx->ureg;
++   struct Shader_cf *cf, *loop;
++   unsigned label;
++
++   assert(sx->cf_depth && sx->cf[sx->cf_depth - 1].is_switch);
++   cf = &sx->cf[--sx->cf_depth];
++   if (cf->case_open) {
++      ureg_ENDIF(ureg);
++   }
++   ureg_BRK(ureg);
++   ureg_ENDLOOP(ureg, &label);
++   ureg_release_temporary(ureg, cf->flags);
++
++   /* a continue inside the switch */
++   loop = cf_innermost_loop(sx);
++   if (loop && loop->lowered) {
++      ureg_UIF(ureg, ureg_scalar(ureg_src(loop->flags), TGSI_SWIZZLE_Y), &label);
++      ureg_BRK(ureg);
++      ureg_ENDIF(ureg);
++   }
++}
++
+ const struct tgsi_token *
+ Shader_tgsi_translate(const unsigned *code,
+-                      unsigned *output_mapping)
+-{
+-   struct Shader_xlate sx;
++                      unsigned *output_mapping,
++                      struct Shader_tex_slots *tex_slots)
++{
++   /* Large (4096 temporaries): on the heap, a stack frame this size overflowed DWM's shader-creating thread */
++   struct Shader_xlate *sx;
+    struct Shader_parser parser;
+    struct ureg_program *ureg = NULL;
+    struct Shader_opcode opcode;
+@@ -1263,7 +2402,10 @@
+    bool inside_sub = false;
+    uint i, j;
+ 
+-   memset(&sx, 0, sizeof sx);
++   sx = CALLOC_STRUCT(Shader_xlate);
++   if (!sx) {
++      return NULL;
++   }
+ 
+    Shader_parse_init(&parser, code);
+ 
+@@ -1272,17 +2414,17 @@
+       shader_dumped = true;
+    }
+ 
+-   sx.max_calls = 64;
+-   sx.calls = (struct Shader_call *)MALLOC(sx.max_calls *
++   sx->max_calls = 64;
++   sx->calls = (struct Shader_call *)MALLOC(sx->max_calls *
+                                            sizeof(struct Shader_call));
+-   sx.num_calls = 0;
+-
+-   sx.max_labels = 64;
+-   sx.labels = (struct Shader_label *)MALLOC(sx.max_labels *
++   sx->num_calls = 0;
++
++   sx->max_labels = 64;
++   sx->labels = (struct Shader_label *)MALLOC(sx->max_labels *
+                                              sizeof(struct Shader_call));
+-   sx.num_labels = 0;
+-
+-
++   sx->num_labels = 0;
++
++   Shader_scan_control_flow(sx, code);
+ 
+    /* Header. */
+    switch (parser.header.type) {
+@@ -1298,12 +2440,12 @@
+    }
+ 
+    assert(ureg);
+-   sx.ureg = ureg;
++   sx->ureg = ureg;
+ 
+    for(uint i = 0; i < SHADER_MAX_ADDRS; i++) {
+-      sx.addrs[i] = ureg_DECL_address(sx.ureg);
+-   }
+-   sx.addr_cur = 0;
++      sx->addrs[i] = ureg_DECL_address(sx->ureg);
++   }
++   sx->addr_cur = 0;
+ 
+    while (Shader_parse_opcode(&parser, &opcode)) {
+       const struct dx10_opcode_xlate *ox;
+@@ -1311,32 +2453,37 @@
+       assert(opcode.type < D3D10_SB_NUM_OPCODES);
+       ox = &opcode_xlate[opcode.type];
+ 
++      if ((virgl_tex_ops() && translate_texture_virgl(sx, &opcode)) || translate_sm5_alu(sx, &opcode)) {
++         Shader_opcode_free(&opcode);
++         continue;
++      }
++
+       switch (opcode.type) {
+       case D3D10_SB_OPCODE_EXP:
+-         expand_unary_to_scalarf(ureg, ureg_EX2, &sx, &opcode);
++         expand_unary_to_scalarf(ureg, ureg_EX2, sx, &opcode);
+          break;
+       case D3D10_SB_OPCODE_SQRT:
+-         expand_unary_to_scalarf(ureg, ureg_SQRT, &sx, &opcode);
++         expand_unary_to_scalarf(ureg, ureg_SQRT, sx, &opcode);
+          break;
+       case D3D10_SB_OPCODE_RSQ:
+-         expand_unary_to_scalarf(ureg, ureg_RSQ, &sx, &opcode);
++         expand_unary_to_scalarf(ureg, ureg_RSQ, sx, &opcode);
+          break;
+       case D3D10_SB_OPCODE_LOG:
+-         expand_unary_to_scalarf(ureg, ureg_LG2, &sx, &opcode);
++         expand_unary_to_scalarf(ureg, ureg_LG2, sx, &opcode);
+          break;
+       case D3D10_SB_OPCODE_IMUL:
+          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
+             ureg_IMUL_HI(ureg,
+-                        translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
+-                        translate_src_operand(&sx, &opcode.src[0], OF_INT),
+-                        translate_src_operand(&sx, &opcode.src[1], OF_INT));
++                        translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
++                        translate_src_operand(sx, &opcode.src[0], OF_INT),
++                        translate_src_operand(sx, &opcode.src[1], OF_INT));
+          }
+ 
+          if (opcode.dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
+             ureg_UMUL(ureg,
+-                      translate_dst_operand(&sx, &opcode.dst[1], opcode.saturate),
+-                      translate_src_operand(&sx, &opcode.src[0], OF_INT),
+-                      translate_src_operand(&sx, &opcode.src[1], OF_INT));
++                      translate_dst_operand(sx, &opcode.dst[1], opcode.saturate),
++                      translate_src_operand(sx, &opcode.src[0], OF_INT),
++                      translate_src_operand(sx, &opcode.src[1], OF_INT));
+          }
+ 
+          break;
+@@ -1358,12 +2505,12 @@
+          struct ureg_dst too_large = ureg_DECL_temporary(ureg);
+          struct ureg_dst tmp = ureg_DECL_temporary(ureg);
+          ureg_FSGE(ureg, too_large,
+-                   translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
++                   translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
+                    ureg_imm1f(ureg, 2147483648.0f));
+          ureg_F2I(ureg, tmp,
+-                  translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
++                  translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
+          ureg_UCMP(ureg,
+-                   translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
++                   translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
+                    ureg_src(too_large),
+                    ureg_imm1i(ureg, 0x7fffffff),
+                    ureg_src(tmp));
+@@ -1382,7 +2529,7 @@
+          struct ureg_dst too_large = ureg_DECL_temporary(ureg);
+          struct ureg_dst tmp = ureg_DECL_temporary(ureg);
+          ureg_FSGE(ureg, too_large,
+-                   translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
++                   translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
+                    ureg_imm1f(ureg, 4294967296.0f));
+          /* clamp negative values + NaN to zero.
+           * (Could be done slightly more efficient in llvmpipe due to
+@@ -1390,11 +2537,11 @@
+           */
+          ureg_MAX(ureg, tmp,
+                   ureg_imm1f(ureg, 0.0f),
+-                  translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
++                  translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
+          ureg_F2U(ureg, tmp,
+                   ureg_src(tmp));
+          ureg_UCMP(ureg,
+-                   translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
++                   translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
+                    ureg_src(too_large),
+                    ureg_imm1u(ureg, 0xffffffff),
+                    ureg_src(tmp));
+@@ -1413,24 +2560,24 @@
+             assert(opcode.src[1].base.index_dim == 1);
+             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
+ 
+-            if (ureg_src_is_undef(sx.samplers[resource])) {
+-               sx.samplers[resource] =
++            if (ureg_src_is_undef(sx->samplers[resource])) {
++               sx->samplers[resource] =
+                   ureg_DECL_sampler(ureg, resource);
+             }
+ 
+             ureg_TXF(ureg,
+-                     translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
+-                     sx.resources[resource].target,
+-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
+-                     sx.samplers[resource]);
++                     translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
++                     sx->resources[resource].target,
++                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
++                     sx->samplers[resource]);
+          }
+          else {
+             struct ureg_src srcreg[2];
+-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_INT);
+-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_INT);
++            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_INT);
++            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_INT);
+ 
+             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_I, 2, &opcode,
+-                             translate_dst_operand(&sx, &opcode.dst[0],
++                             translate_dst_operand(sx, &opcode.dst[0],
+                                                    opcode.saturate),
+                              srcreg);
+          }
+@@ -1439,7 +2586,7 @@
+       case D3D10_SB_OPCODE_CUSTOMDATA:
+          if (opcode.customdata._class ==
+              D3D10_SB_CUSTOMDATA_DCL_IMMEDIATE_CONSTANT_BUFFER) {
+-            sx.imms =
++            sx->imms =
+                ureg_DECL_immediate_block_uint(ureg,
+                                               opcode.customdata.u.constbuf.data,
+                                               opcode.customdata.u.constbuf.count);
+@@ -1454,22 +2601,22 @@
+             assert(opcode.src[1].base.index_dim == 1);
+             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
+ 
+-            if (ureg_src_is_undef(sx.samplers[resource])) {
+-               sx.samplers[resource] =
++            if (ureg_src_is_undef(sx->samplers[resource])) {
++               sx->samplers[resource] =
+                   ureg_DECL_sampler(ureg, resource);
+             }
+             /* don't bother with swizzle, ret type etc. */
+             ureg_TXQ(ureg,
+-                     translate_dst_operand(&sx, &opcode.dst[0],
++                     translate_dst_operand(sx, &opcode.dst[0],
+                                            opcode.saturate),
+-                     sx.resources[resource].target,
+-                     translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+-                     sx.samplers[resource]);
++                     sx->resources[resource].target,
++                     translate_src_operand(sx, &opcode.src[0], OF_UINT),
++                     sx->samplers[resource]);
+          }
+          else {
+             struct ureg_dst r0 = ureg_DECL_temporary(ureg);
+-            struct ureg_src tsrc = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+-            struct ureg_dst dstreg = translate_dst_operand(&sx, &opcode.dst[0],
++            struct ureg_src tsrc = translate_src_operand(sx, &opcode.src[1], OF_UINT);
++            struct ureg_dst dstreg = translate_dst_operand(sx, &opcode.dst[0],
+                                                            opcode.saturate);
+ 
+             /* while specs say swizzle is ignored better safe than sorry */
+@@ -1479,7 +2626,7 @@
+             tsrc.SwizzleW = TGSI_SWIZZLE_W;
+ 
+             ureg_SVIEWINFO(ureg, r0,
+-                           translate_src_operand(&sx, &opcode.src[0], OF_UINT),
++                           translate_src_operand(sx, &opcode.src[0], OF_UINT),
+                            tsrc);
+ 
+             tsrc = ureg_src(r0);
+@@ -1505,7 +2652,7 @@
+                 * This is one sick modifier if you ask me!
+                 */
+                unsigned res_index = opcode.src[1].base.index[0].imm;
+-               unsigned target = sx.resources[res_index].target;
++               unsigned target = sx->resources[res_index].target;
+                unsigned dims = texture_dim_from_tgsi_target(target);
+ 
+                ureg_I2F(ureg, r0, ureg_src(r0));
+@@ -1537,20 +2684,20 @@
+             LOG_UNSUPPORTED(opcode.src[1].base.index[0].imm != opcode.src[2].base.index[0].imm);
+ 
+             ureg_TEX(ureg,
+-                     translate_dst_operand(&sx, &opcode.dst[0],
++                     translate_dst_operand(sx, &opcode.dst[0],
+                                            opcode.saturate),
+-                     sx.resources[opcode.src[1].base.index[0].imm].target,
+-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
+-                     translate_src_operand(&sx, &opcode.src[2], OF_FLOAT));
++                     sx->resources[opcode.src[1].base.index[0].imm].target,
++                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
++                     translate_src_operand(sx, &opcode.src[2], OF_FLOAT));
+          }
+          else {
+             struct ureg_src srcreg[3];
+-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
+-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
++            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
++            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
++            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
+ 
+             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE, 3, &opcode,
+-                             translate_dst_operand(&sx, &opcode.dst[0],
++                             translate_dst_operand(sx, &opcode.dst[0],
+                                                    opcode.saturate),
+                              srcreg);
+          }
+@@ -1565,7 +2712,7 @@
+              *      for other dimensions and if there is enough space
+              *      in a single operand for all possible cases.
+              */
+-            LOG_UNSUPPORTED(sx.resources[opcode.src[1].base.index[0].imm].target !=
++            LOG_UNSUPPORTED(sx->resources[opcode.src[1].base.index[0].imm].target !=
+                             TGSI_TEXTURE_2D);
+ 
+             assert(opcode.src[1].base.index_dim == 1);
+@@ -1575,32 +2722,32 @@
+              */
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_XYW),
+-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_Z),
+-                     translate_src_operand(&sx, &opcode.src[3], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[3], OF_FLOAT));
+ 
+             /* XXX: Pass explicit Lod=0 in D3D10_SB_OPCODE_SAMPLE_C_LZ case.
+              */
+ 
+             ureg_TEX(ureg,
+-                     translate_dst_operand(&sx, &opcode.dst[0],
++                     translate_dst_operand(sx, &opcode.dst[0],
+                                            opcode.saturate),
+-                     sx.resources[opcode.src[1].base.index[0].imm].target,
++                     sx->resources[opcode.src[1].base.index[0].imm].target,
+                      ureg_src(r0),
+-                     translate_src_operand(&sx, &opcode.src[2], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[2], OF_FLOAT));
+ 
+             ureg_release_temporary(ureg, r0);
+          }
+          else {
+             struct ureg_src srcreg[4];
+-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
+-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+-            srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
++            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
++            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
++            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
++            srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
+ 
+             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_C, 4, &opcode,
+-                             translate_dst_operand(&sx, &opcode.dst[0],
++                             translate_dst_operand(sx, &opcode.dst[0],
+                                                    opcode.saturate),
+                              srcreg);
+          }
+@@ -1618,7 +2765,7 @@
+              *      for other dimensions and if there is enough space
+              *      in a single operand for all possible cases.
+              */
+-            LOG_UNSUPPORTED(sx.resources[opcode.src[1].base.index[0].imm].target !=
++            LOG_UNSUPPORTED(sx->resources[opcode.src[1].base.index[0].imm].target !=
+                             TGSI_TEXTURE_2D);
+ 
+             /* Insert the compare value into .z component.
+@@ -1626,32 +2773,32 @@
+              */
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_XY),
+-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_Z),
+-                     translate_src_operand(&sx, &opcode.src[3], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[3], OF_FLOAT));
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_W),
+                      ureg_imm1f(ureg, 0.0f));
+ 
+             ureg_TXL(ureg,
+-                     translate_dst_operand(&sx, &opcode.dst[0],
++                     translate_dst_operand(sx, &opcode.dst[0],
+                                            opcode.saturate),
+-                     sx.resources[opcode.src[1].base.index[0].imm].target,
++                     sx->resources[opcode.src[1].base.index[0].imm].target,
+                      ureg_src(r0),
+-                     translate_src_operand(&sx, &opcode.src[2], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[2], OF_FLOAT));
+ 
+             ureg_release_temporary(ureg, r0);
+          }
+          else {
+             struct ureg_src srcreg[4];
+-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
+-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+-            srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
++            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
++            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
++            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
++            srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
+ 
+             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_C_LZ, 4, &opcode,
+-                             translate_dst_operand(&sx, &opcode.dst[0],
++                             translate_dst_operand(sx, &opcode.dst[0],
+                                                    opcode.saturate),
+                              srcreg);
+          }
+@@ -1668,29 +2815,29 @@
+              */
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_XYZ),
+-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_W),
+-                     translate_src_operand(&sx, &opcode.src[3], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[3], OF_FLOAT));
+ 
+             ureg_TXL(ureg,
+-                     translate_dst_operand(&sx, &opcode.dst[0],
++                     translate_dst_operand(sx, &opcode.dst[0],
+                                            opcode.saturate),
+-                     sx.resources[opcode.src[1].base.index[0].imm].target,
++                     sx->resources[opcode.src[1].base.index[0].imm].target,
+                      ureg_src(r0),
+-                     translate_src_operand(&sx, &opcode.src[2], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[2], OF_FLOAT));
+ 
+             ureg_release_temporary(ureg, r0);
+          }
+          else {
+             struct ureg_src srcreg[4];
+-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
+-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+-            srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
++            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
++            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
++            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
++            srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
+ 
+             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_L, 4, &opcode,
+-                             translate_dst_operand(&sx, &opcode.dst[0],
++                             translate_dst_operand(sx, &opcode.dst[0],
+                                                    opcode.saturate),
+                              srcreg);
+          }
+@@ -1702,24 +2849,24 @@
+             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
+ 
+             ureg_TXD(ureg,
+-                     translate_dst_operand(&sx, &opcode.dst[0],
++                     translate_dst_operand(sx, &opcode.dst[0],
+                                            opcode.saturate),
+-                     sx.resources[opcode.src[1].base.index[0].imm].target,
+-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
+-                     translate_src_operand(&sx, &opcode.src[3], OF_FLOAT),
+-                     translate_src_operand(&sx, &opcode.src[4], OF_FLOAT),
+-                     translate_src_operand(&sx, &opcode.src[2], OF_FLOAT));
++                     sx->resources[opcode.src[1].base.index[0].imm].target,
++                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT),
++                     translate_src_operand(sx, &opcode.src[3], OF_FLOAT),
++                     translate_src_operand(sx, &opcode.src[4], OF_FLOAT),
++                     translate_src_operand(sx, &opcode.src[2], OF_FLOAT));
+          }
+          else {
+             struct ureg_src srcreg[5];
+-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
+-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+-            srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
+-            srcreg[4] = translate_src_operand(&sx, &opcode.src[4], OF_FLOAT);
++            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
++            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
++            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
++            srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
++            srcreg[4] = translate_src_operand(sx, &opcode.src[4], OF_FLOAT);
+ 
+             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_D, 5, &opcode,
+-                             translate_dst_operand(&sx, &opcode.dst[0],
++                             translate_dst_operand(sx, &opcode.dst[0],
+                                                    opcode.saturate),
+                              srcreg);
+          }
+@@ -1736,29 +2883,29 @@
+              */
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_XYZ),
+-                     translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
+             ureg_MOV(ureg,
+                      ureg_writemask(r0, TGSI_WRITEMASK_W),
+-                     translate_src_operand(&sx, &opcode.src[3], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[3], OF_FLOAT));
+ 
+             ureg_TXB(ureg,
+-                     translate_dst_operand(&sx, &opcode.dst[0],
++                     translate_dst_operand(sx, &opcode.dst[0],
+                                            opcode.saturate),
+-                     sx.resources[opcode.src[1].base.index[0].imm].target,
++                     sx->resources[opcode.src[1].base.index[0].imm].target,
+                      ureg_src(r0),
+-                     translate_src_operand(&sx, &opcode.src[2], OF_FLOAT));
++                     translate_src_operand(sx, &opcode.src[2], OF_FLOAT));
+ 
+             ureg_release_temporary(ureg, r0);
+          }
+          else {
+             struct ureg_src srcreg[4];
+-            srcreg[0] = translate_src_operand(&sx, &opcode.src[0], OF_FLOAT);
+-            srcreg[1] = translate_src_operand(&sx, &opcode.src[1], OF_UINT);
+-            srcreg[2] = translate_src_operand(&sx, &opcode.src[2], OF_UINT);
+-            srcreg[3] = translate_src_operand(&sx, &opcode.src[3], OF_FLOAT);
++            srcreg[0] = translate_src_operand(sx, &opcode.src[0], OF_FLOAT);
++            srcreg[1] = translate_src_operand(sx, &opcode.src[1], OF_UINT);
++            srcreg[2] = translate_src_operand(sx, &opcode.src[2], OF_UINT);
++            srcreg[3] = translate_src_operand(sx, &opcode.src[3], OF_FLOAT);
+ 
+             sample_ureg_emit(ureg, TGSI_OPCODE_SAMPLE_B, 4, &opcode,
+-                             translate_dst_operand(&sx, &opcode.dst[0],
++                             translate_dst_operand(sx, &opcode.dst[0],
+                                                    opcode.saturate),
+                              srcreg);
+          }
+@@ -1766,9 +2913,9 @@
+ 
+       case D3D10_SB_OPCODE_SINCOS: {
+          struct ureg_dst src0 = ureg_DECL_temporary(ureg);
+-         ureg_MOV(ureg, src0, translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
++         ureg_MOV(ureg, src0, translate_src_operand(sx, &opcode.src[0], OF_FLOAT));
+          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
+-            struct ureg_dst dst = translate_dst_operand(&sx, &opcode.dst[0],
++            struct ureg_dst dst = translate_dst_operand(sx, &opcode.dst[0],
+                                                         opcode.saturate);
+             struct ureg_src src = ureg_src(src0);
+             ureg_SIN(ureg, ureg_writemask(dst, TGSI_WRITEMASK_X),
+@@ -1781,7 +2928,7 @@
+                      ureg_scalar(src, TGSI_SWIZZLE_W));
+          }
+          if (opcode.dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
+-            struct ureg_dst dst = translate_dst_operand(&sx, &opcode.dst[1],
++            struct ureg_dst dst = translate_dst_operand(sx, &opcode.dst[1],
+                                                         opcode.saturate);
+             struct ureg_src src = ureg_src(src0);
+             ureg_COS(ureg, ureg_writemask(dst, TGSI_WRITEMASK_X),
+@@ -1800,17 +2947,17 @@
+       case D3D10_SB_OPCODE_UDIV: {
+          struct ureg_dst src0 = ureg_DECL_temporary(ureg);
+          struct ureg_dst src1 = ureg_DECL_temporary(ureg);
+-         ureg_MOV(ureg, src0, translate_src_operand(&sx, &opcode.src[0], OF_UINT));
+-         ureg_MOV(ureg, src1, translate_src_operand(&sx, &opcode.src[1], OF_UINT));
++         ureg_MOV(ureg, src0, translate_src_operand(sx, &opcode.src[0], OF_UINT));
++         ureg_MOV(ureg, src1, translate_src_operand(sx, &opcode.src[1], OF_UINT));
+          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
+             ureg_UDIV(ureg,
+-                      translate_dst_operand(&sx, &opcode.dst[0],
++                      translate_dst_operand(sx, &opcode.dst[0],
+                                             opcode.saturate),
+                       ureg_src(src0), ureg_src(src1));
+          }
+          if (opcode.dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
+             ureg_UMOD(ureg,
+-                      translate_dst_operand(&sx, &opcode.dst[1],
++                      translate_dst_operand(sx, &opcode.dst[1],
+                                             opcode.saturate),
+                       ureg_src(src0), ureg_src(src1));
+          }
+@@ -1821,17 +2968,17 @@
+       case D3D10_SB_OPCODE_UMUL: {
+          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
+             ureg_UMUL_HI(ureg,
+-                         translate_dst_operand(&sx, &opcode.dst[0],
++                         translate_dst_operand(sx, &opcode.dst[0],
+                                                opcode.saturate),
+-                         translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+-                         translate_src_operand(&sx, &opcode.src[1], OF_UINT));
++                         translate_src_operand(sx, &opcode.src[0], OF_UINT),
++                         translate_src_operand(sx, &opcode.src[1], OF_UINT));
+          }
+          if (opcode.dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
+             ureg_UMUL(ureg,
+-                      translate_dst_operand(&sx, &opcode.dst[1],
++                      translate_dst_operand(sx, &opcode.dst[1],
+                                             opcode.saturate),
+-                      translate_src_operand(&sx, &opcode.src[0], OF_UINT),
+-                      translate_src_operand(&sx, &opcode.src[1], OF_UINT));
++                      translate_src_operand(sx, &opcode.src[0], OF_UINT),
++                      translate_src_operand(sx, &opcode.src[1], OF_UINT));
+          }
+       }
+          break;
+@@ -1844,9 +2991,12 @@
+          assert(res_index < SHADER_MAX_RESOURCES);
+ 
+          target = translate_resource_dimension(opcode.specific.dcl_resource_dimension);
+-         sx.resources[res_index].target = target;
++         sx->resources[res_index].target = target;
++         for (unsigned c = 0; c < 4; c++) {
++            sx->resources[res_index].ret[c] = trans_dcl_ret_type(opcode.dcl_resource_ret_type[c]);
++         }
+          if (!(use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS))) {
+-            sx.sv[res_index] =
++            sx->sv[res_index] =
+                ureg_DECL_sampler_view(ureg, res_index, target,
+                                       trans_dcl_ret_type(opcode.dcl_resource_ret_type[0]),
+                                       trans_dcl_ret_type(opcode.dcl_resource_ret_type[1]),
+@@ -1878,9 +3028,11 @@
+          assert(opcode.dst[0].base.index_dim == 1);
+          assert(opcode.dst[0].base.index[0].imm < SHADER_MAX_SAMPLERS);
+ 
+-         sx.samplers[opcode.dst[0].base.index[0].imm] =
+-            ureg_DECL_sampler(ureg,
+-                              opcode.dst[0].base.index[0].imm);
++         if (!virgl_tex_ops()) {
++            sx->samplers[opcode.dst[0].base.index[0].imm] =
++               ureg_DECL_sampler(ureg,
++                                 opcode.dst[0].base.index[0].imm);
++         }
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY:
+@@ -1888,19 +3040,19 @@
+ 
+          switch (opcode.specific.dcl_gs_output_primitive_topology) {
+          case D3D10_SB_PRIMITIVE_TOPOLOGY_POINTLIST:
+-            ureg_property(sx.ureg,
++            ureg_property(sx->ureg,
+                           TGSI_PROPERTY_GS_OUTPUT_PRIM,
+                           MESA_PRIM_POINTS);
+             break;
+ 
+          case D3D10_SB_PRIMITIVE_TOPOLOGY_LINESTRIP:
+-            ureg_property(sx.ureg,
++            ureg_property(sx->ureg,
+                           TGSI_PROPERTY_GS_OUTPUT_PRIM,
+                           MESA_PRIM_LINE_STRIP);
+             break;
+ 
+          case D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+-            ureg_property(sx.ureg,
++            ureg_property(sx->ureg,
+                           TGSI_PROPERTY_GS_OUTPUT_PRIM,
+                           MESA_PRIM_TRIANGLE_STRIP);
+             break;
+@@ -1917,36 +3069,36 @@
+           */
+          switch (opcode.specific.dcl_gs_input_primitive) {
+          case D3D10_SB_PRIMITIVE_POINT:
+-            declare_vertices_in(&sx, 1);
+-            ureg_property(sx.ureg,
++            declare_vertices_in(sx, 1);
++            ureg_property(sx->ureg,
+                           TGSI_PROPERTY_GS_INPUT_PRIM,
+                           MESA_PRIM_POINTS);
+             break;
+ 
+          case D3D10_SB_PRIMITIVE_LINE:
+-            declare_vertices_in(&sx, 2);
+-            ureg_property(sx.ureg,
++            declare_vertices_in(sx, 2);
++            ureg_property(sx->ureg,
+                           TGSI_PROPERTY_GS_INPUT_PRIM,
+                           MESA_PRIM_LINES);
+             break;
+ 
+          case D3D10_SB_PRIMITIVE_TRIANGLE:
+-            declare_vertices_in(&sx, 3);
+-            ureg_property(sx.ureg,
++            declare_vertices_in(sx, 3);
++            ureg_property(sx->ureg,
+                           TGSI_PROPERTY_GS_INPUT_PRIM,
+                           MESA_PRIM_TRIANGLES);
+             break;
+ 
+          case D3D10_SB_PRIMITIVE_LINE_ADJ:
+-            declare_vertices_in(&sx, 4);
+-            ureg_property(sx.ureg,
++            declare_vertices_in(sx, 4);
++            ureg_property(sx->ureg,
+                           TGSI_PROPERTY_GS_INPUT_PRIM,
+                           MESA_PRIM_LINES_ADJACENCY);
+             break;
+ 
+          case D3D10_SB_PRIMITIVE_TRIANGLE_ADJ:
+-            declare_vertices_in(&sx, 6);
+-            ureg_property(sx.ureg,
++            declare_vertices_in(sx, 6);
++            ureg_property(sx->ureg,
+                           TGSI_PROPERTY_GS_INPUT_PRIM,
+                           MESA_PRIM_TRIANGLES_ADJACENCY);
+             break;
+@@ -1959,45 +3111,50 @@
+       case D3D10_SB_OPCODE_DCL_MAX_OUTPUT_VERTEX_COUNT:
+          assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
+ 
+-         ureg_property(sx.ureg,
++         ureg_property(sx->ureg,
+                        TGSI_PROPERTY_GS_MAX_OUTPUT_VERTICES,
+                        opcode.specific.dcl_max_output_vertex_count);
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT:
+-         if (parser.header.type == D3D10_SB_VERTEX_SHADER) {
+-            dcl_vs_input(&sx, ureg, &opcode.dst[0]);
++         if (opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_INPUT_COVERAGE_MASK) {
++            sx->coverage = ureg_scalar(ureg_DECL_system_value(ureg, TGSI_SEMANTIC_SAMPLEMASK, 0), TGSI_SWIZZLE_X);
++         } else if (parser.header.type == D3D10_SB_PIXEL_SHADER) {
++            /* other input registers without a semantic: none in pixel shaders before compute/tessellation */
++            LOG_UNSUPPORTED(true);
++         } else if (parser.header.type == D3D10_SB_VERTEX_SHADER) {
++            dcl_vs_input(sx, ureg, &opcode.dst[0]);
+          } else {
+             assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
+-            dcl_gs_input(&sx, ureg, &opcode.dst[0]);
++            dcl_gs_input(sx, ureg, &opcode.dst[0]);
+          }
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT_SGV:
+          assert(parser.header.type == D3D10_SB_VERTEX_SHADER);
+-         dcl_sgv_input(&sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
++         dcl_sgv_input(sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT_SIV:
+          assert(parser.header.type == D3D10_SB_GEOMETRY_SHADER);
+-         dcl_siv_input(&sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
++         dcl_siv_input(sx, ureg, &opcode.dst[0], opcode.dcl_siv_name);
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT_PS:
+          assert(parser.header.type == D3D10_SB_PIXEL_SHADER);
+-         dcl_ps_input(&sx, ureg, &opcode.dst[0],
++         dcl_ps_input(sx, ureg, &opcode.dst[0],
+                       opcode.specific.dcl_in_ps_interp);
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT_PS_SGV:
+          assert(parser.header.type == D3D10_SB_PIXEL_SHADER);
+-         dcl_ps_sgv_input(&sx, ureg, &opcode.dst[0],
++         dcl_ps_sgv_input(sx, ureg, &opcode.dst[0],
+                           opcode.dcl_siv_name);
+          break;
+ 
+       case D3D10_SB_OPCODE_DCL_INPUT_PS_SIV:
+          assert(parser.header.type == D3D10_SB_PIXEL_SHADER);
+-         dcl_ps_siv_input(&sx, ureg, &opcode.dst[0],
++         dcl_ps_siv_input(sx, ureg, &opcode.dst[0],
+                           opcode.dcl_siv_name,
+                           opcode.specific.dcl_in_ps_interp);
+          break;
+@@ -2005,18 +3162,28 @@
+       case D3D10_SB_OPCODE_DCL_OUTPUT:
+          if (parser.header.type == D3D10_SB_PIXEL_SHADER) {
+             /* Pixel shader outputs. */
+-            if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH) {
++            if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH ||
++                opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL ||
++                opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL) {
+                /* Depth output. */
+                assert(opcode.dst[0].base.index_dim == 0);
+ 
+-               sx.output_depth = ureg_DECL_output_masked(ureg, TGSI_SEMANTIC_POSITION, 0, TGSI_WRITEMASK_Z, 0, 1);
+-               sx.output_depth = ureg_writemask(sx.output_depth, TGSI_WRITEMASK_Z);
++               sx->output_depth = ureg_DECL_output_masked(ureg, TGSI_SEMANTIC_POSITION, 0, TGSI_WRITEMASK_Z, 0, 1);
++               sx->output_depth = ureg_writemask(sx->output_depth, TGSI_WRITEMASK_Z);
++               if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH) {
++                  /* conservative depth */
++                  ureg_property(ureg, TGSI_PROPERTY_FS_DEPTH_LAYOUT,
++                                opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL ?
++                                TGSI_FS_DEPTH_LAYOUT_GREATER : TGSI_FS_DEPTH_LAYOUT_LESS);
++               }
++            } else if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK) {
++               sx->output_mask = ureg_DECL_output(ureg, TGSI_SEMANTIC_SAMPLEMASK, 0);
+             } else {
+                /* Color outputs. */
+                assert(opcode.dst[0].base.index_dim == 1);
+                assert(opcode.dst[0].base.index[0].imm < SHADER_MAX_OUTPUTS);
+ 
+-               dcl_base_output(&sx, ureg,
++               dcl_base_output(sx, ureg,
+                                ureg_DECL_output(ureg,
+                                                 TGSI_SEMANTIC_COLOR,
+                                                 opcode.dst[0].base.index[0].imm),
+@@ -2031,7 +3198,7 @@
+                output_mapping[nr_outputs]
+                   = opcode.dst[0].base.index[0].imm;
+             }
+-            dcl_base_output(&sx, ureg,
++            dcl_base_output(sx, ureg,
+                             ureg_DECL_output(ureg,
+                                              TGSI_SEMANTIC_GENERIC,
+                                              opcode.dst[0].base.index[0].imm),
+@@ -2057,36 +3224,36 @@
+              * simply determined by by number of clip/cull dists (that is,
+              * all clip dists must come first).
+              */
+-            unsigned numcliporcull = sx.num_clip_distances_declared +
+-                                     sx.num_cull_distances_declared;
+-            sx.clip_distance_mapping[numcliporcull].d3d =
++            unsigned numcliporcull = sx->num_clip_distances_declared +
++                                     sx->num_cull_distances_declared;
++            sx->clip_distance_mapping[numcliporcull].d3d =
+                opcode.dst[0].base.index[0].imm;
+-            sx.clip_distance_mapping[numcliporcull].tgsi = numcliporcull;
++            sx->clip_distance_mapping[numcliporcull].tgsi = numcliporcull;
+             if (opcode.dcl_siv_name == D3D10_SB_NAME_CLIP_DISTANCE) {
+-               ++sx.num_clip_distances_declared;
++               ++sx->num_clip_distances_declared;
+                /* re-emit should be safe... */
+                ureg_property(ureg, TGSI_PROPERTY_NUM_CLIPDIST_ENABLED,
+-                             sx.num_clip_distances_declared);
++                             sx->num_clip_distances_declared);
+             } else {
+-               ++sx.num_cull_distances_declared;
++               ++sx->num_cull_distances_declared;
+                ureg_property(ureg, TGSI_PROPERTY_NUM_CULLDIST_ENABLED,
+-                             sx.num_cull_distances_declared);
++                             sx->num_cull_distances_declared);
+             }
+          } else if (0 && opcode.dcl_siv_name == D3D10_SB_NAME_CULL_DISTANCE) {
+-            sx.cull_distance_mapping[sx.num_cull_distances_declared].d3d =
++            sx->cull_distance_mapping[sx->num_cull_distances_declared].d3d =
+                opcode.dst[0].base.index[0].imm;
+-            sx.cull_distance_mapping[sx.num_cull_distances_declared].tgsi =
+-               sx.num_cull_distances_declared;
+-            ++sx.num_cull_distances_declared;
++            sx->cull_distance_mapping[sx->num_cull_distances_declared].tgsi =
++               sx->num_cull_distances_declared;
++            ++sx->num_cull_distances_declared;
+             ureg_property(ureg, TGSI_PROPERTY_NUM_CULLDIST_ENABLED,
+-                          sx.num_cull_distances_declared);
+-         }
+-
+-         dcl_base_output(&sx, ureg,
++                          sx->num_cull_distances_declared);
++         }
++
++         dcl_base_output(sx, ureg,
+                          ureg_DECL_output_masked(
+                             ureg,
+                             translate_system_name(opcode.dcl_siv_name),
+-                            translate_semantic_index(&sx, opcode.dcl_siv_name,
++                            translate_semantic_index(sx, opcode.dcl_siv_name,
+                                                      &opcode.dst[0]),
+                             opcode.dst[0].mask >> D3D10_SB_OPERAND_4_COMPONENT_MASK_SHIFT,
+                             0, 1),
+@@ -2102,7 +3269,7 @@
+             output_mapping[nr_outputs]
+                = opcode.dst[0].base.index[0].imm;
+          }
+-         dcl_base_output(&sx, ureg,
++         dcl_base_output(sx, ureg,
+                          ureg_DECL_output(ureg,
+                                           translate_system_name(opcode.dcl_siv_name),
+                                           0),
+@@ -2113,15 +3280,15 @@
+          {
+             uint i;
+ 
+-            assert(opcode.specific.dcl_num_temps + sx.declared_temps <=
++            assert(opcode.specific.dcl_num_temps + sx->declared_temps <=
+                    SHADER_MAX_TEMPS);
+ 
+-            sx.temp_offset = sx.declared_temps;
++            sx->temp_offset = sx->declared_temps;
+ 
+             for (i = 0; i < opcode.specific.dcl_num_temps; i++) {
+-               sx.temps[sx.declared_temps + i] = ureg_DECL_temporary(ureg);
++               sx->temps[sx->declared_temps + i] = ureg_DECL_temporary(ureg);
+             }
+-            sx.declared_temps += opcode.specific.dcl_num_temps;
++            sx->declared_temps += opcode.specific.dcl_num_temps;
+          }
+          break;
+ 
+@@ -2132,33 +3299,33 @@
+ 
+             assert(opcode.specific.dcl_indexable_temp.index <
+                    SHADER_MAX_INDEXABLE_TEMPS);
+-            assert(opcode.specific.dcl_indexable_temp.count + sx.declared_temps <=
++            assert(opcode.specific.dcl_indexable_temp.count + sx->declared_temps <=
+                    SHADER_MAX_TEMPS);
+ 
+-            sx.indexable_temp_offsets[opcode.specific.dcl_indexable_temp.index] =
+-               sx.declared_temps;
++            sx->indexable_temp_offsets[opcode.specific.dcl_indexable_temp.index] =
++               sx->declared_temps;
+ 
+             /* A TGSI temporary array, so relative addressing is declared as such. virgl (TGSI translated to
+              * GLSL on the host) doesn't handle relative addressing of plain temporaries: draws that index an
+              * array, e.g. by SV_VertexID, rendered nothing. */
+             array = ureg_DECL_array_temporary(ureg, opcode.specific.dcl_indexable_temp.count, true);
+             for (i = 0; i < opcode.specific.dcl_indexable_temp.count; i++) {
+-               sx.temps[sx.declared_temps + i] = ureg_dst_array_offset(array, i);
++               sx->temps[sx->declared_temps + i] = ureg_dst_array_offset(array, i);
+             }
+-            sx.declared_temps += opcode.specific.dcl_indexable_temp.count;
++            sx->declared_temps += opcode.specific.dcl_indexable_temp.count;
+          }
+          break;
+       case D3D10_SB_OPCODE_IF: {
+          unsigned label = 0;
+          if (opcode.specific.test_boolean == D3D10_SB_INSTRUCTION_TEST_ZERO) {
+             struct ureg_src src =
+-               translate_src_operand(&sx, &opcode.src[0], OF_INT);
++               translate_src_operand(sx, &opcode.src[0], OF_INT);
+             struct ureg_dst src_nz = ureg_DECL_temporary(ureg);
+             ureg_USEQ(ureg, src_nz, src, ureg_imm1u(ureg, 0));
+             ureg_UIF(ureg, ureg_src(src_nz), &label);
+             ureg_release_temporary(ureg, src_nz);;
+          } else {
+-            ureg_UIF(ureg, translate_src_operand(&sx, &opcode.src[0], OF_INT), &label);
++            ureg_UIF(ureg, translate_src_operand(sx, &opcode.src[0], OF_INT), &label);
+          }
+       }
+          break;
+@@ -2172,34 +3339,34 @@
+          assert(operand_is_scalar(&opcode.src[0]));
+          if (opcode.specific.test_boolean == D3D10_SB_INSTRUCTION_TEST_ZERO) {
+             struct ureg_src src =
+-               translate_src_operand(&sx, &opcode.src[0], OF_INT);
++               translate_src_operand(sx, &opcode.src[0], OF_INT);
+             struct ureg_dst src_nz = ureg_DECL_temporary(ureg);
+             ureg_USEQ(ureg, src_nz, src, ureg_imm1u(ureg, 0));
+             ureg_UIF(ureg, ureg_src(src_nz), &label);
+             ureg_release_temporary(ureg, src_nz);
+          }
+          else {
+-            ureg_UIF(ureg, translate_src_operand(&sx, &opcode.src[0], OF_INT), &label);
++            ureg_UIF(ureg, translate_src_operand(sx, &opcode.src[0], OF_INT), &label);
+          }
+          switch (opcode.type) {
+          case D3D10_SB_OPCODE_RETC:
+             ureg_RET(ureg);
+             break;
+          case D3D10_SB_OPCODE_CONTINUEC:
+-            ureg_CONT(ureg);
++            cf_continue(sx);
+             break;
+          case D3D10_SB_OPCODE_CALLC: {
+             unsigned label = opcode.src[1].base.index[0].imm;
+             unsigned tgsi_token_label = 0;
+             ureg_CAL(ureg, &tgsi_token_label);
+-            Shader_add_call(&sx, label, tgsi_token_label);
++            Shader_add_call(sx, label, tgsi_token_label);
+          }
+             break;
+          case D3D10_SB_OPCODE_DISCARD:
+             ureg_KILL(ureg);
+             break;
+          case D3D10_SB_OPCODE_BREAKC:
+-            ureg_BRK(ureg);
++            cf_break(sx);
+             break;
+          default:
+             assert(0);
+@@ -2217,15 +3384,39 @@
+          tgsi_inst_no = ureg_get_instruction_number(ureg);
+          ureg_BGNSUB(ureg);
+          inside_sub = true;
+-         Shader_add_label(&sx, label, tgsi_inst_no);
++         Shader_add_label(sx, label, tgsi_inst_no);
+       }
+          break;
+       case D3D10_SB_OPCODE_CALL: {
+          unsigned label = opcode.src[0].base.index[0].imm;
+          unsigned tgsi_token_label = 0;
+          ureg_CAL(ureg, &tgsi_token_label);
+-         Shader_add_call(&sx, label, tgsi_token_label);
+-      }
++         Shader_add_call(sx, label, tgsi_token_label);
++      }
++         break;
++      case D3D10_SB_OPCODE_LOOP:
++         cf_loop(sx);
++         break;
++      case D3D10_SB_OPCODE_ENDLOOP:
++         cf_endloop(sx);
++         break;
++      case D3D10_SB_OPCODE_BREAK:
++         cf_break(sx);
++         break;
++      case D3D10_SB_OPCODE_CONTINUE:
++         cf_continue(sx);
++         break;
++      case D3D10_SB_OPCODE_SWITCH:
++         cf_switch(sx, translate_src_operand(sx, &opcode.src[0], OF_UINT));
++         break;
++      case D3D10_SB_OPCODE_CASE:
++         cf_case(sx, false, opcode.src[0].imm[0].u32);
++         break;
++      case D3D10_SB_OPCODE_DEFAULT:
++         cf_case(sx, true, 0);
++         break;
++      case D3D10_SB_OPCODE_ENDSWITCH:
++         cf_endswitch(sx);
+          break;
+       case D3D10_SB_OPCODE_EMIT:
+          ureg_EMIT(ureg, ureg_imm1u(ureg, 0));
+@@ -2254,26 +3445,29 @@
+                   dx10_shader_dump_tokens(code);
+                   shader_dumped = true;
+                }
+-               debug_printf("%s: unsupported opcode %i\n",
+-                            __func__, ox->type);
+-               assert(ox->tgsi_opcode != TGSI_LOG_UNSUPPORTED);
++               DebugPrintf("%s: unsupported opcode %i\n", __func__, opcode.type);
++               break;
+             }
+ 
+             /* Destination operands. */
+             for (i = 0; i < opcode.num_dst; i++) {
+-               dst[i] = translate_dst_operand(&sx, &opcode.dst[i],
++               dst[i] = translate_dst_operand(sx, &opcode.dst[i],
+                                               opcode.saturate);
+             }
+ 
+             /* Source operands. */
+             for (i = 0; i < opcode.num_src; i++) {
+-               src[i] = translate_src_operand(&sx, &opcode.src[i], ox->format);
++               src[i] = translate_src_operand(sx, &opcode.src[i], ox->format);
+             }
+ 
+             /* Try to re-route output depth to Z channel. */
+-            if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH) {
++            if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH ||
++                opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_GREATER_EQUAL ||
++                opcode.dst[0].base.type == D3D11_SB_OPERAND_TYPE_OUTPUT_DEPTH_LESS_EQUAL) {
+                LOG_UNSUPPORTED(opcode.type != D3D10_SB_OPCODE_MOV);
+                dst[0] = ureg_writemask(dst[0], TGSI_WRITEMASK_Z);
++               src[0] = ureg_scalar(src[0], TGSI_SWIZZLE_X);
++            } else if (opcode.dst[0].base.type == D3D10_SB_OPERAND_TYPE_OUTPUT_COVERAGE_MASK) {
+                src[0] = ureg_scalar(src[0], TGSI_SWIZZLE_X);
+             }
+ 
+@@ -2295,19 +3489,30 @@
+ 
+    ureg_END(ureg);
+ 
+-   for (i = 0; i < sx.num_calls; ++i) {
+-      for (j = 0; j < sx.num_labels; ++j) {
+-         if (sx.calls[i].d3d_label == sx.labels[j].d3d_label) {
+-            ureg_fixup_label(sx.ureg,
+-                             sx.calls[i].tgsi_label_token,
+-                             sx.labels[j].tgsi_insn_no);
++   for (i = 0; i < sx->num_calls; ++i) {
++      for (j = 0; j < sx->num_labels; ++j) {
++         if (sx->calls[i].d3d_label == sx->labels[j].d3d_label) {
++            ureg_fixup_label(sx->ureg,
++                             sx->calls[i].tgsi_label_token,
++                             sx->labels[j].tgsi_insn_no);
+             break;
+          }
+       }
+-      ASSERT(j < sx.num_labels);
+-   }
+-   FREE(sx.labels);
+-   FREE(sx.calls);
++      ASSERT(j < sx->num_labels);
++   }
++   FREE(sx->labels);
++   FREE(sx->calls);
++   for (i = 0; i < sx->num_switches; i++) {
++      FREE(sx->switches[i].values);
++   }
++   FREE(sx->switches);
++   FREE(sx->loop_has_continue);
++
++   if (tex_slots) {
++      *tex_slots = sx->tex_slots;
++   }
++
++   FREE(sx);
+ 
+    tokens = ureg_get_tokens(ureg, &nr_tokens);
+    assert(tokens);
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -39,6 +39,7 @@
+ 
+ #include <d3dukmdt.h>
+ #include "gdikmt_d3dddi.h"
++#include "ShaderParse.h"
+ 
+ #define SUPPORT_MSAA 0
+ #define SUPPORT_D3D10_1 0
+@@ -66,6 +67,7 @@
+    struct pipe_shader_state state;
+    unsigned output_mapping[PIPE_MAX_SHADER_OUTPUTS];
+    bool output_resolved;
++   struct Shader_tex_slots tex_slots;   /* virgl: views and samplers per TGSI sampler (ShaderParse.h) */
+ };
+ 
+ struct Query;
+@@ -99,6 +101,8 @@
+    struct pipe_stream_output_target *draw_so_target;
+    Shader *bound_empty_gs;
+    Shader *bound_vs;
++   Shader *bound_shader[PIPE_SHADER_TYPES];      /* virgl: whose tex_slots to bind */
++   bool tex_slots_dirty[PIPE_SHADER_TYPES];
+ 
+    unsigned max_dual_source_render_targets;
+    

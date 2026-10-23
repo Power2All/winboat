@@ -1,0 +1,108 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: hull and domain shader inputs named by their signature
+
+D3D links shader stages by register; a stage may read a register the previous one writes as SV_Position or
+SV_ClipDistance with a plain dcl_input, the name in its signature only. Windows 10's Direct2D does that: its curve
+tessellation's hull shader reads the vertex shader's SV_Position and SV_ClipDistance. They were declared GENERIC, which
+GL doesn't link to gl_Position/gl_ClipDistance: the curve patches came out degenerate and Direct2D's path fills and
+geometric layer masks lost every curved part (dx-test on Windows 10 with WinBoat's host: path geometry and layers
+failed; Windows 11's Direct2D draws curves another way). Hull and domain shaders now take the input signature's
+SV_Position as POSITION and SV_ClipDistance as CLIPDIST (slots by register, as the writing stage numbers them), and the
+variant translations (typed UAV formats, the domain shader's tessellation) keep these and the hull shader's
+pass-through registers instead of starting from no options.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+index 6d7a34a..db77d1f 100644
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -149,6 +149,9 @@ ShaderSelectVariant(Device *pDevice, enum pipe_shader_type type, Shader *shader)
+ 
+       memset(&bindings, 0, sizeof bindings);
+       memset(&options, 0, sizeof options);
++      if (type == PIPE_SHADER_TESS_CTRL || type == PIPE_SHADER_TESS_EVAL) {
++         options = shader->options;   /* what their signatures said (CreateTessellationShader) */
++      }
+       options.image_formats = want;
+       if (tess_key) {
+          options.have_tess = true;
+@@ -1885,6 +1888,25 @@ CreateTessellationShader(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D1
+          options.num_passthrough++;
+       }
+    }
++   if (pSignatures && pSignatures->pInputSignatureDeprecated) {
++      /* inputs the previous stage writes as gl_Position/gl_ClipDistance (Direct2D's hull shader reads both); clip
++       * distance registers in slots by register, as the writing stage numbers them */
++      for (UINT i = 0; i < pSignatures->NumInputSignatureEntries; i++) {
++         const D3D11_1DDIARG_SIGNATURE_ENTRY *e = &pSignatures->pInputSignatureDeprecated[i];
++         if (e->Register < ARRAY_SIZE(options.input_name) &&
++             (e->SystemValue == D3D10_SB_NAME_POSITION || e->SystemValue == D3D10_SB_NAME_CLIP_DISTANCE)) {
++            options.input_name[e->Register] = e->SystemValue;
++         }
++      }
++      unsigned slot = 0;
++      for (unsigned r = 0; r < ARRAY_SIZE(options.input_name); r++) {
++         if (options.input_name[r] == D3D10_SB_NAME_CLIP_DISTANCE) {
++            options.input_slot[r] = MIN2(slot, 1);
++            slot++;
++         }
++      }
++   }
++   pShader->options = options;
+    pShader->state.tokens = Shader_tgsi_translate_ex(pShaderCode, pShader->output_mapping, &pShader->bindings,
+                                                     &options);
+    pShader->handle = !pShader->state.tokens ? NULL :
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.h b/src/gallium/frontends/d3d10umd/ShaderParse.h
+index 36639d7..aa41239 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.h
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.h
+@@ -251,6 +251,11 @@ struct Shader_translate_options {
+    struct {
+       unsigned char reg, mask, position;
+    } passthrough[32];
++   /* hull and domain shaders: input registers the signature names SV_Position (D3D10_SB_NAME_POSITION) or
++    * SV_ClipDistance (D3D10_SB_NAME_CLIP_DISTANCE, its slot in input_slot) though the bytecode declares them plainly:
++    * the previous stage writes them as gl_Position and gl_ClipDistance, which GL links by name */
++   unsigned char input_name[32];
++   unsigned char input_slot[32];
+    /* domain shaders: the hull shader's partitioning and output primitive (GL declares them in this stage) */
+    bool have_tess;
+    unsigned tess_partitioning;
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index cbf1e06..580b437 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -768,13 +768,16 @@ dcl_gs_input(struct Shader_xlate *sx,
+       /* XXX: Implement declaration masks in gallium.
+        */
+       if (!sx->inputs[dst->base.index[1].imm].reg.File) {
++         unsigned r = dst->base.index[1].imm;
++         /* a register the signature names SV_Position or SV_ClipDistance (Shader_translate_options) */
++         unsigned name = sx->options && r < ARRAY_SIZE(sx->options->input_name) ? sx->options->input_name[r]
++                                                                                 : D3D10_SB_NAME_UNDEFINED;
+          struct ureg_src reg =
+-            ureg_DECL_input(ureg,
+-                            TGSI_SEMANTIC_GENERIC,
+-                            dst->base.index[1].imm,
+-                            0, 1);
+-         dcl_base_input(sx, ureg, dst, reg, dst->base.index[1].imm,
+-                        D3D10_SB_NAME_UNDEFINED);
++            name == D3D10_SB_NAME_POSITION ? ureg_DECL_input(ureg, TGSI_SEMANTIC_POSITION, 0, 0, 1) :
++            name == D3D10_SB_NAME_CLIP_DISTANCE ?
++               ureg_DECL_input(ureg, TGSI_SEMANTIC_CLIPDIST, sx->options->input_slot[r], 0, 1) :
++               ureg_DECL_input(ureg, TGSI_SEMANTIC_GENERIC, r, 0, 1);
++         dcl_base_input(sx, ureg, dst, reg, r, name);
+       }
+    } else if (dst->base.type == D3D11_SB_OPERAND_TYPE_INPUT_GS_INSTANCE_ID) {
+       sx->gs_instance_id = ureg_scalar(ureg_DECL_system_value(ureg, TGSI_SEMANTIC_INVOCATIONID, 0),
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+index bfb2824..c350a59 100644
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -83,6 +83,7 @@ struct Shader
+    unsigned num_variants;
+    enum pipe_format bound_formats[SHADER_MAX_IMAGE_SLOTS];   /* the bound translation's: all NONE for the first */
+    unsigned bound_tess_key;   /* domain shaders: the hull shader tessellation the bound translation has (0: none) */
++   struct Shader_translate_options options;   /* from the signatures, for the variants too */
+    /* clip distances it writes (ShaderClipDistances), for the tokens scanned */
+    const struct tgsi_token *clip_scanned;
+    unsigned num_clip_distances;

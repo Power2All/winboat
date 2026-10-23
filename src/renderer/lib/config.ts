@@ -56,10 +56,20 @@ export enum MultiMonitorMode {
     Span = "Span"
 };
 
+/** Windows' light or dark mode: the Linux desktop's ("follow"), or a fixed one */
+export type WindowsTheme = "follow" | "light" | "dark";
+/**
+ * The SPICE route's app windows show a part of Windows' screen: Windows' desktop shows around and through them
+ * (rounded corners, see-through windows). "black" replaces the wallpaper with black while they're shown;
+ * "transparent" with a color the viewer leaves out, so the Linux desktop shows there.
+ */
+export type SeamlessBackground = "black" | "transparent";
+
 export type WinboatConfigObj = {
     scale: number;
     scaleDesktop: number;
     smartcardEnabled: boolean;
+    legacyRemoteApp: boolean; // FreeRDP /app hidef:off
     rdpMonitoringEnabled: boolean;
     passedThroughDevices: PTSerializableDeviceInfo[];
     customApps: WinApp[];
@@ -68,6 +78,9 @@ export type WinboatConfigObj = {
     multiMonitor: MultiMonitorMode;
     rdpArgs: RdpArg[];
     disableAnimations: boolean;
+    windowsTheme: WindowsTheme; // Windows' light or dark mode
+    seamlessBackground: SeamlessBackground; // what shows around and through app windows (SPICE route)
+    vmRefreshRate: number; // Windows' refresh rate on the SPICE route (Hz), 0: the monitor's
     containerRuntime: ContainerRuntimes;
     versionData: WinboatVersionData;
     appsSortOrder: string;
@@ -79,6 +92,7 @@ const defaultConfig: WinboatConfigObj = {
     scale: 100,
     scaleDesktop: 100,
     smartcardEnabled: false,
+    legacyRemoteApp: false,
     rdpMonitoringEnabled: false,
     passedThroughDevices: [],
     customApps: [],
@@ -87,6 +101,9 @@ const defaultConfig: WinboatConfigObj = {
     multiMonitor: MultiMonitorMode.None,
     rdpArgs: [],
     disableAnimations: false,
+    windowsTheme: "follow",
+    seamlessBackground: "black",
+    vmRefreshRate: 0,
     // TODO: Ideally should be podman once we flesh out everything
     containerRuntime: ContainerRuntimes.DOCKER,
     versionData: {

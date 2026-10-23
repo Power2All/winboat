@@ -1,0 +1,62 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: share swap chain buffers only where the host does
+
+Patch 0012's shared swap chain buffers need virglrenderer image patch 0012 on the host. On a stock virglrenderer
+(a plain QEMU VM: the standalone installer) the shared bind flag is ignored, the texture is an ordinary one, and
+Venus' import of it ends the Venus context: Present crashed (Venus aborts, 0xC0000409). The driver now asks for
+the virgl caps (VIOGPU_GET_CAPS) once and shares only with WinBoat's VIRGL_CAP_V2_VK_SHARED (virglrenderer 0017);
+elsewhere buffers are copied as before 0012.
+---
+diff --git a/libs/viogpu_umd/umd_resource.cpp b/libs/viogpu_umd/umd_resource.cpp
+index 1d003e17..2e1a646d 100644
+--- a/libs/viogpu_umd/umd_resource.cpp
++++ b/libs/viogpu_umd/umd_resource.cpp
+@@ -285,6 +285,39 @@ struct import_memory_resource_info_mesa {
+  * image is RGBA, which Present blits it into (vkConvert, viogpu_shared_blit: the blit swaps the channels). False when
+  * anything is missing (format, flags, host or driver support): nothing is left behind and the caller makes a copied
+  * buffer */
++/* Whether the host makes VIOGPU_UMD_VIRGL_BIND_VK_SHARED textures from Vulkan memory (WinBoat's
++ * VIRGL_CAP_V2_VK_SHARED in the virgl caps, the kernel driver's VIOGPU_GET_CAPS): a stock host makes an ordinary
++ * texture, and Venus' import of that ends the context */
++static bool
++host_shares_vk_textures(viogpu_device *device)
++{
++   static int shares = -1;
++   if (shares >= 0)
++      return shares;
++#pragma pack(push, 1)
++   struct {
++      USHORT Type, DataLength;
++      ULONG CapsetId, Version, Size;
++      UINT64 Capset;
++   } req = {};
++#pragma pack(pop)
++   static uint8_t caps[1384]; /* union virgl_caps */
++   req.Type = 0x002;          /* VIOGPU_GET_CAPS */
++   req.DataLength = 20;       /* VIOGPU_CAPSET_REQ */
++   req.CapsetId = 2;          /* VIRGL2 */
++   req.Size = sizeof(caps);
++   req.Capset = (UINT64)(uintptr_t)caps;
++   D3DDDICB_ESCAPE escape = {};
++   escape.hDevice = device->hRTDevice.handle;
++   escape.pPrivateDriverData = &req;
++   escape.PrivateDriverDataSize = sizeof(req);
++   uint32_t bits_v2 = 0;  /* struct virgl_caps_v2's capability_bits_v2, at 688 */
++   if (SUCCEEDED(device->ktCallbacks->pfnEscapeCb(device->hRTAdapter, &escape)))
++      memcpy(&bits_v2, caps + 688, sizeof(bits_v2));
++   shares = (bits_v2 & (1u << 29)) != 0; /* VIRGL_CAP_V2_VK_SHARED */
++   return shares;
++}
++
+ static bool
+ shared_swap_chain_buffer(viogpu_device *device, viogpu_resource *res, const D3D12_RESOURCE_DESC &desc)
+ {
+@@ -302,7 +335,7 @@ shared_swap_chain_buffer(viogpu_device *device, viogpu_resource *res, const D3D1
+        (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+       return false;
+    shared_vk vk;
+-   if (!shared_vk_load(device, &vk))
++   if (!host_shares_vk_textures(device) || !shared_vk_load(device, &vk))
+       return false;
+ 
+    res->desc = desc;

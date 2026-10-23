@@ -1,0 +1,28 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: only a resource's first allocation belongs to the runtime resource
+
+CreateResource hands the runtime's resource handle (and the primary flag) to the next allocation the device makes.
+When creating a resource made more than one (a staging buffer for its initial data), each went to the runtime
+resource: a second allocation set on a shared resource, which the kernel treats as a driver bug (bug check 0x113,
+subtype 7, in DXGDEVICE::CreateDriverAllocations). The D3D11.1/WDDM 1.3 interface (patch 0007) shares more
+resources and ran into it at boot. Clear both after the first allocation.
+---
+diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
+--- a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
++++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
+@@ -173,6 +173,15 @@
+       options->pAllocationInfo->Flags.Primary = 1;
+    }
+ 
++   /*
++    * Only the first allocation CreateResource makes is the runtime resource's own: whatever else gets allocated
++    * meanwhile (a staging buffer for the initial data) is the device's. A second allocation set on a shared
++    * resource is a driver bug to the kernel (bug check 0x113, subtype 7), which the D3D11 runtime's WDDM 1.3
++    * interface ran into (more resources are shared there).
++    */
++   device->hRTResource = NULL;
++   device->isPrimary = false;
++
+    NTSTATUS Status =
+       device->KTCallbacks.pfnAllocateCb(device->hRTDevice, &createAllocation);
+ 

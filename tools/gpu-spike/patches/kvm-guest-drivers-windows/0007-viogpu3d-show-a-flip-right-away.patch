@@ -1,0 +1,118 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: show a flip right away, complete it at the vblank
+
+SetVidPnSourceAddress only marked the flip, and the flip thread sent the scanout to the host at the next 60 Hz timer
+tick, together with the vsync interrupt that completes it. A finished frame thus waited up to a frame before the host
+could show it. Queue a DPC that wakes the flip thread to send it at once (SetVidPnSourceAddress may run at a raised
+IRQL, where an event can't be set); the vsync interrupt stays on the timer, so Windows still composes once per
+vblank.
+---
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index 0957bdd..34fb147 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -25,6 +25,9 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
+ 
+     m_SystemDisplaySourceId = D3DDDI_ID_UNINITIALIZED;
+ 
++    KeInitializeEvent(&m_flipNowEvent, SynchronizationEvent, FALSE);
++    KeInitializeDpc(&m_flipNowDpc, VioGpuVidPN::FlipNowDpc, this);
++
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+ }
+ 
+@@ -1978,7 +1981,7 @@ void VioGpuVidPN::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
+     SetVideoModeInfo(m_CustomModeIndex, &tmpModeInfo);
+ }
+ 
+-void VioGpuVidPN::Flip()
++void VioGpuVidPN::Flip(bool vsync)
+ {
+     PAGED_CODE();
+ 
+@@ -1993,6 +1996,10 @@ void VioGpuVidPN::Flip()
+             m_pAdapter->ctrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
+         }
+     }
++    if (!vsync)
++    {
++        return;
++    }
+     DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt;
+     interrupt.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
+ 
+@@ -2018,11 +2025,16 @@ void VioGpuVidPN::FlipThread(void *ctx)
+     {
+         ExSetTimer(timer, interval.QuadPart, -interval.QuadPart, NULL);
+     }
++    // A new frame goes to the host as soon as Windows flips to it, not at the next vblank: that saved up to a frame
++    // of latency. Windows still learns at the vblank that the flip completed, so it composes once per vblank.
++    PVOID events[] = {&vidpn->m_flipNowEvent, &vidpn->m_flipEvent};
+     while (true)
+     {
++        bool vsync = true;
+         if (timer != NULL)
+         {
+-            KeWaitForSingleObject(&vidpn->m_flipEvent, Executive, KernelMode, FALSE, NULL);
++            vsync = KeWaitForMultipleObjects(ARRAYSIZE(events), events, WaitAny, Executive, KernelMode, FALSE, NULL,
++                                             NULL) != STATUS_WAIT_0;
+         }
+         else
+         {
+@@ -2036,7 +2048,7 @@ void VioGpuVidPN::FlipThread(void *ctx)
+             }
+             return;
+         }
+-        vidpn->Flip();
++        vidpn->Flip(vsync);
+     }
+ }
+ 
+@@ -2055,11 +2067,22 @@ void VioGpuVidPN::FlipTimerCallback(PEX_TIMER Timer, PVOID ctx)
+     KeSetEvent(&reinterpret_cast<VioGpuVidPN *>(ctx)->m_flipEvent, IO_NO_INCREMENT, FALSE);
+ }
+ 
++// Runs at DISPATCH_LEVEL: wakes the flip thread to show the new source address
++void VioGpuVidPN::FlipNowDpc(PKDPC Dpc, PVOID ctx, PVOID SystemArgument1, PVOID SystemArgument2)
++{
++    UNREFERENCED_PARAMETER(Dpc);
++    UNREFERENCED_PARAMETER(SystemArgument1);
++    UNREFERENCED_PARAMETER(SystemArgument2);
++    KeSetEvent(&reinterpret_cast<VioGpuVidPN *>(ctx)->m_flipNowEvent, IO_NO_INCREMENT, FALSE);
++}
++
+ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
+ {
+     m_sourceAddress = pSetVidPnSourceAddress->PrimaryAddress;
+     m_sourceRes = reinterpret_cast<VioGpuAllocation *>(pSetVidPnSourceAddress->hAllocation);
+     InterlockedOr(&m_shouldFlip, 1);
++    // May run at a raised IRQL: a DPC can be queued at any IRQL, an event set only up to DISPATCH_LEVEL
++    KeInsertQueueDpc(&m_flipNowDpc, NULL, NULL);
+ 
+     return STATUS_SUCCESS;
+ };
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index 33e44bf..8a811cd 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -98,9 +98,10 @@ class VioGpuVidPN
+                             _In_ INT PositionX,
+                             _In_ INT PositionY);
+ 
+-    void Flip();
++    void Flip(bool vsync);
+     static void FlipThread(void *ctx);
+     static EXT_CALLBACK FlipTimerCallback;
++    static KDEFERRED_ROUTINE FlipNowDpc;
+ 
+     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
+ 
+@@ -143,4 +144,8 @@ class VioGpuVidPN
+     PETHREAD m_pFlipThread;
+     BOOL m_shouldFlipStop = false;
+     KEVENT m_flipEvent;
++    // A new source address: the flip thread shows it right away (SetVidPnSourceAddress can't wait), the vsync
++    // that completes it stays on the timer
++    KEVENT m_flipNowEvent;
++    KDPC m_flipNowDpc;
+ };

@@ -1,0 +1,185 @@
+spice-widget: a transparent color
+
+WinBoat's seamless app windows show a part of the guest's screen, so the guest's desktop shows around and through
+them: rounded corners, see-through windows. With the guest's desktop in one color that apps don't use, leaving out
+that color's pixels shows the host's desktop there instead.
+
+- spice_display_set_transparent_color() leaves out the pixels of a color (OpenGL drawing: the fragment shader
+  discards them, over a transparent clear).
+- SPICE_GTK_EGL_ALPHA picks an EGL config with an alpha channel and a 32-bit visual (X11), set before displays are
+  created: the config is chosen when a display is. The guest's alpha means nothing: the picture is drawn opaque
+  (the cursor keeps its alpha).
+
+diff --color -ru a/src/map-file-gtk b/src/map-file-gtk
+--- a/src/map-file-gtk
++++ b/src/map-file-gtk
+@@ -10,6 +10,7 @@
+ spice_display_new_with_monitor;
+ spice_display_send_keys;
+ spice_display_set_grab_keys;
++spice_display_set_transparent_color;
+ spice_display_set_window_area;
+ spice_grab_sequence_as_string;
+ spice_grab_sequence_copy;
+diff --color -ru a/src/spice-widget.c b/src/spice-widget.c
+--- a/src/spice-widget.c
++++ b/src/spice-widget.c
+@@ -391,6 +391,26 @@
+         spice_display_widget_update_monitor_area(display);
+ }
+ 
++/**
++ * spice_display_set_transparent_color:
++ * @display: a #SpiceDisplay
++ * @enabled: whether pixels of @rgb are left out
++ * @rgb: the color, as 0xRRGGBB
++ *
++ * Leaves out the pixels of one color (OpenGL drawing): what is behind the window shows there, when the window
++ * has an alpha channel (a 32-bit visual: set SPICE_GTK_EGL_ALPHA before creating displays).
++ **/
++void spice_display_set_transparent_color(SpiceDisplay *display, gboolean enabled, guint32 rgb)
++{
++    SpiceDisplayPrivate *d;
++
++    g_return_if_fail(SPICE_IS_DISPLAY(display));
++    d = display->priv;
++    d->transparent_set = enabled;
++    d->transparent_color = rgb & 0xffffff;
++    gtk_widget_queue_draw(GTK_WIDGET(display));
++}
++
+ static void
+ spice_display_set_keypress_delay(SpiceDisplay *display, guint delay)
+ {
+diff --color -ru a/src/spice-widget-egl.c b/src/spice-widget-egl.c
+--- a/src/spice-widget-egl.c
++++ b/src/spice-widget-egl.c
+@@ -62,10 +62,19 @@
+   in vec2 tcoords;                              \
+   out vec4 fragmentColor;                       \
+   uniform sampler2D samp;                       \
++  uniform bool opaque;                          \
++  uniform vec4 key;                             \
+                                                 \
+   void  main()                                  \
+   {                                             \
+-    fragmentColor = texture2D(samp, tcoords);   \
++    vec4 c = texture2D(samp, tcoords);          \
++    if (key.a > 0.5 &&                          \
++        all(lessThan(abs(c.rgb - key.rgb),      \
++                     vec3(0.6 / 255.0))))       \
++      discard;                                  \
++    if (opaque)                                 \
++      c.a = 1.0;                                \
++    fragmentColor = c;                          \
+   }                                             \
+ ";
+ 
+@@ -148,6 +157,8 @@
+     g_assert(tex_loc != -1);
+     d->egl.mproj = glGetUniformLocation(d->egl.prog, "mproj");
+     g_assert(d->egl.mproj != -1);
++    d->egl.opaque = glGetUniformLocation(d->egl.prog, "opaque");
++    d->egl.key = glGetUniformLocation(d->egl.prog, "key");
+ 
+     glUniform1i(tex_loc, 0);
+ 
+@@ -253,8 +264,46 @@
+         return FALSE;
+     }
+ 
+-    b = eglChooseConfig(d->egl.display, conf_att, &d->egl.conf,
+-                        1, &n);
++    b = EGL_FALSE;
++#ifdef GDK_WINDOWING_X11
++    /*
++     * SPICE_GTK_EGL_ALPHA: windows with an alpha channel (a 32-bit visual),
++     * so a transparent color (spice_display_set_transparent_color) shows
++     * what is behind the window
++     */
++    if (GDK_IS_X11_DISPLAY(gdk_dpy) && g_getenv("SPICE_GTK_EGL_ALPHA")) {
++        static const EGLint alpha_att[] = {
++            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++            EGL_RED_SIZE, 8,
++            EGL_GREEN_SIZE, 8,
++            EGL_BLUE_SIZE, 8,
++            EGL_ALPHA_SIZE, 8,
++            EGL_NONE,
++        };
++        EGLConfig configs[64];
++        EGLint count = 0, i, visual_id;
++
++        if (eglChooseConfig(d->egl.display, alpha_att, configs, G_N_ELEMENTS(configs), &count)) {
++            for (i = 0; i < count && !b; i++) {
++                GdkVisual *visual;
++
++                if (eglGetConfigAttrib(d->egl.display, configs[i], EGL_NATIVE_VISUAL_ID, &visual_id) &&
++                    (visual = gdk_x11_screen_lookup_visual(gdk_screen_get_default(), visual_id)) &&
++                    gdk_visual_get_depth(visual) == 32) {
++                    d->egl.conf = configs[i];
++                    n = 1;
++                    b = EGL_TRUE;
++                }
++            }
++        }
++        if (!b)
++            g_warning("No EGL config with a 32-bit visual: windows can't be transparent");
++    }
++#endif
++    if (!b)
++        b = eglChooseConfig(d->egl.display, conf_att, &d->egl.conf,
++                            1, &n);
+ 
+     if (!b || n != 1) {
+         g_set_error_literal(err, SPICE_CLIENT_ERROR, SPICE_CLIENT_ERROR_FAILED,
+@@ -664,8 +713,15 @@
+     glDisable(GL_BLEND);
+     glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+     glUseProgram(d->egl.prog);
++    /* The guest's alpha means nothing; a transparent color shows what's behind the window */
++    glUniform1i(d->egl.opaque, 1);
++    glUniform4f(d->egl.key, ((d->transparent_color >> 16) & 0xff) / 255.0f,
++                ((d->transparent_color >> 8) & 0xff) / 255.0f, (d->transparent_color & 0xff) / 255.0f,
++                d->transparent_set ? 1.0f : 0.0f);
+     client_draw_rect_tex(display, x, y, w, h,
+                          tx, ty, tw, th);
++    glUniform1i(d->egl.opaque, 0);
++    glUniform4f(d->egl.key, 0.0f, 0.0f, 0.0f, 0.0f);
+ 
+     if (d->mouse_mode == SPICE_MOUSE_MODE_SERVER &&
+         d->mouse_guest_x != -1 && d->mouse_guest_y != -1 &&
+diff --color -ru a/src/spice-widget.h b/src/spice-widget.h
+--- a/src/spice-widget.h
++++ b/src/spice-widget.h
+@@ -91,6 +91,8 @@
+ GdkPixbuf *spice_display_get_pixbuf(SpiceDisplay *display);
+ SPICE_GTK_AVAILABLE_IN_ALL
+ void spice_display_set_window_area(SpiceDisplay *display, gint x, gint y, gint width, gint height);
++SPICE_GTK_AVAILABLE_IN_ALL
++void spice_display_set_transparent_color(SpiceDisplay *display, gboolean enabled, guint32 rgb);
+ 
+ G_END_DECLS
+ 
+diff --color -ru a/src/spice-widget-priv.h b/src/spice-widget-priv.h
+--- a/src/spice-widget-priv.h
++++ b/src/spice-widget-priv.h
+@@ -73,6 +73,9 @@
+     /* spice_display_set_window_area(): shows this part of the display instead of the monitor's */
+     gboolean                window_area_set;
+     GdkRectangle            window_area;
++    /* spice_display_set_transparent_color(): pixels of this color (0xRRGGBB) are left out */
++    gboolean                transparent_set;
++    guint32                 transparent_color;
+     struct {
+         enum SpiceSurfaceFmt    format;
+         gint                    width, height, stride;
+@@ -144,7 +147,7 @@
+         EGLDisplay          display;
+         EGLConfig           conf;
+         EGLContext          ctx;
+-        gint                mproj, attr_pos, attr_tex;
++        gint                mproj, attr_pos, attr_tex, opaque, key;
+         guint               vbuf_id;
+         guint               tex_id;
+         guint               tex_pointer_id;

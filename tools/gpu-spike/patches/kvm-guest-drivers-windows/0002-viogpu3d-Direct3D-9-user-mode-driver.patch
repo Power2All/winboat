@@ -1,0 +1,85 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: Direct3D 9 user-mode driver
+
+Package the Mesa d3d9umd builds (viogpu_d3d9.dll, viogpu_d3d9_x86.dll) and register them as the first
+UserModeDriverName(Wow) entry, which the Direct3D 9 runtime loads.
+---
+diff --git a/viogpu/viogpu3d/viogpu3d.inx b/viogpu/viogpu3d/viogpu3d.inx
+index 9e90103..cfc2e78 100644
+--- a/viogpu/viogpu3d/viogpu3d.inx
++++ b/viogpu/viogpu3d/viogpu3d.inx
+@@ -26,8 +26,10 @@ VioGpu3D_Files.Usermode = 13 ; DriverStore
+ 
+ [SourceDisksFiles]
+ viogpu3d.sys = 1,,f
++viogpu_d3d9.dll = 1,,
+ viogpu_d3d10.dll = 1,,
+ viogpu_wgl.dll = 1,,
++viogpu_d3d9_x86.dll = 1,,
+ viogpu_d3d10_x86.dll = 1,,
+ viogpu_wgl_x86.dll = 1,,
+ 
+@@ -41,8 +43,10 @@ viogpu_wgl_x86.dll = 1,,
+ viogpu3d.sys,,,2
+ 
+ [VioGpu3D_Files.Usermode]
++viogpu_d3d9.dll,,,0
+ viogpu_d3d10.dll,,,0
+ viogpu_wgl.dll,,,0
++viogpu_d3d9_x86.dll,,,0
+ viogpu_d3d10_x86.dll,,,0
+ viogpu_wgl_x86.dll,,,0
+ 
+@@ -77,12 +81,13 @@ HKR,,TypesSupported,%REG_DWORD%,7
+ HKR,, HWCursor,                    %REG_DWORD%, 0
+ HKR,, FlexResolution,              %REG_DWORD%, 1
+ HKR,, UsePhysicalMemory,           %REG_DWORD%, 0
+-HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll
++; The first entry is the Direct3D 9 driver, the others Direct3D 10/11
++HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\viogpu_d3d9.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll
+ HKR,, OpenGLDriverName,            %REG_MULTI_SZ%, %13%\viogpu_wgl.dll
+ HKR,, OpenGLFlags,                 %REG_DWORD%, 3
+ HKR,, OpenGLVersion,               %REG_DWORD%, 4096
+ ; 32-bit (WOW64) apps
+-HKR,, UserModeDriverNameWow,       %REG_MULTI_SZ%, %13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll
++HKR,, UserModeDriverNameWow,       %REG_MULTI_SZ%, %13%\viogpu_d3d9_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll,%13%\viogpu_d3d10_x86.dll
+ HKR,, OpenGLDriverNameWow,         %REG_MULTI_SZ%, %13%\viogpu_wgl_x86.dll
+ HKR,, OpenGLFlagsWow,              %REG_DWORD%, 3
+ HKR,, OpenGLVersionWow,            %REG_DWORD%, 4096
+diff --git a/viogpu/viogpu3d/viogpu3d.vcxproj b/viogpu/viogpu3d/viogpu3d.vcxproj
+index a4c17e4..7bd9825 100644
+--- a/viogpu/viogpu3d/viogpu3d.vcxproj
++++ b/viogpu/viogpu3d/viogpu3d.vcxproj
+@@ -188,6 +188,10 @@
+     </FilesToPackage>
+   </ItemGroup>
+   <ItemGroup Condition="Exists('$(MESA_PREFIX)\bin\viogpu_d3d10.dll')">
++    <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_d3d9.dll">
++      <PackageRelativeDirectory>
++      </PackageRelativeDirectory>
++    </FilesToPackage>
+     <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_d3d10.dll">
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+@@ -196,6 +200,10 @@
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+     </FilesToPackage>
++    <FilesToPackage Include="$(MESA_PREFIX32)\bin\viogpu_d3d9_x86.dll">
++      <PackageRelativeDirectory>
++      </PackageRelativeDirectory>
++    </FilesToPackage>
+     <FilesToPackage Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll">
+       <PackageRelativeDirectory>
+       </PackageRelativeDirectory>
+@@ -214,8 +222,10 @@
+     <PackOne_Files Include="..\viogpuap\$(OutDir)viogpuap.pdb" />
+     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.exe" />
+     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.pdb" />
++    <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_d3d9.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_d3d10.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_wgl.dll" />
++    <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d9_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_d3d10_x86.dll" />
+     <PackOne_Files Include="$(MESA_PREFIX32)\bin\viogpu_wgl_x86.dll" />
+   </ItemGroup>
