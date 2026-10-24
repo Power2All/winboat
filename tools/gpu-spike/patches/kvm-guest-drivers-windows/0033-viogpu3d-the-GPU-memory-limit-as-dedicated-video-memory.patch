@@ -1,0 +1,45 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: the GPU memory limit as dedicated video memory
+
+The local memory segment (Windows 11, with a host-visible window) was the window's size, 4 GB: what DXGI reports
+as the adapter's dedicated video memory, and what programs judge the GPU by (Topaz Video AI wants 6-8 GB, DaVinci
+Resolve 4 GB, newer games 8 GB and size texture streaming by it). It is now the VM's GPU memory limit
+(GpuMemoryLimitMB, 8 GB by default) when that is larger: what the VM's GPU resources may hold. Nothing is placed in
+the segment, so its size costs nothing. Windows 10 still has no local segment: with the page tables in the aperture
+segment instead its video memory manager faults the same way (tried).
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 214e6dc..7c44e41 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -886,11 +886,13 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                                                                           : sizeof(*pSegmentDesc);
+                     DXGK_SEGMENTDESCRIPTOR4 *pLocal = (DXGK_SEGMENTDESCRIPTOR4 *)((BYTE *)pSegmentDesc + stride);
+                     memset(pLocal, 0, stride);
+-                    // Not CPU-visible: most of the window has nothing mapped until Venus maps blobs there
++                    // Not CPU-visible: most of the window has nothing mapped until Venus maps blobs there. Its size:
++                    // the VM's GPU memory limit (GpuMemoryLimitMB), what the VM's GPU resources may hold - programs
++                    // read it as the card's video memory (Topaz Video AI wants 6-8 GB, games size texture streaming by it)
+                     pLocal->BaseAddress.QuadPart = 0x100000000; // after the aperture's GPU addresses
+                     pLocal->Flags.LocalBudgetGroup = TRUE;
+-                    pLocal->Size = m_HostmemSize;
+-                    pLocal->CommitLimit = m_HostmemSize;
++                    pLocal->Size = (SIZE_T)max((ULONGLONG)m_HostmemSize, m_AllocationLimit);
++                    pLocal->CommitLimit = pLocal->Size;
+                 }
+                 return STATUS_SUCCESS;
+             }
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index ab6de1a..709b715 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -123,7 +123,8 @@ class VioGpuAdapter : IVioGpuPCI
+ 
+   private:
+     // The local memory segment over the window (QUERYSEGMENT4): Windows 11 only. Windows 10's video memory manager
+-    // (19041) faults (bugcheck 0x7E in dxgmms2 InitPagingProcessVaSpace) setting up the paging process with it there
++    // (19041) faults (bugcheck 0x7E in dxgmms2 InitPagingProcessVaSpace) setting up the paging process with it there,
++    // its page tables in the aperture segment too (tried 2026-10-24)
+     bool m_LocalSegment = false;
+ 
+     // GPU resource memory in use, and its limit (GpuMemoryLimitMB)

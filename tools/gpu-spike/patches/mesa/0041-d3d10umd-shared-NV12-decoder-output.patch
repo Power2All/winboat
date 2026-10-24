@@ -1,0 +1,128 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: shared NV12 decoder output
+
+Shared NV12/P010 textures bound for decoding (browsers share decoded frames with their compositor's device this
+way) kept the video codec's buffers, whose planes the runtime resource's allocation doesn't have: the other device
+opened the luma plane alone. They now get the shared planes as other shared NV12 textures do (patch 0040), and the
+decoder decodes into a video buffer of the codec's per slice (as AYUV/Y410/Y416 output does), copied into the planes
+after each frame. dx-test: "H.264 (AVC) decoding into a shared texture". (Shared NV12 arrays: the D3D11 runtime
+refuses them itself, WARP's as well.)
+---
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+index 088c992..501df43 100644
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -219,7 +219,8 @@ struct Resource
+    struct pipe_stream_output_target *so_target;
+    struct ResourceShadow *shadows;   /* 3D read maps, slice by slice (ResourceMap); NV12/P010 maps (Video.cpp) */
+    struct VideoSurface *video;       /* NV12/P010/P016 textures: each array slice's planes (Video.cpp) */
+-   struct pipe_video_buffer **decoded; /* AYUV/Y410/Y416 decoder output: each array slice's picture (Video.cpp) */
++   struct pipe_video_buffer **decoded; /* AYUV/Y410/Y416 and shared NV12/P010 decoder output: each array slice's
++                                        * picture (Video.cpp) */
+    void *sysmem;                     /* decoder buffers: the memory programs fill and the decoder reads */
+    UINT sysmem_size;
+    struct TiledInfo *tiled;          /* tiled resources and tile pools (Tiled.cpp) */
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index 742441e..6a88bd7 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -12,8 +12,10 @@
+  *
+  *    NV12 and P010 textures: each array slice is a gallium video buffer whose planes are separate R8 and R8G8 (R16,
+  *    R16G16) textures. The host copies each decoded picture into them and keeps the picture itself as the reference
+- *    for later ones, so a decoder output slice keeps its video buffer. Views select a plane by format (R8: luma, R8G8:
+- *    chroma); maps and uploads see the D3D layout (the chroma rows after the luma rows, at the same pitch).
++ *    for later ones, so a decoder output slice keeps its video buffer. Shared ones (11.4) have planes the allocation
++ *    brings along instead: the decoder decodes into buffers of the codec's, copied into them. Views select a plane by
++ *    format (R8: luma, R8G8: chroma); maps and uploads see the D3D layout (the chroma rows after the luma rows, at the
++ *    same pitch).
+  *
+  *    The video processor converts NV12/P010 (or RGB) to RGB with scaling: gallium's video compositor.
+  *
+@@ -277,17 +279,17 @@ VideoCreateResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_CREATERESOURCE *
+    tmpl.interlaced = false;
+    struct pipe_context *vpipe = VideoPipe(pDevice);
+    bool decoder = (pCreateResource->BindFlags & D3D11_DDI_BIND_DECODER) && vpipe->create_video_buffer;
+-   /* shared (11.4's ExtendedNV12SharedTextureSupported): one slice, whose planes the one allocation has.
+-    * ponytail: decoder output keeps the codec's buffers and isn't shared that way; their planes if programs share them */
+-   bool shared = (pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) && !decoder;
++   /* shared (11.4's ExtendedNV12SharedTextureSupported): one slice (the runtime refuses shared NV12 arrays), whose
++    * planes the one allocation has; decoder output too (Surface decodes into the codec's buffers then) */
++   bool shared = (pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) != 0;
+    if (shared && slices != 1) {
+       SetError(hDevice, E_INVALIDARG);
+       return true;
+    }
+    for (unsigned s = 0; s < slices; s++) {
+       /* decoder output: the video codec's buffers (the host's surfaces with them); the others the texture's size */
+-      v->buffers[s] = decoder ? vpipe->create_video_buffer(vpipe, &tmpl)
+-                              : CreatePlaneBuffer(pDevice, &tmpl, PipeUsage((D3D10_DDI_RESOURCE_USAGE)pCreateResource->Usage),
++      v->buffers[s] = decoder && !shared ? vpipe->create_video_buffer(vpipe, &tmpl)
++                                         : CreatePlaneBuffer(pDevice, &tmpl, PipeUsage((D3D10_DDI_RESOURCE_USAGE)pCreateResource->Usage),
+                                                   shared);
+       if (!v->buffers[s]) {
+          SetError(hDevice, E_OUTOFMEMORY);
+@@ -903,29 +905,30 @@ VideoDecoderSubmitBuffers(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder,
+    return S_OK;
+ }
+ 
+-/* The picture a DXVA surface index names: in D3D11 the decoder output texture's array slice (AYUV/Y410/Y416: the
+- * slice's own video buffer, made on its first use) */
++/* The picture a DXVA surface index names: in D3D11 the decoder output texture's array slice (AYUV/Y410/Y416 and
++ * shared NV12/P010: the slice's own video buffer of the codec's, made on its first use) */
+ static struct pipe_video_buffer *
+ Surface(DxvaDecoder *d, unsigned index)
+ {
+    VideoDecoder *dec = static_cast<VideoDecoder *>(d);
+    Resource *r = dec->target;
+    VideoSurface *v = r->video;
+-   if (v) {
++   if (v && !(r->resource->flags & PIPE_RESOURCE_FLAG_CHROMA_PLANE)) {
+       return index < v->slices ? v->buffers[index] : NULL;
+    }
+-   if (index >= r->resource->array_size) {
++   unsigned slices = v ? v->slices : r->resource->array_size;
++   if (index >= slices) {
+       return NULL;
+    }
+    if (!r->decoded) {
+-      r->decoded = (struct pipe_video_buffer **)calloc(r->resource->array_size, sizeof *r->decoded);
++      r->decoded = (struct pipe_video_buffer **)calloc(slices, sizeof *r->decoded);
+    }
+    if (r->decoded && !r->decoded[index]) {
+       struct pipe_context *vpipe = dec->codec->context;
+       struct pipe_video_buffer tmpl = {};
+-      tmpl.buffer_format = r->resource->format;
+-      tmpl.width = r->resource->width0;
+-      tmpl.height = r->resource->height0;
++      tmpl.buffer_format = v ? v->format : r->resource->format;
++      tmpl.width = v ? v->width : r->resource->width0;
++      tmpl.height = v ? v->height : r->resource->height0;
+       r->decoded[index] = vpipe->create_video_buffer(vpipe, &tmpl);
+    }
+    return r->decoded ? r->decoded[index] : NULL;
+@@ -948,14 +951,18 @@ VideoDecoderEndFrame(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HDECODE hDecoder)
+    }
+    FlushDevice(pDevice);
+    DxvaDecode(dec, target);
+-   /* AYUV/Y410/Y416: the picture into the texture's slice */
+-   if (!dec->target->video) {
++   /* AYUV/Y410/Y416: the picture into the texture's slice; shared NV12/P010: into its planes */
++   if (dec->target->decoded) {
+       struct pipe_resource *res[VL_NUM_COMPONENTS] = {};
+       target->get_resources(target, res);
+-      struct pipe_resource *dst = dec->target->resource;
+-      struct pipe_box box;
+-      u_box_3d(0, 0, 0, MIN2(dst->width0, res[0]->width0), MIN2(dst->height0, res[0]->height0), 1, &box);
+-      dec->codec->context->resource_copy_region(dec->codec->context, dst, 0, 0, 0, dec->slice, res[0], 0, &box);
++      VideoSurface *v = dec->target->video;
++      for (unsigned p = 0; p < (v ? 2 : 1); p++) {
++         struct pipe_resource *dst = v ? Plane(v, dec->slice, p) : dec->target->resource;
++         struct pipe_box box;
++         u_box_3d(0, 0, 0, MIN2(dst->width0, res[p]->width0), MIN2(dst->height0, res[p]->height0), 1, &box);
++         dec->codec->context->resource_copy_region(dec->codec->context, dst, 0, 0, 0, v ? 0 : dec->slice, res[p], 0,
++                                                   &box);
++      }
+    }
+    FlushVideo(pDevice);
+    dec->target = NULL;

@@ -67,6 +67,7 @@ $HelperTask = "WinBoat display resolution"
 $HelperPath = Join-Path $env:ProgramData "WinBoat\viogpuap.exe"
 $InfName = "viogpu3d.inf"
 $CheckSource = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\drivers\gpucheck"))
+$OpenClSource = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\drivers\opencl"))
 $CheckDir = Join-Path $env:ProgramFiles "WinBoat\GPU Check"
 $CheckShortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\WinBoat GPU Check.lnk"
 # (and on every user's desktop: the Public one)
@@ -238,7 +239,8 @@ function Install-SpiceHelpers {
     $helper = Join-Path $SpiceDir "viogpuap.exe"
     if (Test-Path $helper) {
         Unregister-ScheduledTask -TaskName $HelperTask -Confirm:$false -ErrorAction SilentlyContinue
-        Stop-Process -Name viogpuap -Force -ErrorAction SilentlyContinue
+        # gone before the copy (Stop-Process doesn't wait: an update over a running helper failed on its exe)
+        Get-Process viogpuap -ErrorAction SilentlyContinue | ForEach-Object { $_.Kill(); $_.WaitForExit(10000) | Out-Null }
         New-Item -ItemType Directory -Path (Split-Path $HelperPath) -Force | Out-Null
         Copy-Item $helper $HelperPath -Force
         # Elevated in each administrator's session (it opens the driver's event); a console program, so headless
@@ -279,6 +281,31 @@ function Install-GpuCheck {
         $link.WindowStyle = 7      # minimized: the console it starts with closes at once, unseen
         $link.Description = "What the GPU can do: Direct3D, Vulkan, OpenGL, OpenCL, DirectML, video"
         $link.Save()
+    }
+}
+
+# Windows 10 has no OpenCL.dll (11 has one): Khronos' loader (tools/opencl-loader), with which Microsoft's OpenCL,
+# OpenGL and Vulkan Compatibility Pack (OpenCLOn12, on this driver's Direct3D 12) runs OpenCL on the GPU. Only where
+# Windows has none or it's ours (state OpenClLoader<x64|x86>); never over Windows 11's or a GPU vendor's
+function Install-OpenClLoader {
+    if ($Win81 -or -not (Test-Path (Join-Path $OpenClSource "x64\OpenCL.dll"))) { return }
+    $targets = @(@{ From = "x64"; To = "$env:SystemRoot\System32" })
+    if (Test-Path "$env:SystemRoot\SysWOW64") { $targets += @{ From = "x86"; To = "$env:SystemRoot\SysWOW64" } }
+    foreach ($t in $targets) {
+        $dest = Join-Path $t.To "OpenCL.dll"
+        if ((Test-Path $dest) -and -not (Get-State "OpenClLoader$($t.From)")) { continue }
+        try {
+            Copy-Item (Join-Path $OpenClSource "$($t.From)\OpenCL.dll") $dest -Force
+            Set-State "OpenClLoader$($t.From)" 1
+        } catch {
+            # (in use by a running OpenCL program: the one there stays until the next install)
+        }
+    }
+}
+
+function Uninstall-OpenClLoader {
+    foreach ($t in @(@{ From = "x64"; To = "$env:SystemRoot\System32" }, @{ From = "x86"; To = "$env:SystemRoot\SysWOW64" })) {
+        if (Get-State "OpenClLoader$($t.From)") { Remove-Item (Join-Path $t.To "OpenCL.dll") -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -426,6 +453,7 @@ function Install-Driver {
 
     if (-not $Win7) { Install-SpiceHelpers }  # (Windows 7: no ScheduledTasks module; untested there)
     Install-GpuCheck
+    Install-OpenClLoader
 
     Set-State "InstalledAt" (Get-Date).ToString("o")
     Set-State "InstalledFingerprint" (Get-BundleFingerprint)
@@ -471,6 +499,7 @@ function Uninstall-Driver {
     }
     if (-not $Win7) { Uninstall-SpiceHelpers }
     Uninstall-GpuCheck
+    Uninstall-OpenClLoader
     Remove-Item $StateKey -Recurse -Force -ErrorAction SilentlyContinue
     # Reboot-pending marker for Status: the device falls back to the basic display driver on the next boot
     New-Item -Path $StateKey -Force | Out-Null

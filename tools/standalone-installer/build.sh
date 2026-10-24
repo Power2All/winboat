@@ -9,7 +9,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$HERE/../.." && pwd)"
 INF="$REPO_DIR/guest_server/drivers/viogpu3d/viogpu3d.inf"
-for dir in viogpu3d spice gpucheck; do
+for dir in viogpu3d spice gpucheck opencl; do
     [ -d "$REPO_DIR/guest_server/drivers/$dir" ] || { echo "No guest_server/drivers/$dir: run tools/gpu-spike/export-driver-package.sh first" >&2; exit 1; }
 done
 VERSION="$(sed -n 's/^DriverVer *= *[^,]*, *\([0-9.]*\).*/\1/p' "$INF" | tr -d '\r')"
@@ -55,7 +55,7 @@ fi
     echo
     echo "- Windows 10 1709 or later, Windows 11: Direct3D 9-12, OpenGL, Vulkan, video decoding"
     [ -f "$HERE/win81/viogpu3d/viogpu3d.inf" ] && echo "- Windows 8.1: Direct3D 9-11 and OpenGL"
-    [ -f "$HERE/win7/viogpu3d/viogpu3d.inf" ] && echo "- Windows 7 SP1: Direct3D 9-10, Direct3D 11 up to feature level 10_0, OpenGL. Give the device hostmem= for desktops above about 1680x1050. Shader compiling (most Direct3D 10/11 programs) needs Microsoft's KB4019990."
+    [ -f "$HERE/win7/viogpu3d/viogpu3d.inf" ] && echo "- Windows 7 SP1: Direct3D 9-11 (feature levels 10_1 and 11_0 with the Platform Update, KB2670838), OpenGL. Give the device hostmem= for desktops above about 1680x1050. Shader compiling (most Direct3D 10/11 programs) needs Microsoft's KB4019990."
     echo
     echo "WHAT SETUP CHANGES"
     echo

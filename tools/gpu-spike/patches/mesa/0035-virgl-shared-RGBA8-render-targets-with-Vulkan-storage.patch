@@ -1,0 +1,51 @@
+From: WinBoat
+Subject: [PATCH] virgl: shared RGBA8 render targets with Vulkan storage on hosts that have it
+
+A shared (MISC_SHARED) RGBA8 2D render target is created with VIRGL_BIND_VK_SHARED when the host reports
+VIRGL_CAP_V2_VK_SHARED (virglrenderer patches 0012/0017): its host storage is Vulkan memory that a Venus context
+can import by the resource id. Venus' window system path (mesa-venus patch 0009) presents through such a texture
+and a DXGI swap chain instead of reading each frame back to the CPU: 1080p Vulkan presents 0.98 -> 0.41 ms, 1440p
+1.58 -> 0.44 ms (vkpresentbench).
+---
+diff --git a/src/gallium/drivers/virgl/virgl_resource.c b/src/gallium/drivers/virgl/virgl_resource.c
+index ad8b95c..16615a7 100644
+--- a/src/gallium/drivers/virgl/virgl_resource.c
++++ b/src/gallium/drivers/virgl/virgl_resource.c
+@@ -661,6 +661,15 @@ static struct pipe_resource *virgl_resource_create_front(struct pipe_screen *scr
+    vflags = pipe_to_virgl_flags(vs, templ->flags);
+    virgl_resource_layout(&res->b, &res->metadata, 0, 0, 0, 0);
+ 
++   /* A shared RGBA8 render target (D3D11's MISC_SHARED: Vulkan's window system path presents through one) gets
++    * its host storage from Vulkan memory where the host does that, so a Venus context can render into it. Textures
++    * are never reallocated (virgl_can_rebind_resource), so the storage stays what was imported */
++   if ((templ->bind & PIPE_BIND_SHARED) && (templ->bind & PIPE_BIND_RENDER_TARGET) &&
++       templ->target == PIPE_TEXTURE_2D && templ->last_level == 0 && templ->array_size <= 1 &&
++       templ->nr_samples <= 1 && templ->format == PIPE_FORMAT_R8G8B8A8_UNORM &&
++       (vs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_VK_SHARED))
++      vbind |= VIRGL_BIND_VK_SHARED;
++
+    /* virglrenderer takes a buffer with several bind flags only when one of them is the sampler view's (it makes
+     * it a texture buffer); others are refused, and the missing resource's first use fails the whole context. D3D
+     * buffers are often vertex and index, or vertex and stream output, buffers at once. */
+diff --git a/src/virtio/virtio-gpu/virgl_hw.h b/src/virtio/virtio-gpu/virgl_hw.h
+index e747d71..5940590 100644
+--- a/src/virtio/virtio-gpu/virgl_hw.h
++++ b/src/virtio/virtio-gpu/virgl_hw.h
+@@ -593,6 +593,8 @@ enum virgl_formats {
+ /* WinBoat: gl_Layer and gl_ViewportIndex written by tessellation evaluation shaders too
+  * (GL_ARB_shader_viewport_layer_array) */
+ #define VIRGL_CAP_V2_TES_LAYER_VIEWPORT   (1u << 30)
++/* WinBoat's host: textures with VIRGL_BIND_VK_SHARED get Vulkan storage a Venus context can import */
++#define VIRGL_CAP_V2_VK_SHARED            (1u << 29)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+@@ -606,6 +608,8 @@ enum virgl_formats {
+ #define VIRGL_BIND_DISPLAY_TARGET (1 << 7)
+ #define VIRGL_BIND_COMMAND_ARGS  (1 << 8)
+ #define VIRGL_BIND_STREAM_OUTPUT (1 << 11)
++/* WinBoat's host: storage from Vulkan memory a Venus context imports (VIRGL_CAP_V2_VK_SHARED) */
++#define VIRGL_BIND_VK_SHARED     (1 << 13)
+ #define VIRGL_BIND_SHADER_BUFFER (1 << 14)
+ #define VIRGL_BIND_QUERY_BUFFER  (1 << 15)
+ #define VIRGL_BIND_CURSOR        (1 << 16)

@@ -90,9 +90,13 @@ static bool g_skipping = false;
 
 #define NO_HLSL_COMPILER "no HLSL compiler (D3DCompiler_47.dll; Windows 7: KB4019990)"
 
-static void report(Status s, const std::string &name, const std::string &detail = "")
+// Added to a group's missing optional features: why they are missing (Windows 10's Direct3D 12 runtime)
+static std::string g_warnNote;
+
+static void report(Status s, const std::string &name, const std::string &detail_ = "")
 {
    if (g_skipping) return;
+   std::string detail = s == Status::Warn ? detail_ + g_warnNote : detail_;
    // Windows 7 without KB4019990: the test couldn't run, the GPU didn't fail it
    if (s == Status::Fail && detail.rfind(NO_HLSL_COMPILER, 0) == 0) s = Status::Skip;
    printf("@@R\t%s\t%s\t%s\n", statusName(s), sanitize(name).c_str(), sanitize(detail).c_str());
@@ -124,17 +128,19 @@ static void optional(bool supported, const std::string &name, const std::string 
 
 // Windows 10 or later: Direct3D 12, DirectML, flip-discard swap chains and our Vulkan driver need it (before that a
 // missing one is optional, not a failure)
-static bool windows10OrLater()
+static OSVERSIONINFOW osVersion()
 {
-   static int major = -1;
-   if (major < 0) {
+   static OSVERSIONINFOW os = [] {
       typedef LONG(WINAPI * PFN_GetVersion)(OSVERSIONINFOW *);
-      OSVERSIONINFOW os = {sizeof(os)};
+      OSVERSIONINFOW v = {sizeof(v)};
       auto get = (PFN_GetVersion)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlGetVersion");
-      major = get && get(&os) == 0 ? (int)os.dwMajorVersion : 10;
-   }
-   return major >= 10;
+      if (!get || get(&v) != 0) v.dwMajorVersion = 10;
+      return v;
+   }();
+   return os;
 }
+
+static bool windows10OrLater() { return osVersion().dwMajorVersion >= 10; }
 
 static std::string fmt(const char *format, ...)
 {
@@ -285,14 +291,17 @@ static HWND createWindow(const char *title, int width, int height, bool visible)
 }
 
 // A pixel of a window's client area as the desktop shows it (PrintWindow: DWM's copy of the window; without DWM's
-// composition, Windows 7's basic theme, the screen's pixel: PrintWindow leaves out what Direct3D presented there)
+// composition, Windows 7's basic theme, the screen's pixel: PrintWindow leaves out what Direct3D presented there; and
+// before Windows 8.1 always the screen's, the window being on top: PrintWindow has no PW_RENDERFULLCONTENT there)
 static bool windowPixel(HWND hwnd, int x, int y, COLORREF &out)
 {
    typedef HRESULT(WINAPI * PFN_DwmIsCompositionEnabled)(BOOL *);
    HMODULE dwmapi = LoadLibraryA("dwmapi.dll");
    auto composed = dwmapi ? (PFN_DwmIsCompositionEnabled)GetProcAddress(dwmapi, "DwmIsCompositionEnabled") : nullptr;
    BOOL composition = TRUE;
-   if (composed && SUCCEEDED(composed(&composition)) && !composition) {
+   const OSVERSIONINFOW os = osVersion();
+   const bool before8_1 = os.dwMajorVersion < 6 || (os.dwMajorVersion == 6 && os.dwMinorVersion < 3);
+   if (before8_1 || (composed && SUCCEEDED(composed(&composition)) && !composition)) {
       POINT p = {x, y};
       ClientToScreen(hwnd, &p);
       HDC sdc = GetDC(nullptr);
@@ -352,8 +361,17 @@ static uint16_t toHalf(float f)
 #include "vulkan.inc"
 #include "directml.inc"
 #include "opencl.inc"
+// DXTEST_AGILITY=<SDK version> (build.sh): Direct3D 12 from the Agility SDK's runtime in .\D3D12\ (D3D12Core.dll beside
+// the exe), as games ship it: on Windows 10 the newest features come only that way
+#ifdef DXTEST_AGILITY
+extern "C" {
+__declspec(dllexport) extern const unsigned int D3D12SDKVersion = DXTEST_AGILITY;
+__declspec(dllexport) extern const char *D3D12SDKPath = ".\\D3D12\\";
+}
+#endif
 #include "opengl.inc"
 #include "video.inc"
+#include "video_full.inc"
 
 // ---------------------------------------------------------------------------------------------------------------
 // Parent: runs every group in a child process and writes the checklist
@@ -393,6 +411,7 @@ static const Group GROUPS[] = {
    {"opengl", "OpenGL", groupOpenGL, false, true},
    {"opengl-32", "OpenGL (32-bit programs)", groupOpenGL, true, false},
    {"video", "Video decoding (Direct3D 11 / DXVA)", groupVideo, false, true},
+   {"video-full", "Video decoding and encoding (DXVA2, Direct3D 12, Media Foundation)", groupVideoFull, false, true},
 };
 
 struct Result {
@@ -510,6 +529,7 @@ static void runGroupOnce(const Group &group, DWORD timeoutMs, std::vector<Result
    size_t before = results.size();
    size_t pos = 0;
    std::string current;   // the test that started last
+   std::string exceptions; // the process's serious exceptions (exceptionNote)
    while (pos < output.size()) {
       size_t end = output.find('\n', pos);
       if (end == std::string::npos) end = output.size();
@@ -520,6 +540,8 @@ static void runGroupOnce(const Group &group, DWORD timeoutMs, std::vector<Result
          results.push_back({group.id, parts[1], parts[2], parts[3]});
       } else if (parts.size() >= 2 && parts[0] == "@@T") {
          current = parts[1];
+      } else if (parts.size() >= 2 && parts[0] == "@@X") {
+         exceptions += (exceptions.empty() ? "" : ", ") + parts[1];
       }
       pos = end + 1;
    }
@@ -532,7 +554,8 @@ static void runGroupOnce(const Group &group, DWORD timeoutMs, std::vector<Result
                          fmt("hung: the test process was stopped after %lu s", timeoutMs / 1000)});
    } else if (exitCode != 0) {
       results.push_back({group.id, "FAIL", where.empty() ? "Tests ran without crashing" : where,
-                         fmt("crashed (0x%08lX), the group went on after it", exitCode)});
+                         fmt("crashed (0x%08lX), the group went on after it", exitCode) +
+                            (exceptions.empty() ? "" : "; exceptions before: " + exceptions)});
    }
    if ((timedOut || exitCode != 0) && !current.empty()) crashedIn = current;
    (void)produced;
@@ -754,6 +777,28 @@ static int runAll(DWORD timeoutMs, const std::string &only)
 
 #include "gui.inc"
 
+// A test process's serious exceptions as they happen (handled or not: a crash in a window procedure ends as
+// 0xC000041D, which names nothing), so a crashed group's report says where: the code and the module + offset
+static LONG CALLBACK exceptionNote(EXCEPTION_POINTERS *e)
+{
+   static LONG notes = 0;
+   DWORD code = e->ExceptionRecord->ExceptionCode;
+   // errors only (not C++ throws, RPC or debugger notices), a few per process
+   if ((code & 0xF0000000u) != 0xC0000000u || code == 0xC0000194u /* deadlock: a wait timed out */ ||
+       InterlockedIncrement(&notes) > 4)
+      return EXCEPTION_CONTINUE_SEARCH;
+   void *at = e->ExceptionRecord->ExceptionAddress;
+   HMODULE mod = nullptr;
+   char path[MAX_PATH] = "?";
+   if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          (LPCSTR)at, &mod))
+      GetModuleFileNameA(mod, path, MAX_PATH);
+   const char *name = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+   printf("@@X\t0x%08lX in %s+0x%llx\n", code, name, (unsigned long long)((char *)at - (char *)mod));
+   fflush(stdout);
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int argc, char **argv)
 {
    SetConsoleOutputCP(CP_UTF8);
@@ -763,6 +808,7 @@ int main(int argc, char **argv)
    if (!setDpi || !setDpi((HANDLE)-4 /* per monitor v2 */)) SetProcessDPIAware();
    // A crashing driver mustn't open error dialogs that would hang a test process
    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+   AddVectoredExceptionHandler(1, exceptionNote);
 
    std::string group, only;
    DWORD timeoutMs = 180 * 1000;

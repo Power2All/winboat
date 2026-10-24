@@ -1,0 +1,298 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: video encoding: metadata into any buffer, HEVC encoder overrides read from its SPS
+
+Two things the full video test (dx-test's video-full) found in Direct3D 12 video encoding:
+- ResolveEncoderOutputMetadata wrote the resolved metadata on the CPU into a buffer it mapped: right for ffmpeg's
+  readback buffer, but the spec's (and other programs') default-heap buffer can't be mapped, and those programs got
+  0 bytes for every frame. Such a buffer gets the metadata through an upload buffer and a copy queue now, before the
+  encode queue's fence is signaled.
+- NVIDIA's encoder forces SAO on as well as AMP (Vulkan lets it override parameter sets), and the probe took any SPS
+  override for AMP. The encoder's own SPS is read now (amp_enabled_flag, sample_adaptive_offset_enabled_flag): AMP
+  is reported as required only when forced, SAO as supported when forced, and since D3D12 has no "SAO required",
+  setups without SAO are refused (CODEC_CONFIGURATION_NOT_SUPPORTED) where it's forced: before, a program that left
+  SAO off got slices its headers didn't describe (garbage when decoded). ffmpeg's hevc_d3d12va enables SAO when
+  offered and is unaffected.
+---
+diff --git a/libs/viogpu_umd/umd_video.cpp b/libs/viogpu_umd/umd_video.cpp
+index 6735387..b8e490d 100644
+--- a/libs/viogpu_umd/umd_video.cpp
++++ b/libs/viogpu_umd/umd_video.cpp
+@@ -19,7 +19,8 @@
+  *   profile); the application's reconstructed textures only name the slots (texture and subresource -> slot).
+  * - Output metadata: the bitstream size comes from an encode feedback query. ResolveEncoderOutputMetadata is done on
+  *   the CPU once the GPU finished the submission, before the queue's fence is signaled (viogpu_video_queue): the
+- *   encode queue family has no compute, and Vulkan has no way to write query results there.
++ *   encode queue family has no compute, and Vulkan has no way to write query results there. Into a CPU-visible
++ *   buffer directly (ffmpeg's readback one), into any other (the spec's default-heap buffer) through a copy queue.
+  * The encoder's objects: the session (with its parameters, DPB and queries) lives in the encoder heap, which D3D12
+  * makes per resolution set; ponytail: one encoder per heap (what applications do). */
+ 
+@@ -317,7 +318,7 @@ dpb_capacity(const video_caps *c)
+ #define CAPS(T) (args->DataSize >= sizeof(T) ? (T *)args->pData : NULL)
+ 
+ static HRESULT video_get_caps_(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_VIDEO_GETCAPS_0020 *args);
+-static bool hevc_amp_required(viogpu_video *v, int index);
++static int hevc_overrides(viogpu_video *v, int index);
+ 
+ static HRESULT APIENTRY
+ video_get_caps(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_VIDEO_GETCAPS_0020 *args)
+@@ -508,12 +509,16 @@ video_get_caps_(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_VIDEO_GETCAPS_0020 *
+          if (std & VK_VIDEO_ENCODE_H265_STD_CONSTRAINED_INTRA_PRED_FLAG_SET_BIT_KHR)
+             s->SupportFlags |=
+                D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_0083_0_CONSTRAINED_INTRAPREDICTION_SUPPORT;
+-         /* AMP changes the CU syntax of P/B slices, and Vulkan lets the encoder override amp_enabled_flag (NVIDIA
+-          * sets it): such an encoder needs applications to write it */
+-         if (hevc_amp_required(video, profile_index(d->Codec, &d->Profile)))
++         /* AMP and SAO change the slices' syntax, and Vulkan lets the encoder override their SPS flags (NVIDIA
++          * sets both): such an encoder needs applications to write them. AMP has D3D12's REQUIRED flag; SAO has
++          * none, so it's offered and the setups without it are refused (ENCODER_SUPPORT) */
++         int overrides = hevc_overrides(video, profile_index(d->Codec, &d->Profile));
++         if (overrides & 2)
+             s->SupportFlags |=
+                D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_0083_0_ASYMETRIC_MOTION_PARTITION_SUPPORT |
+                D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_0083_0_ASYMETRIC_MOTION_PARTITION_REQUIRED;
++         if (overrides & 4)
++            s->SupportFlags |= D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_0083_0_SAO_FILTER_SUPPORT;
+          /* coding units 16x16 up to the CTB, transform units 4x4 up to 32x32, the full hierarchy. 16, not the
+           * encoder's 8: applications pad their reconstructed pictures to it (ffmpeg's hevc_d3d12va does), and
+           * decoders' 1088-line frames then match them (with 8, 1080p from a decoder fails the runtime's check) */
+@@ -555,6 +560,13 @@ video_get_caps_(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_VIDEO_GETCAPS_0020 *
+           d->CodecGopSequence.pH264GroupOfPictures->pic_order_cnt_type != 0 &&
+           d->CodecGopSequence.pH264GroupOfPictures->pic_order_cnt_type != 2)
+          flags |= D3D12DDI_VIDEO_ENCODER_VALIDATION_FLAG_0082_0_GOP_STRUCTURE_NOT_SUPPORTED;
++      /* an encoder that forces AMP or SAO on: the setups without them make streams their headers don't describe */
++      const auto *hc = hevc ? d->CodecConfiguration.pHEVCConfig : NULL;
++      int overrides = c && hc ? hevc_overrides(video, index) : 0;
++      if (((overrides & 2) &&
++           !(hc->ConfigurationFlags & D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_0082_0_USE_ASYMETRIC_MOTION_PARTITION)) ||
++          ((overrides & 4) && !(hc->ConfigurationFlags & D3D12DDI_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_0082_0_ENABLE_SAO_FILTER)))
++         flags |= D3D12DDI_VIDEO_ENCODER_VALIDATION_FLAG_0082_0_CODEC_CONFIGURATION_NOT_SUPPORTED;
+       for (UINT i = 0; c && i < d->ResolutionsListCount; i++) {
+          const auto &r = d->pResolutionList[i];
+          if (r.Width < c->caps.minCodedExtent.width || r.Height < c->caps.minCodedExtent.height ||
+@@ -1104,14 +1116,81 @@ h265_sets_fill(h265_sets *s, const viogpu_video_heap *heap, const viogpu_video_e
+    pps.sps_video_parameter_set_id = 0;
+ }
+ 
+-/* Probe: parameters with AMP off for a small session; an SPS override means the encoder forces AMP on */
++/* An HEVC SPS's amp_enabled_flag and sample_adaptive_offset_enabled_flag (the NAL unit as the encoder wrote it:
++ * start code, header, emulation prevention bytes); false if it can't be read that far (scaling list data) */
+ static bool
+-hevc_amp_required(viogpu_video *v, int index)
++hevc_sps_flags(const UINT8 *data, size_t size, bool *amp, bool *sao)
+ {
+-   if (index < 0 || index >= PROFILE_COUNT)
++   size_t i = 0;
++   while (i + 3 < size && !(data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1))
++      i++;
++   i = i + 3 < size ? i + 3 + 2 : 2; /* past the start code (if any) and the NAL header */
++   std::vector<UINT8> rbsp;
++   for (int zeros = 0; i < size; i++) {
++      if (zeros >= 2 && data[i] == 3) {
++         zeros = 0;
++         continue;
++      }
++      rbsp.push_back(data[i]);
++      zeros = data[i] ? 0 : zeros + 1;
++   }
++   size_t bit = 0;
++   auto u = [&](int n) {
++      UINT v = 0;
++      for (int k = 0; k < n; k++, bit++)
++         v = v << 1 | (bit / 8 < rbsp.size() ? (rbsp[bit / 8] >> (7 - bit % 8)) & 1 : 0);
++      return v;
++   };
++   auto ue = [&]() {
++      int zeros = 0;
++      while (!u(1) && zeros < 32)
++         zeros++;
++      return (1u << zeros) - 1 + u(zeros);
++   };
++   u(4);
++   UINT subLayers = u(3);
++   u(1);
++   u(96); /* general profile, tier and level */
++   bool profile[8] = {}, level[8] = {};
++   for (UINT k = 0; k < subLayers; k++)
++      profile[k] = u(1), level[k] = u(1);
++   if (subLayers)
++      for (UINT k = subLayers; k < 8; k++)
++         u(2);
++   for (UINT k = 0; k < subLayers; k++)
++      u((profile[k] ? 88 : 0) + (level[k] ? 8 : 0));
++   ue();
++   if (ue() == 3)
++      u(1);
++   ue();
++   ue();
++   if (u(1))
++      ue(), ue(), ue(), ue();
++   ue();
++   ue();
++   ue();
++   bool ordering = u(1);
++   for (UINT k = ordering ? 0 : subLayers; k <= subLayers; k++)
++      ue(), ue(), ue();
++   for (int k = 0; k < 6; k++)
++      ue();
++   if (u(1) && u(1))
+       return false;
++   *amp = u(1);
++   *sao = u(1);
++   return bit <= rbsp.size() * 8;
++}
++
++/* Probe: parameters with AMP and SAO off for a small session; what the encoder's own SPS has instead (Vulkan lets
++ * it override them: NVIDIA turns both on) is what applications must write. Bits of ampRequired: 1 probed,
++ * 2 AMP forced, 4 SAO forced */
++static int
++hevc_overrides(viogpu_video *v, int index)
++{
++   if (index < 0 || index >= PROFILE_COUNT)
++      return 0;
+    if (v->ampRequired[index])
+-      return v->ampRequired[index] == 2;
++      return v->ampRequired[index];
+    v->ampRequired[index] = 1;
+    video_session s = {};
+    s.video = v;
+@@ -1170,15 +1249,20 @@ hevc_amp_required(viogpu_video *v, int index)
+       feedback.pNext = &codec;
+       UINT8 data[512];
+       size_t size = sizeof(data);
+-      /* ponytail: any SPS override counts as AMP (the only one seen); parse the SPS when another shows up */
++      bool amp = false, sao = false;
+       if (v->GetEncodedVideoSessionParametersKHR(v->device, &get, &feedback, &size, data) == VK_SUCCESS &&
+-          codec.hasStdSPSOverrides)
+-         v->ampRequired[index] = 2;
++          codec.hasStdSPSOverrides) {
++         /* an SPS that can't be read: AMP, as before the parsing (the one override seen first) */
++         if (!hevc_sps_flags(data, size, &amp, &sao))
++            amp = true, sao = false;
++         v->ampRequired[index] |= (amp ? 2 : 0) | (sao ? 4 : 0);
++      }
+       v->DestroyVideoSessionParametersKHR(v->device, params, NULL);
+    }
+    v->DestroyVideoSessionKHR(v->device, session, NULL);
+-   viogpu_log("video: HEVC profile %d: the encoder %s AMP", index, v->ampRequired[index] == 2 ? "forces" : "leaves");
+-   return v->ampRequired[index] == 2;
++   viogpu_log("video: HEVC profile %d: the encoder %s AMP, %s SAO", index, v->ampRequired[index] & 2 ? "forces" : "leaves",
++              v->ampRequired[index] & 4 ? "forces" : "leaves");
++   return v->ampRequired[index];
+ }
+ 
+ /* Whether the encoder overrides parameter-set values (Vulkan lets it): the application writes its own headers, so
+@@ -2157,6 +2241,13 @@ struct viogpu_video_queue {
+    viogpu_device *device;
+    ID3D12Fence *gpuDone;
+    ID3D12Fence *done;
++   /* resolved metadata for buffers the CPU can't map: written into an upload buffer, copied (made on first use) */
++   ID3D12CommandQueue *copyQueue;
++   ID3D12CommandAllocator *copyAllocator;
++   ID3D12GraphicsCommandList *copyList;
++   ID3D12Fence *copyFence;
++   UINT64 copyValue;
++   ID3D12Resource *staging;
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE wake;
+    std::deque<video_batch> batches;
+@@ -2164,9 +2255,44 @@ struct viogpu_video_queue {
+    HANDLE thread;
+ };
+ 
++/* The resolved metadata copied from the upload buffer into a buffer the CPU can't map, waited for */
++static bool
++copy_resolved(viogpu_video_queue *q, ID3D12Resource *dst, UINT64 offset, const void *data, UINT64 size)
++{
++   ID3D12Device *dev = q->device->vkd3d;
++   if (!q->copyQueue) {
++      D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_COPY};
++      D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_UPLOAD};
++      D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, 4096, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
++                                D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
++      if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q->copyQueue))) ||
++          FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&q->copyAllocator))) ||
++          FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, q->copyAllocator, NULL, IID_PPV_ARGS(&q->copyList))) ||
++          FAILED(q->copyList->Close()) || FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&q->copyFence))) ||
++          FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
++                                              IID_PPV_ARGS(&q->staging))))
++         return false;
++   }
++   UINT8 *mapped = NULL;
++   if (size > 4096 || FAILED(q->staging->Map(0, NULL, (void **)&mapped)))
++      return false;
++   memcpy(mapped, data, size);
++   q->staging->Unmap(0, NULL);
++   q->copyAllocator->Reset();
++   q->copyList->Reset(q->copyAllocator, NULL);
++   q->copyList->CopyBufferRegion(dst, offset, q->staging, 0, size);
++   if (FAILED(q->copyList->Close()))
++      return false;
++   ID3D12CommandList *lists[] = {q->copyList};
++   q->copyQueue->ExecuteCommandLists(1, lists);
++   q->copyQueue->Signal(q->copyFence, ++q->copyValue);
++   return SUCCEEDED(q->copyFence->SetEventOnCompletion(q->copyValue, NULL));
++}
++
+ static void
+-resolve(viogpu_video *v, const metadata_resolve &r)
++resolve(viogpu_video_queue *q, const metadata_resolve &r)
+ {
++   viogpu_video *v = q->device->video;
+    D3D12DDI_VIDEO_ENCODER_OUTPUT_METADATA_0083_0 meta = {};
+    D3D12DDI_VIDEO_ENCODER_FRAME_SUBREGION_METADATA_0083_0 region = {};
+    if (r.session) {
+@@ -2191,12 +2317,15 @@ resolve(viogpu_video *v, const metadata_resolve &r)
+    } else {
+       meta.EncodeErrorFlags = D3D12DDI_VIDEO_ENCODER_ENCODE_ERROR_FLAG_0082_0_INVALID_METADATA_BUFFER_SOURCE;
+    }
+-   /* ponytail: resolved metadata in a CPU-visible buffer (readback, as applications use); a default-heap one would
+-    * need a copy queue */
++   /* a CPU-visible buffer written directly; any other through the copy queue */
+    UINT8 *data = NULL;
+    D3D12_RANGE none = {0, 0};
+    if (!r.buffer || FAILED(r.buffer->Map(0, &none, (void **)&data)) || !data) {
+-      viogpu_log("video: the resolved metadata buffer is not CPU-visible");
++      UINT8 both[sizeof(meta) + sizeof(region)];
++      memcpy(both, &meta, sizeof(meta));
++      memcpy(both + sizeof(meta), &region, sizeof(region));
++      if (!r.buffer || !copy_resolved(q, r.buffer, r.offset, both, sizeof(both)))
++         viogpu_log("video: copying the resolved metadata failed");
+       return;
+    }
+    memcpy(data + r.offset, &meta, sizeof(meta));
+@@ -2223,7 +2352,7 @@ video_queue_thread(void *param)
+ 
+       queue->gpuDone->SetEventOnCompletion(batch.n, NULL);
+       for (const metadata_resolve &r : batch.resolves)
+-         resolve(queue->device->video, r);
++         resolve(queue, r);
+       queue->done->Signal(batch.n);
+    }
+ }
+@@ -2254,6 +2383,11 @@ viogpu_video_queue_destroy(viogpu_video_queue *queue)
+    WakeAllConditionVariable(&queue->wake);
+    WaitForSingleObject(queue->thread, INFINITE);
+    CloseHandle(queue->thread);
++   if (queue->staging) queue->staging->Release();
++   if (queue->copyFence) queue->copyFence->Release();
++   if (queue->copyList) queue->copyList->Release();
++   if (queue->copyAllocator) queue->copyAllocator->Release();
++   if (queue->copyQueue) queue->copyQueue->Release();
+    DeleteCriticalSection(&queue->lock);
+    delete queue;
+ }
+diff --git a/libs/viogpu_umd/umd_video.h b/libs/viogpu_umd/umd_video.h
+index d92ddb9..299d2b6 100644
+--- a/libs/viogpu_umd/umd_video.h
++++ b/libs/viogpu_umd/umd_video.h
+@@ -103,7 +103,8 @@ struct viogpu_video {
+    DECODE_FUNCS(X)
+ #undef X
+    video_caps caps[PROFILE_COUNT];
+-   /* HEVC: whether the encoder forces asymmetric motion partitions (0: not probed yet, 1: no, 2: yes) */
++   /* HEVC: what the encoder's SPS forces on (umd_video.cpp's hevc_overrides; 0: not probed yet, else 1 | 2 for
++    * asymmetric motion partitions | 4 for SAO) */
+    int ampRequired[PROFILE_COUNT];
+    /* an encoder's hardware metadata buffer (resource, offset) -> the feedback query of the encode that wrote it */
+    CRITICAL_SECTION lock;

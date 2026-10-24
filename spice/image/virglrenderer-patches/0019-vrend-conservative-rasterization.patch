@@ -1,0 +1,166 @@
+From: WinBoat
+Subject: [PATCH] vrend: conservative rasterization
+
+Direct3D 11.3's conservative rasterization (ConservativeRasterizationMode in the rasterizer state: every pixel a
+triangle touches at all is drawn, for voxelization and occlusion culling). GL has it as GL_NV_conservative_raster. A
+new command, VIRGL_CCMD_SET_CONSERVATIVE_RASTER (after VIRGL_CCMD_SET_RASTER_SAMPLES), turns it on or off; the host
+announces it with VIRGL_CAP_V2_CONSERVATIVE_RASTER (bit 28). Like the raster samples it is enabled around the
+guest's draws only, so the renderer's own blits and clears don't get it.
+---
+diff --git a/src/virgl_hw.h b/src/virgl_hw.h
+index b98f5fd..aefaa73 100644
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -636,6 +636,8 @@ enum virgl_formats {
+ /* WinBoat: textures with VIRGL_BIND_VK_SHARED get Vulkan storage a Venus context can import (stock hosts make an
+  * ordinary texture, and Venus' import of it ends the context) */
+ #define VIRGL_CAP_V2_VK_SHARED            (1u << 29)
++/* WinBoat: VIRGL_CCMD_SET_CONSERVATIVE_RASTER (GL_NV_conservative_raster) */
++#define VIRGL_CAP_V2_CONSERVATIVE_RASTER  (1u << 28)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+diff --git a/src/virgl_protocol.h b/src/virgl_protocol.h
+index 2fce6ca..d7bb59e 100644
+--- a/src/virgl_protocol.h
++++ b/src/virgl_protocol.h
+@@ -146,6 +146,7 @@ enum virgl_context_cmd {
+    VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT,
+    /* WinBoat */
+    VIRGL_CCMD_SET_RASTER_SAMPLES,
++   VIRGL_CCMD_SET_CONSERVATIVE_RASTER,
+ 
+    VIRGL_MAX_COMMANDS
+ };
+@@ -797,4 +798,9 @@ enum vrend_tweak_type {
+ #define VIRGL_SET_RASTER_SAMPLES_SIZE 1
+ #define VIRGL_SET_RASTER_SAMPLES_COUNT 1
+ 
++/* VIRGL_CCMD_SET_CONSERVATIVE_RASTER (WinBoat): conservative rasterization on (1) or off (0), D3D 11.3's
++ * ConservativeRasterizationMode */
++#define VIRGL_SET_CONSERVATIVE_RASTER_SIZE 1
++#define VIRGL_SET_CONSERVATIVE_RASTER_MODE 1
++
+ #endif
+diff --git a/src/vrend/vrend_debug.c b/src/vrend/vrend_debug.c
+index 57cbaa4..dba2bc7 100644
+--- a/src/vrend/vrend_debug.c
++++ b/src/vrend/vrend_debug.c
+@@ -98,6 +98,7 @@ static const char *command_names[VIRGL_MAX_COMMANDS] = {
+    "CLEAR_SURFACE",
+    "GET_PIPE_RESOURCE_LAYOUT",
+    "SET_RASTER_SAMPLES",
++   "SET_CONSERVATIVE_RASTER",
+ };
+ 
+ static const char *object_type_names[VIRGL_MAX_OBJECTS] = {
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index f634c75..a4fc162 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1064,6 +1064,14 @@ static int vrend_decode_set_raster_samples(struct vrend_context *ctx, const uint
+    return 0;
+ }
+ 
++static int vrend_decode_set_conservative_raster(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
++{
++   if (length != VIRGL_SET_CONSERVATIVE_RASTER_SIZE)
++      return EINVAL;
++   vrend_set_conservative_raster(ctx, get_buf_entry(buf, VIRGL_SET_CONSERVATIVE_RASTER_MODE) != 0);
++   return 0;
++}
++
+ static int vrend_decode_resource_copy_region(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
+ {
+    struct pipe_box box;
+@@ -2040,6 +2048,7 @@ static const vrend_decode_callback decode_table[VIRGL_MAX_COMMANDS] = {
+ #endif
+    [VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT] = vrend_decode_get_pipe_resource_layout,
+    [VIRGL_CCMD_SET_RASTER_SAMPLES] = vrend_decode_set_raster_samples,
++   [VIRGL_CCMD_SET_CONSERVATIVE_RASTER] = vrend_decode_set_conservative_raster,
+ };
+ 
+ static void dump_command_stream_to_file(const void *buffer, size_t size)
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index b629581..2084689 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -234,6 +234,7 @@ enum features_id
+    feat_vs_viewport_index,
+    feat_raster_multisample,
+    feat_viewport_layer_array,
++   feat_conservative_raster,
+    feat_last,
+ };
+ 
+@@ -349,6 +350,7 @@ static const  struct {
+    FEAT(vs_viewport_index, UNAVAIL, UNAVAIL, "GL_AMD_vertex_shader_viewport_index"),
+    FEAT(raster_multisample, UNAVAIL, UNAVAIL, "GL_EXT_raster_multisample"),
+    FEAT(viewport_layer_array, UNAVAIL, UNAVAIL, "GL_ARB_shader_viewport_layer_array"),
++   FEAT(conservative_raster, UNAVAIL, UNAVAIL, "GL_NV_conservative_raster"),
+ };
+ 
+ struct global_renderer_state {
+@@ -812,6 +814,7 @@ struct vrend_sub_context {
+    struct vrend_streamout_object *current_so;
+    uint64_t so_captures;
+    unsigned raster_samples;   /* VIRGL_CCMD_SET_RASTER_SAMPLES, 0: the framebuffer's */
++   bool conservative_raster;  /* VIRGL_CCMD_SET_CONSERVATIVE_RASTER */
+ 
+    struct pipe_blend_color blend_color;
+ 
+@@ -6176,6 +6179,8 @@ int vrend_draw_vbo(struct vrend_context *ctx,
+       glEnable(GL_RASTER_MULTISAMPLE_EXT);
+       glRasterSamplesEXT(sub_ctx->raster_samples, GL_FALSE);
+    }
++   if (sub_ctx->conservative_raster)
++      glEnable(GL_CONSERVATIVE_RASTERIZATION_NV);
+ 
+    /* set the vertex state up now on a delay */
+    if (!info->indexed) {
+@@ -6250,6 +6255,8 @@ int vrend_draw_vbo(struct vrend_context *ctx,
+ 
+    if (sub_ctx->raster_samples)
+       glDisable(GL_RASTER_MULTISAMPLE_EXT);
++   if (sub_ctx->conservative_raster)
++      glDisable(GL_CONSERVATIVE_RASTERIZATION_NV);
+ 
+    if (info->primitive_restart) {
+       if (vrend_state.use_gles) {
+@@ -10549,6 +10556,14 @@ void vrend_set_raster_samples(struct vrend_context *ctx, unsigned samples)
+    ctx->sub->raster_samples = samples > 1 ? samples : 0;
+ }
+ 
++/* Conservative rasterization (GL_NV_conservative_raster), like the raster samples around the guest's draws only */
++void vrend_set_conservative_raster(struct vrend_context *ctx, bool enable)
++{
++   if (!has_feature(feat_conservative_raster))
++      return;
++   ctx->sub->conservative_raster = enable;
++}
++
+ void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples)
+ {
+    float min_sample_shading = (float)min_samples;
+@@ -13101,6 +13116,9 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+    if (has_feature(feat_raster_multisample))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_RASTER_SAMPLES;
+ 
++   if (has_feature(feat_conservative_raster))
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_CONSERVATIVE_RASTER;
++
+    if (has_feature(feat_pipeline_statistics_query))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY;
+ 
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index d6f582c..792e1c7 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -437,6 +437,7 @@ void vrend_set_clip_state(struct vrend_context *ctx, struct pipe_clip_state *ucp
+ void vrend_set_sample_mask(struct vrend_context *ctx, unsigned sample_mask);
+ void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples);
+ void vrend_set_raster_samples(struct vrend_context *ctx, unsigned samples);
++void vrend_set_conservative_raster(struct vrend_context *ctx, bool enable);
+ 
+ void vrend_set_constants(struct vrend_context *ctx,
+                          uint32_t shader,

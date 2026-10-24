@@ -14,10 +14,15 @@ if [ ! -f "$VKH/include/vulkan/vulkan.h" ]; then
     tar -xzf dist/vulkan-headers.tar.gz -C dist
     rm dist/vulkan-headers.tar.gz
 fi
+# DXTEST_AGILITY=<SDK version>: winboat-dxtest-agility(32).exe, Direct3D 12 from that Agility SDK's D3D12Core.dll in a
+# D3D12 folder beside them (not included)
+AGILITY=() SUFFIX=""
+[ -n "${DXTEST_AGILITY:-}" ] && AGILITY=(-DDXTEST_AGILITY="$DXTEST_AGILITY") SUFFIX=-agility
 for target in x86_64:winboat-dxtest i686:winboat-dxtest32; do
     arch="${target%%:*}" name="${target##*:}"
-    "$arch-w64-mingw32-g++" -std=c++17 -O2 -Wall -Wno-missing-field-initializers -Wno-cast-function-type \
+    name="${name/dxtest/dxtest$SUFFIX}"
+    "$arch-w64-mingw32-g++" "${AGILITY[@]}" -std=c++17 -O2 -Wall -Wno-missing-field-initializers -Wno-cast-function-type \
         -Wno-unused-function -Wno-unused-variable -I "$VKH/include" -static dxtest.cpp -o "dist/$name.exe" \
-        -ld3d9 -ld3d10 -ld3d11 -ldxgi -ld2d1 -ldwrite -ldxva2 -lgdi32 -luser32 -lole32 -lshell32 -lopengl32
+        -ld3d9 -ld3d10 -ld3d11 -ldxgi -ld2d1 -ldwrite -ldxva2 -lgdi32 -luser32 -lole32 -loleaut32 -lshell32 -lopengl32 -lmfuuid -lstrmiids -lwmcodecdspuuid
     echo "Built $(pwd)/dist/$name.exe"
 done

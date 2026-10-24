@@ -1,0 +1,111 @@
+From: WinBoat
+Subject: [PATCH] vrend: sampler reduction modes, minimum and maximum
+
+Direct3D 11.2's min/max filtering (D3D11_FILTER_MINIMUM_* and MAXIMUM_*: the filter's taps reduced to their minimum
+or maximum instead of weighted, for tiled resources' residency maps and depth pyramids). GL has it as
+ARB_texture_filter_minmax (GL_TEXTURE_REDUCTION_MODE_ARB). The sampler state's S0 takes it in bits 26-27 (0 weighted
+average, 1 minimum, 2 maximum), set on the sampler objects and the textures' own parameters; the host announces it
+with VIRGL_CAP_V2_SAMPLER_REDUCTION (bit 25).
+---
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+index 1b5bb39..8bf2bf2 100644
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -325,6 +325,7 @@ struct pipe_sampler_state
+    unsigned compare_func:3;      /**< PIPE_FUNC_x */
+    unsigned max_anisotropy:5;
+    unsigned seamless_cube_map:1;
++   unsigned reduction_mode:2;    /**< WinBoat: 0 weighted average, 1 minimum, 2 maximum */
+    unsigned pad:9;               /**< take bits from this for new members */
+    float lod_bias;               /**< LOD/lambda bias */
+    float min_lod, max_lod;       /**< LOD clamp range, after bias */
+diff --git a/src/virgl_hw.h b/src/virgl_hw.h
+index 3b7f2ef..e5ce27a 100644
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -643,6 +643,9 @@ enum virgl_formats {
+ /* WinBoat: D3D tiled resources - sparse textures and buffers (VIRGL_BIND_SPARSE) whose pages VIRGL_CCMD_TILE_MAP binds
+  * to tile pools (VIRGL_BIND_TILE_POOL); page shapes are D3D's standard tile shapes */
+ #define VIRGL_CAP_V2_TILED                (1u << 26)
++/* WinBoat: samplers' reduction mode, minimum or maximum (VIRGL_OBJ_SAMPLE_STATE_S0_REDUCTION_MODE,
++ * ARB_texture_filter_minmax) */
++#define VIRGL_CAP_V2_SAMPLER_REDUCTION    (1u << 25)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+diff --git a/src/virgl_protocol.h b/src/virgl_protocol.h
+index 2228e5c..5676df2 100644
+--- a/src/virgl_protocol.h
++++ b/src/virgl_protocol.h
+@@ -403,6 +403,8 @@ enum virgl_context_cmd {
+ #define VIRGL_OBJ_SAMPLE_STATE_S0_COMPARE_MODE(x) (((x) & 0x1) << 15)
+ #define VIRGL_OBJ_SAMPLE_STATE_S0_COMPARE_FUNC(x) (((x) & 0x7) << 16)
+ #define VIRGL_OBJ_SAMPLE_STATE_S0_SEAMLESS_CUBE_MAP(x) (((x) & 0x1) << 19)
++/* WinBoat (VIRGL_CAP_V2_SAMPLER_REDUCTION): 0 weighted average, 1 minimum, 2 maximum (D3D 11.2's min/max filtering) */
++#define VIRGL_OBJ_SAMPLE_STATE_S0_REDUCTION_MODE(x) (((x) & 0x3) << 26)
+ #define VIRGL_OBJ_SAMPLE_STATE_S0_MAX_ANISOTROPY(x) (((x & 0x1f)) << 20) /* Used to be 6 bits wide */
+ 
+ #define VIRGL_OBJ_SAMPLER_STATE_LOD_BIAS 3
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index 4b85623..91f607c 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -751,6 +751,7 @@ static int vrend_decode_create_sampler_state(struct vrend_context *ctx, const ui
+    state.compare_func = (tmp >> 16) & 0x7;
+    state.seamless_cube_map = (tmp >> 19) & 0x1;
+    state.max_anisotropy = (tmp >> 20) & 0x1f;
++   state.reduction_mode = (tmp >> 26) & 0x3;
+ 
+    state.lod_bias = uif(get_buf_entry(buf, VIRGL_OBJ_SAMPLER_STATE_LOD_BIAS));
+    state.min_lod = uif(get_buf_entry(buf, VIRGL_OBJ_SAMPLER_STATE_MIN_LOD));
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 1519d9e..8bd9406 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -239,6 +239,7 @@ enum features_id
+    feat_sparse_texture2,
+    feat_sparse_buffer,
+    feat_memory_object_sparse,
++   feat_texture_filter_minmax,
+    feat_last,
+ };
+ 
+@@ -359,6 +360,7 @@ static const  struct {
+    FEAT(sparse_texture2, UNAVAIL, UNAVAIL, "GL_ARB_sparse_texture2"),
+    FEAT(sparse_buffer, UNAVAIL, UNAVAIL, "GL_ARB_sparse_buffer"),
+    FEAT(memory_object_sparse, UNAVAIL, UNAVAIL, "GL_NV_memory_object_sparse"),
++   FEAT(texture_filter_minmax, UNAVAIL, UNAVAIL, "GL_ARB_texture_filter_minmax", "GL_EXT_texture_filter_minmax"),
+ };
+ 
+ struct global_renderer_state {
+@@ -2664,6 +2666,10 @@ int vrend_create_sampler_state(struct vrend_context *ctx,
+          }
+ 
+          apply_sampler_border_color(state->ids[i], templ->border_color.ui);
++         if (has_feature(feat_texture_filter_minmax))
++            glSamplerParameteri(state->ids[i], GL_TEXTURE_REDUCTION_MODE_ARB,
++                                templ->reduction_mode == 1 ? GL_MIN : templ->reduction_mode == 2 ? GL_MAX
++                                                                                                  : GL_WEIGHTED_AVERAGE_ARB);
+          if (has_feature(feat_texture_srgb_decode))
+             glSamplerParameteri(state->ids[i], GL_TEXTURE_SRGB_DECODE_EXT,
+                                 i == 0 ? GL_SKIP_DECODE_EXT : GL_DECODE_EXT);
+@@ -7251,6 +7257,9 @@ static void vrend_apply_sampler_state(struct vrend_sub_context *sub_ctx,
+       glTexParameteri(target, GL_TEXTURE_COMPARE_FUNC, GL_NEVER + state->compare_func);
+    if (has_feature(feat_anisotropic_filter) && (tex->state.max_anisotropy != state->max_anisotropy || set_all))
+       glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY, state->max_anisotropy);
++   if (has_feature(feat_texture_filter_minmax) && (tex->state.reduction_mode != state->reduction_mode || set_all))
++      glTexParameteri(target, GL_TEXTURE_REDUCTION_MODE_ARB,
++                      state->reduction_mode == 1 ? GL_MIN : state->reduction_mode == 2 ? GL_MAX : GL_WEIGHTED_AVERAGE_ARB);
+ 
+    /*
+     * Oh this is a fun one. On GLES 2.0 all cubemap MUST NOT be seamless.
+@@ -13276,6 +13285,9 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+    if (vrend_tiled_supported())
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_TILED;
+ 
++   if (has_feature(feat_texture_filter_minmax))
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_SAMPLER_REDUCTION;
++
+    if (has_feature(feat_pipeline_statistics_query))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY;
+ 

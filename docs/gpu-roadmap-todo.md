@@ -26,9 +26,9 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done
 - [x] Feature level 11_1: UAVs in every stage, 64 UAV slots, target-independent rasterization and UAV-only
       rendering with a forced sample count (virglrenderer patch 0004, image 6.05-7), ClearView on UAVs; the
       desktop (DWM) runs at 11_1 fine
-- [x] Tiled resources (tier 1/2) and min/max filtering: not possible on the OpenGL route (D3D tile pools alias
-      memory between resources; GL sparse textures only commit driver-owned pages; D3D reports min/max filtering
-      with tier 2). Moved to stage C: Vulkan's sparse binding can do it.
+- [x] Tiled resources (tier 1/2) and min/max filtering: thought impossible on the OpenGL route (D3D tile pools alias
+      memory between resources; ARB_sparse_texture only commits driver-owned pages) - NV_memory_object_sparse binds
+      sparse pages to a memory object at offsets, which is D3D's tile pool exactly (done 2026-10-24, below)
 - [x] 11.3 options the host allows (2026-10-21, gpu.73: Mesa 0029, virglrenderer 0016, image 6.05-24). The D3D11
       runtime reads them from no driver below the WDDM 2.0 DDI, so d3d10umd now offers it (WINBOAT_D3D_WDDM2=0 leaves
       it out): the 2.0 table is the 1.3 one with longer arguments in seven places (views' plane slices, conservative
@@ -44,6 +44,53 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done
       protocol for them), standard swizzle. dx-test: 5 new 11.3 tests. Spike 663/0, user VM 661/0
       Found on the way: mesa patch 0028 (HEVC RExt) had been cut down to its last fix by a regeneration over
       itself; rebuilt in full (the series reproduces the spike tree again)
+- [x] Conservative rasterization (tier 1) and ROVs (2026-10-24, spike: Mesa 0037, virglrenderer 0019/0020, image
+      6.05-28). Conservative: the WDDM 2.0 rasterizer state's mode goes to gallium's conservative_raster_mode, virgl sends
+      VIRGL_CCMD_SET_CONSERVATIVE_RASTER (new command, cap bit 28) and the host turns GL_NV_conservative_raster on around
+      the guest's draws. ROVs: a pixel shader declaring one gets the TGSI property FS_INTERLOCK (cap bit 27); the host
+      renames its main and calls it between beginInvocationInterlockARB/endInvocationInterlockARB (they may be neither
+      in control flow nor after a return), GLSL 1.50 for the layout qualifier. The ROV UAVs must be coherent: without it
+      every invocation read stale values (the interlock orders, coherence makes the writes visible). Found on the way:
+      the UAV declarations' flags were decoded with DECODE_D3D11_SB_UAV_FLAGS (the counter bit only), so
+      globally-coherent never reached the shaders. dx-test: draws a sliver triangle per pixel (conservative only) and
+      64 instanced full-screen RMWs in order (ROV), both against WARP. Spike 694/0
+- [x] What's left of 11.2-11.4, and why (2026-10-24, probed): min/max filtering and ClearView on depth formats have no
+      DDI cap of their own - the runtime derives them from the tiled resources tier (reporting tier 1 turned on
+      ClearView on depth, tier 2 min/max filtering), so they come only with tiled resources (stage C's note above;
+      on this route it would need GL_NV_memory_object_sparse-style aliasing of tile pools). Shared NV12 textures
+      (11.4): the UMD's DDI version (done below: the WDDM 2.1 DDI). Not the driver's: stencil
+      reference from pixel shaders (NVIDIA's GL has no ARB_shader_stencil_export, and NVIDIA's D3D11 driver doesn't
+      offer it either) and standard swizzle (NVIDIA offers it nowhere): dx-test counts them as optional, not failures
+- [x] Tiled resources, tier 2, and min/max filtering (2026-10-24, spike: Mesa 0038, virglrenderer 0021-0023, image
+      6.05-29). The host's sparse pages are D3D's standard tile shapes (NVIDIA: 256x256 at 8 bits ... 64x64 at 128, BC1
+      512x256, checked at start); a tiled resource is sparse storage (ARB_sparse_texture2/sparse_buffer), a tile pool
+      device-local Vulkan memory GL imports, and VIRGL_CCMD_TILE_MAP binds pages into it (NV_memory_object_sparse's
+      TexturePageCommitmentMemNV: aliasing is real, no copies). The UMD (Tiled.cpp) keeps every tile's mapping, packs
+      mips below a tile (the host's mip tail, a tile a slice), grows pools in chunks; tiled textures transfer through
+      staging buffers, tiled buffers and pools take GPU copies only. Found: virgl skipped the readback of textures it
+      thought clean - an aliased tile changes behind it, so sparse ones always read back. Tier 2: unmapped tiles read
+      0; the feedback instructions (sample/gather/ld *_s, check_access_fully_mapped) and sample_*_cl through a TGSI
+      SPARSE before the texture instruction (the host emits the lookup's Clamp form and the same lookup's sparse form
+      for the residency); min/max filtering (sampler S0 bits 26-27 -> GL_TEXTURE_REDUCTION_MODE_ARB; MAXIMUM_* filters
+      had been taken for comparison ones by their 0x80 bit). With tier 1 the runtime adds ClearView on depth-only
+      formats (DSV clears in rectangles). dx-test: 7 new tests (mappings/aliasing/rendering, CopyTileMappings and
+      CopyTiles and tiled buffers, packed mips, min/max, residency and unmapped reads, LOD clamp, ClearView on depth),
+      against WARP. Spike 711/0. Left of 11.2-11.4: stencil reference and standard swizzle (NVIDIA has neither), shared
+      NV12 (next entry)
+- [x] Shared NV12 textures, 11.4's ExtendedNV12SharedTextureSupported (2026-10-24, spike: Mesa 0040, kvm 0032). Not
+      WDDM 2.4 as thought: d3d11.dll's CheckFeatureSupport (OPTIONS4) reads the negotiated DDI version (>= 5, which
+      the WDDM 2.1 DDI is; found with cdb on CDevice+0x41c), the kernel driver's WDDM version plays no part. The UMD
+      offers D3DWDDM2_1 (2.0's device table plus the sync token entries, DXGI 1.5's base table, and the video table the
+      runtime asks for under sub-ID 5 - the regression caught its absence: no D3D11 video device at all). The sharing itself:
+      the UMD makes NV12/P010 of two host textures, and a shared resource is the allocations made with it in one call,
+      so the opener found the luma plane only. The luma plane's allocation of a shared NV12/P010 texture now also makes
+      the chroma plane (kernel-only flag VIOGPU_RESOURCE_FLAG_CHROMA_PLANE; attached to every context with the
+      allocation, destroyed with it; VIOGPU_RES_INFO returns its id), and OpenResource rebuilds the surface from both.
+      dx-test: "NV12 textures shared between devices", legacy and NT handles, both planes compared. One slice: the
+      D3D11 runtime refuses shared NV12 arrays itself (E_INVALIDARG before the driver sees them; WARP the same).
+      Decoder output (Mesa 0041): shared ones get the shared planes too and decode into a codec buffer per slice,
+      copied into the planes after each frame (as AYUV output is); dx-test "H.264 (AVC) decoding into a shared
+      texture" reads the frame on another device
 - [x] Optional formats: B4G4R4A4 (11.1) added. Left: R32G32B32_FLOAT sampling/rendering, BGRA8 typed UAVs
       (GL images have no BGRA formats) — niche
 - [x] Direct2D test group in dx-test (`d2d`, `d2d-32`: 16 scenes compared with WARP; mismatches saved as BMPs)
@@ -127,7 +174,7 @@ Asked for on 2026-10-14: D3D9 and D3D10 must be full implementations, not just p
       of its own, FIFO/MAILBOX paced by DwmFlush, IMMEDIATE and MAILBOX offered; Venus skips its queue-idle wait
       before presents on Windows. 1200x781: 63 -> 1093 fps (IMMEDIATE), FIFO at 60 Hz; resize with queued frames OK
       Deployed as gpu.39 (driver 100.6.101.59284): user VM 514 passed, 1 failed (no D3D12)
-- [ ] Zero-copy present (later, if large windows need it): the CPU path costs ~1 ms per megapixel on the present
+- [x] Zero-copy present (2026-10-23, gpu.83: Mesa 0035, mesa-venus 0009; see the performance section). Before: the CPU path cost ~1 ms per megapixel on the present
       thread. Measured 2026-10-21 (spike, deploy/tools/src/vkpresentbench.cpp, IMMEDIATE): 1621/912/568 fps at
       720p/1080p/1440p, vkQueuePresentKHR 0.54/1.01/1.68 ms (D3D11 ~2400 fps, 0.25 ms flat): ~0.45 ms per
       megapixel, ~5 ms at 5120x2065 (a ~200 fps ceiling and a CPU core; latency, not frame rate, below that).
@@ -448,7 +495,12 @@ driver. What they call, and what a virtual GPU can offer:
       driver now loads viogpu_vk.dll directly (no other drivers or layers in D3D12 programs); (2) creating a
       pipeline library failed, which the runtime takes as a driver error and removes the device (OpenCLOn12, and
       every engine with a PSO cache) - pass-through libraries now. dx-test group `opencl` (saxpy over 1M floats)
-      and a pipeline library test in the D3D12 group
+      and a pipeline library test in the D3D12 group. Windows 10 (2026-10-24): the pack alone isn't enough there -
+      Windows 10 has no OpenCL.dll (Windows 11 has the ICD loader); Khronos' loader (OpenCL-SDK release, which finds the
+      pack's OpenCLOn12 by its package family) and the VC++ 2015-2022 runtime it needs make it work: 3/3. Shipped since
+      gpu.87: tools/opencl-loader builds the loader with MinGW (static runtime: only Windows 10's own UCRT), the
+      driver payload carries it (drivers/opencl) and gpu-driver.ps1 puts it in System32/SysWOW64 where Windows has no
+      OpenCL.dll (never over Windows 11's or a vendor's; removed on uninstall only if it put it there)
 - [x] Video decoding on the host GPU (2026-10-16, spike, image 6.05-10): virgl's gallium video (host VA-API,
       nvidia-vaapi-driver on NVDEC; neither Mesa 26's nor virglrenderer 1.3.0's Venus protocol has Vulkan Video).
       Host fixes found by decoding for real (none of it had ever worked on NVIDIA):
@@ -651,6 +703,19 @@ driver. What they call, and what a virtual GPU can offer:
       user VM 586/0, and Topaz Video AI's bundled ffmpeg encodes hevc_d3d12va there (1080p 5x, 48.5 dB). Topaz's UI
       has no D3D12 encoder entry (see Topaz above); D3D12 video decoding followed (below)
 - [ ] Tests: ffmpeg (decode, encode, filters per route), DirectML samples, Topaz Video AI (trial)
+- [x] A full video test in dx-test (2026-10-24, group `video-full`, its own row in the GPU check too): the key frames the
+      `video` group decodes through D3D11 also through DXVA2 (D3D9) and Direct3D 12 (H.264, HEVC, VP9, AV1: identical to
+      libavcodec's pictures); Media Foundation's H.264 decoder on the GPU (DXVA through a D3D11 device manager) on a
+      stream with P and B frames from Microsoft's software encoder (every frame identical to the same decoder on the
+      CPU); the Media Foundation hardware encoders (ours: H.264, HEVC) and Direct3D 12 encoding (H.264 High, HEVC Main;
+      IDR then P frames, the program's own parameter sets) decoded again and compared with the source (PSNR; HEVC
+      through Microsoft's HEVC Video Extensions, else checked as a bitstream). DXTEST_VIDEO_DUMP=1 saves the streams.
+      Spike: 13 passed, AV1 encoding optional (Ampere has none). It found two D3D12 encoding bugs (vkd3d-proton 0018):
+      the resolved metadata only reached CPU-mappable buffers (ffmpeg's readback one): a default-heap one, as the spec
+      has it, got 0 bytes per frame - copied through a copy queue now; and NVIDIA forces SAO on as well as AMP, which
+      the override probe took for AMP only: a program leaving SAO off got slices its headers didn't describe. The
+      encoder's SPS is parsed now; SAO is offered and setups without it refused where it's forced (D3D12 has no "SAO
+      required"). ffmpeg's d3d12va encoders unchanged (venc-test: H.264 42 dB, HEVC 48.5, Main 10 47.5)
 
 ## F. CUDA and NVENC forwarding (NVIDIA hosts only; go on 2026-10-16, skipped 2026-10-17)
 
@@ -692,8 +757,11 @@ and games take their fallbacks (or refuse) the way they do on a real GPU of that
       CONTEXT_INIT; else virgl's capsets get a plain context and Venus' is refused). Then: D3D9/10/11 pass,
       D3D12CreateDevice returns DXGI_ERROR_UNSUPPORTED (the D3D12 driver now says so for any vkd3d-proton device
       failure), Vulkan has no device - what a vendor driver of a GPU without D3D12/Vulkan reports
-- [ ] A real older-GPU host (GL 3.3 / Vulkan 1.2, e.g. an Intel HD 4000 machine): when one is around; the
-      software-host idea (llvmpipe with a capped GL version) needs vhost-user-gpu without a render node
+- [x] Software hosts (2026-10-24, gpu.93): stock QEMU with the GPU hidden (plain-qemu.sh PLAIN_SOFT=1: llvmpipe, GL
+      4.6 without NVIDIA's extensions, no Vulkan) and as an older GPU (PLAIN_GL=3.3: 2010's extensions): 504/6 and
+      502/6 after two fixes (Mesa 0044 dual-source blend reset, 0045 nine's video memory); the 6 are no D3D12/Vulkan/
+      OpenCL without Vulkan and one llvmpipe precision case
+- [ ] A real AMD or Intel host (radeonsi/RADV, iris/ANV), and a real older GPU (GL 3.3 / Vulkan 1.2): when one is around
 
 ## H. Any GTX/RTX host, and what newer cards add (asked 2026-10-16; newer cards when an RTX 5080 is around)
 
@@ -858,19 +926,112 @@ compute, DirectML), video (DXVA2/D3D11/D3D12 video, Media Foundation), OpenCL. B
       console in virt-manager (KDE Wayland, NVIDIA), so QEMU renders (egl-headless) and SPICE sends frames; Windows 7
       gets a USB 2 controller (no xHCI driver: no tablet). The setup's welcome page is short now, the rest on a
       scrolling "Before you install" page (build.sh writes it for the Windows versions the setup carries)
+- [x] Draw-call throughput (2026-10-23, gpu.82: Mesa 0034, virglrenderer 0018, image 6.05-26). tools/gpu-bench's
+      gpubench (draws three ways, fill rate, upload/readback, compute, presents; presentbench/vkpresentbench beside it;
+      deploy/tools/spike-bench.sh) found D3D11 draws at 381 thousand/s with no state change, and a constant buffer
+      mapped WRITE_DISCARD per draw (most games) at 134 thousand/s, slower than WARP. Two causes: (1) virgl reallocated a
+      busy discarded buffer, a kernel allocation and a host resource per draw on Windows: buffers up to 64 KB take its
+      staging path now (Mesa 0034); (2) the host: a perf profile of vhost-user-gpu (deploy/tools/host-profile.sh, as
+      root) put 75% of its time in NVIDIA's GL driver and 4% in virglrenderer, and a test on the host (headless EGL)
+      showed why: glUseProgram and glBindProgramPipeline of what's already bound cost ~1 us each on NVIDIA (a draw
+      0.04 us), and vrend did both for every draw; each sub context now remembers its binding (virglrenderer 0018).
+      Spike, thousand draws/s: no state change 381 -> 1407, UpdateSubresource each 281 -> 667, Map WRITE_DISCARD each
+      134 -> 686; OpenGL 393 -> 1147. dx-test 675/0, video 96 ok. Left: the kernel round trip of a submission
+      (D3DKMTRender ~170-600 us when the host keeps up) and Vulkan presents through the CPU (~1 ms at 1080p)
+- [x] Vulkan presents on the GPU (2026-10-23, gpu.83: Mesa 0035, mesa-venus 0009; no host change, virglrenderer
+      0012/0017 had it). Venus' Win32 WSI read each frame back and drew it with StretchDIBits (~0.45 ms per megapixel).
+      Now each swapchain image gets a shared D3D11 RGBA8 texture whose host storage is Vulkan memory (virgl
+      VIRGL_BIND_VK_SHARED when the host has VIRGL_CAP_V2_VK_SHARED), imported into Venus by its host resource id (the
+      KMD's VIOGPU_RES_INFO escape, VkImportMemoryResourceInfoMESA); the present blits the app's image into it
+      (vkCmdBlitImage, BGRA -> RGBA) and the present thread copies it into a flip-discard DXGI swap chain and presents
+      (FIFO interval 1, IMMEDIATE with tearing). Spike, vkpresentbench: 1080p 0.98 -> 0.41 ms (942 -> 1987 fps), 1440p
+      1.58 -> 0.44 ms (599 -> 1905 fps). Colors checked on the desktop (UNORM 255,127,0, SRGB 255,188,0, as the CPU
+      path), a swapchain recreated at half the size (VKPB_RESIZE) presents right. Any failure falls back to the CPU
+      path per surface; WINBOAT_VK_PRESENT=copy forces it. Vulkan isn't in the 7/8.1 packages, so Windows 10/11 only.
+      Regression: video 96 ok, dx-test 675 passed, 1 failed (the known intermittent OpenGL 0xC000041D, 32-bit; the
+      OpenGL groups 5/5 clean on rerun)
+- [x] Submission cost (2026-10-23, gpu.84: kvm 0030, QEMU 0011, image 6.05-27). A D3D11 flush cost ~300 us
+      (gpubench GB_DRAWS_PER_FLUSH=1: 3.3 thousand/s); timed in the winsys (temporary): D3DKMTRender 190 us of it, the
+      UMD 3-8 us between; a NOP-only DMA buffer (no host) 14 us, an empty virgl submission 215 us back to back and 324 us
+      waited for. Two causes: (1) the KMD sent a DMA buffer only once the one before was done on the host
+      (VIOGPU_MAX_RUNNING 1): the 3D node now has up to 8 in flight once each was fully sent, completions reported in
+      order, long lists still not stacked (kvm 0030); (2) vhost-user-gpu made virglrenderer's context 0 current before
+      every command, so each submission cost two eglMakeCurrent (a flush each on NVIDIA; vhost-user-gpu's thread ~120
+      us CPU per empty submission): submissions skip it now (QEMU 0011; transfers and resource commands keep it).
+      Empty submission 215 -> 139 us, host thread ~73 us CPU each. D3D11 thousand draws/s at 1/10/100 draws per flush:
+      3.3/31.7/270 -> 6.0/62.7/479. Left: the fence per submission (glFenceSync + glFlush, the sync thread's wake) and
+      the virtio round trip; fences can't be shared across submissions of different GL contexts
+- [x] Windows 10 pass (2026-10-24, gpu.84 package 58906 from the new setup, a fresh 22H2 by dockur; win10/compose-gpu.yml
+      runs it on WinBoat's image 6.05-27). Setup /S, restart, driver up. dx-test 652/0 (28 optional missing, 4 skipped);
+      GPU check window 340/0. What's missing beyond Windows 11 is Windows 10's: (1) Direct3D 12's newer features (FL
+      12_2, SM 6.8, enhanced barriers, EI 1.1, relaxed casting, UAV-only MSAA, 4096 sampler heaps) - not in its own
+      D3D12 runtime; dx-test built against the Agility SDK (DXTEST_AGILITY=619, 1.619.6's D3D12Core.dll in .\D3D12\)
+      gets all 92/92 there, so programs that bring it have them; dx-test now says so on those lines (Windows 10 build
+      < 22000, not the Agility build); (2) OpenCL: no runtime until Microsoft's compatibility pack (as on 11);
+      (3) Direct3D 12 video (ffmpeg d3d12va decode and encode): QueryInterface(ID3D12VideoDevice) fails - our UMD
+      offers the video DDI 0083/0094, Windows 10's runtime is older (0060s); D3D11/DXVA2 decode 19/19 + VC-1 14/14 +
+      HEVC RExt 8/8 and Vulkan decode 19/19, Vulkan encode 2/2 work. Not done: an older video DDI for a decode route
+      players don't use on 10. Benchmarks: 1.92 M draws/s, Present 5065 fps, Vulkan present 0.30 ms, GL 1.25 M draws/s.
+      Stock host (plain QEMU 11.1, virglrenderer 1.3.0): 609/4 as before (the ExecuteIndirect state changes)
+- [x] Windows 8.1 pass (2026-10-24, the 58906 setup's 8.1 package on a fresh 8.1 Enterprise eval, plain QEMU = the stock
+      host, the standalone route; WinBoat itself installs 10/11). Setup /S exit 0, driver up after a restart. dx-test
+      476 passed / 4 failed, as on 2026-10-22 (all 8.1's WARP: 11.1 doubles 64/32, CalculateLevelOfDetail,
+      structured buffers in vertex shaders). dx-test outside the setup's folder needs the Universal CRT beside it (the
+      64-bit DLLs) and the 32-bit exe in 32\ with the 32-bit ones (else 0xC0000135 / 0xC000007B). gpubench: 306 k
+      draws/s, Present 2896 fps (stock host: without QEMU 0011/virglrenderer 0018). OpenGL 4.2 there is the stock
+      host's virglrenderer (Windows 10 on plain QEMU: 4.2 too; on WinBoat's image 4.6), not the Windows version
 - [ ] The 3D driver on a device whose host has no working 3D (2026-10-23): under libvirt with Venus and QEMU's
       seccomp sandbox on, virglrenderer fails to start ("virgl could not be initialized") and Windows 11 with the
       driver installed never finished booting (no SSH). It should fall back (the 2D driver's way, or a clear device
       error) rather than hang
-- [ ] Windows 7 left: (a) feature levels 10_1/11_0: d3d10umd offers no 10.1/11.0 DDI (SUPPORT_D3D10_1/SUPPORT_D3D11 0
-      in State.h; 7's runtime knows nothing newer); (b) windowed D3D9 presents (Basic theme) never reach the screen:
-      the present blits the back buffer to the primary at the window and the scanout is flushed, yet nothing shows
-      (a virgl blit instead of the copy changes nothing; GetPixel reads the right color, from somewhere other than
-      the primary; with DWM running too, the 7 VM's GPU check of 2026-10-23). Likely CDD's CPU path: it writes the primary's CPU view, which is now the primary segment's
-      memory rather than the primary's backing (before: RAM at 0); copying that segment's content to the scanout, or
-      backing primaries by it, would show it; (c) an intermittent hang in whole-suite runs (a test process stuck in
-      the kernel, not seen with tracing or a group alone; maybe the same views at 0, to be seen again);
-      (d) OpenGL 4.2 rather than 4.6; (e) docs/standalone-install.md for 7
+- [x] Windows 7 left (2026-10-24, package 59083 on a fresh 7 Ultimate SP1, stock host): (a) feature levels 10_1/11_0:
+      the adapter offers 7 the 10.1 and 11.0 DDIs (Mesa 0036: the 11.0 table from the 11.1 one, 25 entries adapted;
+      11_1 not reported there) - a D3D11 program gets 11_0, the GPU check with KB2670838 (WARP at 11_x as the
+      reference, DXGI 1.2) 212 passed / 1 failed (was 93/7): rendering, compute, tessellation at 11_0, D3D10.1 at 10_1;
+      (b) windowed presents: they did reach the screen (a test window showed them) - what failed was the GPU check:
+      a "64x64" window is wider (WS_OVERLAPPEDWINDOW's minimum), DXGI stretched the swap chain in the kernel present,
+      and the KMD copied at the destination's size, past the source's edge (dropped by the host): scaled presents are
+      a VIRGL_CCMD_BLIT now (kvm 0031); dx-test reads the screen's pixel before 8.1 (PrintWindow has no
+      PW_RENDERFULLCONTENT there, DWM or not) and takes ClearView as optional where D3D11_OPTIONS says the driver has
+      none (the 11.1 runtime over an 11.0 driver); (c) the intermittent hang: not seen in this pass; (d) OpenGL 4.2: the
+      stock host's, on every Windows (4.6 on WinBoat's image); (e) standalone-install.md updated. Left: GDI drawing
+      into a Direct2D target (GetDC) is lost on 7 (the GPU check's 1 failure; 7's WARP draws it white). Test VM notes:
+      wusa refuses over SSH (exit 5): expand the .msu and dism /online /add-package the .cab
+- [x] gpu.85 (2026-10-24, driver 59083: kvm 0030/0031, Mesa 0035/0036; image 6.05-27 unchanged): spike 675/0, video 96
+      ok; user VM GPU check 351/0. The setup 59083 on 8.1 476/4 as before. Found there: an update over a running
+      viogpuap.exe failed ("being used by another process": Stop-Process doesn't wait) - gpu-driver.ps1 now kills the
+      helper and waits for it before copying (setup over a running helper: exit 0)
+- [x] gpu.90-93 (2026-10-24, driver 58789: kvm 0033, Mesa 0042-0045; image 6.05-29 unchanged; the setup in dist/):
+      games/apps review (docs/games-and-apps.md) and every report rerun with it. kvm 0033: Windows 11's local segment
+      is the GPU memory limit (8 GB) instead of the 4 GB window - Topaz Video AI shows VRAM 8 GB, picks onnx16
+      (DirectML), 9.7 s vs 34.8 s on the CPU. Windows 10 still reports none (Topaz there: OpenVINO on the CPU): its
+      video memory manager bugchecks at driver start with the local segment, the page tables in the aperture segment
+      too (tried; the test VM went to recovery, repaired by booting without virtio-gpu). Mesa 0042: DXVA2's decoder
+      list may be empty (no error). Mesa 0043: no NV12/P010 on Windows 7 (its runtime refuses them). Mesa 0044: the
+      host's stale dual-source blend functions reset (Mesa GL hosts refused later multi-target draws and the context
+      died: 45 of 54 failures on a llvmpipe host). Mesa 0045: nine counts 4 GB when the host reports no video memory
+      (no D3D9 device at all on an older-GPU host). MFT: not made without a host encoder (programs take the next one).
+      dx-test: 64-bit atomics (SM 6.6, UE5's Nanite), H.264 decoding into a shared texture; stock-host video and
+      Windows 7 NV12 cases optional. Results (reports/README.md): user VM 385/0, spike 719/0, Win10 691/0, Win10 stock
+      617/4, 8.1 476/4, 7 438/5 (GPU check 212/1), llvmpipe host 504/6, older-GPU host 502/6. Tools: plain-qemu.sh
+      PLAIN_SOFT=1 [PLAIN_GL=3.3] (bubblewrap hides /dev/dri, SDL offscreen GL, no VNC), deploy/tools/testvm-rerun.sh
+      (each test VM: setup, full dx-test, Topaz, reports), deploy/tz-vm.ps1, uservm-topaz.ps1
+- [x] gpu.89 (2026-10-24, driver 58496: Mesa 0041; image 6.05-29 unchanged): shared NV12 decoder output (decoded into
+      a codec buffer, copied into the shared planes). Spike 717/0 (the new "H.264 (AVC) decoding into a shared texture"),
+      user VM GPU check 384/0. Setup 58496 built (8.1 and 7 parts too). Shared NV12 arrays: refused by the D3D11 runtime
+      itself (WARP too), nothing for the driver to do
+- [x] gpu.88 (2026-10-24, driver 58381: Mesa 0040, kvm 0032; image 6.05-29 unchanged): the WDDM 2.1 DDI and shared
+      NV12 textures. Spike 716/0 (the two sharing tests; 11.4's shared NV12 no longer missing), ffmpeg/video cases as
+      before; user VM GPU check 383/0. Setup 58381 built (8.1 and 7 parts too; their runtimes stay on older DDIs)
+- [x] gpu.87 (2026-10-24, driver 58247: Mesa 0038/0039; image 6.05-29: virglrenderer 0021-0023; the OpenCL loader for
+      Windows 10): spike 711/0, video unchanged (the 51 cases); Windows 10 test VM (setup 58247 on image 6.05-29) 685/0,
+      the loader installed by the setup, OpenCL 3/3; user VM GPU check 380/0. Found on the way: an intermittent crash
+      at the end of OpenGL programs (0xC000041D, about one run in five on Windows 10: dx-test now notes a test process's
+      serious exceptions, and named viogpu_wgl.dll+0x272f) - the DXGI framebuffer returned a new swapchain texture
+      without the caller's reference, so it was released twice (Mesa 0039); 0 of 20 runs since, on 11 and 10
+- [x] gpu.86 (2026-10-24, driver 58113: Mesa 0037, vkd3d-proton 0018; image 6.05-28: virglrenderer 0019/0020): spike
+      694/0 (the new render and video tests), video 96 ok; user VM GPU check 370/0 (the video-full row in it). Setup
+      58113 built (8.1 and 7 parts too)
 - [x] Installer for any QEMU VM with virtio-gpu 3D, Windows 10/11 x64 (2026-10-16): an NSIS setup .exe built on
       Linux in a container (tools/standalone-installer/build.sh), installing the same layout as WinBoat's payload and
       running gpu-driver.ps1 (per-VM signing, test mode, RDP GPU policy, SPICE agent and resolution helper, GPU

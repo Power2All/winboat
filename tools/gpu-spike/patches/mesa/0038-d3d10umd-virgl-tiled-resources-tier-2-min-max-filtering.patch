@@ -1,0 +1,1261 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd, virgl: tiled resources (tier 2), min/max filtering
+
+Direct3D 11.2's tiled resources on the host's sparse storage (WinBoat's virglrenderer 0021-0023):
+- Tiled.cpp: MISC_TILED resources are sparse (PIPE_RESOURCE_FLAG_SPARSE: virgl's VIRGL_BIND_SPARSE), MISC_TILE_POOL
+  ones memory only (PIPE_RESOURCE_FLAG_TILE_POOL: VIRGL_BIND_TILE_POOL), in chunks so ResizeTilePool keeps the tiles
+  it had. Tiles have D3D's standard shapes (the host's sparse pages have them); mips smaller than a tile in either
+  dimension are packed (the host's mip tail), one tile per slice. UpdateTileMappings, CopyTileMappings (every tile's
+  mapping is kept), CopyTiles, UpdateTiles, TiledResourceBarrier, GetMipPacking, ResizeTilePool, the TILED format
+  support, single-sampled tiled quality levels. A new pipe_context hook, tile_map, binds a region to a pool's memory
+  at an offset (virgl: VIRGL_CCMD_TILE_MAP). Tiled textures transfer through staging buffers; tiled buffers and pools
+  have no guest storage (GPU copies; UpdateSubresource on a tiled buffer through a staging buffer). virgl reads a
+  sparse resource back on every map: an aliased tile changes behind it.
+- Tier 2: unmapped tiles read 0 (the host's sparse_texture2); the feedback variants of sample/gather/ld and
+  check_access_fully_mapped (ShaderTGSI.c's translate_feedback: the base instruction with a TGSI SPARSE before its
+  texture instruction, which the host turns into the lookup's residency and LOD clamp; the status 1 or 0); min/max
+  filtering (the sampler filter's reduction type, bits 7-8, as gallium's reduction_mode: virgl's sampler S0 bits
+  26-27 where the host takes them; MAXIMUM_* filters were taken for comparison ones before, by their 0x80 bit).
+- With tier 1 the runtime gives ClearView on depth-only formats: ClearView on depth-stencil views clears the depth.
+D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 reports tier 1 where the host announces VIRGL_CAP_V2_TILED, tier 2 with
+VIRGL_CAP_V2_SAMPLER_REDUCTION and VIRGL_CAP_V2_SPARSE_FEEDBACK too.
+---
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_info_opcodes.h b/src/gallium/auxiliary/tgsi/tgsi_info_opcodes.h
+index 99ee14d..4123f4b 100644
+--- a/src/gallium/auxiliary/tgsi/tgsi_info_opcodes.h
++++ b/src/gallium/auxiliary/tgsi/tgsi_info_opcodes.h
+@@ -252,3 +252,4 @@ OPCODE(1, 2, COMP, DDIV)
+ OPCODE(1, 3, OTHR, LOD)
+ OPCODE(1, 3, OTHR, ATOMINC_WRAP, .is_store = 1)
+ OPCODE(1, 3, OTHR, ATOMDEC_WRAP, .is_store = 1)
++OPCODE(1, 1, OTHR, SPARSE)
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+index 59bceac..31fae0c 100644
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -471,6 +471,14 @@ static void *virgl_create_rasterizer_state(struct pipe_context *ctx,
+    return (void *)vrs;
+ }
+ 
++/* WinBoat: D3D tiled resources' tile mappings (VIRGL_CCMD_TILE_MAP), in the command stream's order */
++static void virgl_tile_map(struct pipe_context *ctx, struct pipe_resource *res, unsigned level,
++                           const struct pipe_box *box, struct pipe_resource *pool, uint64_t offset)
++{
++   struct virgl_context *vctx = virgl_context(ctx);
++   virgl_encode_tile_map(vctx, virgl_resource(res), level, box, pool ? virgl_resource(pool) : NULL, offset);
++}
++
+ static void virgl_bind_rasterizer_state(struct pipe_context *ctx,
+                                                 void *rs_state)
+ {
+@@ -1830,6 +1838,9 @@ struct pipe_context *virgl_context_create(struct pipe_screen *pscreen,
+    if (rs->caps.caps.v2.host_feature_check_version >= 7)
+       vctx->base.link_shader = virgl_link_shader;
+ 
++   if (rs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_TILED)
++      vctx->base.tile_map = virgl_tile_map;
++
+    virgl_init_context_resource_functions(&vctx->base);
+    virgl_init_query_functions(vctx);
+    virgl_init_so_functions(vctx);
+diff --git a/src/gallium/drivers/virgl/virgl_encode.c b/src/gallium/drivers/virgl/virgl_encode.c
+index 760b873..8a5af65 100644
+--- a/src/gallium/drivers/virgl/virgl_encode.c
++++ b/src/gallium/drivers/virgl/virgl_encode.c
+@@ -551,6 +551,25 @@ int virgl_encode_set_conservative_raster(struct virgl_context *ctx, bool enable)
+    return 0;
+ }
+ 
++/* WinBoat: a sparse resource's region bound to a tile pool's memory, or unbound (VIRGL_CAP_V2_TILED) */
++int virgl_encode_tile_map(struct virgl_context *ctx, struct virgl_resource *res, unsigned level,
++                          const struct pipe_box *box, struct virgl_resource *pool, uint64_t offset)
++{
++   virgl_encoder_write_cmd_dword(ctx, VIRGL_CMD0(VIRGL_CCMD_TILE_MAP, 0, VIRGL_TILE_MAP_SIZE));
++   virgl_encoder_write_res(ctx, res);
++   virgl_encoder_write_dword(ctx->cbuf, level);
++   virgl_encoder_write_dword(ctx->cbuf, box->x);
++   virgl_encoder_write_dword(ctx->cbuf, box->y);
++   virgl_encoder_write_dword(ctx->cbuf, box->z);
++   virgl_encoder_write_dword(ctx->cbuf, box->width);
++   virgl_encoder_write_dword(ctx->cbuf, box->height);
++   virgl_encoder_write_dword(ctx->cbuf, box->depth);
++   virgl_encoder_write_res(ctx, pool);
++   virgl_encoder_write_dword(ctx->cbuf, (uint32_t)offset);
++   virgl_encoder_write_dword(ctx->cbuf, (uint32_t)(offset >> 32));
++   return 0;
++}
++
+ int virgl_encode_delete_object(struct virgl_context *ctx,
+                               uint32_t handle, uint32_t object)
+ {
+@@ -1125,6 +1144,9 @@ int virgl_encode_sampler_state(struct virgl_context *ctx,
+       VIRGL_OBJ_SAMPLE_STATE_S0_COMPARE_FUNC(state->compare_func) |
+       VIRGL_OBJ_SAMPLE_STATE_S0_SEAMLESS_CUBE_MAP(state->seamless_cube_map) |
+       VIRGL_OBJ_SAMPLE_STATE_S0_MAX_ANISOTROPY(state->max_anisotropy);
++   /* WinBoat: min/max filtering, where the host takes it */
++   if (virgl_screen(ctx->base.screen)->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_SAMPLER_REDUCTION)
++      tmp |= VIRGL_OBJ_SAMPLE_STATE_S0_REDUCTION_MODE(state->reduction_mode);
+ 
+    virgl_encoder_write_dword(ctx->cbuf, tmp);
+    virgl_encoder_write_dword(ctx->cbuf, fui(state->lod_bias));
+diff --git a/src/gallium/drivers/virgl/virgl_encode.h b/src/gallium/drivers/virgl/virgl_encode.h
+index fef0d07..988f80c 100644
+--- a/src/gallium/drivers/virgl/virgl_encode.h
++++ b/src/gallium/drivers/virgl/virgl_encode.h
+@@ -127,6 +127,8 @@ int virgl_encode_clear_texture(struct virgl_context *ctx,
+ 
+ int virgl_encode_set_raster_samples(struct virgl_context *ctx, uint32_t samples);
+ int virgl_encode_set_conservative_raster(struct virgl_context *ctx, bool enable);
++int virgl_encode_tile_map(struct virgl_context *ctx, struct virgl_resource *res, unsigned level,
++                          const struct pipe_box *box, struct virgl_resource *pool, uint64_t offset);
+ 
+ int virgl_encode_bind_object(struct virgl_context *ctx,
+                             uint32_t handle, uint32_t object);
+diff --git a/src/gallium/drivers/virgl/virgl_resource.c b/src/gallium/drivers/virgl/virgl_resource.c
+index 16615a7..9d130da 100644
+--- a/src/gallium/drivers/virgl/virgl_resource.c
++++ b/src/gallium/drivers/virgl/virgl_resource.c
+@@ -146,7 +146,8 @@ static bool virgl_res_needs_readback(struct virgl_context *vctx,
+                 PIPE_MAP_DISCARD_WHOLE_RESOURCE))
+       return false;
+ 
+-   if (res->clean_mask & (1 << level))
++   /* (a sparse resource's tiles can change through another resource on the same tile pool memory: D3D's aliasing) */
++   if ((res->clean_mask & (1 << level)) && !(res->b.flags & PIPE_RESOURCE_FLAG_SPARSE))
+       return false;
+ 
+    return true;
+@@ -686,12 +687,19 @@ static struct pipe_resource *virgl_resource_create_front(struct pipe_screen *scr
+       vbind |= VIRGL_BIND_PREFER_EMULATED_BGRA;
+    }
+ 
++   /* D3D tiled resources (VIRGL_CAP_V2_TILED): sparse storage, or a tile pool (memory only). Neither has guest
++    * storage: textures transfer through staging buffers, buffers and pools only take GPU copies and tile_map */
++   bool tiled = (vs->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_TILED) &&
++                (templ->flags & (PIPE_RESOURCE_FLAG_SPARSE | PIPE_RESOURCE_FLAG_TILE_POOL));
++   if (tiled)
++      vbind |= templ->flags & PIPE_RESOURCE_FLAG_TILE_POOL ? VIRGL_BIND_TILE_POOL : VIRGL_BIND_SPARSE;
++
+    // If renderer supports copy transfer from host, and we either have support
+    // for then for textures alloc minimum size of bo
+    // This size is not passed to the host
+-   res->use_staging = virgl_can_copy_transfer_from_host(vs, res, vbind);
++   res->use_staging = virgl_can_copy_transfer_from_host(vs, res, vbind) || (tiled && templ->target != PIPE_BUFFER);
+ 
+-   if (res->use_staging)
++   if (res->use_staging || tiled)
+       alloc_size = 1;
+    else
+       alloc_size = res->metadata.total_size;
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index 2f27fcb..6a6f1d6 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -410,6 +410,20 @@ GetCaps(D3D10DDI_HADAPTER hAdapter,
+          static_cast<D3DWDDM2_0DDI_GPUVA_CAPS_DATA *>(pData->pData)->MaxGPUVirtualAddressBitsPerResource = 40;
+       }
+       break;
++   case D3DWDDM1_3DDICAPS_D3D11_OPTIONS1: {
++      /* 11.2's tiled resources (Tiled.cpp: WinBoat's virglrenderer patches, VIRGL_CAP_V2_TILED), the runtime gives
++       * ClearView on depth-only formats with tier 1. Tier 2: unmapped tiles read 0 (the host's sparse_texture2),
++       * min/max filtering (VIRGL_CAP_V2_SAMPLER_REDUCTION; the runtime gives it with tier 2), the shaders' residency
++       * and LOD clamp (VIRGL_CAP_V2_SPARSE_FEEDBACK) */
++      const unsigned tier2 = VIRGL_CAP_V2_TILED | VIRGL_CAP_V2_SAMPLER_REDUCTION | VIRGL_CAP_V2_SPARSE_FEEDBACK;
++      if (pData->DataSize >= sizeof(D3DWDDM1_3DDI_D3D11_OPTIONS_DATA1) && HostSupportsFL11() &&
++          (host_caps.v2.capability_bits_v2 & VIRGL_CAP_V2_TILED)) {
++         static_cast<D3DWDDM1_3DDI_D3D11_OPTIONS_DATA1 *>(pData->pData)->TiledResourcesSupportFlags =
++            D3DWDDM1_3DDI_TILED_RESOURCES_TIER_1_SUPPORTED |
++            ((host_caps.v2.capability_bits_v2 & tier2) == tier2 ? D3DWDDM1_3DDI_TILED_RESOURCES_TIER_2_SUPPORTED : 0);
++      }
++      break;
++   }
+    case D3DWDDM2_0DDICAPS_D3D11_OPTIONS2:
+       /* 11.3: conservative rasterization, tier 1 (GL_NV_conservative_raster: WinBoat's virglrenderer patch,
+        * VIRGL_CAP_V2_CONSERVATIVE_RASTER; tier 2's 1/256 pixel uncertainty and tier 3's inner coverage aren't
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+index e0a56e3..a331945 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -28,6 +28,7 @@
+ #include "Rasterizer.h"
+ #include "Shader.h"
+ #include "State.h"
++#include "Tiled.h"
+ #include "frontend/winsys_handle.h"
+ #include "Video.h"
+ 
+@@ -526,6 +527,28 @@ ClearView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE viewType, VOID *hView, c
+                                     NumRects);
+       return;
+    }
++   if (viewType == D3D10DDI_HT_DEPTHSTENCILVIEW && hView) {
++      /* depth-only formats (11.2, with tiled resources' tier 1): the depth Color[0], in the rectangles */
++      struct pipe_context *pipe = CastDevice(hDevice)->pipe;
++      struct pipe_surface *surface = static_cast<DepthStencilView *>(hView)->surface;
++      if (!surface) {
++         return;
++      }
++      if (!pRect || !NumRects) {
++         pipe->clear_depth_stencil(pipe, surface, PIPE_CLEAR_DEPTH, Color[0], 0, 0, 0, surface->width,
++                                   surface->height, true);
++         return;
++      }
++      for (UINT r = 0; r < NumRects; r++) {
++         LONG left = MAX2(pRect[r].left, 0), top = MAX2(pRect[r].top, 0);
++         LONG right = MIN2(pRect[r].right, (LONG)surface->width), bottom = MIN2(pRect[r].bottom, (LONG)surface->height);
++         if (right > left && bottom > top) {
++            pipe->clear_depth_stencil(pipe, surface, PIPE_CLEAR_DEPTH, Color[0], 0, left, top, right - left,
++                                      bottom - top, true);
++         }
++      }
++      return;
++   }
+    if (viewType != D3D10DDI_HT_RENDERTARGETVIEW || !hView) {
+       return;
+    }
+@@ -939,7 +962,9 @@ CheckMultisampleQualityLevelsWDDM1_3(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Forma
+                                      UINT *pNumQualityLevels)
+ {
+    if (Flags & D3DWDDM1_3DDI_CHECK_MULTISAMPLE_QUALITY_LEVELS_TILED_RESOURCE) {
+-      *pNumQualityLevels = 0; /* no tiled resources */
++      /* tiled resources: single-sampled only (Tiled.cpp) */
++      *pNumQualityLevels = SampleCount == 1 && TiledSupported(CastPipeContext(hDevice)) &&
++                           TiledFormat(FormatTranslate(Format, false)) ? 1 : 0;
+       return;
+    }
+    funcs10.pfnCheckMultisampleQualityLevels(hDevice, Format, SampleCount, pNumQualityLevels);
+@@ -952,13 +977,7 @@ FillDeviceFuncsWDDM1_3(D3DWDDM1_3DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEF
+    FillDeviceFuncs11_1(reinterpret_cast<D3D11_1DDI_DEVICEFUNCS *>(pFuncs), pFuncs10);
+    pFuncs->pfnRelocateDeviceFuncs = RelocateDeviceFuncsWDDM1_3;
+    pFuncs->pfnCheckMultisampleQualityLevels = CheckMultisampleQualityLevelsWDDM1_3;
+-   STUB(pfnUpdateTileMappings);
+-   STUB(pfnCopyTileMappings);
+-   STUB(pfnCopyTiles);
+-   STUB(pfnUpdateTiles);
+-   STUB(pfnTiledResourceBarrier);
+-   STUB(pfnGetMipPacking);
+-   STUB(pfnResizeTilePool);
++   FillTiledFuncs(pFuncs);
+    STUB(pfnSetMarker);
+    STUB(pfnSetMarkerMode);
+ }
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index 4b26a46..6657a4a 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -41,6 +41,7 @@
+ #include "Resource.h"
+ #include "Shader.h"
+ #include "State.h"
++#include "Tiled.h"
+ #include "Video.h"
+ #include "Format.h"
+ 
+@@ -657,6 +658,11 @@ CheckFormatSupport(D3D10DDI_HDEVICE hDevice, // IN
+                                    PIPE_BIND_SAMPLER_VIEW)) {
+       *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE;
+ 
++      /* tiled resources' formats (Tiled.cpp: the ones with a standard tile shape) */
++      if (TiledSupported(pipe) && TiledFormat(format)) {
++         *pFormatCaps |= D3DWDDM1_3DDI_FORMAT_SUPPORT_TILED;
++      }
++
+       /* also the formats that read multisampled depth buffers */
+       if (!IsFamilyParent(Format) && FamilyMultisample(screen, Format, 4) &&
+           screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 4, 4, PIPE_BIND_SAMPLER_VIEW)) {
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index aa00670..6e252e7 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -33,6 +33,7 @@
+ 
+ #include "Resource.h"
+ #include "Video.h"
++#include "Tiled.h"
+ #include "Format.h"
+ #include "State.h"
+ #include "Query.h"
+@@ -327,6 +328,12 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+       templat.bind |= PIPE_BIND_SAMPLER_VIEW;
+    }
+ 
++   /* tiled resources and tile pools: sparse storage, or memory only (Tiled.cpp) */
++   if (!TiledTemplate(pipe, pCreateResource, &templat)) {
++      SetError(hDevice, E_INVALIDARG);
++      goto unlock;
++   }
++
+    if (templat.target != PIPE_BUFFER) {
+       /* (as an image: whether a UAV format works as one shows when it's bound) */
+       if (!screen->is_format_supported(screen,
+@@ -352,6 +359,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+    pResource->NumSubResources = pCreateResource->MipLevels * pCreateResource->ArraySize;
+    pResource->transfers = (struct pipe_transfer **)calloc(pResource->NumSubResources,
+                                                           sizeof *pResource->transfers);
++   TiledCreateResource(pCreateResource, pResource);
+ 
+    if (pCreateResource->pInitialDataUP) {
+       if (pResource->buffer) {
+@@ -547,6 +555,7 @@ DestroyResource(D3D10DDI_HDEVICE hDevice,       // IN
+       pResource->shadows = NULL;
+    }
+    VideoDestroyResource(pResource);
++   TiledDestroyResource(pResource);
+ 
+    pipe_resource_reference(&pResource->resource, NULL);
+ }
+@@ -1064,6 +1073,20 @@ ResourceUpdateSubResourceUP(D3D10DDI_HDEVICE hDevice,                // IN
+       return;
+    }
+ 
++   /* a tiled buffer has no guest storage to write into: through a staging buffer and a copy */
++   if (pDstResource->tiled && pDstResource->buffer) {
++      unsigned x = pDstBox ? pDstBox->left : 0;
++      unsigned width = pDstBox ? pDstBox->right - pDstBox->left : dst_resource->width0;
++      struct pipe_resource *staging = pipe_buffer_create_with_data(pipe, 0, PIPE_USAGE_STAGING, width, pSysMemUP);
++      if (staging) {
++         struct pipe_box src;
++         u_box_1d(0, width, &src);
++         pipe->resource_copy_region(pipe, dst_resource, 0, x, 0, 0, staging, 0, &src);
++         pipe_resource_reference(&staging, NULL);
++      }
++      return;
++   }
++
+    unsigned level;
+    struct pipe_box box;
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+index db77d1f..bd27fc3 100644
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -816,10 +816,14 @@ CreateSampler(D3D10DDI_HDEVICE hDevice,                        // IN
+     */
+    LOG_UNSUPPORTED(D3D10_DDI_DECODE_IS_TEXT_1BIT_FILTER(pSamplerDesc->Filter));
+ 
+-   /* Comparison. */
+-   if (D3D10_DDI_DECODE_IS_COMPARISON_FILTER(pSamplerDesc->Filter)) {
++   /* Comparison, or 11.2's minimum/maximum reduction: the filter's reduction type, bits 7-8 (standard, comparison,
++    * minimum, maximum; MAXIMUM_* has the comparison bit too) */
++   UINT reduction = (pSamplerDesc->Filter >> 7) & 3;
++   if (reduction == 1) {
+       state.compare_mode = PIPE_TEX_COMPARE_R_TO_TEXTURE;
+       state.compare_func = translate_comparison(pSamplerDesc->ComparisonFunc);
++   } else if (reduction) {
++      state.reduction_mode = reduction == 2 ? PIPE_TEX_REDUCTION_MIN : PIPE_TEX_REDUCTION_MAX;
+    }
+ 
+    /* Level of detail. */
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.c b/src/gallium/frontends/d3d10umd/ShaderParse.c
+index 0a3cf01..8389b92 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.c
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.c
+@@ -290,23 +290,24 @@ opcode_info[D3D10_SB_NUM_OPCODES] = {
+    {_(D3D11_1_SB_OPCODE_ITOD),                           1, 1, 0},
+    {_(D3D11_1_SB_OPCODE_UTOD),                           1, 1, 0},
+    {_(D3D11_1_SB_OPCODE_RESERVED0),                      0, 0, OP_NOT_DONE},
+-   /* Tiled resources' feedback variants (WDDM 1.3): not offered */
+-   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_FEEDBACK),            0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_C_FEEDBACK),          0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_PO_FEEDBACK),         0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_PO_C_FEEDBACK),       0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_LD_FEEDBACK),                 0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_LD_MS_FEEDBACK),              0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_LD_UAV_TYPED_FEEDBACK),       0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_LD_RAW_FEEDBACK),             0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_LD_STRUCTURED_FEEDBACK),      0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_L_FEEDBACK),           0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_C_LZ_FEEDBACK),        0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_CLAMP_FEEDBACK),       0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_B_CLAMP_FEEDBACK),     0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_D_CLAMP_FEEDBACK),     0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_C_CLAMP_FEEDBACK),     0, 0, OP_NOT_DONE},
+-   {_(D3DWDDM1_3_SB_OPCODE_CHECK_ACCESS_FULLY_MAPPED),   0, 0, OP_NOT_DONE},
++   /* Tiled resources' feedback variants (WDDM 1.3, tier 2): the base instruction's operands, a status destination
++    * after the result, the LOD clamp last (ShaderTGSI.c's translate_feedback) */
++   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_FEEDBACK),            2, 3, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_C_FEEDBACK),          2, 4, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_PO_FEEDBACK),         2, 4, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_GATHER4_PO_C_FEEDBACK),       2, 5, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_FEEDBACK),                 2, 2, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_MS_FEEDBACK),              2, 3, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_UAV_TYPED_FEEDBACK),       2, 2, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_RAW_FEEDBACK),             2, 2, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_LD_STRUCTURED_FEEDBACK),      2, 3, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_L_FEEDBACK),           2, 4, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_C_LZ_FEEDBACK),        2, 4, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_CLAMP_FEEDBACK),       2, 4, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_B_CLAMP_FEEDBACK),     2, 5, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_D_CLAMP_FEEDBACK),     2, 6, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_SAMPLE_C_CLAMP_FEEDBACK),     2, 5, 0},
++   {_(D3DWDDM1_3_SB_OPCODE_CHECK_ACCESS_FULLY_MAPPED),   1, 1, 0},
+    {_(D3DWDDM1_3_SB_OPCODE_RESERVED0),                   0, 0, OP_NOT_DONE},
+ };
+ 
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.h b/src/gallium/frontends/d3d10umd/ShaderParse.h
+index 0c2381d..401ab94 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.h
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.h
+@@ -120,7 +120,7 @@ struct Shader_src_operand {
+ };
+ 
+ #define SHADER_MAX_DST_OPERANDS 2
+-#define SHADER_MAX_SRC_OPERANDS 5
++#define SHADER_MAX_SRC_OPERANDS 6
+ 
+ struct Shader_opcode {
+    D3D10_SB_OPCODE_TYPE type;
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index 0aede16..f99eb02 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -2933,6 +2933,76 @@ hs_write_patch_constants(struct Shader_xlate *sx)
+    }
+ }
+ 
++/*
++ * Tiled resources' tier 2 instructions: the feedback variants of sample, gather and load (a status after the
++ * result, sample_*_cl a minimum LOD) and check_access_fully_mapped. Each becomes its base instruction, with a SPARSE
++ * before its texture instruction: the host (WinBoat's virglrenderer 0023) clamps that lookup's LOD and writes its
++ * residency, 1 or 0, into a temporary, which the status gets. Loads from UAVs and buffers have no residency in GL:
++ * resident (ponytail: tiled buffers' unmapped tiles read 0 anyway). The status is only ever read through
++ * check_access_fully_mapped, which compares it with 0. False: not one of them
++ */
++static bool
++translate_feedback(struct Shader_xlate *sx, struct Shader_opcode *opcode)
++{
++   struct ureg_program *ureg = sx->ureg;
++   unsigned base;
++   int clamp = -1;
++   bool texture = true;
++
++   switch (opcode->type) {
++   case D3DWDDM1_3_SB_OPCODE_CHECK_ACCESS_FULLY_MAPPED:
++      if (opcode->dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
++         ureg_USNE(ureg, translate_dst_operand(sx, &opcode->dst[0], false),
++                   translate_src_operand(sx, &opcode->src[0], OF_UINT), ureg_imm1u(ureg, 0));
++      }
++      return true;
++   case D3DWDDM1_3_SB_OPCODE_SAMPLE_CLAMP_FEEDBACK: base = D3D10_SB_OPCODE_SAMPLE; clamp = 3; break;
++   case D3DWDDM1_3_SB_OPCODE_SAMPLE_B_CLAMP_FEEDBACK: base = D3D10_SB_OPCODE_SAMPLE_B; clamp = 4; break;
++   case D3DWDDM1_3_SB_OPCODE_SAMPLE_C_CLAMP_FEEDBACK: base = D3D10_SB_OPCODE_SAMPLE_C; clamp = 4; break;
++   case D3DWDDM1_3_SB_OPCODE_SAMPLE_D_CLAMP_FEEDBACK: base = D3D10_SB_OPCODE_SAMPLE_D; clamp = 5; break;
++   case D3DWDDM1_3_SB_OPCODE_SAMPLE_L_FEEDBACK: base = D3D10_SB_OPCODE_SAMPLE_L; break;
++   case D3DWDDM1_3_SB_OPCODE_SAMPLE_C_LZ_FEEDBACK: base = D3D10_SB_OPCODE_SAMPLE_C_LZ; break;
++   case D3DWDDM1_3_SB_OPCODE_LD_FEEDBACK: base = D3D10_SB_OPCODE_LD; break;
++   case D3DWDDM1_3_SB_OPCODE_LD_MS_FEEDBACK: base = D3D10_SB_OPCODE_LD_MS; break;
++   case D3DWDDM1_3_SB_OPCODE_GATHER4_FEEDBACK: base = D3D10_1_SB_OPCODE_GATHER4; break;
++   case D3DWDDM1_3_SB_OPCODE_GATHER4_C_FEEDBACK: base = D3D11_SB_OPCODE_GATHER4_C; break;
++   case D3DWDDM1_3_SB_OPCODE_GATHER4_PO_FEEDBACK: base = D3D11_SB_OPCODE_GATHER4_PO; break;
++   case D3DWDDM1_3_SB_OPCODE_GATHER4_PO_C_FEEDBACK: base = D3D11_SB_OPCODE_GATHER4_PO_C; break;
++   case D3DWDDM1_3_SB_OPCODE_LD_UAV_TYPED_FEEDBACK: base = D3D11_SB_OPCODE_LD_UAV_TYPED; texture = false; break;
++   case D3DWDDM1_3_SB_OPCODE_LD_RAW_FEEDBACK: base = D3D11_SB_OPCODE_LD_RAW; texture = false; break;
++   case D3DWDDM1_3_SB_OPCODE_LD_STRUCTURED_FEEDBACK: base = D3D11_SB_OPCODE_LD_STRUCTURED; texture = false; break;
++   default:
++      return false;
++   }
++
++   struct ureg_dst status = ureg_writemask(ureg_DECL_temporary(ureg), TGSI_WRITEMASK_X);
++   if (texture) {
++      struct ureg_src value = clamp >= 0 ? ureg_scalar(translate_src_operand(sx, &opcode->src[clamp], OF_FLOAT), TGSI_SWIZZLE_X)
++                                         : ureg_imm1f(ureg, -1000.0f);
++      ureg_insn(ureg, TGSI_OPCODE_SPARSE, &status, 1, &value, 1, 0);
++   } else {
++      ureg_MOV(ureg, status, ureg_imm1u(ureg, 1));
++   }
++
++   struct Shader_opcode b = *opcode;
++   b.type = (D3D10_SB_OPCODE_TYPE)base;
++   b.num_dst = 1;
++   if (clamp >= 0) {
++      b.num_src = clamp;
++   }
++   if (texture) {
++      translate_texture_virgl(sx, &b);
++   } else {
++      translate_sm5_memory(sx, &b);
++   }
++
++   if (opcode->dst[1].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
++      ureg_MOV(ureg, translate_dst_operand(sx, &opcode->dst[1], false), ureg_scalar(ureg_src(status), TGSI_SWIZZLE_X));
++   }
++   ureg_release_temporary(ureg, ureg_writemask(status, TGSI_WRITEMASK_XYZW));
++   return true;
++}
++
+ /* Code in a run-once loop, where ret leaves the loop: hull shader phases, the domain shader (virglrenderer
+  * turns RET into a plain return there, skipping its epilogue: the y flip, clip distances), and inlined calls */
+ static bool
+@@ -3757,7 +3827,7 @@ Shader_tgsi_translate_ex(const unsigned *code,
+       sx->integer_op = ox->format != OF_FLOAT && opcode.type != D3D10_SB_OPCODE_MOV &&
+                        opcode.type != D3D10_SB_OPCODE_MOVC && opcode.type != D3D11_SB_OPCODE_SWAPC;
+ 
+-      if (translate_hs_phase(sx, &opcode) || translate_sm5_memory(sx, &opcode) ||
++      if (translate_hs_phase(sx, &opcode) || translate_feedback(sx, &opcode) || translate_sm5_memory(sx, &opcode) ||
+           (virgl_tex_ops() && translate_texture_virgl(sx, &opcode)) ||
+           translate_sm5_alu(sx, &opcode)) {
+          Shader_opcode_free(&opcode);
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+index c350a59..088c992 100644
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -222,6 +222,7 @@ struct Resource
+    struct pipe_video_buffer **decoded; /* AYUV/Y410/Y416 decoder output: each array slice's picture (Video.cpp) */
+    void *sysmem;                     /* decoder buffers: the memory programs fill and the decoder reads */
+    UINT sysmem_size;
++   struct TiledInfo *tiled;          /* tiled resources and tile pools (Tiled.cpp) */
+ };
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Tiled.cpp b/src/gallium/frontends/d3d10umd/Tiled.cpp
+new file mode 100644
+index 0000000..20546e7
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/Tiled.cpp
+@@ -0,0 +1,587 @@
++/*
++ * Tiled.cpp --
++ *    Direct3D 11.2's tiled resources (tier 1) on virgl's sparse resources (WinBoat's virglrenderer 0021,
++ *    VIRGL_CAP_V2_TILED). A tiled resource is sparse storage on the host whose 64 KB tiles are bound to tile pool
++ *    memory there (pipe_context::tile_map); the same pool tile under several resources is D3D's aliasing, as it is on
++ *    the host. A tile pool is memory only, in chunks: ResizeTilePool adds one (the tiles it had stay where they are)
++ *    or drops whole chunks past the new size.
++ *
++ *    Tiles have D3D's standard shapes (the host's sparse pages have them, which it checks). Mips smaller than a tile
++ *    in either dimension are packed: the host binds them (its mip tail) as one, so a slice's packed mips take one
++ *    tile when they fit in 64 KB (ponytail: a tail of more than a tile, from very narrow textures, gets the count
++ *    but binds at its first tile's offset only). Tiles are numbered as D3D's GetResourceTiling numbers them: by array
++ *    slice, its standard mips row by row, then its packed tiles. Every tile's mapping is kept (CopyTileMappings
++ *    copies them; each holds a reference to its pool chunk).
++ *
++ *    Tiled textures have no guest storage: they transfer through staging buffers (UpdateTiles, CopyTiles). Tiled
++ *    buffers and pools take GPU copies only.
++ */
++
++#include "Tiled.h"
++#include "State.h"
++
++#include "util/format/u_format.h"
++#include "util/u_inlines.h"
++#include "util/u_math.h"
++
++#include <vector>
++
++static const UINT TILE_BYTES = 65536;
++
++struct TileMapping {
++   struct pipe_resource *chunk; /* referenced; NULL: unmapped */
++   UINT64 offset;
++};
++
++struct TiledInfo {
++   /* a pool: its chunks and how many tiles each has */
++   bool pool;
++   std::vector<struct pipe_resource *> chunks;
++   std::vector<UINT> chunkTiles;
++   UINT64 poolSize;
++
++   /* a tiled resource: tile shape in texels (buffers: 64 KB of bytes), mips that have whole tiles and the packed
++    * ones, each slice's tiles, every tile's mapping */
++   UINT tileWidth, tileHeight;
++   UINT standardMips, packedMips, packedTiles;
++   UINT slices, mips;
++   std::vector<UINT> start;   /* first tile of each slice's mips (slice * mips + mip), then the packed tiles */
++   UINT sliceTiles;
++   std::vector<TileMapping> map;
++};
++
++bool
++TiledSupported(struct pipe_context *pipe)
++{
++   return pipe->tile_map != NULL;
++}
++
++/* D3D's standard 2D tile shapes, by the size of a format's element (a block for compressed ones) */
++static bool
++TileShape(enum pipe_format format, UINT *width, UINT *height)
++{
++   const struct util_format_description *desc = util_format_description(format);
++   if (!desc || desc->layout == UTIL_FORMAT_LAYOUT_PLANAR2 || desc->layout == UTIL_FORMAT_LAYOUT_PLANAR3 ||
++       util_format_is_yuv(format)) {
++      return false;
++   }
++   UINT w, h;
++   switch (desc->block.bits) {
++   case 8: w = 256; h = 256; break;
++   case 16: w = 256; h = 128; break;
++   case 32: w = 128; h = 128; break;
++   case 64: w = 128; h = 64; break;
++   case 128: w = 64; h = 64; break;
++   default: return false;
++   }
++   *width = w * desc->block.width;
++   *height = h * desc->block.height;
++   return true;
++}
++
++bool
++TiledFormat(enum pipe_format format)
++{
++   UINT w, h;
++   return TileShape(format, &w, &h);
++}
++
++bool
++TiledTemplate(struct pipe_context *pipe, const D3D10DDIARG_CREATERESOURCE *pCreateResource,
++              struct pipe_resource *templat)
++{
++   const UINT misc = pCreateResource->MiscFlags;
++   if (!(misc & (D3DWDDM1_3DDI_RESOURCE_MISC_TILED | D3DWDDM1_3DDI_RESOURCE_MISC_TILE_POOL))) {
++      return true;
++   }
++   if (!TiledSupported(pipe)) {
++      return false;
++   }
++   if (misc & D3DWDDM1_3DDI_RESOURCE_MISC_TILE_POOL) {
++      templat->flags |= PIPE_RESOURCE_FLAG_TILE_POOL;
++      return templat->target == PIPE_BUFFER;
++   }
++   templat->flags |= PIPE_RESOURCE_FLAG_SPARSE;
++   /* tier 1/2: buffers and 2D textures (arrays too), not multisampled */
++   return templat->target == PIPE_BUFFER ||
++          ((templat->target == PIPE_TEXTURE_2D || templat->target == PIPE_TEXTURE_2D_ARRAY) &&
++           templat->nr_samples <= 1 && TiledFormat(templat->format));
++}
++
++static UINT
++DivRoundUp(UINT a, UINT b)
++{
++   return (a + b - 1) / b;
++}
++
++void
++TiledCreateResource(const D3D10DDIARG_CREATERESOURCE *pCreateResource, Resource *pResource)
++{
++   struct pipe_resource *res = pResource->resource;
++   if (!(res->flags & (PIPE_RESOURCE_FLAG_SPARSE | PIPE_RESOURCE_FLAG_TILE_POOL))) {
++      return;
++   }
++   TiledInfo *t = new TiledInfo();
++   pResource->tiled = t;
++   if (res->flags & PIPE_RESOURCE_FLAG_TILE_POOL) {
++      t->pool = true;
++      pipe_resource *chunk = NULL;
++      pipe_resource_reference(&chunk, res);
++      t->chunks.push_back(chunk);
++      t->chunkTiles.push_back(res->width0 / TILE_BYTES);
++      t->poolSize = res->width0;
++      return;
++   }
++   t->mips = res->target == PIPE_BUFFER ? 1 : res->last_level + 1;
++   t->slices = res->target == PIPE_BUFFER ? 1 : res->array_size;
++   if (res->target == PIPE_BUFFER) {
++      t->tileWidth = TILE_BYTES;
++      t->tileHeight = 1;
++      t->standardMips = 1;
++      t->start.push_back(0);
++      t->sliceTiles = DivRoundUp(res->width0, TILE_BYTES);
++   } else {
++      TileShape(res->format, &t->tileWidth, &t->tileHeight);
++      UINT tail = 0;
++      for (UINT m = 0; m < t->mips; m++) {
++         UINT w = u_minify(res->width0, m), h = u_minify(res->height0, m);
++         if (t->standardMips == m && w >= t->tileWidth && h >= t->tileHeight) {
++            t->standardMips++;
++         } else {
++            tail += util_format_get_2d_size(res->format, util_format_get_stride(res->format, w), h);
++         }
++      }
++      t->packedMips = t->mips - t->standardMips;
++      t->packedTiles = t->packedMips ? DivRoundUp(tail, TILE_BYTES) : 0;
++      UINT n = 0;
++      for (UINT m = 0; m < t->standardMips; m++) {
++         t->start.push_back(n);
++         n += DivRoundUp(u_minify(res->width0, m), t->tileWidth) * DivRoundUp(u_minify(res->height0, m), t->tileHeight);
++      }
++      t->start.push_back(n);   /* the packed tiles */
++      t->sliceTiles = n + t->packedTiles;
++   }
++   t->map.assign((size_t)t->sliceTiles * t->slices, TileMapping{NULL, 0});
++}
++
++void
++TiledDestroyResource(Resource *pResource)
++{
++   TiledInfo *t = pResource->tiled;
++   if (!t) {
++      return;
++   }
++   for (auto &chunk : t->chunks) {
++      pipe_resource_reference(&chunk, NULL);
++   }
++   for (auto &m : t->map) {
++      pipe_resource_reference(&m.chunk, NULL);
++   }
++   delete t;
++   pResource->tiled = NULL;
++}
++
++/* The tiles a region covers, in order: a box of them (slices by Depth for arrays) or NumTiles from its start on */
++static void
++RegionTiles(const TiledInfo *t, struct pipe_resource *res, UINT mipLevels,
++            const D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE &start, const D3DWDDM1_3DDI_TILE_REGION_SIZE *size,
++            std::vector<long> &tiles)
++{
++   auto across = [&](UINT mip) {
++      return res->target == PIPE_BUFFER ? t->sliceTiles : DivRoundUp(u_minify(res->width0, mip), t->tileWidth);
++   };
++   auto index = [&](const D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE &c) -> long {
++      UINT mip = c.Subresource % MAX2(mipLevels, 1), slice = c.Subresource / MAX2(mipLevels, 1);
++      if (slice >= t->slices) {
++         return -1;
++      }
++      long base = (long)slice * t->sliceTiles;
++      if (mip >= t->standardMips) {
++         return c.X < t->packedTiles ? base + t->start[t->standardMips] + c.X : -1;
++      }
++      return base + t->start[mip] + (long)c.Y * across(mip) + c.X;
++   };
++   if (!size) {
++      tiles.push_back(index(start));
++      return;
++   }
++   if (!size->bUseBox) {
++      long first = index(start);
++      for (UINT i = 0; i < size->NumTiles; i++) {
++         tiles.push_back(first < 0 || first + i >= (long)t->map.size() ? -1 : first + i);
++      }
++      return;
++   }
++   for (UINT z = 0; z < MAX2(size->Depth, 1); z++) {
++      for (UINT y = 0; y < MAX2(size->Height, 1); y++) {
++         for (UINT x = 0; x < size->Width; x++) {
++            D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE c = start;
++            c.X += x;
++            c.Y += y;
++            c.Subresource += z * MAX2(mipLevels, 1);   /* (arrays: the next slice's same mip) */
++            tiles.push_back(index(c));
++         }
++      }
++   }
++}
++
++/* A tile's mapping on the host: its region of the resource bound to the chunk at offset (unbound without one).
++ * Packed tiles: the first binds the slice's mip tail, the others have nothing of their own on the host */
++static void
++TileBind(struct pipe_context *pipe, Resource *pResource, long tile, const TileMapping &m)
++{
++   TiledInfo *t = pResource->tiled;
++   struct pipe_resource *res = pResource->resource;
++   UINT slice = (UINT)(tile / t->sliceTiles), local = (UINT)(tile % t->sliceTiles);
++   struct pipe_box box = {};
++   unsigned level = 0;
++   if (res->target == PIPE_BUFFER) {
++      box.x = (int)(local * TILE_BYTES);
++      box.width = TILE_BYTES;
++      box.height = box.depth = 1;
++   } else if (local >= t->start[t->standardMips]) {
++      if (local != t->start[t->standardMips]) {
++         return;
++      }
++      level = t->standardMips;
++      box.z = (int)slice;
++      box.width = (int)u_minify(res->width0, level);
++      box.height = (int)u_minify(res->height0, level);
++      box.depth = 1;
++   } else {
++      while (level + 1 < t->standardMips && local >= t->start[level + 1]) {
++         level++;
++      }
++      UINT across = DivRoundUp(u_minify(res->width0, level), t->tileWidth);
++      UINT i = local - t->start[level];
++      box.x = (int)((i % across) * t->tileWidth);
++      box.y = (int)((i / across) * t->tileHeight);
++      box.z = (int)slice;
++      box.width = (int)t->tileWidth;
++      box.height = (int)t->tileHeight;
++      box.depth = 1;
++   }
++   pipe->tile_map(pipe, res, level, &box, m.chunk, m.offset);
++}
++
++static void
++TileSet(struct pipe_context *pipe, Resource *pResource, long tile, struct pipe_resource *chunk, UINT64 offset)
++{
++   TileMapping &m = pResource->tiled->map[tile];
++   pipe_resource_reference(&m.chunk, chunk);
++   m.offset = offset;
++   TileBind(pipe, pResource, tile, m);
++}
++
++/* A pool's tile: its chunk and the offset in it, or false past the pool's end */
++static bool
++PoolTile(const TiledInfo *pool, UINT tile, struct pipe_resource **chunk, UINT64 *offset)
++{
++   for (size_t c = 0; c < pool->chunks.size(); c++) {
++      if (tile < pool->chunkTiles[c]) {
++         *chunk = pool->chunks[c];
++         *offset = (UINT64)tile * TILE_BYTES;
++         return true;
++      }
++      tile -= pool->chunkTiles[c];
++   }
++   return false;
++}
++
++static VOID APIENTRY
++UpdateTileMappings(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hTiledResource, UINT NumTiledResourceRegions,
++                   const D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE *pTiledResourceRegionStartCoords,
++                   const D3DWDDM1_3DDI_TILE_REGION_SIZE *pTiledResourceRegionSizes, D3D10DDI_HRESOURCE hTilePool,
++                   UINT NumRanges, const UINT *pRangeFlags, const UINT *pTilePoolStartOffsets,
++                   const UINT *pRangeTileCounts, UINT Flags)
++{
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   Resource *pResource = CastResource(hTiledResource);
++   Resource *pPool = hTilePool.pDrvPrivate ? CastResource(hTilePool) : NULL;
++   TiledInfo *t = pResource->tiled;
++   if (!t || t->pool || (pPool && (!pPool->tiled || !pPool->tiled->pool))) {
++      return;
++   }
++   std::vector<long> tiles;
++   for (UINT r = 0; r < NumTiledResourceRegions; r++) {
++      RegionTiles(t, pResource->resource, pResource->MipLevels, pTiledResourceRegionStartCoords[r],
++                  pTiledResourceRegionSizes ? &pTiledResourceRegionSizes[r] : NULL, tiles);
++   }
++   /* the ranges take the tiles in order; one range without a count takes them all */
++   size_t next = 0;
++   for (UINT r = 0; r < NumRanges && next < tiles.size(); r++) {
++      UINT flags = pRangeFlags ? pRangeFlags[r] : 0;
++      UINT count = pRangeTileCounts ? pRangeTileCounts[r] : (UINT)(tiles.size() - next);
++      UINT first = pTilePoolStartOffsets ? pTilePoolStartOffsets[r] : 0;
++      for (UINT i = 0; i < count && next < tiles.size(); i++, next++) {
++         long tile = tiles[next];
++         if (tile < 0 || (flags & D3DWDDM_1_3DDI_TILE_RANGE_SKIP)) {
++            continue;
++         }
++         struct pipe_resource *chunk = NULL;
++         UINT64 offset = 0;
++         if (!(flags & D3DWDDM_1_3DDI_TILE_RANGE_NULL) && pPool) {
++            UINT poolTile = flags & D3DWDDM_1_3DDI_TILE_RANGE_REUSE_SINGLE_TILE ? first : first + i;
++            if (!PoolTile(pPool->tiled, poolTile, &chunk, &offset)) {
++               chunk = NULL;
++            }
++         }
++         TileSet(pipe, pResource, tile, chunk, offset);
++      }
++   }
++}
++
++static VOID APIENTRY
++CopyTileMappings(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDestTiledResource,
++                 const D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE *pDestRegionStartCoord,
++                 D3D10DDI_HRESOURCE hSourceTiledResource,
++                 const D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE *pSourceRegionStartCoord,
++                 const D3DWDDM1_3DDI_TILE_REGION_SIZE *pTileRegionSize, UINT Flags)
++{
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   Resource *pDst = CastResource(hDestTiledResource), *pSrc = CastResource(hSourceTiledResource);
++   if (!pDst->tiled || !pSrc->tiled || pDst->tiled->pool || pSrc->tiled->pool) {
++      return;
++   }
++   std::vector<long> dst, src;
++   RegionTiles(pDst->tiled, pDst->resource, pDst->MipLevels, *pDestRegionStartCoord, pTileRegionSize, dst);
++   RegionTiles(pSrc->tiled, pSrc->resource, pSrc->MipLevels, *pSourceRegionStartCoord, pTileRegionSize, src);
++   /* (source and destination may overlap: the source's mappings first) */
++   std::vector<TileMapping> from;
++   for (long s : src) {
++      from.push_back(s >= 0 ? pSrc->tiled->map[s] : TileMapping{NULL, 0});
++   }
++   for (size_t i = 0; i < dst.size() && i < from.size(); i++) {
++      if (dst[i] >= 0) {
++         TileSet(pipe, pDst, dst[i], from[i].chunk, from[i].offset);
++      }
++   }
++}
++
++/* A tile's texels: its box at its mip level (clipped to the level), or false for packed tiles */
++static bool
++TileBox(const TiledInfo *t, struct pipe_resource *res, long tile, unsigned *level, struct pipe_box *box)
++{
++   UINT slice = (UINT)(tile / t->sliceTiles), local = (UINT)(tile % t->sliceTiles);
++   if (res->target == PIPE_BUFFER || local >= t->start[t->standardMips]) {
++      return false;
++   }
++   unsigned l = 0;
++   while (l + 1 < t->standardMips && local >= t->start[l + 1]) {
++      l++;
++   }
++   UINT w = u_minify(res->width0, l), h = u_minify(res->height0, l);
++   UINT across = DivRoundUp(w, t->tileWidth), i = local - t->start[l];
++   UINT x = (i % across) * t->tileWidth, y = (i / across) * t->tileHeight;
++   u_box_3d((int)x, (int)y, (int)slice, (int)MIN2(t->tileWidth, w - x), (int)MIN2(t->tileHeight, h - y), 1, box);
++   *level = l;
++   return true;
++}
++
++/* Tile data in the linear layout UpdateTiles and CopyTiles use: each tile 64 KB, its rows of blocks one after the
++ * other (a row: the tile's width in blocks); a slice's packed tiles hold its packed mips one after the other */
++static UINT
++TileRowPitch(const TiledInfo *t, enum pipe_format format)
++{
++   return util_format_get_stride(format, t->tileWidth);
++}
++
++/* Moves one tile between a tiled texture and linear memory (toTiles: memory into the tile) */
++static void
++TileTransfer(struct pipe_context *pipe, Resource *pResource, long tile, uint8_t *data, bool toTiles)
++{
++   TiledInfo *t = pResource->tiled;
++   struct pipe_resource *res = pResource->resource;
++   enum pipe_format format = res->format;
++   UINT slice = (UINT)(tile / t->sliceTiles), local = (UINT)(tile % t->sliceTiles);
++   std::vector<std::pair<unsigned, struct pipe_box>> parts;
++   std::vector<UINT> pitches;
++   unsigned level;
++   struct pipe_box box;
++   if (TileBox(t, res, tile, &level, &box)) {
++      parts.push_back({level, box});
++      pitches.push_back(TileRowPitch(t, format));
++   } else if (local == t->start[t->standardMips]) {
++      /* the packed mips, one after the other (only the first packed tile has them) */
++      for (unsigned m = t->standardMips; m < t->mips; m++) {
++         u_box_3d(0, 0, (int)slice, (int)u_minify(res->width0, m), (int)u_minify(res->height0, m), 1, &box);
++         parts.push_back({m, box});
++         pitches.push_back(util_format_get_stride(format, box.width));
++      }
++   }
++   size_t offset = 0;
++   for (size_t p = 0; p < parts.size(); p++) {
++      const struct pipe_box &b = parts[p].second;
++      UINT rows = util_format_get_nblocksy(format, b.height);
++      if (offset + (size_t)pitches[p] * rows > TILE_BYTES) {
++         break;
++      }
++      if (toTiles) {
++         pipe->texture_subdata(pipe, res, parts[p].first, PIPE_MAP_WRITE, &b, data + offset, pitches[p], 0);
++      } else {
++         struct pipe_transfer *transfer = NULL;
++         const uint8_t *map = (const uint8_t *)pipe->texture_map(pipe, res, parts[p].first, PIPE_MAP_READ, &b, &transfer);
++         if (map) {
++            UINT rowBytes = util_format_get_stride(format, b.width);
++            for (UINT y = 0; y < rows; y++) {
++               memcpy(data + offset + (size_t)y * pitches[p], map + (size_t)y * transfer->stride, rowBytes);
++            }
++            pipe->texture_unmap(pipe, transfer);
++         }
++      }
++      offset += (size_t)pitches[p] * rows;
++   }
++}
++
++/* A tiled buffer's tiles from or into another buffer: GPU copies (neither side has guest storage to map) */
++static void
++BufferTilesCopy(struct pipe_context *pipe, struct pipe_resource *dst, UINT64 dstOffset, struct pipe_resource *src,
++                UINT64 srcOffset, UINT64 size)
++{
++   struct pipe_box box;
++   u_box_1d((int)srcOffset, (int)size, &box);
++   pipe->resource_copy_region(pipe, dst, 0, (unsigned)dstOffset, 0, 0, src, 0, &box);
++}
++
++static VOID APIENTRY
++CopyTiles(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hTiledResource,
++          const D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE *pTileRegionStartCoord,
++          const D3DWDDM1_3DDI_TILE_REGION_SIZE *pTileRegionSize, D3D10DDI_HRESOURCE hBuffer,
++          UINT64 BufferStartOffsetInBytes, UINT Flags)
++{
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   Resource *pResource = CastResource(hTiledResource), *pBuffer = CastResource(hBuffer);
++   TiledInfo *t = pResource->tiled;
++   if (!t || t->pool || !pBuffer->resource) {
++      return;
++   }
++   bool toTiles = Flags & D3DWDDM1_3DDI_TILE_COPY_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE;
++   std::vector<long> tiles;
++   RegionTiles(t, pResource->resource, pResource->MipLevels, *pTileRegionStartCoord, pTileRegionSize, tiles);
++   std::vector<uint8_t> data(TILE_BYTES);
++   for (size_t i = 0; i < tiles.size(); i++) {
++      if (tiles[i] < 0) {
++         continue;
++      }
++      UINT64 linear = BufferStartOffsetInBytes + (UINT64)i * TILE_BYTES;
++      if (pResource->resource->target == PIPE_BUFFER) {
++         UINT64 at = (UINT64)(tiles[i] % t->sliceTiles) * TILE_BYTES;
++         UINT64 size = MIN2((UINT64)TILE_BYTES, pResource->resource->width0 - at);
++         if (toTiles) {
++            BufferTilesCopy(pipe, pResource->resource, at, pBuffer->resource, linear, size);
++         } else {
++            BufferTilesCopy(pipe, pBuffer->resource, linear, pResource->resource, at, size);
++         }
++         continue;
++      }
++      if (toTiles) {
++         pipe_buffer_read(pipe, pBuffer->resource, (unsigned)linear, TILE_BYTES, data.data());
++         TileTransfer(pipe, pResource, tiles[i], data.data(), true);
++      } else {
++         memset(data.data(), 0, TILE_BYTES);
++         TileTransfer(pipe, pResource, tiles[i], data.data(), false);
++         pipe->buffer_subdata(pipe, pBuffer->resource, PIPE_MAP_WRITE, (unsigned)linear, TILE_BYTES, data.data());
++      }
++   }
++}
++
++static VOID APIENTRY
++UpdateTiles(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDestTiledResource,
++            const D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE *pDestTileRegionStartCoord,
++            const D3DWDDM1_3DDI_TILE_REGION_SIZE *pDestTileRegionSize, const VOID *pSourceTileData, UINT Flags)
++{
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   Resource *pResource = CastResource(hDestTiledResource);
++   TiledInfo *t = pResource->tiled;
++   if (!t || t->pool) {
++      return;
++   }
++   std::vector<long> tiles;
++   RegionTiles(t, pResource->resource, pResource->MipLevels, *pDestTileRegionStartCoord, pDestTileRegionSize, tiles);
++   const uint8_t *src = (const uint8_t *)pSourceTileData;
++   for (size_t i = 0; i < tiles.size(); i++) {
++      if (tiles[i] < 0) {
++         continue;
++      }
++      const uint8_t *tileData = src + i * TILE_BYTES;
++      if (pResource->resource->target == PIPE_BUFFER) {
++         UINT64 at = (UINT64)(tiles[i] % t->sliceTiles) * TILE_BYTES;
++         UINT size = (UINT)MIN2((UINT64)TILE_BYTES, pResource->resource->width0 - at);
++         struct pipe_resource *staging = pipe_buffer_create_with_data(pipe, 0, PIPE_USAGE_STAGING, size, tileData);
++         if (staging) {
++            BufferTilesCopy(pipe, pResource->resource, at, staging, 0, size);
++            pipe_resource_reference(&staging, NULL);
++         }
++      } else {
++         TileTransfer(pipe, pResource, tiles[i], const_cast<uint8_t *>(tileData), true);
++      }
++   }
++}
++
++static VOID APIENTRY
++TiledResourceBarrier(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE BeforeType, VOID *hBefore,
++                     D3D11DDI_HANDLETYPE AfterType, VOID *hAfter)
++{
++   /* one GL context on the host runs everything in order; aliased memory's writes are visible to what follows */
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   if (pipe->memory_barrier) {
++      pipe->memory_barrier(pipe, PIPE_BARRIER_ALL);
++   }
++}
++
++static VOID APIENTRY
++GetMipPacking(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hTiledResource, UINT *pNumPackedMips,
++              UINT *pNumTilesForPackedMips)
++{
++   TiledInfo *t = CastResource(hTiledResource)->tiled;
++   *pNumPackedMips = t && !t->pool ? t->packedMips : 0;
++   *pNumTilesForPackedMips = t && !t->pool ? t->packedTiles : 0;
++}
++
++static VOID APIENTRY
++ResizeTilePool(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hTilePool, UINT64 NewSizeInBytes)
++{
++   struct pipe_context *pipe = CastPipeContext(hDevice);
++   TiledInfo *t = CastResource(hTilePool)->tiled;
++   if (!t || !t->pool) {
++      return;
++   }
++   UINT64 have = 0;
++   for (UINT n : t->chunkTiles) {
++      have += (UINT64)n * TILE_BYTES;
++   }
++   if (NewSizeInBytes > have) {
++      /* a chunk more: the tiles the pool had stay where they are */
++      struct pipe_resource templat = *t->chunks[0];
++      templat.width0 = (unsigned)(NewSizeInBytes - have);
++      templat.next = NULL;
++      struct pipe_resource *chunk = pipe->screen->resource_create(pipe->screen, &templat);
++      if (!chunk) {
++         SetError(hDevice, E_OUTOFMEMORY);
++         return;
++      }
++      t->chunks.push_back(chunk);
++      t->chunkTiles.push_back(templat.width0 / TILE_BYTES);
++   } else {
++      /* chunks entirely past the new size go (mappings into them keep them until they change) */
++      while (t->chunks.size() > 1 && have - (UINT64)t->chunkTiles.back() * TILE_BYTES >= NewSizeInBytes) {
++         have -= (UINT64)t->chunkTiles.back() * TILE_BYTES;
++         pipe_resource_reference(&t->chunks.back(), NULL);
++         t->chunks.pop_back();
++         t->chunkTiles.pop_back();
++      }
++   }
++   t->poolSize = NewSizeInBytes;
++}
++
++void
++FillTiledFuncs(D3DWDDM1_3DDI_DEVICEFUNCS *pFuncs)
++{
++   pFuncs->pfnUpdateTileMappings = UpdateTileMappings;
++   pFuncs->pfnCopyTileMappings = CopyTileMappings;
++   pFuncs->pfnCopyTiles = CopyTiles;
++   pFuncs->pfnUpdateTiles = UpdateTiles;
++   pFuncs->pfnTiledResourceBarrier = TiledResourceBarrier;
++   pFuncs->pfnGetMipPacking = GetMipPacking;
++   pFuncs->pfnResizeTilePool = ResizeTilePool;
++}
+diff --git a/src/gallium/frontends/d3d10umd/Tiled.h b/src/gallium/frontends/d3d10umd/Tiled.h
+new file mode 100644
+index 0000000..2b8e794
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/Tiled.h
+@@ -0,0 +1,25 @@
++/*
++ * Tiled.h --
++ *    Direct3D 11.2's tiled resources and tile pools on virgl's sparse resources. See Tiled.cpp.
++ */
++
++#pragma once
++
++#include "DriverIncludes.h"
++
++struct Resource;
++
++/* Whether the host has tiled resources (VIRGL_CAP_V2_TILED: pipe_context::tile_map) */
++bool TiledSupported(struct pipe_context *pipe);
++/* Whether a format can be a tiled resource's (it has a standard tile shape) */
++bool TiledFormat(enum pipe_format format);
++/* The resource template's flags for MISC_TILED / MISC_TILE_POOL resources; false when the device can't make them */
++bool TiledTemplate(struct pipe_context *pipe, const D3D10DDIARG_CREATERESOURCE *pCreateResource,
++                   struct pipe_resource *templat);
++/* After the pipe resource is made: the tile layout, or the pool's first chunk */
++void TiledCreateResource(const D3D10DDIARG_CREATERESOURCE *pCreateResource, Resource *pResource);
++void TiledDestroyResource(Resource *pResource);
++
++/* The WDDM 1.3 table's tiled resource entries */
++struct D3DWDDM1_3DDI_DEVICEFUNCS;
++void FillTiledFuncs(D3DWDDM1_3DDI_DEVICEFUNCS *pFuncs);
+diff --git a/src/gallium/frontends/d3d10umd/meson.build b/src/gallium/frontends/d3d10umd/meson.build
+index 1503e43..19f01bf 100644
+--- a/src/gallium/frontends/d3d10umd/meson.build
++++ b/src/gallium/frontends/d3d10umd/meson.build
+@@ -23,6 +23,7 @@ libd3d10umd = static_library(
+     'Resource.cpp',
+     'Shader.cpp',
+     'Video.cpp',
++    'Tiled.cpp',
+     'DxvaDecode.cpp',
+     'ShaderDump.cpp',
+     'ShaderParse.c',
+diff --git a/src/gallium/include/pipe/p_context.h b/src/gallium/include/pipe/p_context.h
+index 7d1be91..b3a5f39 100644
+--- a/src/gallium/include/pipe/p_context.h
++++ b/src/gallium/include/pipe/p_context.h
+@@ -932,6 +932,15 @@ struct pipe_context {
+    bool (*resource_commit)(struct pipe_context *, struct pipe_resource *,
+                            unsigned level, struct pipe_box *box, bool commit);
+ 
++   /**
++    * WinBoat (D3D tiled resources, virgl): binds a region of a sparse resource (PIPE_RESOURCE_FLAG_SPARSE) to the
++    * memory of a tile pool (PIPE_RESOURCE_FLAG_TILE_POOL) at offset, or unbinds it (pool NULL). Textures: texels of
++    * a level, box->z the array layer; buffers: box->x and box->width in bytes. A level of the mip tail binds the tail.
++    * NULL where the driver can't.
++    */
++   void (*tile_map)(struct pipe_context *, struct pipe_resource *res, unsigned level, const struct pipe_box *box,
++                    struct pipe_resource *pool, uint64_t offset);
++
+    /**
+     * Creates a video codec for a specific video format/profile
+     */
+diff --git a/src/gallium/include/pipe/p_defines.h b/src/gallium/include/pipe/p_defines.h
+index 6d29cdb..9305ff7 100644
+--- a/src/gallium/include/pipe/p_defines.h
++++ b/src/gallium/include/pipe/p_defines.h
+@@ -506,6 +506,7 @@ enum pipe_flush_flags
+ #define PIPE_RESOURCE_FLAG_DONT_MAP_DIRECTLY     (1 << 7) /* for small visible VRAM */
+ #define PIPE_RESOURCE_FLAG_UNMAPPABLE            (1 << 8) /* implies staging transfers due to VK interop */
+ #define PIPE_RESOURCE_FLAG_DRV_PRIV              (1 << 9) /* driver/winsys private */
++#define PIPE_RESOURCE_FLAG_TILE_POOL             (1 << 10) /* WinBoat: a D3D tile pool, memory only (tile_map) */
+ #define PIPE_RESOURCE_FLAG_FRONTEND_PRIV         (1 << 24) /* gallium frontend private */
+ 
+ /**
+diff --git a/src/gallium/include/pipe/p_shader_tokens.h b/src/gallium/include/pipe/p_shader_tokens.h
+index 12a4e02..2721878 100644
+--- a/src/gallium/include/pipe/p_shader_tokens.h
++++ b/src/gallium/include/pipe/p_shader_tokens.h
+@@ -618,7 +618,10 @@ enum tgsi_opcode {
+    TGSI_OPCODE_ATOMINC_WRAP       = 250,
+    TGSI_OPCODE_ATOMDEC_WRAP       = 251,
+ 
+-   TGSI_OPCODE_LAST               = 252,
++   /* WinBoat (virgl): the next texture instruction's residency (1 or 0) into dst and its LOD clamp src.x */
++   TGSI_OPCODE_SPARSE             = 252,
++
++   TGSI_OPCODE_LAST               = 253,
+ };
+ 
+ 
+diff --git a/src/virtio/virtio-gpu/virgl_hw.h b/src/virtio/virtio-gpu/virgl_hw.h
+index 84ee110..70261d6 100644
+--- a/src/virtio/virtio-gpu/virgl_hw.h
++++ b/src/virtio/virtio-gpu/virgl_hw.h
+@@ -599,6 +599,13 @@ enum virgl_formats {
+ #define VIRGL_CAP_V2_CONSERVATIVE_RASTER  (1u << 28)
+ /* WinBoat: fragment shaders in pixel order (TGSI_PROPERTY_FS_INTERLOCK, GL_ARB_fragment_shader_interlock) */
+ #define VIRGL_CAP_V2_FS_INTERLOCK         (1u << 27)
++/* WinBoat: D3D tiled resources (sparse resources whose pages VIRGL_CCMD_TILE_MAP binds to tile pools; D3D's tile
++ * shapes) */
++#define VIRGL_CAP_V2_TILED                (1u << 26)
++/* WinBoat: samplers' reduction mode (VIRGL_OBJ_SAMPLE_STATE_S0_REDUCTION_MODE: D3D 11.2's min/max filtering) */
++#define VIRGL_CAP_V2_SAMPLER_REDUCTION    (1u << 25)
++/* WinBoat: TGSI's SPARSE (the next texture lookup's residency and LOD clamp: tiled resources tier 2) */
++#define VIRGL_CAP_V2_SPARSE_FEEDBACK      (1u << 24)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+@@ -612,6 +619,9 @@ enum virgl_formats {
+ #define VIRGL_BIND_DISPLAY_TARGET (1 << 7)
+ #define VIRGL_BIND_COMMAND_ARGS  (1 << 8)
+ #define VIRGL_BIND_STREAM_OUTPUT (1 << 11)
++/* WinBoat (VIRGL_CAP_V2_TILED): sparse storage; a tile pool (memory only) */
++#define VIRGL_BIND_SPARSE        (1 << 10)
++#define VIRGL_BIND_TILE_POOL     (1 << 12)
+ /* WinBoat's host: storage from Vulkan memory a Venus context imports (VIRGL_CAP_V2_VK_SHARED) */
+ #define VIRGL_BIND_VK_SHARED     (1 << 13)
+ #define VIRGL_BIND_SHADER_BUFFER (1 << 14)
+diff --git a/src/virtio/virtio-gpu/virgl_protocol.h b/src/virtio/virtio-gpu/virgl_protocol.h
+index 97db746..0f8bbe3 100644
+--- a/src/virtio/virtio-gpu/virgl_protocol.h
++++ b/src/virtio/virtio-gpu/virgl_protocol.h
+@@ -134,6 +134,7 @@ enum virgl_context_cmd {
+    /* WinBoat's virglrenderer patches; sent only when the host's caps announce them */
+    VIRGL_CCMD_SET_RASTER_SAMPLES,         /* VIRGL_CAP_V2_RASTER_SAMPLES */
+    VIRGL_CCMD_SET_CONSERVATIVE_RASTER,    /* VIRGL_CAP_V2_CONSERVATIVE_RASTER */
++   VIRGL_CCMD_TILE_MAP,                   /* VIRGL_CAP_V2_TILED */
+ 
+    VIRGL_MAX_COMMANDS
+ };
+@@ -398,6 +399,8 @@ enum virgl_shader_stage {
+ #define VIRGL_OBJ_SAMPLE_STATE_S0_COMPARE_MODE(x) (((x) & 0x1) << 15)
+ #define VIRGL_OBJ_SAMPLE_STATE_S0_COMPARE_FUNC(x) (((x) & 0x7) << 16)
+ #define VIRGL_OBJ_SAMPLE_STATE_S0_SEAMLESS_CUBE_MAP(x) (((x) & 0x1) << 19)
++/* WinBoat (VIRGL_CAP_V2_SAMPLER_REDUCTION): 0 weighted average, 1 minimum, 2 maximum */
++#define VIRGL_OBJ_SAMPLE_STATE_S0_REDUCTION_MODE(x) (((x) & 0x3) << 26)
+ #define VIRGL_OBJ_SAMPLE_STATE_S0_MAX_ANISOTROPY(x) (((x & 0x1f)) << 20) /* Used to be 6 bits wide */
+ 
+ #define VIRGL_OBJ_SAMPLER_STATE_LOD_BIAS 3
+@@ -792,4 +795,18 @@ enum vrend_tweak_type {
+ #define VIRGL_SET_CONSERVATIVE_RASTER_SIZE 1
+ #define VIRGL_SET_CONSERVATIVE_RASTER_MODE 1
+ 
++/* VIRGL_CCMD_TILE_MAP: a region of a sparse resource bound to tile pool memory at an offset, or unbound (pool 0) */
++#define VIRGL_TILE_MAP_SIZE 11
++#define VIRGL_TILE_MAP_HANDLE 1
++#define VIRGL_TILE_MAP_LEVEL 2
++#define VIRGL_TILE_MAP_X 3
++#define VIRGL_TILE_MAP_Y 4
++#define VIRGL_TILE_MAP_Z 5
++#define VIRGL_TILE_MAP_WIDTH 6
++#define VIRGL_TILE_MAP_HEIGHT 7
++#define VIRGL_TILE_MAP_DEPTH 8
++#define VIRGL_TILE_MAP_POOL 9
++#define VIRGL_TILE_MAP_OFFSET_LO 10
++#define VIRGL_TILE_MAP_OFFSET_HI 11
++
+ #endif

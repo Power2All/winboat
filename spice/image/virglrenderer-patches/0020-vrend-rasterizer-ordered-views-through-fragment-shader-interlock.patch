@@ -1,0 +1,172 @@
+From: WinBoat
+Subject: [PATCH] vrend: rasterizer ordered views through fragment shader interlock
+
+Direct3D 11.3's rasterizer ordered views: a pixel shader's accesses to them happen in the order the primitives were
+drawn, pixel by pixel (order-independent transparency, programmable blending). GL has it as
+GL_ARB_fragment_shader_interlock: what runs between beginInvocationInterlockARB() and endInvocationInterlockARB()
+is ordered like that. A new TGSI property, FS_INTERLOCK (after SEPARABLE_PROGRAM: the guest sends it by name), puts
+the whole fragment shader in the interlock: its main becomes vrend_interlocked_main, called by a main of its own
+between the two calls (which may be neither in control flow nor after a return, and the shader may return
+anywhere), with layout(pixel_interlock_ordered). The host announces it with VIRGL_CAP_V2_FS_INTERLOCK (bit 27).
+---
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_strings.c b/src/gallium/auxiliary/tgsi/tgsi_strings.c
+index 257447a..1e0c6aa 100644
+--- a/src/gallium/auxiliary/tgsi/tgsi_strings.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_strings.c
+@@ -167,6 +167,7 @@ const char *tgsi_property_names[TGSI_PROPERTY_COUNT] =
+    "LAYER_VIEWPORT_RELATIVE",
+    "FS_BLEND_EQUATION_ADVANCED",
+    "SEPARABLE_PROGRAM",
++   "FS_INTERLOCK",
+ };
+ 
+ const char *tgsi_return_type_names[TGSI_RETURN_TYPE_COUNT] =
+diff --git a/src/gallium/include/pipe/p_shader_tokens.h b/src/gallium/include/pipe/p_shader_tokens.h
+index edfb761..fbb08a5 100644
+--- a/src/gallium/include/pipe/p_shader_tokens.h
++++ b/src/gallium/include/pipe/p_shader_tokens.h
+@@ -326,6 +326,7 @@ enum tgsi_property_name {
+    TGSI_PROPERTY_LAYER_VIEWPORT_RELATIVE,
+    TGSI_PROPERTY_FS_BLEND_EQUATION_ADVANCED,
+    TGSI_PROPERTY_SEPARABLE_PROGRAM,
++   TGSI_PROPERTY_FS_INTERLOCK,   /* WinBoat: the fragment shader runs in pixel order */
+    TGSI_PROPERTY_COUNT,
+ };
+ 
+diff --git a/src/virgl_hw.h b/src/virgl_hw.h
+index aefaa73..89ed800 100644
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -638,6 +638,8 @@ enum virgl_formats {
+ #define VIRGL_CAP_V2_VK_SHARED            (1u << 29)
+ /* WinBoat: VIRGL_CCMD_SET_CONSERVATIVE_RASTER (GL_NV_conservative_raster) */
+ #define VIRGL_CAP_V2_CONSERVATIVE_RASTER  (1u << 28)
++/* WinBoat: TGSI_PROPERTY_FS_INTERLOCK (GL_ARB_fragment_shader_interlock) */
++#define VIRGL_CAP_V2_FS_INTERLOCK         (1u << 27)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 2084689..75d4a64 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -235,6 +235,7 @@ enum features_id
+    feat_raster_multisample,
+    feat_viewport_layer_array,
+    feat_conservative_raster,
++   feat_fragment_shader_interlock,
+    feat_last,
+ };
+ 
+@@ -351,6 +352,7 @@ static const  struct {
+    FEAT(raster_multisample, UNAVAIL, UNAVAIL, "GL_EXT_raster_multisample"),
+    FEAT(viewport_layer_array, UNAVAIL, UNAVAIL, "GL_ARB_shader_viewport_layer_array"),
+    FEAT(conservative_raster, UNAVAIL, UNAVAIL, "GL_NV_conservative_raster"),
++   FEAT(fragment_shader_interlock, UNAVAIL, UNAVAIL, "GL_ARB_fragment_shader_interlock"),
+ };
+ 
+ struct global_renderer_state {
+@@ -8142,6 +8144,7 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+    grctx->shader_cfg.has_vs_layer = has_feature(feat_vs_layer_viewport);
+    grctx->shader_cfg.has_vs_viewport_index = has_feature(feat_vs_viewport_index);
+    grctx->shader_cfg.has_viewport_layer_array = has_feature(feat_viewport_layer_array);
++   grctx->shader_cfg.has_fragment_shader_interlock = has_feature(feat_fragment_shader_interlock);
+ 
+    vrend_renderer_create_sub_ctx(grctx, 0);
+    vrend_renderer_set_sub_ctx(grctx, 0);
+@@ -13119,6 +13122,9 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+    if (has_feature(feat_conservative_raster))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_CONSERVATIVE_RASTER;
+ 
++   if (has_feature(feat_fragment_shader_interlock))
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_FS_INTERLOCK;
++
+    if (has_feature(feat_pipeline_statistics_query))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY;
+ 
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index 2bc706b..fd196ae 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -85,6 +85,7 @@
+ #define SHADER_REQ_SHADER_GROUP_VOTE      (1ULL << 40)
+ #define SHADER_REQ_EXPLICIT_UNIFORM_LOCATION (1ULL << 41)
+ #define SHADER_REQ_VIEWPORT_LAYER_ARRAY   (1ULL << 42)
++#define SHADER_REQ_FRAGMENT_SHADER_INTERLOCK (1ULL << 43)
+ 
+ #define FRONT_COLOR_EMITTED (1 << 0)
+ #define BACK_COLOR_EMITTED  (1 << 1);
+@@ -285,6 +286,7 @@ struct dump_ctx {
+    bool fs_lower_left_origin, fs_integer_pixel_center;
+    int fs_depth_layout;
+    uint32_t fs_blend_equation_advanced;
++   bool fs_interlock;
+ 
+    bool separable_program;
+ 
+@@ -363,6 +365,7 @@ static const struct vrend_shader_table shader_req_table[] = {
+     { SHADER_REQ_SHADER_GROUP_VOTE, "ARB_shader_group_vote"},
+     { SHADER_REQ_EXPLICIT_UNIFORM_LOCATION, "ARB_explicit_uniform_location"},
+     { SHADER_REQ_VIEWPORT_LAYER_ARRAY, "ARB_shader_viewport_layer_array"},
++    { SHADER_REQ_FRAGMENT_SHADER_INTERLOCK, "ARB_fragment_shader_interlock"},
+ };
+ 
+ enum vrend_type_qualifier {
+@@ -2118,6 +2121,15 @@ iter_property(struct tgsi_iterate_context *iter,
+          ctx->shader_req_bits |= SHADER_REQ_BLEND_EQUATION_ADVANCED;
+       }
+       break;
++   case TGSI_PROPERTY_FS_INTERLOCK:
++      /* D3D's rasterizer ordered views: the whole shader in the interlock (see emit_fs_interlock_main) */
++      if (ctx->cfg->has_fragment_shader_interlock && prop->u[0].Data && ctx->info.processor == TGSI_PROCESSOR_FRAGMENT) {
++         ctx->fs_interlock = true;
++         /* (input layout qualifiers: GLSL 1.50) */
++         ctx->glsl_ver_required = require_glsl_ver(ctx, 150);
++         ctx->shader_req_bits |= SHADER_REQ_FRAGMENT_SHADER_INTERLOCK;
++      }
++      break;
+    case TGSI_PROPERTY_SEPARABLE_PROGRAM:
+       /* GLES is very strict in how separable shaders interfaces should be matched.
+        * It doesn't allow, for example, inputs without matching outputs. So, we just
+@@ -5546,7 +5558,7 @@ iter_instruction(struct tgsi_iterate_context *iter,
+          rewrite_vs_pos_array(ctx);
+       }
+ 
+-      emit_buf(&ctx->glsl_strbufs, "void main(void)\n{\n");
++      emit_buf(&ctx->glsl_strbufs, ctx->fs_interlock ? "void vrend_interlocked_main(void)\n{\n" : "void main(void)\n{\n");
+       if (iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT) {
+          emit_color_select(ctx, &ctx->glsl_strbufs);
+          if (ctx->fs_uses_clipdist_input)
+@@ -5934,6 +5946,11 @@ iter_instruction(struct tgsi_iterate_context *iter,
+          handle_fragment_proc_exit(ctx, &ctx->glsl_strbufs);
+       }
+       emit_buf(&ctx->glsl_strbufs, "}\n");
++      /* The interlock's calls may be neither in control flow nor after a return: the shader's own main, which may
++       * return anywhere, runs between them */
++      if (ctx->fs_interlock)
++         emit_buf(&ctx->glsl_strbufs, "void main(void)\n{\n   beginInvocationInterlockARB();\n"
++                  "   vrend_interlocked_main();\n   endInvocationInterlockARB();\n}\n");
+       break;
+    case TGSI_OPCODE_RET:
+       if (iter->processor.Processor == TGSI_PROCESSOR_VERTEX) {
+@@ -7271,6 +7288,8 @@ static void emit_ios_fs(const struct dump_ctx *ctx,
+    if (ctx->early_depth_stencil) {
+       emit_hdr(glsl_strbufs, "layout(early_fragment_tests) in;\n");
+    }
++   if (ctx->fs_interlock)
++      emit_hdr(glsl_strbufs, "layout(pixel_interlock_ordered) in;\n");
+ 
+    emit_ios_indirect_generics_input(ctx, glsl_strbufs, "");
+ 
+diff --git a/src/vrend/vrend_shader.h b/src/vrend/vrend_shader.h
+index 5ebc256..efdb285 100644
+--- a/src/vrend/vrend_shader.h
++++ b/src/vrend/vrend_shader.h
+@@ -260,6 +260,7 @@ struct vrend_shader_cfg {
+    uint32_t has_vs_layer : 1;
+    uint32_t has_vs_viewport_index : 1;
+    uint32_t has_viewport_layer_array : 1;
++   uint32_t has_fragment_shader_interlock : 1;
+ };
+ 
+ struct vrend_context;

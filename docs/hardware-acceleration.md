@@ -977,8 +977,11 @@ Faster presents (Mesa patch 0015, after gpu.38): presents were capped at 63 fps 
 which lasts a whole 15.6 ms timer tick, and Venus waits for the GPU by polling with short sleeps. With a
 high-resolution waitable timer, drawing straight from the mapped frame, and a present thread (FIFO paced by
 `DwmFlush`, IMMEDIATE and MAILBOX added), a 1200x781 window goes from 63 to ~1100 fps uncapped and vsync'd apps run
-at the display's rate. The copy through the CPU costs ~1 ms per megapixel on the present thread; a zero-copy path
-(Venus blob shared with the D3D driver on the host) is noted for later.
+at the display's rate. The copy through the CPU cost ~1 ms per megapixel on the present thread. Since gpu.83 (Mesa
+patch 0035, mesa-venus 0009) presents stay on the GPU: each swapchain image has a shared Direct3D 11 texture whose
+host storage is Vulkan memory, which Venus imports by its host resource id; a present blits into it and the driver's
+own DXGI swap chain shows it. A present costs ~0.4 ms whatever the window size (1440p: 1.58 -> 0.44 ms). Anything
+missing falls back to the CPU path; `WINBOAT_VK_PRESENT=copy` forces it.
 
 Not yet: ray tracing, mesh shaders and Vulkan Video (the host's Venus doesn't forward them; video is stage E).
 

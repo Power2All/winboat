@@ -1,0 +1,159 @@
+From: WinBoat
+Subject: [PATCH] vrend: program binds only when the program changes
+
+Every draw bound its program again (glBindProgramPipeline(0) and glUseProgram, or glUseProgram(0) and
+glBindProgramPipeline): on NVIDIA's driver each costs ~1 us even when the same thing is bound, against ~0.04 us for
+the draw itself, so a D3D11 or OpenGL program drawing many small batches spent most of the host's time there. Each
+sub context remembers what its GL context has bound; vrend_use_program skips a bind that changes nothing. The
+clear and transfer paths, which may run in another sub context's GL context, bind as before and drop the memory;
+deleting a program or pipeline (a bound pipeline is unbound at once and its name can be reused) invalidates every
+sub context's memory.
+---
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 46858a4..b629581 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -717,6 +717,15 @@ struct vrend_sub_context {
+ 
+    virgl_gl_context gl_context;
+ 
++   /* The program (or program pipeline) this context's GL context has bound, so vrend_use_program skips binding it
++    * again: a glUseProgram or glBindProgramPipeline of what's already bound costs ~1 us on NVIDIA's driver, as much
++    * as twenty draws, and every draw did both. Valid while bound_program_generation matches
++    * vrend_program_generation (bumped by every program or pipeline deletion: a deleted pipeline is unbound at once
++    * and its name can come back) */
++   GLuint bound_program_id;
++   bool bound_program_is_pipeline;
++   uint32_t bound_program_generation;
++
+    int sub_ctx_id;
+ 
+    GLuint vaoid;
+@@ -1470,12 +1479,21 @@ static bool vrend_is_timer_query(GLenum gltype)
+       gltype == GL_TIME_ELAPSED;
+ }
+ 
+-static void vrend_use_program(struct vrend_linked_shader_program *program)
++/* Generation of vrend_sub_context.bound_program_id: 0 is never current (a sub context's memory starts out unknown) */
++static uint32_t vrend_program_generation = 1;
++
++/* sub_ctx: the sub context whose GL context is current, whose binding is remembered; NULL where that isn't certain
++ * (the binding is made, and remembered nowhere) */
++static void vrend_use_program(struct vrend_sub_context *sub_ctx, struct vrend_linked_shader_program *program)
+ {
+    GLuint id = !program ? 0 :
+                           program->is_pipeline ? program->id.pipeline :
+                                                  program->id.program;
+-   if (program && program->is_pipeline) {
++   bool is_pipeline = program && program->is_pipeline;
++   if (sub_ctx && sub_ctx->bound_program_generation == vrend_program_generation &&
++       sub_ctx->bound_program_id == id && sub_ctx->bound_program_is_pipeline == is_pipeline)
++      return;
++   if (is_pipeline) {
+       glUseProgram(0);
+       glBindProgramPipeline(id);
+    } else {
+@@ -1483,6 +1501,18 @@ static void vrend_use_program(struct vrend_linked_shader_program *program)
+           glBindProgramPipeline(0);
+        glUseProgram(id);
+    }
++   if (sub_ctx) {
++      sub_ctx->bound_program_id = id;
++      sub_ctx->bound_program_is_pipeline = is_pipeline;
++      sub_ctx->bound_program_generation = vrend_program_generation;
++   }
++}
++
++/* A binding made outside vrend_use_program, or in a GL context that may not be the sub context's */
++static void vrend_forget_program_binding(struct vrend_sub_context *sub_ctx)
++{
++   if (sub_ctx)
++      sub_ctx->bound_program_generation = 0;
+ }
+ 
+ static void vrend_depth_test_enable(struct vrend_sub_context *sub_ctx, bool depth_test_enable)
+@@ -1966,7 +1996,7 @@ static struct vrend_linked_shader_program *add_cs_shader_program(struct vrend_co
+    sprog->id.program = prog_id;
+    list_addtail(&sprog->head, &ctx->sub->cs_programs);
+ 
+-   vrend_use_program(sprog);
++   vrend_use_program(ctx->sub, sprog);
+ 
+    bind_sampler_locs(sprog, PIPE_SHADER_COMPUTE, 0);
+    bind_ubo_locs(sprog, PIPE_SHADER_COMPUTE, 0);
+@@ -2154,7 +2184,7 @@ static struct vrend_linked_shader_program *add_shader_program(struct vrend_sub_c
+    sprog->ubo_sysval_buffer_id = GL_INVALID_INDEX;
+    sprog->sysvalue_data_cookie = UINT32_MAX;
+ 
+-   vrend_use_program(sprog);
++   vrend_use_program(sub_ctx, sprog);
+ 
+    for (enum pipe_shader_type shader_type = PIPE_SHADER_VERTEX;
+         shader_type <= last_shader;
+@@ -2249,6 +2279,7 @@ static void vrend_destroy_program(struct vrend_linked_shader_program *ent)
+        glDeleteProgramPipelines(1, &ent->id.pipeline);
+    else
+        glDeleteProgram(ent->id.program);
++   vrend_program_generation++;  /* (every sub context's remembered binding: unknown) */
+ 
+    list_del(&ent->head);
+ 
+@@ -4810,7 +4841,8 @@ void vrend_clear(struct vrend_context *ctx, unsigned buffers,
+    if (sub_ctx->viewport_state_dirty)
+       vrend_update_viewport_state(sub_ctx);
+ 
+-   vrend_use_program(NULL);
++   vrend_use_program(NULL, NULL);
++   vrend_forget_program_binding(sub_ctx);
+ 
+    glDisable(GL_SCISSOR_TEST);
+ 
+@@ -5798,7 +5830,7 @@ vrend_select_program(struct vrend_sub_context *sub_ctx, uint8_t vertices_per_pat
+           }
+ 
+           if (need_rebind) {
+-             vrend_use_program(prog);
++             vrend_use_program(sub_ctx, prog);
+              rebind_ubo_and_sampler_locs(prog, last_shader);
+           }
+       }
+@@ -6015,7 +6047,7 @@ int vrend_draw_vbo(struct vrend_context *ctx,
+       return 0;
+    }
+ 
+-   vrend_use_program(sub_ctx->prog);
++   vrend_use_program(sub_ctx, sub_ctx->prog);
+ 
+    if (has_feature(feat_draw_parameters) &&
+        sub_ctx->prog->reads_drawid &&
+@@ -6302,7 +6334,7 @@ void vrend_launch_grid(struct vrend_context *ctx,
+       return;
+    }
+ 
+-   vrend_use_program(sub_ctx->prog);
++   vrend_use_program(sub_ctx, sub_ctx->prog);
+ 
+    vrend_set_active_pipeline_stage(sub_ctx->prog, PIPE_SHADER_COMPUTE);
+    vrend_draw_bind_ubo_shader(sub_ctx, PIPE_SHADER_COMPUTE, 0);
+@@ -9522,7 +9554,9 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
+       uint32_t stride = info->stride;
+       uint32_t layer_stride = info->layer_stride;
+ 
+-      vrend_use_program(NULL);
++      vrend_use_program(NULL, NULL);
++      if (ctx)
++         vrend_forget_program_binding(ctx->sub);
+ 
+       if (!stride)
+          stride = util_format_get_nblocksx(res->base.format, u_minify(res->base.width0, info->level)) * elsize;
+@@ -9944,7 +9978,9 @@ static int vrend_transfer_send_readpixels(struct vrend_context *ctx,
+    int row_stride = info->stride / elsize;
+    GLint old_fbo;
+ 
+-   vrend_use_program(NULL);
++   vrend_use_program(NULL, NULL);
++   if (ctx)
++      vrend_forget_program_binding(ctx->sub);
+ 
+    enum virgl_formats fmt = res->base.format;
+ 

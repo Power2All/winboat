@@ -1,0 +1,26 @@
+From: WinBoat
+Subject: [PATCH] d3d9umd: no decoders listed without an error
+
+On a host without video decoding (a stock virglrenderer, or a GPU without it) the DXVA2 decoder list is empty, and
+the runtime asks for it with no buffer: PutArray refused that (E_INVALIDARG), so DXVA2CreateVideoService and
+GetDecoderDeviceGuids failed (E_FAIL) instead of listing none, and programs saw an error where a GPU without
+decoders answers "none". Empty lists are fine now.
+---
+diff --git a/src/gallium/frontends/d3d9umd/decode.cpp b/src/gallium/frontends/d3d9umd/decode.cpp
+index c0cb0e7..a74d6eb 100644
+--- a/src/gallium/frontends/d3d9umd/decode.cpp
++++ b/src/gallium/frontends/d3d9umd/decode.cpp
+@@ -74,9 +74,11 @@ template <typename T>
+ static HRESULT
+ PutArray(const D3DDDIARG_GETCAPS *p, const T *values, UINT count)
+ {
+-   if (!p->pData || p->DataSize < count * sizeof(T))
++   /* (none: a host without video decoding lists no decoders, and the runtime passes no buffer for them) */
++   if (count && (!p->pData || p->DataSize < count * sizeof(T)))
+       return E_INVALIDARG;
+-   memcpy(p->pData, values, count * sizeof(T));
++   if (count)
++      memcpy(p->pData, values, count * sizeof(T));
+    return S_OK;
+ }
+ 

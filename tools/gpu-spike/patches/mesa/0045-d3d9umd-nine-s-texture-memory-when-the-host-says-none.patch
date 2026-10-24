@@ -1,0 +1,25 @@
+From: WinBoat
+Subject: [PATCH] d3d9umd: nine's texture memory when the host says none
+
+A host GL without a way to say how much video memory it has (no GL_NVX_gpu_memory_info, ATI_meminfo or
+MESA_query_renderer: older GPUs, and llvmpipe with 2010's extensions) gives PIPE_CAP_VIDEO_MEMORY 0, and gallium
+nine's texture memory counter then refused every resource with D3DERR_OUTOFVIDEOMEMORY: no Direct3D 9 device
+could be made. Then nine counts from 4 GB (override_vram_size); the kernel driver holds the real limit.
+---
+diff --git a/src/gallium/frontends/d3d9umd/nine_bridge.c b/src/gallium/frontends/d3d9umd/nine_bridge.c
+index af05dfd..30a5425 100644
+--- a/src/gallium/frontends/d3d9umd/nine_bridge.c
++++ b/src/gallium/frontends/d3d9umd/nine_bridge.c
+@@ -113,7 +113,11 @@ nddi_init_context(struct d3dadapter9_context *ctx, struct pipe_screen *screen)
+    /* The DDI calls arrive serialized from the runtime; no worker thread */
+    ctx->csmt_force = 0;
+    ctx->memfd_virtualsizelimit = -1;
+-   ctx->override_vram_size = -1;
++   /* A host that doesn't say how much video memory it has (no GL_NVX_gpu_memory_info, ATI_meminfo or
++    * MESA_query_renderer: older GPUs) reports 0, and nine's texture memory counter then refused every resource
++    * (D3DERR_OUTOFVIDEOMEMORY: no Direct3D 9 device at all). Then 4 GB: the counter is nine's own, the kernel driver
++    * holds the real limit (GpuMemoryLimitMB) */
++   ctx->override_vram_size = screen->get_param(screen, PIPE_CAP_VIDEO_MEMORY) ? -1 : 4096;
+ }
+ 
+ /* ---- Adapter ---- */

@@ -1,0 +1,299 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd, virgl: conservative rasterization and rasterizer ordered views
+
+Two Direct3D 11.3 features the host GPU has but the D3D11 driver didn't offer (Direct3D 12 had them through Venus):
+- Conservative rasterization, tier 1: the WDDM 2.0 rasterizer state's ConservativeRasterizationMode becomes the
+  gallium state's (post-snap), which virgl sends as VIRGL_CCMD_SET_CONSERVATIVE_RASTER when the rasterizer state
+  changes; the host (virglrenderer 0019) turns GL_NV_conservative_raster on around the draws. Reported through
+  D3DWDDM2_0DDICAPS_D3D11_OPTIONS2 when the host announces VIRGL_CAP_V2_CONSERVATIVE_RASTER.
+- Rasterizer ordered views: a pixel shader declaring one gets the TGSI property FS_INTERLOCK (virglrenderer 0020
+  puts the whole shader in GL_ARB_fragment_shader_interlock's interlock) and its UAVs coherent, which is what makes
+  the next invocation of the pixel see the writes. Reported with D3D11DDICAPS_SHADER_ROVS when the host announces
+  VIRGL_CAP_V2_FS_INTERLOCK.
+The UAV declarations' access flags were read with DECODE_D3D11_SB_UAV_FLAGS, which keeps the order-preserving
+counter bit only: the globally-coherent flag never reached the shaders either. They're read from the opcode token now.
+---
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_strings.c b/src/gallium/auxiliary/tgsi/tgsi_strings.c
+index 1e21c55..121cfe8 100644
+--- a/src/gallium/auxiliary/tgsi/tgsi_strings.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_strings.c
+@@ -168,6 +168,7 @@ const char *tgsi_property_names[TGSI_PROPERTY_COUNT] =
+    "LAYER_VIEWPORT_RELATIVE",
+    "FS_BLEND_EQUATION_ADVANCED",
+    "SEPARABLE_PROGRAM",
++   "FS_INTERLOCK",
+ };
+ 
+ const char *tgsi_return_type_names[TGSI_RETURN_TYPE_COUNT] =
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+index 4d6d92d..59bceac 100644
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -490,6 +490,14 @@ static void virgl_bind_rasterizer_state(struct pipe_context *ctx,
+       virgl_encode_set_raster_samples(vctx, samples);
+       vctx->raster_samples = samples;
+    }
++
++   /* Conservative rasterization (D3D 11.3), likewise */
++   bool conservative = rs_state && ((struct virgl_rasterizer_state *)rs_state)->rs.conservative_raster_mode;
++   if (conservative != vctx->conservative_raster &&
++       (virgl_screen(ctx->screen)->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_CONSERVATIVE_RASTER)) {
++      virgl_encode_set_conservative_raster(vctx, conservative);
++      vctx->conservative_raster = conservative;
++   }
+ }
+ 
+ static void virgl_delete_rasterizer_state(struct pipe_context *ctx,
+diff --git a/src/gallium/drivers/virgl/virgl_context.h b/src/gallium/drivers/virgl/virgl_context.h
+index aa0c173..50f4ca2 100644
+--- a/src/gallium/drivers/virgl/virgl_context.h
++++ b/src/gallium/drivers/virgl/virgl_context.h
+@@ -92,6 +92,7 @@ struct virgl_context {
+ 
+    struct virgl_rasterizer_state rs_state;
+    unsigned raster_samples;   /* the host's, VIRGL_CCMD_SET_RASTER_SAMPLES */
++   bool conservative_raster;  /* the host's, VIRGL_CCMD_SET_CONSERVATIVE_RASTER */
+    struct virgl_so_target so_targets[PIPE_MAX_SO_BUFFERS];
+    unsigned num_so_targets;
+ 
+diff --git a/src/gallium/drivers/virgl/virgl_encode.c b/src/gallium/drivers/virgl/virgl_encode.c
+index 54f6b39..760b873 100644
+--- a/src/gallium/drivers/virgl/virgl_encode.c
++++ b/src/gallium/drivers/virgl/virgl_encode.c
+@@ -543,6 +543,14 @@ int virgl_encode_set_raster_samples(struct virgl_context *ctx, uint32_t samples)
+    return 0;
+ }
+ 
++/* WinBoat: conservative rasterization on or off (VIRGL_CAP_V2_CONSERVATIVE_RASTER) */
++int virgl_encode_set_conservative_raster(struct virgl_context *ctx, bool enable)
++{
++   virgl_encoder_write_cmd_dword(ctx, VIRGL_CMD0(VIRGL_CCMD_SET_CONSERVATIVE_RASTER, 0, VIRGL_SET_CONSERVATIVE_RASTER_SIZE));
++   virgl_encoder_write_dword(ctx->cbuf, enable);
++   return 0;
++}
++
+ int virgl_encode_delete_object(struct virgl_context *ctx,
+                               uint32_t handle, uint32_t object)
+ {
+diff --git a/src/gallium/drivers/virgl/virgl_encode.h b/src/gallium/drivers/virgl/virgl_encode.h
+index 0cb1f3f..fef0d07 100644
+--- a/src/gallium/drivers/virgl/virgl_encode.h
++++ b/src/gallium/drivers/virgl/virgl_encode.h
+@@ -126,6 +126,7 @@ int virgl_encode_clear_texture(struct virgl_context *ctx,
+                                const void *data);
+ 
+ int virgl_encode_set_raster_samples(struct virgl_context *ctx, uint32_t samples);
++int virgl_encode_set_conservative_raster(struct virgl_context *ctx, bool enable);
+ 
+ int virgl_encode_bind_object(struct virgl_context *ctx,
+                             uint32_t handle, uint32_t object);
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index c1fffdc..2f27fcb 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -379,7 +379,10 @@ GetCaps(D3D10DDI_HADAPTER hAdapter,
+             /* 11.3: oStencilRef (GL_ARB_shader_stencil_export); typed UAV loads beyond R32 (GLSL image loads take
+              * any image format: shader variants declare the bound view's) */
+             (host_caps.v1.bset.shader_stencil_export ? D3D11DDICAPS_SHADER_SPECIFIED_STENCIL_REF : 0) |
+-            D3D11DDICAPS_SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS;
++            D3D11DDICAPS_SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS |
++            /* 11.3: rasterizer ordered views (the pixel shader in GL_ARB_fragment_shader_interlock's interlock:
++             * WinBoat's virglrenderer patch, VIRGL_CAP_V2_FS_INTERLOCK) */
++            ((host_caps.v2.capability_bits_v2 & VIRGL_CAP_V2_FS_INTERLOCK) ? D3D11DDICAPS_SHADER_ROVS : 0);
+       }
+       break;
+    case D3D11DDICAPS_3DPIPELINESUPPORT:
+@@ -407,6 +410,16 @@ GetCaps(D3D10DDI_HADAPTER hAdapter,
+          static_cast<D3DWDDM2_0DDI_GPUVA_CAPS_DATA *>(pData->pData)->MaxGPUVirtualAddressBitsPerResource = 40;
+       }
+       break;
++   case D3DWDDM2_0DDICAPS_D3D11_OPTIONS2:
++      /* 11.3: conservative rasterization, tier 1 (GL_NV_conservative_raster: WinBoat's virglrenderer patch,
++       * VIRGL_CAP_V2_CONSERVATIVE_RASTER; tier 2's 1/256 pixel uncertainty and tier 3's inner coverage aren't
++       * promised by it) */
++      if (pData->DataSize >= sizeof(D3DWDDM2_0DDI_D3D11_OPTIONS2_DATA) && HostSupportsFL11() &&
++          (host_caps.v2.capability_bits_v2 & VIRGL_CAP_V2_CONSERVATIVE_RASTER)) {
++         static_cast<D3DWDDM2_0DDI_D3D11_OPTIONS2_DATA *>(pData->pData)->ConservativeRasterizationTier =
++            D3DWDDM2_0DDI_CONSERVATIVE_RASTERIZATION_TIER_1;
++      }
++      break;
+    case D3DWDDM2_0DDICAPS_D3D11_OPTIONS3: {
+       /* 11.3: SV_RenderTargetArrayIndex/SV_ViewportArrayIndex from vertex and domain shaders too (GL_AMD_vertex_shader_layer
+        * and _viewport_index; the domain shader's through WinBoat's virglrenderer patch, GL_ARB_shader_viewport_layer_array) */
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+index 16d455a..e0a56e3 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -1023,7 +1023,7 @@ CreateUnorderedAccessViewWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDIAR
+                              hRTView);
+ }
+ 
+-/* Rasterizer states: no conservative rasterization (tier 0) */
++/* Rasterizer states: with conservative rasterization (tier 1 when the host has it, D3DWDDM2_0DDICAPS_D3D11_OPTIONS2) */
+ static SIZE_T APIENTRY
+ CalcPrivateRasterizerStateSizeWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDI_RASTERIZER_DESC *pDesc)
+ {
+@@ -1034,7 +1034,8 @@ static void APIENTRY
+ CreateRasterizerStateWDDM2_0(D3D10DDI_HDEVICE hDevice, const D3DWDDM2_0DDI_RASTERIZER_DESC *pDesc,
+                              D3D10DDI_HRASTERIZERSTATE hState, D3D10DDI_HRTRASTERIZERSTATE hRTState)
+ {
+-   CreateRasterizerState11_1(hDevice, reinterpret_cast<const D3D11_1_DDI_RASTERIZER_DESC *>(pDesc), hState, hRTState);
++   CreateRasterizerStateForced(hDevice, reinterpret_cast<const D3D10_DDI_RASTERIZER_DESC *>(pDesc), pDesc->ForcedSampleCount,
++                               hState, pDesc->ConservativeRasterizationMode == D3DWDDM2_0DDI_CONSERVATIVE_RASTERIZATION_ON);
+ }
+ 
+ /* Queries: the context type (3D, compute, copy, video) changes nothing here */
+diff --git a/src/gallium/frontends/d3d10umd/Rasterizer.cpp b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+index 0241394..ea0b256 100644
+--- a/src/gallium/frontends/d3d10umd/Rasterizer.cpp
++++ b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+@@ -210,11 +210,12 @@ CreateRasterizerState(
+ 
+ /*
+  * A rasterizer state with 11.1's ForcedSampleCount (target-independent rasterization and UAV-only rendering with
+- * a sample count: rasterized with that many samples whatever the render targets have; 0 for theirs)
++ * a sample count: rasterized with that many samples whatever the render targets have; 0 for theirs) and 11.3's
++ * conservative rasterization
+  */
+ void
+ CreateRasterizerStateForced(D3D10DDI_HDEVICE hDevice, const D3D10_DDI_RASTERIZER_DESC *pRasterizerDesc,
+-                            UINT ForcedSampleCount, D3D10DDI_HRASTERIZERSTATE hRasterizerState)
++                            UINT ForcedSampleCount, D3D10DDI_HRASTERIZERSTATE hRasterizerState, BOOL Conservative)
+ {
+    struct pipe_context *pipe = CastPipeContext(hDevice);
+    RasterizerState *pRasterizerState = CastRasterizerState(hRasterizerState);
+@@ -249,6 +250,7 @@ CreateRasterizerStateForced(D3D10DDI_HDEVICE hDevice, const D3D10_DDI_RASTERIZER
+    state.line_width = 1.0f;
+    state.line_rectangular = 0;
+    state.forced_sample_count = ForcedSampleCount > 1 ? ForcedSampleCount : 0;
++   state.conservative_raster_mode = Conservative ? PIPE_CONSERVATIVE_RASTER_POST_SNAP : PIPE_CONSERVATIVE_RASTER_OFF;
+ 
+    pRasterizerState->state = state;
+    memset(pRasterizerState->clip_handles, 0, sizeof pRasterizerState->clip_handles);
+diff --git a/src/gallium/frontends/d3d10umd/Rasterizer.h b/src/gallium/frontends/d3d10umd/Rasterizer.h
+index 01c16c6..7a49b6c 100644
+--- a/src/gallium/frontends/d3d10umd/Rasterizer.h
++++ b/src/gallium/frontends/d3d10umd/Rasterizer.h
+@@ -51,7 +51,8 @@ void *RasterizerStateForClipDistances(struct pipe_context *pipe, struct Rasteriz
+                                       unsigned num_clip);
+ 
+ void CreateRasterizerStateForced(D3D10DDI_HDEVICE hDevice, const D3D10_DDI_RASTERIZER_DESC *pRasterizerDesc,
+-                                 UINT ForcedSampleCount, D3D10DDI_HRASTERIZERSTATE hRasterizerState);
++                                 UINT ForcedSampleCount, D3D10DDI_HRASTERIZERSTATE hRasterizerState,
++                                 BOOL Conservative = FALSE);
+ 
+ void APIENTRY CreateRasterizerState(
+    D3D10DDI_HDEVICE hDevice,
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.c b/src/gallium/frontends/d3d10umd/ShaderParse.c
+index 2da2c17..0a3cf01 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.c
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.c
+@@ -504,12 +504,12 @@ Shader_parse_opcode(struct Shader_parser *parser,
+       break;
+    case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
+       opcode->specific.dcl_uav.dimension = DECODE_D3D10_SB_RESOURCE_DIMENSION(*curr);
+-      opcode->specific.dcl_uav.flags = DECODE_D3D11_SB_UAV_FLAGS(*curr);
++      opcode->specific.dcl_uav.flags = *curr & SHADER_UAV_FLAGS;
+       break;
+    case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW:
+    case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED:
+       opcode->specific.dcl_uav.dimension = D3D10_SB_RESOURCE_DIMENSION_BUFFER;
+-      opcode->specific.dcl_uav.flags = DECODE_D3D11_SB_UAV_FLAGS(*curr);
++      opcode->specific.dcl_uav.flags = *curr & SHADER_UAV_FLAGS;
+       break;
+    case D3D11_SB_OPCODE_SYNC:
+       opcode->specific.sync_flags = DECODE_D3D11_SB_SYNC_FLAGS(*curr);
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.h b/src/gallium/frontends/d3d10umd/ShaderParse.h
+index aa41239..0c2381d 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.h
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.h
+@@ -36,6 +36,13 @@
+ #include "DriverIncludes.h"
+ #include "util/format/u_formats.h"
+ 
++/* A UAV declaration's access flags as they are in its opcode token (DECODE_D3D11_SB_UAV_FLAGS has the order
++ * preserving counter only): globally coherent, rasterizer ordered (11.3's ROVs) */
++#ifndef D3D11_SB_RASTERIZER_ORDERED_ACCESS
++#define D3D11_SB_RASTERIZER_ORDERED_ACCESS 0x00020000
++#endif
++#define SHADER_UAV_FLAGS (D3D11_SB_GLOBALLY_COHERENT_ACCESS | D3D11_SB_RASTERIZER_ORDERED_ACCESS | D3D11_SB_UAV_FLAGS_MASK)
++
+ /* 11.3's oStencilRef, newer than the WDK's d3d11TokenizedProgramFormat.hpp (DirectX-Headers name it) */
+ #define D3D11_SB_OPERAND_TYPE_OUTPUT_STENCIL_REF ((D3D10_SB_OPERAND_TYPE)41)
+ 
+@@ -142,7 +149,7 @@ struct Shader_opcode {
+       unsigned dcl_thread_group[3];
+       struct {
+          D3D10_SB_RESOURCE_DIMENSION dimension; /* typed UAVs */
+-         unsigned flags;                        /* D3D11_SB_UAV_FLAGS (globally coherent, has counter) */
++         unsigned flags;                        /* SHADER_UAV_FLAGS of the opcode token */
+          unsigned stride;                       /* structured: bytes per element */
+       } dcl_uav;
+       struct {
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index 580b437..0aede16 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -2317,7 +2317,13 @@ dcl_uav(struct Shader_xlate *sx, const struct Shader_opcode *opcode)
+    memset(uav, 0, sizeof *uav);
+    uav->declared = true;
+    /* GLSL makes other invocations' writes visible to coherent accesses only, D3D's UAV barriers do it for all */
+-   uav->qualifier = (opcode->specific.dcl_uav.flags & D3D11_SB_GLOBALLY_COHERENT_ACCESS) || sx->uav_sync ?
++   /* A rasterizer ordered view (pixel shaders only): the shader runs in the interlock (virgl's FS_INTERLOCK), its
++    * accesses coherent (what the interlock orders, the next invocation of the pixel sees only so) */
++   bool rov = opcode->specific.dcl_uav.flags & D3D11_SB_RASTERIZER_ORDERED_ACCESS;
++   if (rov) {
++      ureg_property(sx->ureg, TGSI_PROPERTY_FS_INTERLOCK, 1);
++   }
++   uav->qualifier = (opcode->specific.dcl_uav.flags & D3D11_SB_GLOBALLY_COHERENT_ACCESS) || rov || sx->uav_sync ?
+                     TGSI_MEMORY_COHERENT : 0;
+    if (opcode->type == D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED) {
+       struct Shader_bindings *b = &sx->bindings;
+diff --git a/src/gallium/include/pipe/p_shader_tokens.h b/src/gallium/include/pipe/p_shader_tokens.h
+index 170c5e4..12a4e02 100644
+--- a/src/gallium/include/pipe/p_shader_tokens.h
++++ b/src/gallium/include/pipe/p_shader_tokens.h
+@@ -304,6 +304,7 @@ enum tgsi_property_name {
+    TGSI_PROPERTY_LAYER_VIEWPORT_RELATIVE,
+    TGSI_PROPERTY_FS_BLEND_EQUATION_ADVANCED,
+    TGSI_PROPERTY_SEPARABLE_PROGRAM,
++   TGSI_PROPERTY_FS_INTERLOCK,   /* WinBoat (virgl): the fragment shader runs in pixel order */
+    TGSI_PROPERTY_COUNT,
+ };
+ 
+diff --git a/src/virtio/virtio-gpu/virgl_hw.h b/src/virtio/virtio-gpu/virgl_hw.h
+index 5940590..84ee110 100644
+--- a/src/virtio/virtio-gpu/virgl_hw.h
++++ b/src/virtio/virtio-gpu/virgl_hw.h
+@@ -595,6 +595,10 @@ enum virgl_formats {
+ #define VIRGL_CAP_V2_TES_LAYER_VIEWPORT   (1u << 30)
+ /* WinBoat's host: textures with VIRGL_BIND_VK_SHARED get Vulkan storage a Venus context can import */
+ #define VIRGL_CAP_V2_VK_SHARED            (1u << 29)
++/* WinBoat: conservative rasterization (VIRGL_CCMD_SET_CONSERVATIVE_RASTER, GL_NV_conservative_raster) */
++#define VIRGL_CAP_V2_CONSERVATIVE_RASTER  (1u << 28)
++/* WinBoat: fragment shaders in pixel order (TGSI_PROPERTY_FS_INTERLOCK, GL_ARB_fragment_shader_interlock) */
++#define VIRGL_CAP_V2_FS_INTERLOCK         (1u << 27)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+diff --git a/src/virtio/virtio-gpu/virgl_protocol.h b/src/virtio/virtio-gpu/virgl_protocol.h
+index 02f0271..97db746 100644
+--- a/src/virtio/virtio-gpu/virgl_protocol.h
++++ b/src/virtio/virtio-gpu/virgl_protocol.h
+@@ -133,6 +133,7 @@ enum virgl_context_cmd {
+    VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT,   /* virglrenderer 1.x; not sent */
+    /* WinBoat's virglrenderer patches; sent only when the host's caps announce them */
+    VIRGL_CCMD_SET_RASTER_SAMPLES,         /* VIRGL_CAP_V2_RASTER_SAMPLES */
++   VIRGL_CCMD_SET_CONSERVATIVE_RASTER,    /* VIRGL_CAP_V2_CONSERVATIVE_RASTER */
+ 
+    VIRGL_MAX_COMMANDS
+ };
+@@ -787,4 +788,8 @@ enum vrend_tweak_type {
+ #define VIRGL_SET_RASTER_SAMPLES_SIZE 1
+ #define VIRGL_SET_RASTER_SAMPLES_COUNT 1
+ 
++/* VIRGL_CCMD_SET_CONSERVATIVE_RASTER: conservative rasterization on (1) or off (0) */
++#define VIRGL_SET_CONSERVATIVE_RASTER_SIZE 1
++#define VIRGL_SET_CONSERVATIVE_RASTER_MODE 1
++
+ #endif

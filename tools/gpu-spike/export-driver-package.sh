@@ -51,6 +51,15 @@ chmod 644 "$SPICE_DEST"/*
 echo "Exported the SPICE helpers to $SPICE_DEST:"
 ls -l "$SPICE_DEST"
 
+# Khronos' OpenCL loader for Windows 10 (gpu-driver.ps1 installs it where Windows has no OpenCL.dll)
+OPENCL_DEST="$REPO_DIR/guest_server/drivers/opencl"
+bash "$REPO_DIR/tools/opencl-loader/build.sh" >/dev/null
+rm -rf "$OPENCL_DEST"
+mkdir -p "$OPENCL_DEST"
+cp -r "$REPO_DIR/tools/opencl-loader/dist/x64" "$REPO_DIR/tools/opencl-loader/dist/x86" "$REPO_DIR/tools/opencl-loader/dist/OpenCL-license.txt" "$OPENCL_DEST/"
+echo "Exported the OpenCL loader to $OPENCL_DEST:"
+ls -lR "$OPENCL_DEST"
+
 CHECK_DEST="$REPO_DIR/guest_server/drivers/gpucheck"
 bash "$REPO_DIR/tools/dx-test/build.sh" >/dev/null
 rm -rf "$CHECK_DEST"

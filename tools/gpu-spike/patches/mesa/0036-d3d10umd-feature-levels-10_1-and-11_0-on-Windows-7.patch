@@ -1,0 +1,299 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: feature levels 10_1 and 11_0 on Windows 7
+
+Windows 7's runtimes take no 11.1 DDI from a WDDM 1.1 driver, so Direct3D 10.1 and 11 programs there got feature
+level 10_0. The adapter now offers Windows 7 (only) the 10.1 DDI (Device.cpp's 10.1 entry points, as far as they
+were kept) and the 11.0 DDI: the 11.0 table is the 11.1 table's first 152 entries in the same order (checked at
+compile time), with the 25 whose arguments differ taken from the 10.0/10.1 entry points or small wrappers (hull,
+domain and compute constant buffers without offsets, stream output, tessellation signatures converted to 11.1's
+entries), and DXGI 1.1's ResolveSharedResource. Feature level 11_1 isn't reported there (it needs the 11.1 DDI).
+GetSupportedVersions now filters its list instead of cutting its end.
+
+Windows 7 SP1 with the Platform Update (KB2670838), the setup's GPU check: 202 passed (was 93), D3D11 rendering,
+compute and tessellation at 11_0 compared with WARP; a Direct3D 10.1 device at 10_1. Windows 11 unchanged (675/0).
+---
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index 5004ef2..c1fffdc 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -153,6 +153,11 @@ SupportedDDIInterfaceVersions[] = {
+    D3D11_0_DDI_SUPPORTED,
+    D3D11_0_7_DDI_SUPPORTED,
+ #endif
++   /* Windows 7's Direct3D 10.1 runtime: feature level 10_1 through the 10.1 DDI (Device.cpp's 10.1 entry points) */
++   D3D10_1_7_DDI_SUPPORTED,
++   /* Windows 7's Direct3D 11 runtime: feature level 11_0 through the 11.0 DDI (D3D11_1.cpp's FillDeviceFuncs11_0); first
++    * of what GetSupportedVersions leaves out elsewhere */
++   D3D11_0_7_DDI_SUPPORTED,
+    /* Feature level 10_0 through the 11.1 DDI (D3D11_1.cpp): the D3D11 runtime grants 11.1 features to it, like
+     * sharing more formats with NT handles (ExtendedResourceSharing) */
+    D3D11_1_DDI_SUPPORTED,
+@@ -181,10 +186,16 @@ GetSupportedVersions(D3D10DDI_HADAPTER hAdapter,
+ {
+    LOG_ENTRYPOINT();
+ 
++   /* the 10.1 and 11.0 DDIs on Windows 7 only (newer runtimes take the 11.1 one); WINBOAT_D3D_WDDM2=0 leaves WDDM 2.0 out */
+    char env[4] = "";
+-   UINT count = ARRAYSIZE(SupportedDDIInterfaceVersions);
+-   if (GetEnvironmentVariableA("WINBOAT_D3D_WDDM2", env, sizeof env) && env[0] == '0') {
+-      count--;
++   const bool noWddm2 = GetEnvironmentVariableA("WINBOAT_D3D_WDDM2", env, sizeof env) && env[0] == '0';
++   UINT64 versions[ARRAYSIZE(SupportedDDIInterfaceVersions)];
++   UINT count = 0;
++   for (UINT64 v : SupportedDDIInterfaceVersions) {
++      if (((v == D3D11_0_7_DDI_SUPPORTED || v == D3D10_1_7_DDI_SUPPORTED) && !gdikmt_windows7()) ||
++          (v == D3DWDDM2_0_DDI_SUPPORTED && noWddm2))
++         continue;
++      versions[count++] = v;
+    }
+ 
+    if (pSupportedDDIInterfaceVersions && *puEntries < count) {
+@@ -194,7 +205,7 @@ GetSupportedVersions(D3D10DDI_HADAPTER hAdapter,
+    *puEntries = count;
+ 
+    if (pSupportedDDIInterfaceVersions) {
+-      memcpy(pSupportedDDIInterfaceVersions, SupportedDDIInterfaceVersions, count * sizeof SupportedDDIInterfaceVersions[0]);
++      memcpy(pSupportedDDIInterfaceVersions, versions, count * sizeof versions[0]);
+    }
+ 
+    return S_OK;
+@@ -379,7 +390,8 @@ GetCaps(D3D10DDI_HADAPTER hAdapter,
+             D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0) |
+             (HostSupportsFL10_1() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1) : 0) |
+             (HostSupportsFL11() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0) : 0) |
+-            (HostSupportsFL11_1() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11_1DDI_3DPIPELINELEVEL_11_1) : 0);
++            /* not on Windows 7: 11_1 needs the 11.1 DDI, which its runtime doesn't take from a WDDM 1.1 driver */
++            (HostSupportsFL11_1() && !gdikmt_windows7() ? D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11_1DDI_3DPIPELINELEVEL_11_1) : 0);
+       }
+       break;
+    case D3D11_1DDICAPS_D3D11_OPTIONS:
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+index 50e757b..16d455a 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -789,6 +789,145 @@ FillDeviceFuncs11_1(D3D11_1DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *
+ }
+ 
+ 
++/* The 11.0 DDI (Windows 7's Direct3D 11 runtime, which knows no 11.1 one on a WDDM 1.1 driver): the 11.1 table's
++ * first entries in the same order, the ones whose arguments are 10.0's or 10.1's from there */
++static void APIENTRY
++RelocateDeviceFuncs11(D3D10DDI_HDEVICE hDevice, struct D3D11DDI_DEVICEFUNCS *pDeviceFunctions)
++{
++}
++
++static void APIENTRY
++HsSetConstantBuffers11(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers)
++{
++   HsSetConstantBuffers1(hDevice, StartSlot, NumBuffers, phBuffers, NULL, NULL);
++}
++
++static void APIENTRY
++DsSetConstantBuffers11(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers)
++{
++   DsSetConstantBuffers1(hDevice, StartSlot, NumBuffers, phBuffers, NULL, NULL);
++}
++
++static void APIENTRY
++CsSetConstantBuffers11(D3D10DDI_HDEVICE hDevice, UINT StartSlot, UINT NumBuffers, const D3D10DDI_HRESOURCE *phBuffers)
++{
++   CsSetConstantBuffers1(hDevice, StartSlot, NumBuffers, phBuffers, NULL, NULL);
++}
++
++static SIZE_T APIENTRY
++CalcPrivateGeometryShaderWithStreamOutput11(D3D10DDI_HDEVICE hDevice,
++                                            const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT *pCreate,
++                                            const D3D10DDIARG_STAGE_IO_SIGNATURES *pSignatures)
++{
++   StreamOutput10 so(pCreate);
++   return funcs10.pfnCalcPrivateGeometryShaderWithStreamOutput(hDevice, &so.args, &noSignatures);
++}
++
++static void APIENTRY
++CreateGeometryShaderWithStreamOutput11(D3D10DDI_HDEVICE hDevice,
++                                       const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT *pCreate,
++                                       D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRTShader,
++                                       const D3D10DDIARG_STAGE_IO_SIGNATURES *pSignatures)
++{
++   StreamOutput10 so(pCreate);
++   funcs10.pfnCreateGeometryShaderWithStreamOutput(hDevice, &so.args, hShader, hRTShader, &noSignatures);
++}
++
++/* Tessellation shaders read their signatures' system values, registers and masks: 11.0's entries have just those */
++struct TessellationSignatures11_1 {
++   std::vector<D3D11_1DDIARG_SIGNATURE_ENTRY> in, out, patch;
++   D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES sig = {};
++
++   static void convert(std::vector<D3D11_1DDIARG_SIGNATURE_ENTRY> &v, const D3D10DDIARG_SIGNATURE_ENTRY *p, UINT n)
++   {
++      v.resize(p ? n : 0);
++      for (UINT i = 0; i < v.size(); i++) {
++         v[i] = {};
++         v[i].SystemValue = p[i].SystemValue;
++         v[i].Register = p[i].Register;
++         v[i].Mask = p[i].Mask;
++      }
++   }
++
++   TessellationSignatures11_1(const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *p)
++   {
++      if (!p)
++         return;
++      convert(in, p->pInputSignature, p->NumInputSignatureEntries);
++      convert(out, p->pOutputSignature, p->NumOutputSignatureEntries);
++      convert(patch, p->pPatchConstantSignature, p->NumPatchConstantSignatureEntries);
++      sig.pInputSignatureDeprecated = in.empty() ? NULL : in.data();
++      sig.NumInputSignatureEntries = (UINT)in.size();
++      sig.pOutputSignatureDeprecated = out.empty() ? NULL : out.data();
++      sig.NumOutputSignatureEntries = (UINT)out.size();
++      sig.pPatchConstantSignatureDeprecated = patch.empty() ? NULL : patch.data();
++      sig.NumPatchConstantSignatureEntries = (UINT)patch.size();
++   }
++};
++
++static SIZE_T APIENTRY
++CalcPrivateTessellationShaderSize11(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode,
++                                    const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures)
++{
++   TessellationSignatures11_1 s(pSignatures);
++   return CalcPrivateTessellationShaderSize(hDevice, pShaderCode, &s.sig);
++}
++
++static void APIENTRY
++CreateHullShader11(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                   D3D10DDI_HRTSHADER hRTShader, const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures)
++{
++   TessellationSignatures11_1 s(pSignatures);
++   CreateHullShader(hDevice, pShaderCode, hShader, hRTShader, &s.sig);
++}
++
++static void APIENTRY
++CreateDomainShader11(D3D10DDI_HDEVICE hDevice, const UINT *pShaderCode, D3D10DDI_HSHADER hShader,
++                     D3D10DDI_HRTSHADER hRTShader, const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures)
++{
++   TessellationSignatures11_1 s(pSignatures);
++   CreateDomainShader(hDevice, pShaderCode, hShader, hRTShader, &s.sig);
++}
++
++/* every entry a function pointer, 11.0's the start of 11.1's */
++static_assert(offsetof(D3D11DDI_DEVICEFUNCS, pfnCsSetConstantBuffers) ==
++                 offsetof(D3D11_1DDI_DEVICEFUNCS, pfnCsSetConstantBuffers), "11.0 table layout");
++static_assert(sizeof(D3D11DDI_DEVICEFUNCS) <= sizeof(D3D11_1DDI_DEVICEFUNCS), "11.0 table size");
++
++void
++FillDeviceFuncs11_0(D3D11DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10)
++{
++   D3D11_1DDI_DEVICEFUNCS funcs11_1 = {};
++   FillDeviceFuncs11_1(&funcs11_1, pFuncs10);
++   memcpy(pFuncs, &funcs11_1, sizeof *pFuncs);
++
++   pFuncs->pfnDefaultConstantBufferUpdateSubresourceUP = funcs10.pfnDefaultConstantBufferUpdateSubresourceUP;
++   pFuncs->pfnVsSetConstantBuffers = funcs10.pfnVsSetConstantBuffers;
++   pFuncs->pfnPsSetConstantBuffers = funcs10.pfnPsSetConstantBuffers;
++   pFuncs->pfnGsSetConstantBuffers = funcs10.pfnGsSetConstantBuffers;
++   pFuncs->pfnHsSetConstantBuffers = HsSetConstantBuffers11;
++   pFuncs->pfnDsSetConstantBuffers = DsSetConstantBuffers11;
++   pFuncs->pfnCsSetConstantBuffers = CsSetConstantBuffers11;
++   pFuncs->pfnResourceCopyRegion = funcs10.pfnResourceCopyRegion;
++   pFuncs->pfnResourceConvertRegion = funcs10.pfnResourceCopyRegion;
++   pFuncs->pfnResourceUpdateSubresourceUP = funcs10.pfnResourceUpdateSubresourceUP;
++   pFuncs->pfnFlush = funcs10.pfnFlush;
++   pFuncs->pfnRelocateDeviceFuncs = RelocateDeviceFuncs11;
++   pFuncs->pfnCalcPrivateBlendStateSize = CalcPrivateBlendStateSize1;
++   pFuncs->pfnCreateBlendState = CreateBlendState1;
++   pFuncs->pfnCalcPrivateRasterizerStateSize = funcs10.pfnCalcPrivateRasterizerStateSize;
++   pFuncs->pfnCreateRasterizerState = funcs10.pfnCreateRasterizerState;
++   pFuncs->pfnCalcPrivateShaderSize = funcs10.pfnCalcPrivateShaderSize;
++   pFuncs->pfnCreateVertexShader = funcs10.pfnCreateVertexShader;
++   pFuncs->pfnCreateGeometryShader = funcs10.pfnCreateGeometryShader;
++   pFuncs->pfnCreatePixelShader = funcs10.pfnCreatePixelShader;
++   pFuncs->pfnCalcPrivateGeometryShaderWithStreamOutput = CalcPrivateGeometryShaderWithStreamOutput11;
++   pFuncs->pfnCreateGeometryShaderWithStreamOutput = CreateGeometryShaderWithStreamOutput11;
++   pFuncs->pfnCalcPrivateTessellationShaderSize = CalcPrivateTessellationShaderSize11;
++   pFuncs->pfnCreateHullShader = CreateHullShader11;
++   pFuncs->pfnCreateDomainShader = CreateDomainShader11;
++}
++
+ /* WDDM 1.3 */
+ static void APIENTRY
+ RelocateDeviceFuncsWDDM1_3(D3D10DDI_HDEVICE hDevice, struct D3DWDDM1_3DDI_DEVICEFUNCS *pDeviceFunctions)
+@@ -1000,6 +1139,14 @@ ResolveSharedResource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *pResolve)
+    return S_OK;
+ }
+ 
++/* DXGI 1.1's: 1.0's and ResolveSharedResource */
++void
++FillDXGIFuncs1_1(DXGI1_1_DDI_BASE_FUNCTIONS *pFuncs)
++{
++   pFuncs->pfnResolveSharedResource = ResolveSharedResource;
++}
++
++
+ void
+ FillDXGIFuncs1_2(DXGI1_2_DDI_BASE_FUNCTIONS *pFuncs)
+ {
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.h b/src/gallium/frontends/d3d10umd/D3D11_1.h
+index 8914889..86d118d 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.h
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.h
+@@ -10,10 +10,14 @@
+ /* Fills the 11.1 device function table from a filled 10.0 one (kept for the wrappers to call) */
+ void FillDeviceFuncs11_1(D3D11_1DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
+ 
++/* The 11.0 table (Windows 7) from the same */
++void FillDeviceFuncs11_0(D3D11DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
++
+ /* The WDDM 1.3 table: the 11.1 one and tiled resources (refused) and markers */
+ void FillDeviceFuncsWDDM1_3(D3DWDDM1_3DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
+ 
+ /* The DXGI 1.2 and 1.3 entry points the 1.0 table doesn't have */
++void FillDXGIFuncs1_1(DXGI1_1_DDI_BASE_FUNCTIONS *pFuncs);
+ void FillDXGIFuncs1_2(DXGI1_2_DDI_BASE_FUNCTIONS *pFuncs);
+ void FillDXGIFuncs1_3(DXGI1_3_DDI_BASE_FUNCTIONS *pFuncs);
+ void FillDeviceFuncsWDDM2_0(D3DWDDM2_0DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index c6fc75d..4b26a46 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -129,6 +129,8 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    case D3D10_1_x_DDI_INTERFACE_VERSION:
+    case D3D10_1_7_DDI_INTERFACE_VERSION:
+ #endif
++   case D3D10_1_7_DDI_INTERFACE_VERSION: /* Windows 7 (Adapter.cpp) */
++   case D3D11_0_7_DDI_INTERFACE_VERSION:
+    case D3D11_1_DDI_INTERFACE_VERSION:
+    case D3DWDDM1_3_DDI_INTERFACE_VERSION:
+    case D3DWDDM2_0_DDI_INTERFACE_VERSION:
+@@ -197,9 +199,10 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+     */
+    const bool isWDDM2_0 = pCreateData->Interface == D3DWDDM2_0_DDI_INTERFACE_VERSION;
+    const bool isWDDM1_3 = pCreateData->Interface == D3DWDDM1_3_DDI_INTERFACE_VERSION;
++   const bool is11_0 = pCreateData->Interface == D3D11_0_7_DDI_INTERFACE_VERSION;
+    const bool is11_1 = pCreateData->Interface == D3D11_1_DDI_INTERFACE_VERSION || isWDDM1_3 || isWDDM2_0;
+    D3D10DDI_DEVICEFUNCS funcs10 = {};
+-   D3D10DDI_DEVICEFUNCS *pDeviceFuncs = is11_1 ? &funcs10 : pCreateData->pDeviceFuncs;
++   D3D10DDI_DEVICEFUNCS *pDeviceFuncs = is11_1 || is11_0 ? &funcs10 : pCreateData->pDeviceFuncs;
+    pDeviceFuncs->pfnDefaultConstantBufferUpdateSubresourceUP = ResourceUpdateSubResourceUP;
+    pDeviceFuncs->pfnVsSetConstantBuffers = VsSetConstantBuffers;
+    pDeviceFuncs->pfnPsSetShaderResources = PsSetShaderResources;
+@@ -319,8 +322,10 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+       FillDeviceFuncsWDDM1_3(pCreateData->pWDDM1_3DeviceFuncs, &funcs10);
+    } else if (is11_1) {
+       FillDeviceFuncs11_1(pCreateData->p11_1DeviceFuncs, &funcs10);
++   } else if (is11_0) {
++      FillDeviceFuncs11_0(pCreateData->p11DeviceFuncs, &funcs10);
+    }
+-   if (is11_1) {
++   if (is11_1 || is11_0) {
+       if (pCreateData->ppfnRetrieveSubObject) {
+          *pCreateData->ppfnRetrieveSubObject = RetrieveSubObject11_1;
+       }
+@@ -351,6 +356,8 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+       FillDXGIFuncs1_3(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions4);
+    } else if (is11_1) {
+       FillDXGIFuncs1_2(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions3);
++   } else if (is11_0) {
++      FillDXGIFuncs1_1(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions2);
+    }
+ 
+    return S_OK;

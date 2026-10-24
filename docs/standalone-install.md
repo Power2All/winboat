@@ -59,7 +59,9 @@ above with Venus, Windows 11 (2026-10-21): the GPU check passes 624 tests and fa
 - feature level 11_1 (rasterizer sample counts, virglrenderer 0004; programs get 11_0) and D3D10/11 stream output
   counts (0003)
 - OpenGL above 4.2 (compute shaders, persistent buffer maps: virglrenderer 0009/0010)
-- the 11.3 render target/viewport index from vertex and domain shaders (0016)
+- the 11.3 render target/viewport index from vertex and domain shaders (0016), conservative rasterization (0019)
+  and rasterizer ordered views (0020); 11.2's tiled resources, min/max filtering and ClearView on depth formats
+  (0021-0023)
 - through Venus: Direct3D 12 ExecuteIndirect with state changes (root constants, vertex/index buffers) draws and
   dispatches with wrong arguments (VK_EXT_device_generated_commands, 0013: the 4 failed tests, 64- and 32-bit),
   ExecuteIndirect tier 1.1, shader model 6.8's SampleCmpGrad (VK_KHR_maintenance8, 0011), Vulkan Video
@@ -100,12 +102,14 @@ The GPU check comes with the Universal CRT it needs (8.1 may not have it). The G
 driver. The setup carries the 8.1 package when `tools/standalone-installer/win81/` is there (the spike's
 `win81-package.sh` makes it).
 
-Windows 7 SP1 x64 (tested on 7 Ultimate with a stock host, 2026-10-23): the setup installs a separate WDDM 1.1 package
-there, with Direct3D 9 and 9Ex, Direct3D 10, Direct3D 11 up to feature level 10_0 (Windows 7's runtime knows no newer
-interface of the driver's) and OpenGL; no Direct3D 12, Vulkan or video. Use `-device virtio-vga-gl` (the BIOS boot
+Windows 7 SP1 x64 (tested on 7 Ultimate with a stock host, 2026-10-24): the setup installs a separate WDDM 1.1 package
+there, with Direct3D 9 and 9Ex, Direct3D 10 and 10.1, Direct3D 11 up to feature level 11_0 (compute and tessellation
+included) and OpenGL; no Direct3D 12, Vulkan or video. The Platform Update (KB2670838) is worth having: DXGI 1.2,
+Direct2D 1.1 and Direct3D 11.1's interfaces come with it (feature level 11_1 doesn't, on a Windows 7 driver). Use `-device virtio-vga-gl` (the BIOS boot
 display) with `hostmem=` (as in the Venus flags above): Windows 7 keeps the desktop's surface in device memory, which
 is the top 64 MB of that window; without it, virtio-vga's 8 MB VGA memory limits the desktop to about 1680x1050. The driver files are SHA-1 signed (7 without KB3033929 can't check SHA-2). Shader compiling (HLSL, which
 most Direct3D 10/11 programs need) comes with KB4019990 (D3DCompiler_47, Microsoft Update Catalog); without it the GPU
-check skips those tests. Known: windowed Direct3D 9 presents don't reach the screen yet (full screen and Direct3D 9Ex do). The setup
+check skips those tests. Known: GDI drawing into a Direct2D target (ID2D1GdiInteropRenderTarget::GetDC) is lost on Windows 7 (Windows 7's
+WARP draws it wrong too). The setup
 carries the 7 package when `tools/standalone-installer/win7/` is there (the spike's `win7-package.sh`), and needs
 `tools/standalone-installer/ucrt/` for the GPU check on 7 and 8.1 (`win81-installer-files.sh`).

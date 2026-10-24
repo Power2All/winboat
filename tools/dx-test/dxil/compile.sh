@@ -17,6 +17,7 @@ SHADERS=(
    "sm68.hlsl PS ps_6_8 dxil_sm68_ps"
    "sm68cmp.hlsl CS cs_6_8 dxil_sm68cmp_cs"
    "wg.hlsl - lib_6_8 dxil_wg_lib"
+   "sm66atomics.hlsl CS cs_6_6 dxil_sm66atomics_cs"
 )
 SP_TIMEOUT=60 "$SP" 'New-Item -ItemType Directory -Force C:\build\dxil | Out-Null' >/dev/null
 for f in *.hlsl; do SP_TIMEOUT=60 "$SP" --put "$f" "C:/build/dxil/$f"; done

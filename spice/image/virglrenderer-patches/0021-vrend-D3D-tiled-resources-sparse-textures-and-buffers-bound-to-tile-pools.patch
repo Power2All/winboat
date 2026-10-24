@@ -1,0 +1,448 @@
+From: WinBoat
+Subject: [PATCH] vrend: D3D tiled resources: sparse textures and buffers bound to tile pools
+
+Direct3D 11.2's tiled resources: a resource with no memory of its own whose 64 KB tiles an application binds to tiles
+of a tile pool, the same pool tile under several resources if it likes (aliasing); unbound tiles read 0 and drop
+writes (tier 2). On the host: a resource created with VIRGL_BIND_SPARSE gets sparse storage (ARB_sparse_texture2,
+ARB_sparse_buffer: unbound pages read 0, writes to them are dropped), one with VIRGL_BIND_TILE_POOL is only memory,
+device-local Vulkan memory imported as a GL memory object (vrend_vk_memory_create). A new command,
+VIRGL_CCMD_TILE_MAP, binds a region of a sparse resource to a pool at an offset or unbinds it
+(NV_memory_object_sparse's TexturePageCommitmentMemNV / NamedBufferPageCommitmentMemNV: pages of several resources in
+the same memory are D3D's aliasing); a level of the mip tail binds the tail. The two bind bits are taken off before
+GL's bind checks. The host announces it with VIRGL_CAP_V2_TILED (bit 26) where the extensions, Vulkan memory and the
+entry points are there and the page shapes are D3D's standard tile shapes (NVIDIA's are).
+---
+diff --git a/src/virgl_hw.h b/src/virgl_hw.h
+index 89ed800..3b7f2ef 100644
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -640,6 +640,9 @@ enum virgl_formats {
+ #define VIRGL_CAP_V2_CONSERVATIVE_RASTER  (1u << 28)
+ /* WinBoat: TGSI_PROPERTY_FS_INTERLOCK (GL_ARB_fragment_shader_interlock) */
+ #define VIRGL_CAP_V2_FS_INTERLOCK         (1u << 27)
++/* WinBoat: D3D tiled resources - sparse textures and buffers (VIRGL_BIND_SPARSE) whose pages VIRGL_CCMD_TILE_MAP binds
++ * to tile pools (VIRGL_BIND_TILE_POOL); page shapes are D3D's standard tile shapes */
++#define VIRGL_CAP_V2_TILED                (1u << 26)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+@@ -653,6 +656,10 @@ enum virgl_formats {
+ #define VIRGL_BIND_DISPLAY_TARGET (1u << 7)
+ #define VIRGL_BIND_COMMAND_ARGS  (1u << 8)
+ #define VIRGL_BIND_STREAM_OUTPUT (1u << 11)
++/* WinBoat (VIRGL_CAP_V2_TILED): sparse storage, pages bound by VIRGL_CCMD_TILE_MAP */
++#define VIRGL_BIND_SPARSE        (1u << 10)
++/* WinBoat (VIRGL_CAP_V2_TILED): a tile pool, a buffer resource of width bytes that is only memory (no GL object) */
++#define VIRGL_BIND_TILE_POOL     (1u << 12)
+ /* WinBoat: a texture the guest also renders to through Venus (vrend_vk.h); storage in exportable Vulkan memory */
+ #define VIRGL_BIND_VK_SHARED     (1u << 13)
+ #define VIRGL_BIND_SHADER_BUFFER (1u << 14)
+diff --git a/src/virgl_protocol.h b/src/virgl_protocol.h
+index d7bb59e..2228e5c 100644
+--- a/src/virgl_protocol.h
++++ b/src/virgl_protocol.h
+@@ -147,6 +147,7 @@ enum virgl_context_cmd {
+    /* WinBoat */
+    VIRGL_CCMD_SET_RASTER_SAMPLES,
+    VIRGL_CCMD_SET_CONSERVATIVE_RASTER,
++   VIRGL_CCMD_TILE_MAP,
+ 
+    VIRGL_MAX_COMMANDS
+ };
+@@ -803,4 +804,20 @@ enum vrend_tweak_type {
+ #define VIRGL_SET_CONSERVATIVE_RASTER_SIZE 1
+ #define VIRGL_SET_CONSERVATIVE_RASTER_MODE 1
+ 
++/* VIRGL_CCMD_TILE_MAP (WinBoat): a region of a sparse resource (VIRGL_BIND_SPARSE) bound to tile pool memory
++ * (VIRGL_BIND_TILE_POOL) at an offset, or unbound (pool 0). Textures: texels of a level, layer = z for arrays (whole
++ * pages, or up to the level's edge); buffers: x and width in bytes. A level of the mip tail binds the whole tail */
++#define VIRGL_TILE_MAP_SIZE 11
++#define VIRGL_TILE_MAP_HANDLE 1
++#define VIRGL_TILE_MAP_LEVEL 2
++#define VIRGL_TILE_MAP_X 3
++#define VIRGL_TILE_MAP_Y 4
++#define VIRGL_TILE_MAP_Z 5
++#define VIRGL_TILE_MAP_WIDTH 6
++#define VIRGL_TILE_MAP_HEIGHT 7
++#define VIRGL_TILE_MAP_DEPTH 8
++#define VIRGL_TILE_MAP_POOL 9
++#define VIRGL_TILE_MAP_OFFSET_LO 10
++#define VIRGL_TILE_MAP_OFFSET_HI 11
++
+ #endif
+diff --git a/src/vrend/vrend_debug.c b/src/vrend/vrend_debug.c
+index dba2bc7..ed0086d 100644
+--- a/src/vrend/vrend_debug.c
++++ b/src/vrend/vrend_debug.c
+@@ -99,6 +99,7 @@ static const char *command_names[VIRGL_MAX_COMMANDS] = {
+    "GET_PIPE_RESOURCE_LAYOUT",
+    "SET_RASTER_SAMPLES",
+    "SET_CONSERVATIVE_RASTER",
++   "TILE_MAP",
+ };
+ 
+ static const char *object_type_names[VIRGL_MAX_OBJECTS] = {
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index a4fc162..4b85623 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1072,6 +1072,18 @@ static int vrend_decode_set_conservative_raster(struct vrend_context *ctx, const
+    return 0;
+ }
+ 
++static int vrend_decode_tile_map(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
++{
++   if (length != VIRGL_TILE_MAP_SIZE)
++      return EINVAL;
++   uint64_t offset = get_buf_entry(buf, VIRGL_TILE_MAP_OFFSET_LO) | (uint64_t)get_buf_entry(buf, VIRGL_TILE_MAP_OFFSET_HI) << 32;
++   return vrend_tile_map(ctx, get_buf_entry(buf, VIRGL_TILE_MAP_HANDLE), get_buf_entry(buf, VIRGL_TILE_MAP_LEVEL),
++                         get_buf_entry(buf, VIRGL_TILE_MAP_X), get_buf_entry(buf, VIRGL_TILE_MAP_Y),
++                         get_buf_entry(buf, VIRGL_TILE_MAP_Z), get_buf_entry(buf, VIRGL_TILE_MAP_WIDTH),
++                         get_buf_entry(buf, VIRGL_TILE_MAP_HEIGHT), get_buf_entry(buf, VIRGL_TILE_MAP_DEPTH),
++                         get_buf_entry(buf, VIRGL_TILE_MAP_POOL), offset);
++}
++
+ static int vrend_decode_resource_copy_region(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
+ {
+    struct pipe_box box;
+@@ -2049,6 +2061,7 @@ static const vrend_decode_callback decode_table[VIRGL_MAX_COMMANDS] = {
+    [VIRGL_CCMD_GET_PIPE_RESOURCE_LAYOUT] = vrend_decode_get_pipe_resource_layout,
+    [VIRGL_CCMD_SET_RASTER_SAMPLES] = vrend_decode_set_raster_samples,
+    [VIRGL_CCMD_SET_CONSERVATIVE_RASTER] = vrend_decode_set_conservative_raster,
++   [VIRGL_CCMD_TILE_MAP] = vrend_decode_tile_map,
+ };
+ 
+ static void dump_command_stream_to_file(const void *buffer, size_t size)
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 75d4a64..1519d9e 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -236,6 +236,9 @@ enum features_id
+    feat_viewport_layer_array,
+    feat_conservative_raster,
+    feat_fragment_shader_interlock,
++   feat_sparse_texture2,
++   feat_sparse_buffer,
++   feat_memory_object_sparse,
+    feat_last,
+ };
+ 
+@@ -353,6 +356,9 @@ static const  struct {
+    FEAT(viewport_layer_array, UNAVAIL, UNAVAIL, "GL_ARB_shader_viewport_layer_array"),
+    FEAT(conservative_raster, UNAVAIL, UNAVAIL, "GL_NV_conservative_raster"),
+    FEAT(fragment_shader_interlock, UNAVAIL, UNAVAIL, "GL_ARB_fragment_shader_interlock"),
++   FEAT(sparse_texture2, UNAVAIL, UNAVAIL, "GL_ARB_sparse_texture2"),
++   FEAT(sparse_buffer, UNAVAIL, UNAVAIL, "GL_ARB_sparse_buffer"),
++   FEAT(memory_object_sparse, UNAVAIL, UNAVAIL, "GL_NV_memory_object_sparse"),
+ };
+ 
+ struct global_renderer_state {
+@@ -8421,6 +8427,14 @@ static void vrend_create_buffer(struct vrend_resource *gr, uint32_t width, uint3
+    glGenBuffersARB(1, &gr->gl_id);
+    glBindBufferARB(gr->target, gr->gl_id);
+ 
++   /* a tiled buffer: sparse storage of whole 64 KB pages (D3D's buffer tiles), written through glBufferSubData */
++   if (gr->tiled & VIRGL_BIND_SPARSE) {
++      glBufferStorage(gr->target, ((uint64_t)width + 65535) & ~(uint64_t)65535, NULL,
++                      GL_SPARSE_STORAGE_BIT_ARB | GL_DYNAMIC_STORAGE_BIT);
++      glBindBufferARB(gr->target, 0);
++      return;
++   }
++
+    if (buffer_storage_flags) {
+ #ifdef ENABLE_VENUS
+       int fd = -1;
+@@ -8818,6 +8832,114 @@ static bool vrend_texture_vk_storage(struct vrend_resource *gr, enum virgl_forma
+ }
+ #endif
+ 
++/* D3D tiled resources (WinBoat, VIRGL_CAP_V2_TILED): sparse textures and buffers (ARB_sparse_texture2: unbound pages
++ * read 0, writes to them are dropped, as D3D's tier 2 has it) whose pages bind to tile pools, Vulkan memory GL
++ * imports (NV_memory_object_sparse: the same memory under several resources is D3D's tile aliasing). Looked up at run
++ * time: epoxy may predate the extension */
++typedef void (*vrend_texture_commit_mem_fn)(GLuint texture, GLint layer, GLint level, GLint xoffset, GLint yoffset,
++                                            GLint zoffset, GLsizei width, GLsizei height, GLsizei depth,
++                                            GLuint memory, GLuint64 offset, GLboolean commit);
++typedef void (*vrend_buffer_commit_mem_fn)(GLuint buffer, GLintptr offset, GLsizeiptr size, GLuint memory,
++                                           GLuint64 memOffset, GLboolean commit);
++static vrend_texture_commit_mem_fn vrend_texture_commit_mem;
++static vrend_buffer_commit_mem_fn vrend_buffer_commit_mem;
++
++/* Whether the host can: the extensions, the entry points, Vulkan memory for pools, and page shapes that are D3D's
++ * standard tile shapes (64 KB: 256x256 at 8 bits a texel ... 64x64 at 128, BC1 512x256, BC2-7 256x256) */
++static bool vrend_tiled_supported(void)
++{
++#if defined(ENABLE_VENUS) && defined(HAVE_EPOXY_EGL_H)
++   static int known = -1;
++   if (known >= 0)
++      return known;
++   known = 0;
++   if (!has_feature(feat_sparse_texture2) || !has_feature(feat_sparse_buffer) || !has_feature(feat_memory_object_sparse) ||
++       !has_feature(feat_memory_object) || !has_feature(feat_memory_object_fd) || !vrend_vk_buffers_init())
++      return false;
++   vrend_texture_commit_mem = (vrend_texture_commit_mem_fn)eglGetProcAddress("glTexturePageCommitmentMemNV");
++   vrend_buffer_commit_mem = (vrend_buffer_commit_mem_fn)eglGetProcAddress("glNamedBufferPageCommitmentMemNV");
++   if (!vrend_texture_commit_mem || !vrend_buffer_commit_mem)
++      return false;
++   static const struct { GLenum format; GLint w, h; } shapes[] = {
++      { GL_R8, 256, 256 }, { GL_RG8, 256, 128 }, { GL_RGBA8, 128, 128 }, { GL_RGBA16F, 128, 64 },
++      { GL_RGBA32F, 64, 64 }, { GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, 512, 256 }, { GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, 256, 256 },
++   };
++   for (unsigned i = 0; i < ARRAY_SIZE(shapes); i++) {
++      GLint n = 0, w = 0, h = 0;
++      glGetInternalformativ(GL_TEXTURE_2D, shapes[i].format, GL_NUM_VIRTUAL_PAGE_SIZES_ARB, 1, &n);
++      glGetInternalformativ(GL_TEXTURE_2D, shapes[i].format, GL_VIRTUAL_PAGE_SIZE_X_ARB, 1, &w);
++      glGetInternalformativ(GL_TEXTURE_2D, shapes[i].format, GL_VIRTUAL_PAGE_SIZE_Y_ARB, 1, &h);
++      if (n < 1 || w != shapes[i].w || h != shapes[i].h) {
++         virgl_info("vrend: no tiled resources: format 0x%x has %dx%d pages\n", shapes[i].format, w, h);
++         return false;
++      }
++   }
++   GLint page = 0;
++   glGetIntegerv(GL_SPARSE_BUFFER_PAGE_SIZE_ARB, &page);
++   if (page != 65536)
++      return false;
++   known = 1;
++   return true;
++#else
++   return false;
++#endif
++}
++
++/* A tile pool: device-local Vulkan memory imported as a GL memory object */
++static int vrend_tile_pool_alloc(struct vrend_resource *gr)
++{
++#ifdef ENABLE_VENUS
++   int fd = -1;
++   uint64_t alloc_size = 0;
++   if (!vrend_tiled_supported() || !(gr->vk_memory = vrend_vk_memory_create(gr->base.width0, &fd, &alloc_size)))
++      return ENOMEM;
++   glCreateMemoryObjectsEXT(1, &gr->memobj);
++   glImportMemoryFdEXT(gr->memobj, alloc_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
++   gr->size = alloc_size;
++   gr->storage_bits |= VREND_STORAGE_GL_MEMOBJ;
++   return 0;
++#else
++   return ENOMEM;
++#endif
++}
++
++int vrend_tile_map(struct vrend_context *ctx, uint32_t handle, uint32_t level, uint32_t x, uint32_t y, uint32_t z,
++                   uint32_t width, uint32_t height, uint32_t depth, uint32_t pool, uint64_t offset)
++{
++   struct vrend_resource *res = vrend_renderer_ctx_res_lookup(ctx, handle);
++   struct vrend_resource *mem = pool ? vrend_renderer_ctx_res_lookup(ctx, pool) : NULL;
++   if (!res || !(res->tiled & VIRGL_BIND_SPARSE) || (pool && (!mem || !(mem->tiled & VIRGL_BIND_TILE_POOL))) ||
++       !vrend_tiled_supported())
++      return EINVAL;
++   GLuint memory = mem ? mem->memobj : 0;
++   if (mem && offset >= mem->size)
++      return EINVAL;
++   if (res->base.target == PIPE_BUFFER) {
++      vrend_buffer_commit_mem(res->gl_id, x, width, memory, offset, pool != 0);
++   } else {
++      /* the mip tail as one: committed at its first level, all of it */
++      if ((int)level >= res->sparse_levels) {
++         level = res->sparse_levels;
++         x = y = 0;
++         width = u_minify(res->base.width0, level);
++         height = u_minify(res->base.height0, level);
++      } else {
++         width = MIN2(width, u_minify(res->base.width0, level) - MIN2(x, u_minify(res->base.width0, level)));
++         height = MIN2(height, u_minify(res->base.height0, level) - MIN2(y, u_minify(res->base.height0, level)));
++      }
++      bool layered = res->target == GL_TEXTURE_2D_ARRAY || res->target == GL_TEXTURE_CUBE_MAP_ARRAY ||
++                     res->target == GL_TEXTURE_CUBE_MAP;
++      vrend_texture_commit_mem(res->gl_id, layered ? (GLint)z : 0, level, x, y, layered ? 0 : (GLint)z, width, height,
++                               layered ? 1 : (GLsizei)depth, memory, offset, pool != 0);
++   }
++   GLenum err = glGetError();
++   if (err != GL_NO_ERROR) {
++      virgl_warn("vrend: tile mapping of resource %u (level %u at %u,%u,%u, %ux%ux%u) failed: 0x%x\n", handle, level, x,
++                 y, z, width, height, depth, err);
++   }
++   return 0;
++}
++
+ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+                                         enum virgl_formats format,
+                                         void *image_oes)
+@@ -8870,6 +8992,15 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+ 
+    debug_texture(__func__, gr);
+ 
++   if (gr->tiled & VIRGL_BIND_SPARSE) {
++      if (!vrend_tiled_supported() || !format_can_texture_storage || pr->nr_samples > 1) {
++         glBindTexture(gr->target, 0);
++         return EINVAL;
++      }
++      glTexParameteri(gr->target, GL_TEXTURE_SPARSE_ARB, GL_TRUE);
++      glTexParameteri(gr->target, GL_VIRTUAL_PAGE_SIZE_INDEX_ARB, 0);
++   }
++
+    if (image_oes) {
+       if (has_bit(gr->storage_bits, VREND_STORAGE_GL_IMMUTABLE) &&
+           has_feature(feat_egl_image_storage)) {
+@@ -8902,7 +9033,7 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+       }
+ 
+ #ifdef ENABLE_VENUS
+-      if (vrend_texture_vk_storage(gr, format, internalformat)) {
++      if (!(gr->tiled & VIRGL_BIND_SPARSE) && vrend_texture_vk_storage(gr, format, internalformat)) {
+          /* immutable storage, one level */
+       } else
+ #endif
+@@ -8994,6 +9125,10 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+       glTexParameteri(gr->target, GL_TEXTURE_MAX_LEVEL, pr->last_level);
+    }
+ 
++   /* where a sparse texture's mip tail begins (the levels from it on bind together) */
++   if (gr->tiled & VIRGL_BIND_SPARSE)
++      glGetTexParameteriv(gr->target, GL_NUM_SPARSE_LEVELS_ARB, &gr->sparse_levels);
++
+    glBindTexture(gr->target, 0);
+ 
+    if (image_oes && gr->gbm_bo) {
+@@ -9050,11 +9185,21 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+    struct vrend_resource *gr;
+    int ret;
+ 
+-   gr = vrend_resource_create(args);
++   /* tiled resources' bits aren't GL bind flags (the checks compare whole bind values) */
++   struct vrend_renderer_resource_create_args plain = *args;
++   const uint32_t tiled = plain.bind & (VIRGL_BIND_SPARSE | VIRGL_BIND_TILE_POOL);
++   plain.bind &= ~tiled;
++   if (tiled && !vrend_tiled_supported())
++      return NULL;
++
++   gr = vrend_resource_create(&plain);
+    if (!gr)
+       return NULL;
++   gr->tiled = tiled;
+ 
+-   if (args->target == PIPE_BUFFER) {
++   if (tiled & VIRGL_BIND_TILE_POOL) {
++      ret = args->target == PIPE_BUFFER ? vrend_tile_pool_alloc(gr) : EINVAL;
++   } else if (args->target == PIPE_BUFFER) {
+       ret = vrend_resource_alloc_buffer(gr, args->flags);
+    } else {
+       const enum virgl_formats format = gr->base.format;
+@@ -9091,6 +9236,9 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+ #ifdef ENABLE_VENUS
+    if (res->vk_buffer)
+       vrend_vk_buffer_destroy(res->vk_buffer);
++   /* (a tile pool's: after GL's memory object) */
++   if (res->vk_memory)
++      vrend_vk_buffer_destroy(res->vk_memory);
+    /* after GL's texture and memory object */
+    if (res->vk_image)
+       vrend_vk_image_destroy(res->vk_image);
+@@ -13125,6 +13273,9 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+    if (has_feature(feat_fragment_shader_interlock))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_FS_INTERLOCK;
+ 
++   if (vrend_tiled_supported())
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_TILED;
++
+    if (has_feature(feat_pipeline_statistics_query))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY;
+ 
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 792e1c7..b888db8 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -114,6 +114,11 @@ struct vrend_resource {
+    /* a persistently mappable buffer's storage, when it is Vulkan memory (vrend_vk.c) */
+    struct vrend_vk_buffer *vk_buffer;
+    struct vrend_vk_image *vk_image;
++   /* D3D tiled resources (VIRGL_CAP_V2_TILED): VIRGL_BIND_SPARSE or VIRGL_BIND_TILE_POOL (taken off base.bind); a
++    * pool's memory (memobj on it), a sparse texture's first mip tail level */
++   uint32_t tiled;
++   struct vrend_vk_buffer *vk_memory;
++   int sparse_levels;
+ 
+    uint32_t blob_id;
+    struct list_head head;
+@@ -438,6 +443,8 @@ void vrend_set_sample_mask(struct vrend_context *ctx, unsigned sample_mask);
+ void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples);
+ void vrend_set_raster_samples(struct vrend_context *ctx, unsigned samples);
+ void vrend_set_conservative_raster(struct vrend_context *ctx, bool enable);
++int vrend_tile_map(struct vrend_context *ctx, uint32_t handle, uint32_t level, uint32_t x, uint32_t y, uint32_t z,
++                   uint32_t width, uint32_t height, uint32_t depth, uint32_t pool, uint64_t offset);
+ 
+ void vrend_set_constants(struct vrend_context *ctx,
+                          uint32_t shader,
+diff --git a/src/vrend/vrend_vk.c b/src/vrend/vrend_vk.c
+index 9581027..bb5ef90 100644
+--- a/src/vrend/vrend_vk.c
++++ b/src/vrend/vrend_vk.c
+@@ -38,6 +38,7 @@ static struct {
+    bool tried, ok;
+    VkDevice device;
+    uint32_t memory_type;
++   int local_type;
+    uint32_t map_info;
+    VkPhysicalDeviceMemoryProperties memory;
+    PFN_vkAllocateMemory AllocateMemory;
+@@ -149,6 +150,12 @@ static bool vrend_vk_setup(void)
+    if (found < 0)
+       return false;
+    vk.memory_type = found;
++   vk.local_type = -1;
++   for (uint32_t t = 0; t < memory.memoryTypeCount && vk.local_type < 0; t++) {
++      if ((requirements.memoryTypeBits & (1u << t)) &&
++          (memory.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
++         vk.local_type = t;
++   }
+    vk.map_info = (memory.memoryTypes[found].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+                     ? VIRGL_RENDERER_MAP_CACHE_CACHED
+                     : VIRGL_RENDERER_MAP_CACHE_WC;
+@@ -192,6 +199,33 @@ struct vrend_vk_buffer *vrend_vk_buffer_create(uint64_t size, int *opaque_fd, ui
+    return buffer;
+ }
+ 
++struct vrend_vk_buffer *vrend_vk_memory_create(uint64_t size, int *opaque_fd, uint64_t *alloc_size)
++{
++   if (vk.local_type < 0)
++      return NULL;
++   struct vrend_vk_buffer *buffer = calloc(1, sizeof(*buffer));
++   if (!buffer)
++      return NULL;
++   buffer->size = (size + 65535) & ~(uint64_t)65535;
++   VkExportMemoryAllocateInfo export = { .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++                                         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &export,
++                                .allocationSize = buffer->size, .memoryTypeIndex = (uint32_t)vk.local_type };
++   if (vk.AllocateMemory(vk.device, &mai, NULL, &buffer->memory) != VK_SUCCESS) {
++      free(buffer);
++      return NULL;
++   }
++   VkMemoryGetFdInfoKHR get = { .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = buffer->memory,
++                                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++   *opaque_fd = -1;
++   if (vk.GetMemoryFdKHR(vk.device, &get, opaque_fd) != VK_SUCCESS) {
++      vrend_vk_buffer_destroy(buffer);
++      return NULL;
++   }
++   *alloc_size = buffer->size;
++   return buffer;
++}
++
+ void vrend_vk_buffer_destroy(struct vrend_vk_buffer *buffer)
+ {
+    /* freeing unmaps it */
+diff --git a/src/vrend/vrend_vk.h b/src/vrend/vrend_vk.h
+index 2647d5f..d321a7b 100644
+--- a/src/vrend/vrend_vk.h
++++ b/src/vrend/vrend_vk.h
+@@ -25,6 +25,10 @@ void *vrend_vk_buffer_ptr(struct vrend_vk_buffer *buffer);
+ /* VIRGL_RENDERER_MAP_CACHE_* of the memory */
+ uint32_t vrend_vk_map_info(void);
+ 
++/* Device-local memory of at least size bytes for GL to import (D3D tile pools: sparse pages bind into it); no host
++ * mapping. *opaque_fd and *alloc_size as for buffers; freed with vrend_vk_buffer_destroy */
++struct vrend_vk_buffer *vrend_vk_memory_create(uint64_t size, int *opaque_fd, uint64_t *alloc_size);
++
+ /* Textures the guest renders to through Venus (its D3D12 swap chain buffers, VIRGL_BIND_VK_SHARED): a 2D image of one
+  * level, layer and sample in device-local memory, exported as an opaque fd GL imports as the texture's storage and
+  * as a dma-buf for Venus. The guest's image of it must have the same parameters: VREND_VK_IMAGE_USAGE, mutable

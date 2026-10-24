@@ -47,7 +47,7 @@ export enum DisplayRoute {
     SPICE = "spice",
 }
 
-export const SPICE_IMAGE = "winboat-windows-spice:6.05-25";
+export const SPICE_IMAGE = "winboat-windows-spice:6.05-29";
 // Every version of it (older WinBoats built older ones)
 const SPICE_IMAGE_NAME = SPICE_IMAGE.slice(0, SPICE_IMAGE.indexOf(":") + 1);
 const SPICE_HOST_DIR = path.join(WINBOAT_DIR, "spice");

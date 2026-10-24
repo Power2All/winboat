@@ -1,0 +1,479 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd/virgl: the WDDM 2.1 DDI and NV12 textures shared between devices
+
+The D3D11 runtime offers NV12 textures shared across devices and processes (D3D11_OPTIONS4's
+ExtendedNV12SharedTextureSupported) only to drivers on the WDDM 2.1 DDI (d3d11.dll's CheckFeatureSupport reads the
+negotiated DDI version: >= 5). The UMD offers D3DWDDM2_1_DDI_SUPPORTED after 2.0: 2.0's device table with the sync
+token entries (AcquireResource/ReleaseResource: nothing to do) and DXGI 1.5's base table with OfferResources1 and
+ReclaimResources1 (nothing offered, everything reclaimed OK); the video table asked for with it (sub-ID 5,
+D3DWDDM2_1DDI_VIDEO_FUNCTIONS: 2.0's and HDR metadata, unused) - without it no D3D11 video device was made.
+WINBOAT_D3D_WDDM2=0 leaves both WDDM 2 DDIs out.
+
+And the sharing itself: a shared NV12/P010 texture (one slice, not decoder output) makes its luma plane with
+PIPE_RESOURCE_FLAG_CHROMA_PLANE, which the winsys passes to the kernel driver (VIRGL_RESOURCE_FLAG_CHROMA_PLANE =
+its VIOGPU_RESOURCE_FLAG_CHROMA_PLANE): that allocation - the runtime resource's - also makes the chroma plane. Both
+the maker and whoever opens it import the chroma plane from the allocation (winsys: a D3DKMT_ALLOC handle with
+plane 1, VIOGPU_RES_INFO's ChromaId), and OpenResource rebuilds the NV12/P010 surface from the two planes.
+dx-test: "NV12 textures shared between devices" (legacy and NT handles).
+---
+diff --git a/src/gallium/drivers/virgl/virgl_resource.h b/src/gallium/drivers/virgl/virgl_resource.h
+index 3b348e6..5447592 100644
+--- a/src/gallium/drivers/virgl/virgl_resource.h
++++ b/src/gallium/drivers/virgl/virgl_resource.h
+@@ -175,6 +175,9 @@ static inline unsigned pipe_to_virgl_flags(const struct virgl_screen *vs,
+    if (pflags & PIPE_RESOURCE_FLAG_MAP_COHERENT)
+       out_flags |= VIRGL_RESOURCE_FLAG_MAP_COHERENT;
+ 
++   if (pflags & PIPE_RESOURCE_FLAG_CHROMA_PLANE)
++      out_flags |= VIRGL_RESOURCE_FLAG_CHROMA_PLANE;
++
+    return out_flags;
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index 6a6f1d6..3dd634c 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -165,6 +165,8 @@ SupportedDDIInterfaceVersions[] = {
+    D3DWDDM1_3_DDI_SUPPORTED,
+    /* And WDDM 2.0's: the runtime reads the 11.3 options from no earlier one. Last: WINBOAT_D3D_WDDM2=0 leaves it out */
+    D3DWDDM2_0_DDI_SUPPORTED,
++   /* And WDDM 2.1's: NV12 textures shared with other APIs (ExtendedNV12SharedTextureSupported) */
++   D3DWDDM2_1_DDI_SUPPORTED,
+ };
+ 
+ 
+@@ -193,7 +195,7 @@ GetSupportedVersions(D3D10DDI_HADAPTER hAdapter,
+    UINT count = 0;
+    for (UINT64 v : SupportedDDIInterfaceVersions) {
+       if (((v == D3D11_0_7_DDI_SUPPORTED || v == D3D10_1_7_DDI_SUPPORTED) && !gdikmt_windows7()) ||
+-          (v == D3DWDDM2_0_DDI_SUPPORTED && noWddm2))
++          ((v == D3DWDDM2_0_DDI_SUPPORTED || v == D3DWDDM2_1_DDI_SUPPORTED) && noWddm2))
+          continue;
+       versions[count++] = v;
+    }
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.cpp b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+index a331945..fc637a2 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.cpp
+@@ -602,8 +602,10 @@ RetrieveSubObject11_1(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T Param
+                       SIZE_T OutputParamSize, void *pOutputParamsBuffer)
+ {
+    /* Video decoding and processing (Video.cpp) */
+-   if (SubDeviceID == D3D11_1DDI_VIDEO_FUNCTIONS || SubDeviceID == D3DWDDM2_0DDI_VIDEO_FUNCTIONS) {
+-      return VideoRetrieveFunctions(hDevice, pParams, ParamSize, SubDeviceID == D3DWDDM2_0DDI_VIDEO_FUNCTIONS);
++   if (SubDeviceID == D3D11_1DDI_VIDEO_FUNCTIONS || SubDeviceID == D3DWDDM2_0DDI_VIDEO_FUNCTIONS ||
++       SubDeviceID == D3DWDDM2_1DDI_VIDEO_FUNCTIONS) {
++      return VideoRetrieveFunctions(hDevice, pParams, ParamSize, SubDeviceID != D3D11_1DDI_VIDEO_FUNCTIONS,
++                                    SubDeviceID == D3DWDDM2_1DDI_VIDEO_FUNCTIONS);
+    }
+    return E_NOTIMPL;
+ }
+@@ -1126,6 +1128,25 @@ FillDeviceFuncsWDDM2_0(D3DWDDM2_0DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEF
+    STUB(pfnSetHardwareProtectionState);
+ }
+ 
++/* WDDM 2.1: keyed-mutex-less sync tokens on shared resources (nothing to do: shared resources live on the host, and
++ * the runtime flushes before releasing one) */
++static void APIENTRY
++SyncTokenWDDM2_1(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource, HANDLE hSyncToken)
++{
++}
++
++/* The WDDM 2.1 table: 2.0's and the sync tokens. The D3D11 runtime offers NV12 shared with other APIs
++ * (ExtendedNV12SharedTextureSupported) from this DDI on */
++void
++FillDeviceFuncsWDDM2_1(D3DWDDM2_1DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10)
++{
++   static_assert(offsetof(D3DWDDM2_1DDI_DEVICEFUNCS, pfnAcquireResource) == sizeof(D3DWDDM2_0DDI_DEVICEFUNCS),
++                 "the WDDM 2.1 table begins with the 2.0 one");
++   FillDeviceFuncsWDDM2_0(reinterpret_cast<D3DWDDM2_0DDI_DEVICEFUNCS *>(pFuncs), pFuncs10);
++   pFuncs->pfnAcquireResource = SyncTokenWDDM2_1;
++   pFuncs->pfnReleaseResource = SyncTokenWDDM2_1;
++}
++
+ 
+ /* DXGI 1.2: blits with rectangles (DxgiFns.cpp), offering memory back (nothing to give) */
+ static HRESULT APIENTRY
+@@ -1243,3 +1264,29 @@ FillDXGIFuncs1_4(DXGI1_4_DDI_BASE_FUNCTIONS *pFuncs)
+    pFuncs->pfnTrimResidencySet = TrimResidencySet;
+    pFuncs->pfnCheckMultiplaneOverlayColorSpaceSupport = CheckMultiplaneOverlayColorSpaceSupport;
+ }
++
++/* DXGI 1.5 (with WDDM 2.1): offering and reclaiming with flags and results, nothing given back as before */
++static HRESULT APIENTRY
++OfferResources1(DXGI_DDI_ARG_OFFERRESOURCES1 *pOffer)
++{
++   return S_OK;
++}
++
++static HRESULT APIENTRY
++ReclaimResources1(DXGI_DDI_ARG_RECLAIMRESOURCES1 *pReclaim)
++{
++   for (UINT i = 0; pReclaim->pResults && i < pReclaim->Resources; i++) {
++      pReclaim->pResults[i] = D3DDDI_RECLAIM_RESULT_OK;
++   }
++   return S_OK;
++}
++
++void
++FillDXGIFuncs1_5(DXGI1_5_DDI_BASE_FUNCTIONS *pFuncs)
++{
++   static_assert(offsetof(DXGI1_5_DDI_BASE_FUNCTIONS, pfnReclaimResources1) == sizeof(DXGI1_4_DDI_BASE_FUNCTIONS),
++                 "the DXGI 1.5 table begins with 1.4's layout");
++   FillDXGIFuncs1_4(reinterpret_cast<DXGI1_4_DDI_BASE_FUNCTIONS *>(pFuncs));
++   pFuncs->pfnOfferResources1 = OfferResources1;
++   pFuncs->pfnReclaimResources1 = ReclaimResources1;
++}
+diff --git a/src/gallium/frontends/d3d10umd/D3D11_1.h b/src/gallium/frontends/d3d10umd/D3D11_1.h
+index 86d118d..14f2a4c 100644
+--- a/src/gallium/frontends/d3d10umd/D3D11_1.h
++++ b/src/gallium/frontends/d3d10umd/D3D11_1.h
+@@ -22,6 +22,8 @@ void FillDXGIFuncs1_2(DXGI1_2_DDI_BASE_FUNCTIONS *pFuncs);
+ void FillDXGIFuncs1_3(DXGI1_3_DDI_BASE_FUNCTIONS *pFuncs);
+ void FillDeviceFuncsWDDM2_0(D3DWDDM2_0DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
+ void FillDXGIFuncs1_4(DXGI1_4_DDI_BASE_FUNCTIONS *pFuncs);
++void FillDeviceFuncsWDDM2_1(D3DWDDM2_1DDI_DEVICEFUNCS *pFuncs, const D3D10DDI_DEVICEFUNCS *pFuncs10);
++void FillDXGIFuncs1_5(DXGI1_5_DDI_BASE_FUNCTIONS *pFuncs);
+ 
+ HRESULT APIENTRY RetrieveSubObject11_1(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T ParamSize,
+                                        void *pParams, SIZE_T OutputParamSize, void *pOutputParamsBuffer);
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index 6657a4a..78b033e 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -135,6 +135,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    case D3D11_1_DDI_INTERFACE_VERSION:
+    case D3DWDDM1_3_DDI_INTERFACE_VERSION:
+    case D3DWDDM2_0_DDI_INTERFACE_VERSION:
++   case D3DWDDM2_1_DDI_INTERFACE_VERSION:
+       break;
+    default:
+       DebugPrintf("%s: unsupported interface version 0x%08x\n",
+@@ -198,7 +199,8 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    /*
+     * Fill in the D3D10 DDI functions (for the 11.1 DDI a copy, which D3D11_1.cpp builds its table from)
+     */
+-   const bool isWDDM2_0 = pCreateData->Interface == D3DWDDM2_0_DDI_INTERFACE_VERSION;
++   const bool isWDDM2_1 = pCreateData->Interface == D3DWDDM2_1_DDI_INTERFACE_VERSION;
++   const bool isWDDM2_0 = pCreateData->Interface == D3DWDDM2_0_DDI_INTERFACE_VERSION || isWDDM2_1;
+    const bool isWDDM1_3 = pCreateData->Interface == D3DWDDM1_3_DDI_INTERFACE_VERSION;
+    const bool is11_0 = pCreateData->Interface == D3D11_0_7_DDI_INTERFACE_VERSION;
+    const bool is11_1 = pCreateData->Interface == D3D11_1_DDI_INTERFACE_VERSION || isWDDM1_3 || isWDDM2_0;
+@@ -317,7 +319,9 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+       p10_1DeviceFuncs->pfnResourceConvert = ResourceCopy;
+       p10_1DeviceFuncs->pfnResourceConvertRegion = ResourceCopyRegion;
+    }
+-   if (isWDDM2_0) {
++   if (isWDDM2_1) {
++      FillDeviceFuncsWDDM2_1(pCreateData->pWDDM2_1DeviceFuncs, &funcs10);
++   } else if (isWDDM2_0) {
+       FillDeviceFuncsWDDM2_0(pCreateData->pWDDM2_0DeviceFuncs, &funcs10);
+    } else if (isWDDM1_3) {
+       FillDeviceFuncsWDDM1_3(pCreateData->pWDDM1_3DeviceFuncs, &funcs10);
+@@ -349,7 +353,9 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+       _RotateResourceIdentities;
+    pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions->pfnBlt =
+       _Blt;
+-   if (isWDDM2_0) {
++   if (isWDDM2_1) {
++      FillDXGIFuncs1_5(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions6);
++   } else if (isWDDM2_0) {
+       FillDXGIFuncs1_4(pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions5);
+    } else if (isWDDM1_3) {
+       /* The WDDM 1.3 DDI comes with DXGI 1.3's table, the 11.1 one with DXGI 1.2's (the 1.0 entries above are
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index 6e252e7..dc8c99f 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -43,6 +43,8 @@
+ #include "pipe/p_defines.h"
+ #include "util/u_math.h"
+ #include "util/u_rect.h"
++#include "util/format/u_format.h"
++#include "DxvaDecode.h"
+ #include "util/u_surface.h"
+ 
+ 
+@@ -502,6 +504,12 @@ OpenResource(D3D10DDI_HDEVICE hDevice,                            // IN
+       pResource->MipLevels * pResource->resource->array_size;
+    pResource->transfers = (struct pipe_transfer **)calloc(
+       pResource->NumSubResources, sizeof *pResource->transfers);
++   VideoLog("OpenResource: format %s %ux%u flags 0x%x bind 0x%x\n", util_format_name(pResource->resource->format),
++            pResource->resource->width0, pResource->resource->height0, pResource->resource->flags,
++            pResource->resource->bind);
++   if (pResource->resource->flags & PIPE_RESOURCE_FLAG_CHROMA_PLANE) {
++      VideoOpenResource(hDevice, pResource);   /* NV12/P010: both planes */
++   }
+ 
+ unlock:
+    pDevice->device.pOpenResource = NULL;
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index 9279e13..742441e 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -40,6 +40,7 @@ extern "C" {
+ #include "vl/vl_compositor.h"
+ #include "vl/vl_csc.h"
+ #include "vl/vl_video_buffer.h"
++#include "frontend/winsys_handle.h"
+ #include "tgsi/tgsi_text.h"
+ }
+ 
+@@ -145,9 +146,33 @@ PipeUsage(D3D10_DDI_RESOURCE_USAGE usage)
+    }
+ }
+ 
+-/* A slice for the video processor and copies: planes of the texture's size */
++/* A shared texture's chroma plane: the one its luma plane's allocation made (PIPE_RESOURCE_FLAG_CHROMA_PLANE), here
++ * or in the device that shared it */
++static struct pipe_resource *
++ChromaPlane(Device *pDevice, struct pipe_resource *luma)
++{
++   struct winsys_handle handle = {};
++   handle.type = WINSYS_HANDLE_TYPE_D3DKMT_ALLOC;
++   if (!pDevice->screen->resource_get_handle(pDevice->screen, NULL, luma, &handle, 0)) {
++      return NULL;
++   }
++   handle.plane = 1;
++   struct pipe_resource templat = {};
++   templat.target = PIPE_TEXTURE_2D;
++   templat.format = luma->format == PIPE_FORMAT_R16_UNORM ? PIPE_FORMAT_R16G16_UNORM : PIPE_FORMAT_R8G8_UNORM;
++   templat.width0 = (luma->width0 + 1) / 2;
++   templat.height0 = (luma->height0 + 1) / 2;
++   templat.depth0 = 1;
++   templat.array_size = 1;
++   templat.bind = luma->bind;
++   return pDevice->screen->resource_from_handle(pDevice->screen, &templat, &handle, 0);
++}
++
++/* A slice for the video processor and copies: planes of the texture's size. Shared: the luma plane's allocation
++ * (the runtime resource's) brings the chroma plane along, so that whoever opens it finds both */
+ static struct pipe_video_buffer *
+-CreatePlaneBuffer(Device *pDevice, const struct pipe_video_buffer *tmpl, enum pipe_resource_usage usage)
++CreatePlaneBuffer(Device *pDevice, const struct pipe_video_buffer *tmpl, enum pipe_resource_usage usage,
++                  bool shared = false)
+ {
+    bool ten = tmpl->buffer_format != PIPE_FORMAT_NV12;   /* P010, P016 */
+    const enum pipe_format formats[2] = {ten ? PIPE_FORMAT_R16_UNORM : PIPE_FORMAT_R8_UNORM,
+@@ -161,9 +186,11 @@ CreatePlaneBuffer(Device *pDevice, const struct pipe_video_buffer *tmpl, enum pi
+       templat.height0 = p ? tmpl->height / 2 : tmpl->height;
+       templat.depth0 = 1;
+       templat.array_size = 1;
+-      templat.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
++      templat.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET | (shared ? PIPE_BIND_SHARED : 0);
+       templat.usage = usage;
+-      resources[p] = pDevice->screen->resource_create(pDevice->screen, &templat);
++      templat.flags = shared ? PIPE_RESOURCE_FLAG_CHROMA_PLANE : 0;
++      resources[p] = p && shared ? ChromaPlane(pDevice, resources[0])
++                                 : pDevice->screen->resource_create(pDevice->screen, &templat);
+       if (!resources[p]) {
+          pipe_resource_reference(&resources[0], NULL);
+          return NULL;
+@@ -250,10 +277,18 @@ VideoCreateResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_CREATERESOURCE *
+    tmpl.interlaced = false;
+    struct pipe_context *vpipe = VideoPipe(pDevice);
+    bool decoder = (pCreateResource->BindFlags & D3D11_DDI_BIND_DECODER) && vpipe->create_video_buffer;
++   /* shared (11.4's ExtendedNV12SharedTextureSupported): one slice, whose planes the one allocation has.
++    * ponytail: decoder output keeps the codec's buffers and isn't shared that way; their planes if programs share them */
++   bool shared = (pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) && !decoder;
++   if (shared && slices != 1) {
++      SetError(hDevice, E_INVALIDARG);
++      return true;
++   }
+    for (unsigned s = 0; s < slices; s++) {
+       /* decoder output: the video codec's buffers (the host's surfaces with them); the others the texture's size */
+       v->buffers[s] = decoder ? vpipe->create_video_buffer(vpipe, &tmpl)
+-                              : CreatePlaneBuffer(pDevice, &tmpl, PipeUsage((D3D10_DDI_RESOURCE_USAGE)pCreateResource->Usage));
++                              : CreatePlaneBuffer(pDevice, &tmpl, PipeUsage((D3D10_DDI_RESOURCE_USAGE)pCreateResource->Usage),
++                                                  shared);
+       if (!v->buffers[s]) {
+          SetError(hDevice, E_OUTOFMEMORY);
+          return true;
+@@ -268,6 +303,49 @@ VideoCreateResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_CREATERESOURCE *
+    return true;
+ }
+ 
++/* A shared NV12/P010 texture another device made (OpenResource opened its luma plane): its video surface, with the
++ * chroma plane the allocation has */
++void
++VideoOpenResource(D3D10DDI_HDEVICE hDevice, Resource *pResource)
++{
++   Device *pDevice = CastDevice(hDevice);
++   struct pipe_resource *luma = pResource->resource;
++   VideoSurface *v = (VideoSurface *)calloc(1, sizeof *v);
++   if (v) {
++      v->buffers = (struct pipe_video_buffer **)calloc(1, sizeof *v->buffers);
++   }
++   struct pipe_resource *resources[VL_NUM_COMPONENTS] = {};
++   resources[1] = VideoPipe(pDevice) ? ChromaPlane(pDevice, luma) : NULL;
++   if (!v || !v->buffers || !resources[1]) {
++      pipe_resource_reference(&resources[1], NULL);
++      free(v ? v->buffers : NULL);
++      free(v);
++      SetError(hDevice, E_OUTOFMEMORY);
++      return;
++   }
++   v->format = luma->format == PIPE_FORMAT_R16_UNORM ? PIPE_FORMAT_P010 : PIPE_FORMAT_NV12;
++   v->bpp = v->format == PIPE_FORMAT_NV12 ? 1 : 2;
++   v->width = luma->width0;
++   v->height = luma->height0;
++   v->slices = 1;
++   struct pipe_video_buffer tmpl = {};
++   tmpl.buffer_format = v->format;
++   tmpl.width = v->width;
++   tmpl.height = v->height;
++   pipe_resource_reference(&resources[0], luma);   /* the buffer's, as pResource->resource keeps its own */
++   v->buffers[0] = vl_video_buffer_create_ex2(VideoPipe(pDevice), &tmpl, resources);
++   if (!v->buffers[0]) {
++      pipe_resource_reference(&resources[0], NULL);
++      pipe_resource_reference(&resources[1], NULL);
++      free(v->buffers);
++      free(v);
++      SetError(hDevice, E_OUTOFMEMORY);
++      return;
++   }
++   pResource->video = v;
++   pResource->Format = v->format == PIPE_FORMAT_NV12 ? DXGI_FORMAT_NV12 : DXGI_FORMAT_P010;
++}
++
+ void
+ VideoDestroyResource(Resource *pResource)
+ {
+@@ -1695,7 +1773,7 @@ VideoProcessorGetBehaviorHints(D3D10DDI_HDEVICE hDevice, D3D11_1DDI_HVIDEOPROCES
+ }
+ 
+ HRESULT
+-VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize, bool wddm2_0)
++VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize, bool wddm2_0, bool wddm2_1)
+ {
+    if (!pParams || ParamSize < sizeof(D3D11_1DDI_VIDEO_INPUT)) {
+       return E_INVALIDARG;
+@@ -1812,6 +1890,12 @@ VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize
+       f2->pfnVideoProcessorSetStreamColorSpace1 = VideoProcessorSetStreamColorSpace1;
+       f2->pfnVideoProcessorGetBehaviorHints = VideoProcessorGetBehaviorHints;
+    }
++   if (wddm2_1) {
++      /* the 2.1 table: 2.0's and HDR metadata, which the processor doesn't use (no HDR output) */
++      D3DWDDM2_1DDI_VIDEODEVICEFUNCS *f21 = reinterpret_cast<D3DWDDM2_1DDI_VIDEODEVICEFUNCS *>(f);
++      f21->pfnVideoProcessorSetOutputHDRMetaData = VideoStub<decltype(f21->pfnVideoProcessorSetOutputHDRMetaData)>::Call;
++      f21->pfnVideoProcessorSetStreamHDRMetaData = VideoStub<decltype(f21->pfnVideoProcessorSetStreamHDRMetaData)>::Call;
++   }
+    return S_OK;
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Video.h b/src/gallium/frontends/d3d10umd/Video.h
+index 5fb4c3c..aff73b6 100644
+--- a/src/gallium/frontends/d3d10umd/Video.h
++++ b/src/gallium/frontends/d3d10umd/Video.h
+@@ -15,6 +15,8 @@ struct ShaderResourceView;
+ bool VideoCreateResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_CREATERESOURCE *pCreateResource,
+                          Resource *pResource);
+ void VideoDestroyResource(Resource *pResource);
++/* After OpenResource opened a shared NV12/P010 texture's luma plane (PIPE_RESOURCE_FLAG_CHROMA_PLANE) */
++void VideoOpenResource(D3D10DDI_HDEVICE hDevice, Resource *pResource);
+ 
+ /* The rest: true when the resource is one of them and it was handled */
+ bool VideoResourceMap(D3D10DDI_HDEVICE hDevice, Resource *pResource, UINT SubResource, D3D10_DDI_MAP DDIMap,
+@@ -33,6 +35,7 @@ bool VideoFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFor
+ void VideoAddFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCaps);
+ 
+ /* RetrieveSubObject's video function table (D3D11_1DDI_VIDEO_INPUT) */
+-HRESULT VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize, bool wddm2_0);
++HRESULT VideoRetrieveFunctions(D3D10DDI_HDEVICE hDevice, void *pParams, SIZE_T ParamSize, bool wddm2_0,
++                               bool wddm2_1 = false);
+ 
+ void VideoDestroyDevice(D3D10DDI_HDEVICE hDevice);
+diff --git a/src/gallium/include/pipe/p_defines.h b/src/gallium/include/pipe/p_defines.h
+index 9305ff7..fba45a7 100644
+--- a/src/gallium/include/pipe/p_defines.h
++++ b/src/gallium/include/pipe/p_defines.h
+@@ -507,6 +507,7 @@ enum pipe_flush_flags
+ #define PIPE_RESOURCE_FLAG_UNMAPPABLE            (1 << 8) /* implies staging transfers due to VK interop */
+ #define PIPE_RESOURCE_FLAG_DRV_PRIV              (1 << 9) /* driver/winsys private */
+ #define PIPE_RESOURCE_FLAG_TILE_POOL             (1 << 10) /* WinBoat: a D3D tile pool, memory only (tile_map) */
++#define PIPE_RESOURCE_FLAG_CHROMA_PLANE          (1 << 11) /* WinBoat: a shared NV12/P010 luma plane bringing its chroma plane */
+ #define PIPE_RESOURCE_FLAG_FRONTEND_PRIV         (1 << 24) /* gallium frontend private */
+ 
+ /**
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+index 57811a2..6d27f22 100644
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+@@ -125,6 +125,9 @@ static inline unsigned virgl_to_pipe_flags(unsigned pflags)
+    if (pflags & VIRGL_RESOURCE_FLAG_MAP_COHERENT)
+       out_flags |= PIPE_RESOURCE_FLAG_MAP_COHERENT;
+ 
++   if (pflags & VIRGL_RESOURCE_FLAG_CHROMA_PLANE)
++      out_flags |= PIPE_RESOURCE_FLAG_CHROMA_PLANE;
++
+    return out_flags;
+ }
+ 
+@@ -473,12 +476,38 @@ virgl_gdi_winsys_resource_create_handle(struct virgl_winsys *qws,
+                                         uint32_t *plane_offset,
+                                         uint64_t *modifier, uint32_t *blob_mem)
+ {
+-   if (whandle->type != WINSYS_HANDLE_TYPE_WIN32_HANDLE)
+-      return NULL;
+-
+    struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
+    struct virgl_hw_res *res = NULL;
+ 
++   /* The chroma plane of a VIRGL_RESOURCE_FLAG_CHROMA_PLANE allocation (whandle->handle: the allocation, made or
++    * opened by this device), as the caller's template has it. The allocation is the luma plane's: it stays the
++    * owner (shared: never destroyed here), it is what submissions list */
++   if (whandle->type == WINSYS_HANDLE_TYPE_D3DKMT_ALLOC && whandle->plane == 1) {
++      VIOGPU_ESCAPE info_escape = {0};
++      info_escape.Type = VIOGPU_RES_INFO;
++      info_escape.DataLength = sizeof(VIOGPU_RES_INFO_REQ);
++      info_escape.ResourceInfo.ResHandle = (D3DKMT_HANDLE)(uintptr_t)whandle->handle;
++      if (!NT_SUCCESS(qdws->device->escape(qdws->device, &info_escape, sizeof(info_escape))) ||
++          !info_escape.ResourceInfo.ChromaId)
++         return NULL;
++      res = CALLOC_STRUCT(virgl_hw_res);
++      if (!res)
++         return NULL;
++      *plane = *stride = *plane_offset = 0;
++      *modifier = 0;
++      *blob_mem = 0;
++      res->hAllocation = info_escape.ResourceInfo.ResHandle;
++      res->res_handle = info_escape.ResourceInfo.ChromaId;
++      res->target = templ->target;
++      res->bind = templ->bind;
++      pipe_reference_init(&res->reference, 1);
++      p_atomic_set(&res->shared, true);
++      return res;
++   }
++
++   if (whandle->type != WINSYS_HANDLE_TYPE_WIN32_HANDLE)
++      return NULL;
++
+    struct gdikmt_openallocation openAllocation;
+    openAllocation.hGlobalHandle = (D3DKMT_HANDLE)whandle->handle;
+ 
+diff --git a/src/virtio/virtio-gpu/virgl_hw.h b/src/virtio/virtio-gpu/virgl_hw.h
+index 70261d6..14ad0b4 100644
+--- a/src/virtio/virtio-gpu/virgl_hw.h
++++ b/src/virtio/virtio-gpu/virgl_hw.h
+@@ -845,5 +845,8 @@ enum virgl_statistics_query_index {
+ #define VIRGL_RESOURCE_Y_0_TOP (1 << 0)
+ #define VIRGL_RESOURCE_FLAG_MAP_PERSISTENT (1 << 1)
+ #define VIRGL_RESOURCE_FLAG_MAP_COHERENT   (1 << 2)
++/* WinBoat's kernel driver only, never sent to the host (its VIOGPU_RESOURCE_FLAG_CHROMA_PLANE): the luma plane of a
++ * shared NV12/P010 texture, whose allocation also makes the chroma plane (VIOGPU_RES_INFO's ChromaId) */
++#define VIRGL_RESOURCE_FLAG_CHROMA_PLANE   (1u << 29)
+ 
+ #endif
+diff --git a/src/virtio/wddm/viogpu_wddm_driver.h b/src/virtio/wddm/viogpu_wddm_driver.h
+index ae1261e..68ca0fa 100644
+--- a/src/virtio/wddm/viogpu_wddm_driver.h
++++ b/src/virtio/wddm/viogpu_wddm_driver.h
+@@ -103,6 +103,7 @@ typedef struct _VIOGPU_CAPSET_REQ {
+ typedef struct _VIOGPU_RES_INFO_REQ {
+     D3DKMT_HANDLE ResHandle;
+     ULONG Id;
++    ULONG ChromaId; /* the chroma plane of a VIRGL_RESOURCE_FLAG_CHROMA_PLANE allocation (older drivers leave it) */
+ }VIOGPU_RES_INFO_REQ;
+ #pragma pack()
+ 

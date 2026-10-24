@@ -1,0 +1,31 @@
+From: WinBoat
+Subject: [PATCH] vhost-user-gpu: no context 0 switch before a submission
+
+vg_virgl_process_cmd made virglrenderer's context 0 current before every command, forgetting which GL context was
+current. A submission's decoding then switched to its own context again: two eglMakeCurrent calls per
+VIRTIO_GPU_CMD_SUBMIT_3D, each flushing on NVIDIA's driver. A Windows guest submitting an empty command buffer
+measured ~215 us per submission, ~120 us of it this thread's CPU. Submissions now skip it; every other command (resource
+creation, transfers: they work in whatever GL context is current) still runs in context 0.
+---
+diff --git a/contrib/vhost-user-gpu/virgl.c b/contrib/vhost-user-gpu/virgl.c
+index 05b4e4b..96f4979 100644
+--- a/contrib/vhost-user-gpu/virgl.c
++++ b/contrib/vhost-user-gpu/virgl.c
+@@ -703,7 +703,16 @@ virgl_cmd_resource_unmap_blob(VuGpu *g,
+ 
+ void vg_virgl_process_cmd(VuGpu *g, struct virtio_gpu_ctrl_command *cmd)
+ {
+-    virgl_renderer_force_ctx_0();
++    /*
++     * Context 0's GL context for the commands that work in it. Not for a
++     * submission: decoding makes the submitting context's GL context current
++     * itself (Venus' contexts have none), and forcing context 0 first cost
++     * two GL context switches per submission (each a flush on NVIDIA's
++     * driver: ~120 us of this thread for a submission with nothing in it)
++     */
++    if (cmd->cmd_hdr.type != VIRTIO_GPU_CMD_SUBMIT_3D) {
++        virgl_renderer_force_ctx_0();
++    }
+     switch (cmd->cmd_hdr.type) {
+     case VIRTIO_GPU_CMD_CTX_CREATE:
+         virgl_cmd_context_create(g, cmd);

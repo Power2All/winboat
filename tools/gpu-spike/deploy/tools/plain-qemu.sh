@@ -14,11 +14,24 @@ VENUS="-machine memory-backend=mem -object memory-backend-memfd,id=mem,size=$MEM
 [ "${PLAIN_GPU:-}" = std ] && VENUS="-m $MEM -vga std"
 FIRMWARE="-drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd -drive if=pflash,format=raw,file=$P/vars.fd"
 [ "${PLAIN_BIOS:-}" = 1 ] && FIRMWARE=""
-exec qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 4 $VENUS \
+# PLAIN_SOFT=1: the host GPU hidden from QEMU (bubblewrap), so virglrenderer renders with Mesa's llvmpipe - a host GPU
+# without NVIDIA's extensions (and no Venus: no Vulkan driver for it); PLAIN_GL=3.3 makes it an older GPU (GL 3.3,
+# extensions up to 2010)
+GLDISPLAY="-display egl-headless,rendernode=/dev/dri/renderD128 -vnc 127.0.0.1:5" WRAP=()
+if [ "${PLAIN_SOFT:-}" = 1 ]; then
+   # (no VNC: QEMU takes none with SDL's GL context)
+   GLDISPLAY="-display sdl,gl=on"
+   VENUS="-m $MEM -device virtio-vga-gl"
+   WRAP=(bwrap --dev-bind / / --tmpfs /dev/dri env SDL_VIDEODRIVER=offscreen
+         __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json)
+   [ -n "${PLAIN_GL:-}" ] && WRAP+=(MESA_GL_VERSION_OVERRIDE=$PLAIN_GL MESA_GLSL_VERSION_OVERRIDE=${PLAIN_GL/./}0
+                                    MESA_EXTENSION_MAX_YEAR=2010)
+fi
+exec "${WRAP[@]}" qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 4 $VENUS \
    $FIRMWARE \
    -drive file=$P/data.img,id=d0,format=raw,if=none,cache=none,aio=native \
    -device virtio-scsi-pci,id=scsi0 -device scsi-hd,drive=d0,bus=scsi0.0 \
    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:12322-:22 -device virtio-net-pci,netdev=n0 \
    -device qemu-xhci -device usb-tablet \
-   -display egl-headless,rendernode=/dev/dri/renderD128 -vnc 127.0.0.1:5 \
+   $GLDISPLAY \
    -monitor unix:$P/monitor.sock,server=on,wait=off -serial ${PLAIN_SERIAL:+file:}${PLAIN_SERIAL:-none}

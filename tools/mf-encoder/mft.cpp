@@ -930,6 +930,10 @@ class Factory : public IClassFactory {
       *out = NULL;
       if (outer)
          return CLASS_E_NOAGGREGATION;
+      /* No encoder on the host (no Venus, or no Vulkan video encoding there): not made, so that programs take the
+       * next encoder Media Foundation lists, as with a GPU without one */
+      if (!vk_encoder_supported(hevc))
+         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
       Encoder *e = new (std::nothrow) Encoder(hevc);
       if (!e)
          return E_OUTOFMEMORY;

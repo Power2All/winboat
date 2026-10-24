@@ -1,0 +1,147 @@
+From: WinBoat
+Subject: [PATCH] virgl: the host's dual-source blend functions reset after use
+
+virglrenderer turns blending off with glDisable alone, so the host's GL keeps the last blend functions. Mesa's GL
+(AMD, Intel and llvmpipe hosts) refuses every draw to more than one color buffer while any buffer has a dual-source
+function, blending on or not (ARB_blend_func_extended's GL_INVALID_OPERATION), and virglrenderer then fails the whole
+context: on a llvmpipe host, after dx-test's dual-source blending test every later Direct3D 11 test of the program
+read zeros (Direct2D's ClearType text blends dual-source too). NVIDIA's GL checks enabled buffers only, so it never
+showed there. Blend states now keep their pipe_blend_state; the first draw without dual-source blending after one
+with it goes out with a copy whose disabled render targets blend ONE, ZERO, ADD (what they write anyway), so the host
+sets new functions for every buffer, and the real state is bound again after it.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+index 31fae0c..d49af35 100644
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -47,6 +47,7 @@
+ #include "util/slab.h"
+ #include "util/u_upload_mgr.h"
+ #include "util/u_blitter.h"
++#include "util/u_dual_blend.h"
+ 
+ #include "virgl_encode.h"
+ #include "virgl_context.h"
+@@ -398,15 +399,26 @@ static void virgl_surface_destroy(struct pipe_context *ctx,
+    FREE(surf);
+ }
+ 
++/* Blend states keep what they are: draw_vbo resets the host's dual-source blend functions from them */
++struct virgl_blend_state {
++   uint32_t handle;
++   bool dual_src;
++   struct pipe_blend_state state;
++};
++
+ static void *virgl_create_blend_state(struct pipe_context *ctx,
+                                               const struct pipe_blend_state *blend_state)
+ {
+    struct virgl_context *vctx = virgl_context(ctx);
+-   uint32_t handle;
+-   handle = virgl_object_assign_handle();
++   struct virgl_blend_state *b = CALLOC_STRUCT(virgl_blend_state);
++   if (!b)
++      return NULL;
++   b->handle = virgl_object_assign_handle();
++   b->dual_src = util_blend_state_is_dual(blend_state, 0);
++   b->state = *blend_state;
+ 
+-   virgl_encode_blend_state(vctx, handle, blend_state);
+-   return (void *)(unsigned long)handle;
++   virgl_encode_blend_state(vctx, b->handle, blend_state);
++   return b;
+ 
+ }
+ 
+@@ -414,16 +426,58 @@ static void virgl_bind_blend_state(struct pipe_context *ctx,
+                                            void *blend_state)
+ {
+    struct virgl_context *vctx = virgl_context(ctx);
+-   uint32_t handle = (unsigned long)blend_state;
+-   virgl_encode_bind_object(vctx, handle, VIRGL_OBJECT_BLEND);
++   vctx->blend = (struct virgl_blend_state *)blend_state;
++   virgl_encode_bind_object(vctx, vctx->blend ? vctx->blend->handle : 0, VIRGL_OBJECT_BLEND);
+ }
+ 
+ static void virgl_delete_blend_state(struct pipe_context *ctx,
+                                      void *blend_state)
+ {
+    struct virgl_context *vctx = virgl_context(ctx);
+-   uint32_t handle = (unsigned long)blend_state;
+-   virgl_encode_delete_object(vctx, handle, VIRGL_OBJECT_BLEND);
++   struct virgl_blend_state *b = (struct virgl_blend_state *)blend_state;
++   if (vctx->blend == b)
++      vctx->blend = NULL;
++   virgl_encode_delete_object(vctx, b->handle, VIRGL_OBJECT_BLEND);
++   FREE(b);
++}
++
++/*
++ * The host turns blending off with glDisable alone (virglrenderer's vrend_hw_emit_blend), so the GL keeps the last
++ * blend functions. Mesa's GL (AMD, Intel, llvmpipe hosts) refuses every draw to more than one color buffer while any
++ * buffer has a dual-source function (ARB_blend_func_extended, enabled or not: GL_INVALID_OPERATION), and the host then
++ * fails the whole context: after one dual-source draw, a draw to several render targets broke everything after it
++ * (NVIDIA's GL looks only at enabled ones). So the first draw without dual-source blending after one with it goes out
++ * with a copy of the blend state whose disabled render targets blend ONE, ZERO, ADD - what they write anyway - so that
++ * the host sets new functions for each; the real state is bound again after it. Returns the copy's handle, or 0.
++ */
++static uint32_t virgl_reset_dual_src_blend(struct virgl_context *vctx)
++{
++   if (vctx->blend && vctx->blend->dual_src) {
++      vctx->host_dual_src = true;
++      return 0;
++   }
++   if (!vctx->host_dual_src)
++      return 0;
++   vctx->host_dual_src = false;
++
++   struct pipe_blend_state r = {0};
++   if (vctx->blend)
++      r = vctx->blend->state;
++   for (unsigned i = 1; !r.independent_blend_enable && i < PIPE_MAX_COLOR_BUFS; i++)
++      r.rt[i] = r.rt[0];
++   r.independent_blend_enable = true;
++   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
++      if (r.rt[i].blend_enable)
++         continue;
++      r.rt[i].blend_enable = true;
++      r.rt[i].rgb_func = r.rt[i].alpha_func = PIPE_BLEND_ADD;
++      r.rt[i].rgb_src_factor = r.rt[i].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
++      r.rt[i].rgb_dst_factor = r.rt[i].alpha_dst_factor = PIPE_BLENDFACTOR_ZERO;
++   }
++   uint32_t handle = virgl_object_assign_handle();
++   virgl_encode_blend_state(vctx, handle, &r);
++   virgl_encode_bind_object(vctx, handle, VIRGL_OBJECT_BLEND);
++   return handle;
+ }
+ 
+ static void *virgl_create_depth_stencil_alpha_state(struct pipe_context *ctx,
+@@ -1086,8 +1140,15 @@ static void virgl_draw_vbo(struct pipe_context *ctx,
+ 
+    virgl_hw_set_vertex_buffers(vctx);
+ 
++   uint32_t reset_blend = virgl_reset_dual_src_blend(vctx);
++
+    virgl_encoder_draw_vbo(vctx, &info, drawid_offset, indirect, &draws[0]);
+ 
++   if (reset_blend) {
++      virgl_encode_bind_object(vctx, vctx->blend ? vctx->blend->handle : 0, VIRGL_OBJECT_BLEND);
++      virgl_encode_delete_object(vctx, reset_blend, VIRGL_OBJECT_BLEND);
++   }
++
+    pipe_resource_reference(&ib.buffer, NULL);
+ 
+ }
+diff --git a/src/gallium/drivers/virgl/virgl_context.h b/src/gallium/drivers/virgl/virgl_context.h
+index 50f4ca2..b3c84b1 100644
+--- a/src/gallium/drivers/virgl/virgl_context.h
++++ b/src/gallium/drivers/virgl/virgl_context.h
+@@ -93,6 +93,8 @@ struct virgl_context {
+    struct virgl_rasterizer_state rs_state;
+    unsigned raster_samples;   /* the host's, VIRGL_CCMD_SET_RASTER_SAMPLES */
+    bool conservative_raster;  /* the host's, VIRGL_CCMD_SET_CONSERVATIVE_RASTER */
++   struct virgl_blend_state *blend;  /* the bound blend state (NULL: none) */
++   bool host_dual_src;  /* a draw blended with dual-source factors, which the host's GL may still have (see draw_vbo) */
+    struct virgl_so_target so_targets[PIPE_MAX_SO_BUFFERS];
+    unsigned num_so_targets;
+ 

@@ -1,0 +1,87 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: presents that scale (a scaled blit instead of a copy)
+
+A blit present whose source and destination rectangles differ in size (Windows 7 without DWM: DXGI stretches a swap
+chain into a client area of another size in the present; normal windows can't be narrower than ~120 pixels) was
+emitted as copies of each destination rectangle at the destination's size, reading past the source's edge: the
+host dropped them and the window kept what was behind it. Such presents are now one VIRGL_CCMD_BLIT per destination
+rectangle (the whole source scaled to the whole destination, linear filter, scissored to the rectangle).
+
+Windows 7 GPU check: the windowed presents of Direct3D 9, 10 and 11 (DISCARD, SEQUENTIAL, FLIP_SEQUENTIAL) pass
+(212 passed / 1 failed).
+---
+diff --git a/viogpu/common/virgl_hw.h b/viogpu/common/virgl_hw.h
+index 6ef0d2b..3975200 100644
+--- a/viogpu/common/virgl_hw.h
++++ b/viogpu/common/virgl_hw.h
+@@ -14,6 +14,12 @@
+ #define VIRGL_CMD0(cmd, obj, len)           ((cmd) | ((obj) << 8) | ((len) << 16))
+ #define VIRGL_CCMD_RESOURCE_COPY_REGION     17
+ #define VIRGL_CMD_RESOURCE_COPY_REGION_SIZE 13
++// A scaled copy (a present whose source and destination rectangles differ in size)
++#define VIRGL_CCMD_BLIT                     16
++#define VIRGL_CMD_BLIT_SIZE                 21
++#define VIRGL_CMD_BLIT_S0_MASK(x)           (((x) & 0xff) << 0)
++#define VIRGL_CMD_BLIT_S0_FILTER(x)         (((x) & 0x3) << 8)
++#define VIRGL_CMD_BLIT_S0_SCISSOR_ENABLE(x) (((x) & 0x1) << 10)
+ 
+ // Flags for the driver about resource behaviour
+ #define VIRGL_RESOURCE_Y_0_TOP              (1 << 0)
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index 29c592d..7d20824 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -451,6 +451,53 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuAlloc
+         cmdBody->offset = (ULONGLONG)cmdBody->box.y * cmdBody->stride + cmdBody->box.x * 4;
+     }
+ 
++    // A source and destination of different sizes (a window whose client area isn't its swap chain's size, on
++    // Windows 7 without DWM: DXGI stretches in the present): each destination rectangle a scaled blit of the
++    // whole, cut to it, rather than a copy (which read past the source's edge, and the host dropped it)
++    const LONG srcW = pPresent->SrcRect.right - pPresent->SrcRect.left, srcH = pPresent->SrcRect.bottom - pPresent->SrcRect.top;
++    const LONG dstW = pPresent->DstRect.right - pPresent->DstRect.left, dstH = pPresent->DstRect.bottom - pPresent->DstRect.top;
++    const bool scaled = srcW > 0 && srcH > 0 && (srcW != dstW || srcH != dstH);
++    if (scaled)
++    {
++        UINT sizeOfOneRect = 4 * (VIRGL_CMD_BLIT_SIZE + 1);
++        UINT rectCnt = min(pPresent->SubRectCnt, (pPresent->DmaSize - 0x100) / sizeOfOneRect);
++
++        VIOGPU_COMMAND_HDR *cmd_hdr = (VIOGPU_COMMAND_HDR *)dmaBuf;
++        cmd_hdr->type = VIOGPU_CMD_SUBMIT;
++        cmd_hdr->size = rectCnt * sizeOfOneRect;
++        dmaBuf += sizeof(VIOGPU_COMMAND_HDR);
++
++        for (UINT i = 0; i < rectCnt; i++)
++        {
++            UINT *cmdBody = (UINT *)dmaBuf;
++            dmaBuf += sizeOfOneRect;
++            RECT rect = pPresent->pDstSubRects[i];
++
++            cmdBody[0] = VIRGL_CMD0(VIRGL_CCMD_BLIT, 0, VIRGL_CMD_BLIT_SIZE);
++            cmdBody[1] = VIRGL_CMD_BLIT_S0_MASK(0xf) | VIRGL_CMD_BLIT_S0_FILTER(1) | VIRGL_CMD_BLIT_S0_SCISSOR_ENABLE(1);
++            cmdBody[2] = (UINT)rect.left | ((UINT)rect.top << 16);
++            cmdBody[3] = (UINT)rect.right | ((UINT)rect.bottom << 16);
++            cmdBody[4] = dst->GetId();
++            cmdBody[5] = 0;
++            cmdBody[6] = dst->GetOptions().format;
++            cmdBody[7] = pPresent->DstRect.left;
++            cmdBody[8] = pPresent->DstRect.top;
++            cmdBody[9] = 0;
++            cmdBody[10] = dstW;
++            cmdBody[11] = dstH;
++            cmdBody[12] = 1;
++            cmdBody[13] = src->GetId();
++            cmdBody[14] = 0;
++            cmdBody[15] = src->GetOptions().format;
++            cmdBody[16] = pPresent->SrcRect.left;
++            cmdBody[17] = pPresent->SrcRect.top;
++            cmdBody[18] = 0;
++            cmdBody[19] = srcW;
++            cmdBody[20] = srcH;
++            cmdBody[21] = 1;
++        }
++    }
++    else
+     {
+         UINT sizeOfOneRect = 4 * (VIRGL_CMD_RESOURCE_COPY_REGION_SIZE + 1);
+ 

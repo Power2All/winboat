@@ -1,0 +1,223 @@
+From: WinBoat
+Subject: [PATCH] vrend: sparse lookups: residency and LOD clamp
+
+Direct3D 11.2's tiled resources tier 2 has shader instructions that return whether a lookup touched only mapped
+tiles (sample/gather/ld with a status, check_access_fully_mapped) and sample variants with a minimum LOD (sample_cl).
+GLSL has them as ARB_sparse_texture2's sparseTexture*ARB/sparseTexelsResidentARB and ARB_sparse_texture_clamp's
+texture*ClampARB. A new TGSI instruction, SPARSE (after U642D; sent by name as text), comes before a texture
+instruction: its destination gets that lookup's residency (1 or 0 in its bits; the guest compares it), its source is
+the LOD clamp. The lookup itself becomes its Clamp form (sample, sample_b, sample_d; the clamp after the offset and
+derivatives, before the bias), and the same lookup's sparse form, in the same invocation (the same derivatives and so
+the same footprint), gives the residency. Forms GLSL has no sparse variant of (projection, 1D, buffers, rectangles,
+cube arrays) report 1. The host announces it with VIRGL_CAP_V2_SPARSE_FEEDBACK (bit 24).
+---
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_info.c b/src/gallium/auxiliary/tgsi/tgsi_info.c
+index 303b375..cb27587 100644
+--- a/src/gallium/auxiliary/tgsi/tgsi_info.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_info.c
+@@ -181,6 +181,7 @@ static const struct tgsi_opcode_info opcode_info[TGSI_OPCODE_LAST] =
+    [TGSI_OPCODE_IABS] = { 1, 1, 0, 0, 0, 0, COMP, "IABS" },
+    [TGSI_OPCODE_ISSG] = { 1, 1, 0, 0, 0, 0, COMP, "ISSG" },
+    [TGSI_OPCODE_LOAD] = { 1, 2, 0, 0, 0, 0, OTHR, "LOAD" },
++   [TGSI_OPCODE_SPARSE] = { 1, 1, 0, 0, 0, 0, OTHR, "SPARSE" },
+    [TGSI_OPCODE_STORE] = { 1, 2, 0, 0, 0, 0, OTHR, "STORE" },
+    [TGSI_OPCODE_BARRIER] = { 0, 0, 0, 0, 0, 0, OTHR, "BARRIER" },
+ 
+diff --git a/src/gallium/include/pipe/p_shader_tokens.h b/src/gallium/include/pipe/p_shader_tokens.h
+index fbb08a5..a1529f6 100644
+--- a/src/gallium/include/pipe/p_shader_tokens.h
++++ b/src/gallium/include/pipe/p_shader_tokens.h
+@@ -627,6 +627,9 @@ enum tgsi_opcode {
+    TGSI_OPCODE_U642F,
+    TGSI_OPCODE_U642D,
+ 
++   /* WinBoat: the next texture instruction's residency into dst (D3D's tier 2 feedback) and its LOD clamp src.x */
++   TGSI_OPCODE_SPARSE,
++
+    TGSI_OPCODE_LAST,
+ };
+ 
+diff --git a/src/virgl_hw.h b/src/virgl_hw.h
+index e5ce27a..096858a 100644
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -646,6 +646,9 @@ enum virgl_formats {
+ /* WinBoat: samplers' reduction mode, minimum or maximum (VIRGL_OBJ_SAMPLE_STATE_S0_REDUCTION_MODE,
+  * ARB_texture_filter_minmax) */
+ #define VIRGL_CAP_V2_SAMPLER_REDUCTION    (1u << 25)
++/* WinBoat: the TGSI instruction SPARSE (the next texture lookup's residency and LOD clamp: D3D's tiled resources tier 2;
++ * ARB_sparse_texture2, ARB_sparse_texture_clamp) */
++#define VIRGL_CAP_V2_SPARSE_FEEDBACK      (1u << 24)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 8bd9406..197543f 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -240,6 +240,7 @@ enum features_id
+    feat_sparse_buffer,
+    feat_memory_object_sparse,
+    feat_texture_filter_minmax,
++   feat_sparse_texture_clamp,
+    feat_last,
+ };
+ 
+@@ -361,6 +362,7 @@ static const  struct {
+    FEAT(sparse_buffer, UNAVAIL, UNAVAIL, "GL_ARB_sparse_buffer"),
+    FEAT(memory_object_sparse, UNAVAIL, UNAVAIL, "GL_NV_memory_object_sparse"),
+    FEAT(texture_filter_minmax, UNAVAIL, UNAVAIL, "GL_ARB_texture_filter_minmax", "GL_EXT_texture_filter_minmax"),
++   FEAT(sparse_texture_clamp, UNAVAIL, UNAVAIL, "GL_ARB_sparse_texture_clamp"),
+ };
+ 
+ struct global_renderer_state {
+@@ -13288,6 +13290,9 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+    if (has_feature(feat_texture_filter_minmax))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_SAMPLER_REDUCTION;
+ 
++   if (has_feature(feat_sparse_texture2) && has_feature(feat_sparse_texture_clamp))
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_SPARSE_FEEDBACK;
++
+    if (has_feature(feat_pipeline_statistics_query))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY;
+ 
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index fd196ae..1e72577 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -86,6 +86,8 @@
+ #define SHADER_REQ_EXPLICIT_UNIFORM_LOCATION (1ULL << 41)
+ #define SHADER_REQ_VIEWPORT_LAYER_ARRAY   (1ULL << 42)
+ #define SHADER_REQ_FRAGMENT_SHADER_INTERLOCK (1ULL << 43)
++#define SHADER_REQ_SPARSE_TEXTURE2 (1ULL << 44)
++#define SHADER_REQ_SPARSE_TEXTURE_CLAMP (1ULL << 45)
+ 
+ #define FRONT_COLOR_EMITTED (1 << 0)
+ #define BACK_COLOR_EMITTED  (1 << 1);
+@@ -287,6 +289,11 @@ struct dump_ctx {
+    int fs_depth_layout;
+    uint32_t fs_blend_equation_advanced;
+    bool fs_interlock;
++   /* WinBoat: a SPARSE instruction for the next texture instruction - where its residency goes, its LOD clamp */
++   bool sparse_pending;
++   char sparse_status[128];
++   char sparse_wm[8];
++   char sparse_clamp[160];
+ 
+    bool separable_program;
+ 
+@@ -366,6 +373,8 @@ static const struct vrend_shader_table shader_req_table[] = {
+     { SHADER_REQ_EXPLICIT_UNIFORM_LOCATION, "ARB_explicit_uniform_location"},
+     { SHADER_REQ_VIEWPORT_LAYER_ARRAY, "ARB_shader_viewport_layer_array"},
+     { SHADER_REQ_FRAGMENT_SHADER_INTERLOCK, "ARB_fragment_shader_interlock"},
++    { SHADER_REQ_SPARSE_TEXTURE2, "ARB_sparse_texture2"},
++    { SHADER_REQ_SPARSE_TEXTURE_CLAMP, "ARB_sparse_texture_clamp"},
+ };
+ 
+ enum vrend_type_qualifier {
+@@ -3395,6 +3404,37 @@ static void translate_tex(struct dump_ctx *ctx,
+    const char *bias = exchange_bias_offset ? offset_buf.buf : bias_buf.buf;
+    const char *offset = exchange_bias_offset ? bias_buf.buf : offset_buf.buf;
+ 
++   /* WinBoat: D3D's tier 2 (a SPARSE instruction before this one): the LOD clamp on sample, sample_b and sample_d
++    * (ARB_sparse_texture_clamp: textureClampARB and its offset and grad forms, the clamp after the offset and
++    * derivatives, before the bias), the residency after the texel (below). Not for the forms GLSL has no sparse
++    * variant of: projection, 1D, buffers, rectangles, cube arrays, emulated rectangles, GLES */
++   const bool sparse = ctx->sparse_pending;
++   ctx->sparse_pending = false;
++   const unsigned op = inst->Instruction.Opcode;
++   const bool sparse_ok = sparse && !ctx->cfg->use_gles &&
++      (op == TGSI_OPCODE_TEX || op == TGSI_OPCODE_TXB || op == TGSI_OPCODE_TXL || op == TGSI_OPCODE_TXD ||
++       op == TGSI_OPCODE_TXF || op == TGSI_OPCODE_TG4) &&
++      inst->Texture.Texture != TGSI_TEXTURE_1D && inst->Texture.Texture != TGSI_TEXTURE_1D_ARRAY &&
++      inst->Texture.Texture != TGSI_TEXTURE_SHADOW1D && inst->Texture.Texture != TGSI_TEXTURE_SHADOW1D_ARRAY &&
++      inst->Texture.Texture != TGSI_TEXTURE_BUFFER && inst->Texture.Texture != TGSI_TEXTURE_RECT &&
++      inst->Texture.Texture != TGSI_TEXTURE_SHADOWRECT && inst->Texture.Texture != TGSI_TEXTURE_CUBE_ARRAY &&
++      inst->Texture.Texture != TGSI_TEXTURE_SHADOWCUBE_ARRAY &&
++      !vrend_shader_sampler_views_mask_get(ctx->key->sampler_views_emulated_rect_mask, sinfo->sreg_index);
++   const bool clamp = sparse_ok && (op == TGSI_OPCODE_TEX || op == TGSI_OPCODE_TXB || op == TGSI_OPCODE_TXD);
++   char clamp_ext[32];
++   struct vrend_strbuf clamp_buf;
++   strbuf_alloc(&clamp_buf, 160);
++   if (clamp) {
++      snprintf(clamp_ext, sizeof(clamp_ext), "%sClampARB", tex_ext);
++      tex_ext = clamp_ext;
++      strbuf_appendf(&clamp_buf, "%s, %s", op == TGSI_OPCODE_TXD ? bias : offset, ctx->sparse_clamp);
++      if (op == TGSI_OPCODE_TXD)
++         bias = clamp_buf.buf;
++      else
++         offset = clamp_buf.buf;
++      ctx->shader_req_bits |= SHADER_REQ_SPARSE_TEXTURE_CLAMP;
++   }
++
+    /* We have to unnormalize the coordinate for all but the texel fetch instruction */
+    if (inst->Instruction.Opcode != TGSI_OPCODE_TXF &&
+        vrend_shader_sampler_views_mask_get(ctx->key->sampler_views_emulated_rect_mask, sinfo->sreg_index)) {
+@@ -3600,6 +3640,54 @@ static void translate_tex(struct dump_ctx *ctx,
+       }
+    }
+ 
++   /* WinBoat: the residency (1 or 0 in the status register's bits; the guest compares it): the same lookup's
++    * sparse form, in the same invocation (the same derivatives, so the same footprint). Forms without one: 1 */
++   if (sparse) {
++      struct vrend_strbuf call;
++      strbuf_alloc(&call, 512);
++      if (sparse_ok) {
++         const char *ret = (is_shad && op != TGSI_OPCODE_TG4) ? "float" :
++                           ctx->samplers[sinfo->sreg_index].tgsi_sampler_return == TGSI_RETURN_TYPE_SINT ? "ivec4" :
++                           ctx->samplers[sinfo->sreg_index].tgsi_sampler_return == TGSI_RETURN_TYPE_UINT ? "uvec4" : "vec4";
++         bool offsets = inst->Texture.NumOffsets == 1;
++         const char *clampv = clamp ? ", " : "";
++         const char *clampa = clamp ? ctx->sparse_clamp : "";
++         switch (op) {
++         case TGSI_OPCODE_TEX:
++         case TGSI_OPCODE_TXB:
++            strbuf_appendf(&call, "sparseTexture%s%sARB(%s, %s%s%s%s%s, t%s)", offsets ? "Offset" : "", clamp ? "Clamp" : "",
++                           srcs[sampler_index], srcs[0], src_swizzle, offset_buf.buf, clampv, clampa,
++                           op == TGSI_OPCODE_TXB ? bias_buf.buf : "");
++            break;
++         case TGSI_OPCODE_TXL:
++            strbuf_appendf(&call, "sparseTextureLod%sARB(%s, %s%s%s%s, t)", offsets ? "Offset" : "",
++                           srcs[sampler_index], srcs[0], src_swizzle, bias_buf.buf, offset_buf.buf);
++            break;
++         case TGSI_OPCODE_TXD:
++            strbuf_appendf(&call, "sparseTextureGrad%s%sARB(%s, %s%s%s%s%s%s, t)", offsets ? "Offset" : "",
++                           clamp ? "Clamp" : "", srcs[sampler_index], srcs[0], src_swizzle, bias_buf.buf,
++                           offset_buf.buf, clampv, clampa);
++            break;
++         case TGSI_OPCODE_TXF:
++            strbuf_appendf(&call, "sparseTexelFetch%sARB(%s, %s(%s%s)%s%s, t)", offsets ? "Offset" : "",
++                           srcs[sampler_index], get_string(txfi), srcs[0], src_swizzle, bias_buf.buf, offset_buf.buf);
++            break;
++         default: /* TG4: a shadow one's reference before the texel, the component after it */
++            strbuf_appendf(&call, "sparseTextureGather%sARB(%s, %s%s%s%s, t%s)", offsets ? "Offset" : "",
++                           srcs[sampler_index], srcs[0], src_swizzle, is_shad ? bias_buf.buf : "", offset_buf.buf,
++                           is_shad ? "" : bias_buf.buf);
++            break;
++         }
++         emit_buff(&ctx->glsl_strbufs, "{ %s t; %s = uintBitsToFloat(uvec4(sparseTexelsResidentARB(%s) ? 1u : 0u))%s; }\n",
++                   ret, ctx->sparse_status, call.buf, ctx->sparse_wm);
++         ctx->shader_req_bits |= SHADER_REQ_SPARSE_TEXTURE2;
++      } else {
++         emit_buff(&ctx->glsl_strbufs, "%s = uintBitsToFloat(uvec4(1u))%s;\n", ctx->sparse_status, ctx->sparse_wm);
++      }
++      strbuf_free(&call);
++   }
++   strbuf_free(&clamp_buf);
++
+ cleanup:
+    strbuf_free(&offset_buf);
+    strbuf_free(&bias_buf);
+@@ -5813,6 +5901,12 @@ iter_instruction(struct tgsi_iterate_context *iter,
+    case TGSI_OPCODE_MOD:
+       emit_arit_op2("%");
+       break;
++   case TGSI_OPCODE_SPARSE:
++      ctx->sparse_pending = true;
++      snprintf(ctx->sparse_status, sizeof(ctx->sparse_status), "%s", dsts[0]);
++      snprintf(ctx->sparse_wm, sizeof(ctx->sparse_wm), "%s", writemask);
++      snprintf(ctx->sparse_clamp, sizeof(ctx->sparse_clamp), "%s.x", srcs[0]);
++      break;
+    case TGSI_OPCODE_TEX:
+    case TGSI_OPCODE_TEX2:
+    case TGSI_OPCODE_TXB:

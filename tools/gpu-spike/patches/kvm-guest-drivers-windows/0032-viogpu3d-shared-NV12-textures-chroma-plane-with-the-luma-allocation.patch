@@ -1,0 +1,195 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: shared NV12 textures' chroma plane with the luma plane's allocation
+
+A shared resource is the allocations made with it in one call, and the D3D11 driver makes an NV12/P010 texture of two
+host textures (R8 luma, R8G8 chroma; R16 and R16G16): another device opening it found the luma plane only. An
+allocation flagged VIOGPU_RESOURCE_FLAG_CHROMA_PLANE (kernel driver only, stripped before the host sees the options)
+also makes the chroma plane - half the size, two channels - attached to every context that has the allocation and
+destroyed with it, so it lives as long as the shared resource. VIOGPU_RES_INFO returns its id (ChromaId) to callers
+that pass the longer request; older callers' 8 bytes are still taken.
+---
+diff --git a/viogpu/shared/viogpum.h b/viogpu/shared/viogpum.h
+index c14c0c6..57664e2 100644
+--- a/viogpu/shared/viogpum.h
++++ b/viogpu/shared/viogpum.h
+@@ -111,6 +111,7 @@ typedef struct _VIOGPU_RES_INFO_REQ
+ {
+     D3DKMT_HANDLE ResHandle;
+     ULONG Id;
++    ULONG ChromaId; // (callers that pass it) the chroma plane of VIOGPU_RESOURCE_FLAG_CHROMA_PLANE allocations, else 0
+ } VIOGPU_RES_INFO_REQ;
+ #pragma pack()
+ 
+@@ -289,6 +290,10 @@ typedef struct _VIOGPU_CREATE_RESOURCE_EXCHANGE
+ #define VIOGPU_RESOURCE_FLAG_GDI_SURFACE 0x80000000
+ // Kernel driver only, never sent to the host: a primary (Windows 7 keeps these in its CPU-visible segment)
+ #define VIOGPU_RESOURCE_FLAG_PRIMARY 0x40000000
++// Kernel driver only, never sent to the host: the luma plane (R8 or R16) of a shared NV12/P010 texture. The allocation
++// also makes the chroma plane (R8G8 or R16G16, half the size), which lives as long as it does and whoever opens the
++// allocation finds through VIOGPU_RES_INFO: one allocation for the whole texture, as a shared resource has it
++#define VIOGPU_RESOURCE_FLAG_CHROMA_PLANE 0x20000000
+ 
+ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
+ {
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 30fee70..214e6dc 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1088,7 +1088,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+             }
+         case VIOGPU_RES_INFO:
+             {
+-                size = sizeof(VIOGPU_RES_INFO_REQ);
++                size = RTL_SIZEOF_THROUGH_FIELD(VIOGPU_RES_INFO_REQ, Id); // (ChromaId: newer callers)
+                 if (pVioGpuEscape->DataLength < size)
+                 {
+                     DbgPrint(TRACE_LEVEL_ERROR,
+@@ -1105,7 +1105,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                     return STATUS_INVALID_PARAMETER;
+                 }
+ 
+-                status = allocation->EscapeResourceInfo(&pVioGpuEscape->ResourceInfo);
++                status = allocation->EscapeResourceInfo(&pVioGpuEscape->ResourceInfo, pVioGpuEscape->DataLength);
+ 
+                 break;
+             }
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index 110d4b6..63b065a 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -5,7 +5,7 @@
+ #include "viogpu_adapter.h"
+ #include "virgl_hw.h"
+ 
+-VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIONS *options)
++VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIONS *options, bool chromaPlane)
+ {
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+ 
+@@ -19,6 +19,15 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIO
+     {
+         m_adapter->AddSharedResource(m_Id);
+     }
++    if (chromaPlane)
++    {
++        VIOGPU_RESOURCE_OPTIONS chroma = *options;
++        chroma.format = options->format == 48 /* VIRGL_FORMAT_R16_UNORM */ ? 49 /* R16G16_UNORM */ : 65 /* R8G8_UNORM */;
++        chroma.width = (options->width + 1) / 2;
++        chroma.height = (options->height + 1) / 2;
++        m_ChromaId = m_adapter->resourceIdr.GetId();
++        m_adapter->ctrlQueue.CreateResource3D(m_ChromaId, &chroma);
++    }
+ 
+     m_pMDL = NULL;
+     m_pageCount = 0;
+@@ -41,6 +50,11 @@ VioGpuAllocation::~VioGpuAllocation(void)
+     }
+     m_adapter->ctrlQueue.DestroyResource(m_Id);
+     m_adapter->resourceIdr.PutId(m_Id);
++    if (m_ChromaId)
++    {
++        m_adapter->ctrlQueue.DestroyResource(m_ChromaId);
++        m_adapter->resourceIdr.PutId(m_ChromaId);
++    }
+     m_adapter->UnchargeAllocation(m_ChargedSize);
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+@@ -319,7 +333,12 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+ 
+     // Over the VM's GPU memory limit: out of memory, as a full graphics card answers. Charged by the resource's own
+     // size: textures the CPU never maps have no guest memory (Size 0) and live on the host only
++    bool chromaPlane = (resourceExchange->ResourceOptions.flags & VIOGPU_RESOURCE_FLAG_CHROMA_PLANE) != 0;
+     ULONGLONG charge = HostSize(&resourceExchange->ResourceOptions);
++    if (chromaPlane)
++    {
++        charge += charge / 4; // the chroma plane: a quarter of the texels
++    }
+     if (charge < resourceExchange->Size)
+     {
+         charge = resourceExchange->Size;
+@@ -338,8 +357,8 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+     VIOGPU_RESOURCE_OPTIONS options = resourceExchange->ResourceOptions;
+     bool gdiSurface = (options.flags & VIOGPU_RESOURCE_FLAG_GDI_SURFACE) != 0;
+     bool primary = (options.flags & VIOGPU_RESOURCE_FLAG_PRIMARY) != 0;
+-    options.flags &= ~(VIOGPU_RESOURCE_FLAG_GDI_SURFACE | VIOGPU_RESOURCE_FLAG_PRIMARY);
+-    VioGpuAllocation *allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &options);
++    options.flags &= ~(VIOGPU_RESOURCE_FLAG_GDI_SURFACE | VIOGPU_RESOURCE_FLAG_PRIMARY | VIOGPU_RESOURCE_FLAG_CHROMA_PLANE);
++    VioGpuAllocation *allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &options, chromaPlane);
+     allocation->m_ChargedSize = charge;
+     allocationInfo->hAllocation = allocation;
+     if (gdiSurface)
+@@ -450,12 +469,16 @@ NTSTATUS VioGpuAllocation::UnmapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuil
+     return STATUS_SUCCESS;
+ }
+ 
+-NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo)
++NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, UINT size)
+ {
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d\n", __FUNCTION__, m_Id));
+ 
+     resInfo->Id = m_Id;
++    if (size >= RTL_SIZEOF_THROUGH_FIELD(VIOGPU_RES_INFO_REQ, ChromaId))
++    {
++        resInfo->ChromaId = m_ChromaId;
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+index 8fcb63f..93d39ef 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -14,7 +14,7 @@ class VioGpuResource
+ class VioGpuAllocation
+ {
+   public:
+-    VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIONS *options);
++    VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIONS *options, bool chromaPlane = false);
+     ~VioGpuAllocation(void);
+ 
+     UINT GetId(void)
+@@ -44,6 +44,8 @@ class VioGpuAllocation
+     volatile LONG m_gdiOpen = 0;
+     // The size charged to the adapter's GPU memory limit (VioGpuAdapter::ChargeAllocation)
+     ULONGLONG m_ChargedSize = 0;
++    // VIOGPU_RESOURCE_FLAG_CHROMA_PLANE: the chroma plane's host resource, else 0
++    UINT m_ChromaId = 0;
+ 
+     // GDI drew on the pages: the host texture needs them before D3D uses it next
+     void SetGdiDirty()
+@@ -83,7 +85,7 @@ class VioGpuAllocation
+     NTSTATUS MapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildPagingBuffer);
+     NTSTATUS UnmapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildPagingBuffer);
+ 
+-    NTSTATUS EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo);
++    NTSTATUS EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, UINT size);
+     NTSTATUS EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy);
+ 
+   private:
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index 7d20824..b14900b 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -829,6 +829,10 @@ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAlloc
+     m_pDevice = device;
+ 
+     m_pDevice->GetCtrlQueue()->CtxResource(true, m_pDevice->GetId(), m_pAllocation->GetId());
++    if (m_pAllocation->m_ChromaId) // (VIOGPU_RESOURCE_FLAG_CHROMA_PLANE: the plane the allocation brings along)
++    {
++        m_pDevice->GetCtrlQueue()->CtxResource(true, m_pDevice->GetId(), m_pAllocation->m_ChromaId);
++    }
+ }
+ 
+ VioGpuDeviceAllocation::~VioGpuDeviceAllocation()
+@@ -852,6 +856,10 @@ VioGpuDeviceAllocation::~VioGpuDeviceAllocation()
+     }
+ 
+     m_pDevice->GetCtrlQueue()->CtxResource(false, m_pDevice->GetId(), m_pAllocation->GetId());
++    if (m_pAllocation->m_ChromaId)
++    {
++        m_pDevice->GetCtrlQueue()->CtxResource(false, m_pDevice->GetId(), m_pAllocation->m_ChromaId);
++    }
+ }
+ 
+ VioGpuAllocation *VioGpuDeviceAllocation::GetAllocation()

@@ -1402,6 +1402,89 @@ static void testSampleCmpGrad12(D12 &d, const Options21 &o21)
    release(rs);
 }
 
+#include "dxil/dxil_sm66atomics_cs.h"
+
+// 64-bit atomics (shader model 6.6: Unreal Engine 5's Nanite and virtual shadow maps need them on typed textures):
+// dxil/sm66atomics.hlsl, InterlockedMax from 64 threads into a R32G32_UINT texture through the descriptor heap and
+// into a raw buffer; both must hold the largest value, 0x00000040_00000025
+static void testInt64Atomics12(D12 &d)
+{
+   const char *name = "64-bit atomics on textures and buffers (shader model 6.6, Unreal Engine 5's Nanite)";
+   D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
+   D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9 = {};
+   D3D12_FEATURE_DATA_D3D12_OPTIONS11 o11 = {};
+   D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL_6_6};
+   d.dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof o1);
+   d.dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof o9);
+   d.dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &o11, sizeof o11);
+   d.dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm);
+   if (sm.HighestShaderModel < D3D_SHADER_MODEL_6_6 || !o1.Int64ShaderOps || !o9.AtomicInt64OnTypedResourceSupported ||
+       !o11.AtomicInt64OnDescriptorHeapResourceSupported) {
+      optional(false, name, fmt("shader model 6.%u, 64-bit integers %u, on typed resources %u, on heap resources %u",
+                                sm.HighestShaderModel & 15, o1.Int64ShaderOps, o9.AtomicInt64OnTypedResourceSupported,
+                                o11.AtomicInt64OnDescriptorHeapResourceSupported));
+      return;
+   }
+   if (!startTest(name)) return;
+   std::string detail;
+   D3D12_ROOT_PARAMETER param = {};
+   param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+   // (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)
+   D3D12_ROOT_SIGNATURE_DESC desc = {1, &param, 0, nullptr, (D3D12_ROOT_SIGNATURE_FLAGS)0x400};
+   ID3D12RootSignature *rs = rootSignature12(d, desc, detail);
+   ID3D12PipelineState *pso = nullptr;
+   if (rs) {
+      D3D12_COMPUTE_PIPELINE_STATE_DESC cd = {};
+      cd.pRootSignature = rs;
+      cd.CS = {dxil_sm66atomics_cs, sizeof(dxil_sm66atomics_cs)};
+      HRESULT h = d.dev->CreateComputePipelineState(&cd, __uuidof(ID3D12PipelineState), (void **)&pso);
+      if (FAILED(h)) detail = "CreateComputePipelineState: " + hrs(h);
+   }
+   ID3D12Resource *tex = texture12(d, 1, 1, DXGI_FORMAT_R32G32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+   ID3D12Resource *uav = buffer12(d, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+   ID3D12Resource *rb = buffer12(d, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+   ID3D12DescriptorHeap *heap = nullptr;
+   D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+   d.dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), (void **)&heap);
+   bool ok = pso && tex && uav && rb && heap;
+   if (ok) {
+      // (textures and buffers start zeroed: committed resources are)
+      D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+      ud.Format = DXGI_FORMAT_R32G32_UINT;
+      ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+      d.dev->CreateUnorderedAccessView(tex, nullptr, &ud, heap->GetCPUDescriptorHandleForHeapStart());
+      ID3D12DescriptorHeap *heaps[] = {heap};
+      d.list->SetDescriptorHeaps(1, heaps);
+      d.list->SetComputeRootSignature(rs);
+      d.list->SetPipelineState(pso);
+      d.list->SetComputeRootUnorderedAccessView(0, uav->GetGPUVirtualAddress());
+      d.list->Dispatch(1, 1, 1);
+      barrier12(d.list, uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      d.list->CopyBufferRegion(rb, 0, uav, 0, 16);
+      uint64_t v[2] = {};
+      void *m = nullptr;
+      ok = submit12(d) && SUCCEEDED(rb->Map(0, nullptr, &m));
+      if (ok) {
+         memcpy(v, m, sizeof v);
+         rb->Unmap(0, nullptr);
+      }
+      const uint64_t want = (64ull << 32) | 37;
+      detail = ok ? fmt("texture 0x%016llx, buffer 0x%016llx (expected 0x%016llx)", (unsigned long long)v[0],
+                        (unsigned long long)v[1], (unsigned long long)want)
+                  : "running or reading back failed";
+      ok = ok && v[0] == want && v[1] == want;
+   }
+   check(ok, name, detail + debugMessages12(d));
+   release(heap);
+   release(rb);
+   release(uav);
+   release(tex);
+   release(pso);
+   release(rs);
+}
+
 // ExecuteIndirect with state changes: 4 dispatches at most, 3 by the count buffer, each setting root constants
 // (index, value) before writing out[index] = value. With tier 1.1 the index is an incrementing constant (the
 // command's number) instead of an argument. vkd3d-proton runs both on device-generated commands where it has them
@@ -1813,6 +1896,11 @@ static void testPresent12(D12 &d, IDXGIFactory4 *factory, DXGI_FORMAT format, co
 
 static void groupD3D12()
 {
+#ifndef DXTEST_AGILITY
+   // Windows 10's own runtime knows none of the newer features (programs that ship the Agility SDK get them there)
+   if (osVersion().dwMajorVersion == 10 && osVersion().dwBuildNumber < 22000)
+      g_warnNote = " (Windows 10's built-in Direct3D 12 runtime; programs that bring Microsoft's Agility SDK have it)";
+#endif
    const char *TESTS[] = {"Feature level 11_0 or higher", "Shader model 6.0 or higher", "Command queues, lists and fences",
                           "Root signatures and pipeline states", "Rendering a triangle", "Compute shaders and UAV buffers",
                           "Copy queues", "Bundles", "ExecuteIndirect (indirect draws)", "Descriptor heaps and texture sampling",
@@ -2202,6 +2290,7 @@ static void groupD3D12()
             fmt("tier %u.%u", o21.ExecuteIndirectTier / 10, o21.ExecuteIndirectTier % 10));
    testExecuteIndirectConstants12(d, o21);
    testExecuteIndirectDraws12(d);
+   testInt64Atomics12(d);
    if (sm.HighestShaderModel >= SM_6_8) testSampleCmpGrad12(d, o21);
    if (sm.HighestShaderModel >= SM_6_8) testWorkGraph12(d, o21);
    release(rs);

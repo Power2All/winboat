@@ -1,0 +1,804 @@
+From: WinBoat
+Subject: [PATCH] wsi/win32: Venus presents through a Direct3D 11 swap chain, on the GPU
+
+Venus has no Direct3D 12 queue for DXGI, so its presents took the CPU path: each frame read back into memory and
+drawn with GDI's StretchDIBits, ~1 ms at 1080p and 1.6 ms at 1440p. With Venus (and the GPU driver's Direct3D 11
+driver) each swapchain image now has a shared Direct3D 11 RGBA8 texture whose host storage is Vulkan memory (mesa
+patch 0035, virglrenderer 0012/0017); Venus imports it by its host resource id (the kernel driver's VIOGPU_RES_INFO
+escape, VkImportMemoryResourceInfoMESA). A present blits the app's image into it on the app's queue (vkCmdBlitImage:
+BGRA to RGBA), and the present thread copies it into a flip-model DXGI swap chain's buffer and presents: 0.41 ms at
+1080p, 0.44 ms at 1440p. FIFO presents with sync interval 1, IMMEDIATE tears where DXGI allows it.
+
+Anything missing (no Direct3D 11 device, the host without VK_SHARED, the import failing) falls back to the CPU path
+per surface; WINBOAT_VK_PRESENT=copy forces it.
+---
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 80925d1..51c9abe 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -28,7 +28,7 @@ if with_platform_wayland
+ endif
+ 
+ if with_platform_windows
+-  files_vulkan_wsi += files('wsi_common_win32.cpp')
++  files_vulkan_wsi += files('wsi_common_win32.cpp', 'wsi_common_win32_d3d11.cpp')
+   platform_deps += dep_dxheaders
+ else
+   files_vulkan_wsi += files('wsi_common_headless.c')
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 6450220..3783601 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -193,6 +193,7 @@ wsi_device_init(struct wsi_device *wsi,
+    WSI_GET_CB(BindImageMemory);
+    WSI_GET_CB(BeginCommandBuffer);
+    WSI_GET_CB(CmdPipelineBarrier);
++   WSI_GET_CB(CmdBlitImage);
+    WSI_GET_CB(CmdCopyImage);
+    WSI_GET_CB(CmdCopyImageToBuffer);
+    WSI_GET_CB(CmdResetQueryPool);
+@@ -3380,12 +3381,30 @@ wsi_cmd_blit_image_to_image(VkCommandBuffer cmd_buffer,
+       .dstOffset = { .x = 0, .y = 0, .z = 0 },
+       .extent = info->create.extent,
+    };
+-   wsi->CmdCopyImage(cmd_buffer,
+-                     image->image,
+-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                     image->blit.image,
+-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-                     1, &image_copy);
++   if (info->blit_dst_format != VK_FORMAT_UNDEFINED && info->blit_dst_format != info->create.format) {
++      /* another format (BGRA into RGBA): a blit converts, a copy would keep the bytes */
++      const VkImageBlit image_blit = {
++         .srcSubresource = image_copy.srcSubresource,
++         .srcOffsets = { { 0, 0, 0 },
++                         { (int32_t)info->create.extent.width, (int32_t)info->create.extent.height, 1 } },
++         .dstSubresource = image_copy.dstSubresource,
++         .dstOffsets = { { 0, 0, 0 },
++                         { (int32_t)info->create.extent.width, (int32_t)info->create.extent.height, 1 } },
++      };
++      wsi->CmdBlitImage(cmd_buffer,
++                        image->image,
++                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                        image->blit.image,
++                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                        1, &image_blit, VK_FILTER_NEAREST);
++   } else {
++      wsi->CmdCopyImage(cmd_buffer,
++                        image->image,
++                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                        image->blit.image,
++                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                        1, &image_copy);
++   }
+ 
+    img_mem_barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    img_mem_barriers[0].dstAccessMask = 0;
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index 803d140..bf675fa 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -206,6 +206,7 @@ struct wsi_device {
+    WSI_CB(BindImageMemory);
+    WSI_CB(BeginCommandBuffer);
+    WSI_CB(CmdPipelineBarrier);
++   WSI_CB(CmdBlitImage);
+    WSI_CB(CmdCopyImage);
+    WSI_CB(CmdCopyImageToBuffer);
+    WSI_CB(CmdResetQueryPool);
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index d06be47..1d3aeef 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -76,6 +76,9 @@ struct wsi_drm_image_params {
+ struct wsi_dxgi_image_params {
+    struct wsi_base_image_params base;
+    bool storage_image;
++   /* WinBoat: Venus presenting through Direct3D 11 (wsi_common_win32_d3d11.cpp): images blitted into Venus imports
++    * of shared Direct3D 11 textures */
++   bool venus_d3d11;
+ };
+ 
+ typedef uint32_t (*wsi_memory_type_select_cb)(const struct wsi_device *wsi,
+@@ -115,6 +118,10 @@ struct wsi_image_info {
+    struct VkDrmFormatModifierPropertiesEXT *modifier_props;
+    VkImageCompressionFixedRateFlagsEXT *img_compr_fixed_rate_flags;
+ 
++   /* For image blits into an image of another format (WinBoat: Venus' Direct3D 11 presents, whose images are
++    * RGBA8): that format, and the blit converts; 0 (VK_FORMAT_UNDEFINED): the same format, and it copies */
++   VkFormat blit_dst_format;
++
+    /* For buffer blit images, the linear stride in bytes */
+    uint32_t linear_stride;
+ 
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index c312931..c504a5c 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -42,6 +42,8 @@
+ 
+ #include <dcomp.h>
+ 
++#include "wsi_common_win32_d3d11.h"
++
+ #if defined(__GNUC__)
+ #pragma GCC diagnostic ignored "-Wint-to-pointer-cast"      // warning: cast to pointer from integer of different size
+ #endif
+@@ -59,6 +61,8 @@ struct wsi_win32 {
+       IDXGIFactory4 *factory;
+       IDCompositionDevice *dcomp;
+    } dxgi;
++   /* WinBoat: Venus, which presents through Direct3D 11 (wsi_common_win32_d3d11.cpp) where it can */
++   bool venus;
+ };
+ 
+ enum wsi_win32_image_state {
+@@ -74,6 +78,8 @@ struct wsi_win32_image {
+    struct {
+       ID3D12Resource *swapchain_res;
+    } dxgi;
++   /* WinBoat: Venus presenting through Direct3D 11: the shared texture the image is blitted into */
++   void *d3d11_texture;
+    struct {
+       HDC dc;
+       HBITMAP bmp;
+@@ -97,11 +103,19 @@ struct wsi_win32_surface {
+    IDCompositionTarget *target;
+    IDCompositionVisual *visual;
+    struct wsi_win32_swapchain *current_swapchain;
++
++   /* WinBoat: Venus presenting through Direct3D 11: the window's device and DXGI swap chain, which every Vulkan
++    * swapchain of the surface uses in turn (a window has one flip-model swap chain) */
++   struct wsi_win32_d3d11 *d3d11;
++   /* the path failed for this surface once (the host or the driver without it): copies from then on */
++   bool d3d11_failed;
+ };
+ 
+ struct wsi_win32_swapchain {
+    struct wsi_swapchain         base;
+    IDXGISwapChain3            *dxgi;
++   /* WinBoat: Venus presenting through Direct3D 11 (the present thread copies and presents on the GPU) */
++   bool d3d11;
+    struct wsi_win32           *wsi;
+    wsi_win32_surface          *surface;
+    mtx_t                      acquire_mutex;
+@@ -169,6 +183,7 @@ wsi_win32_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
+ {
+    VK_FROM_HANDLE(vk_instance, instance, _instance);
+    wsi_win32_surface *surface = (wsi_win32_surface *)icd_surface;
++   wsi_win32_d3d11_destroy(surface->d3d11);
+    if (surface->visual)
+       surface->visual->Release();
+    if (surface->target)
+@@ -525,11 +540,92 @@ wsi_create_dxgi_image_mem(const struct wsi_swapchain *drv_chain,
+                               &chain->base.alloc, &image->memory);
+ }
+ 
++/* Venus' VkImportMemoryResourceInfoMESA: the memory of a host resource (the shared texture's) */
++#define WSI_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA ((VkStructureType)1000384002)
++struct wsi_import_memory_resource_info_mesa {
++   VkStructureType sType;
++   const void *pNext;
++   uint32_t resourceId;
++};
++
++/* WinBoat: an image of a swapchain presenting through Direct3D 11 (Venus): the app's image, and as the blit's
++ * destination a Venus image on a shared Direct3D 11 texture's host storage, of the host's parameters for it (RGBA8,
++ * mutable format, optimal tiling: virglrenderer's VREND_VK_IMAGE_USAGE; the sRGB view for sRGB images, so the blit
++ * keeps their encoding) */
++static VkResult
++wsi_create_venus_d3d11_image_mem(const struct wsi_swapchain *drv_chain,
++                                 const struct wsi_image_info *info,
++                                 struct wsi_image *image)
++{
++   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)drv_chain;
++   const struct wsi_device *wsi = chain->base.wsi;
++   struct wsi_win32_image *win32_image = container_of(image, struct wsi_win32_image, base);
++
++   uint32_t res_id = 0;
++   win32_image->d3d11_texture = wsi_win32_d3d11_texture(chain->surface->d3d11, info->create.extent.width,
++                                                        info->create.extent.height, &res_id);
++   if (!win32_image->d3d11_texture)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   const VkExternalMemoryImageCreateInfo external = {
++      VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++   };
++   VkImageCreateInfo create = {};
++   create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++   create.pNext = &external;
++   create.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++   create.imageType = VK_IMAGE_TYPE_2D;
++   create.format = info->blit_dst_format;
++   create.extent = info->create.extent;
++   create.mipLevels = 1;
++   create.arrayLayers = 1;
++   create.samples = VK_SAMPLE_COUNT_1_BIT;
++   create.tiling = VK_IMAGE_TILING_OPTIMAL;
++   create.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++   create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++   VkResult result = wsi->CreateImage(chain->base.device, &create, &chain->base.alloc, &image->blit.image);
++   if (result != VK_SUCCESS)
++      return result;
++
++   VkMemoryRequirements reqs;
++   wsi->GetImageMemoryRequirements(chain->base.device, image->blit.image, &reqs);
++   const struct wsi_import_memory_resource_info_mesa import = {
++      WSI_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA, NULL, res_id,
++   };
++   const VkMemoryDedicatedAllocateInfo dedicated = {
++      VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &import, image->blit.image, VK_NULL_HANDLE,
++   };
++   const VkMemoryAllocateInfo import_info = {
++      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated, reqs.size,
++      wsi_select_device_memory_type(wsi, reqs.memoryTypeBits),
++   };
++   result = wsi->AllocateMemory(chain->base.device, &import_info, &chain->base.alloc, &image->blit.memory);
++   if (result != VK_SUCCESS)
++      return result;
++   result = wsi->BindImageMemory(chain->base.device, image->blit.image, image->blit.memory, 0);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* the app's image */
++   wsi->GetImageMemoryRequirements(chain->base.device, image->image, &reqs);
++   const VkMemoryDedicatedAllocateInfo memory_dedicated_info = {
++      VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, image->image, VK_NULL_HANDLE,
++   };
++   const VkMemoryAllocateInfo memory_info = {
++      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &memory_dedicated_info, reqs.size,
++      info->select_image_memory_type(wsi, reqs.memoryTypeBits),
++   };
++   return wsi->AllocateMemory(chain->base.device, &memory_info, &chain->base.alloc, &image->memory);
++}
++
+ enum wsi_swapchain_blit_type
+ wsi_dxgi_image_needs_blit(const struct wsi_device *wsi,
+                           const struct wsi_dxgi_image_params *params,
+                           VkDevice device)
+ {
++   if (params->venus_d3d11)
++      return WSI_SWAPCHAIN_IMAGE_BLIT;
+    if (wsi->win32.requires_blits && wsi->win32.requires_blits(device))
+       return WSI_SWAPCHAIN_IMAGE_BLIT;
+    else if (params->storage_image)
+@@ -549,6 +645,11 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
+       return result;
+ 
+    info->create_mem = wsi_create_dxgi_image_mem;
++   if (params->venus_d3d11) {
++      info->create_mem = wsi_create_venus_d3d11_image_mem;
++      info->blit_dst_format = vk_format_is_srgb(info->create.format) ? VK_FORMAT_R8G8B8A8_SRGB
++                                                                      : VK_FORMAT_R8G8B8A8_UNORM;
++   }
+ 
+    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
+       wsi_configure_image_blit_image(chain, info);
+@@ -575,7 +676,7 @@ wsi_win32_image_init(VkDevice device_h,
+    chain->wnd = win32_surface->hwnd;
+    image->chain = chain;
+ 
+-   if (chain->dxgi)
++   if (chain->dxgi || chain->d3d11)
+       return VK_SUCCESS;
+ 
+    chain->chain_dc = GetDC(chain->wnd);
+@@ -611,6 +712,7 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
+ {
+    if (image->dxgi.swapchain_res)
+       image->dxgi.swapchain_res->Release();
++   wsi_win32_d3d11_texture_release(image->d3d11_texture);
+ 
+    if (image->sw.dc)
+       DeleteDC(image->sw.dc);
+@@ -646,7 +748,8 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
+    for (uint32_t i = 0; i < chain->base.image_count; i++)
+       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
+ 
+-   DeleteDC(chain->chain_dc);
++   if (chain->chain_dc)
++      DeleteDC(chain->chain_dc);
+ 
+    if (chain->surface->current_swapchain == chain)
+       chain->surface->current_swapchain = NULL;
+@@ -866,7 +969,9 @@ wsi_win32_present_thread(void *data)
+    HDC dc = GetDC(chain->wnd);
+    /* FIFO and MAILBOX: one frame per composition of the desktop (DwmFlush waits for the next one) */
+    typedef HRESULT(WINAPI * PFN_DwmFlush)(void);
+-   HMODULE dwmapi = chain->base.present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR ? LoadLibraryA("dwmapi.dll") : NULL;
++   /* (Direct3D 11's Present paces FIFO itself) */
++   HMODULE dwmapi = chain->base.present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR && !chain->d3d11
++                       ? LoadLibraryA("dwmapi.dll") : NULL;
+    PFN_DwmFlush dwm_flush = dwmapi ? (PFN_DwmFlush)GetProcAddress(dwmapi, "DwmFlush") : NULL;
+ 
+    mtx_lock(&chain->acquire_mutex);
+@@ -887,7 +992,10 @@ wsi_win32_present_thread(void *data)
+ 
+       const uint32_t index = image - chain->images;
+       VkResult result = wsi->WaitForFences(chain->base.device, 1, &chain->base.fences[index], true, UINT64_MAX);
+-      if (result == VK_SUCCESS && !wsi_win32_draw_image(chain, image, dc))
++      if (result == VK_SUCCESS &&
++          !(chain->d3d11 ? wsi_win32_d3d11_present(chain->surface->d3d11, image->d3d11_texture,
++                                                   chain->base.present_mode)
++                         : wsi_win32_draw_image(chain, image, dc)))
+          result = VK_ERROR_SURFACE_LOST_KHR;
+ 
+       /* GDI has copied the pixels: the image goes back before the wait for the compositor */
+@@ -1030,13 +1138,14 @@ wsi_win32_surface_create_swapchain_dxgi(
+ }
+ 
+ static VkResult
+-wsi_win32_surface_create_swapchain(
++wsi_win32_surface_create_swapchain_impl(
+    VkIcdSurfaceBase *icd_surface,
+    VkDevice device,
+    struct wsi_device *wsi_device,
+    const VkSwapchainCreateInfoKHR *create_info,
+    const VkAllocationCallbacks *allocator,
+-   struct wsi_swapchain **swapchain_out)
++   struct wsi_swapchain **swapchain_out,
++   bool d3d11)
+ {
+    wsi_win32_surface *surface = (wsi_win32_surface *)icd_surface;
+    struct wsi_win32 *wsi =
+@@ -1044,7 +1153,8 @@ wsi_win32_surface_create_swapchain(
+ 
+    assert(create_info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+ 
+-   bool supports_dxgi = wsi->dxgi.factory &&
++   bool supports_dxgi = !d3d11 &&
++                        wsi->dxgi.factory &&
+                         wsi->dxgi.dcomp &&
+                         wsi->wsi->win32.get_d3d12_command_queue;
+    /* Software presents: a second image to render into while the present thread draws one, a third for MAILBOX to
+@@ -1081,12 +1191,13 @@ wsi_win32_surface_create_swapchain(
+       { WSI_IMAGE_TYPE_DXGI },
+    };
+    dxgi_image_params.storage_image = (image_usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
++   dxgi_image_params.venus_d3d11 = d3d11;
+ 
+    struct wsi_cpu_image_params cpu_image_params = {
+       { WSI_IMAGE_TYPE_CPU },
+    };
+ 
+-   struct wsi_base_image_params *image_params = supports_dxgi ?
++   struct wsi_base_image_params *image_params = supports_dxgi || d3d11 ?
+       &dxgi_image_params.base : &cpu_image_params.base;
+ 
+    VkResult result = wsi_swapchain_init(wsi_device, &chain->base, device,
+@@ -1111,8 +1222,9 @@ wsi_win32_surface_create_swapchain(
+    chain->status = VK_SUCCESS;
+ 
+    chain->surface = surface;
++   chain->d3d11 = d3d11;
+ 
+-   if (image_params->image_type == WSI_IMAGE_TYPE_DXGI) {
++   if (image_params->image_type == WSI_IMAGE_TYPE_DXGI && !d3d11) {
+       result = wsi_win32_surface_create_swapchain_dxgi(surface, device, wsi, create_info, chain);
+       if (result != VK_SUCCESS)
+          goto fail;
+@@ -1132,6 +1244,11 @@ wsi_win32_surface_create_swapchain(
+       chain->sw.thread = CreateThread(NULL, 0, wsi_win32_present_thread, chain, 0, NULL);
+       if (chain->sw.thread)
+          chain->base.present_waits_for_fence = true;
++      else if (d3d11) {
++         /* (Direct3D 11 presents happen on that thread only) */
++         result = VK_ERROR_OUT_OF_HOST_MEMORY;
++         goto fail;
++      }
+    }
+ 
+    *swapchain_out = &chain->base;
+@@ -1148,6 +1265,55 @@ fail:
+    return result;
+ }
+ 
++/* WinBoat: Venus presents through Direct3D 11 where it can (wsi_common_win32_d3d11.cpp): an 8-bit RGBA/BGRA
++ * swapchain of one layer, the window's device and DXGI swap chain made (or resized) for it */
++static bool
++wsi_win32_d3d11_usable(struct wsi_win32 *wsi, wsi_win32_surface *surface, const VkSwapchainCreateInfoKHR *create_info)
++{
++   if (!wsi->venus || surface->d3d11_failed || create_info->imageArrayLayers != 1)
++      return false;
++   switch (create_info->imageFormat) {
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_SRGB:
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_SRGB:
++      break;
++   default:
++      return false;
++   }
++   if (!surface->d3d11)
++      surface->d3d11 = wsi_win32_d3d11_create(surface->base.hwnd);
++   return surface->d3d11 &&
++          wsi_win32_d3d11_resize(surface->d3d11, create_info->imageExtent.width, create_info->imageExtent.height);
++}
++
++static VkResult
++wsi_win32_surface_create_swapchain(
++   VkIcdSurfaceBase *icd_surface,
++   VkDevice device,
++   struct wsi_device *wsi_device,
++   const VkSwapchainCreateInfoKHR *create_info,
++   const VkAllocationCallbacks *allocator,
++   struct wsi_swapchain **swapchain_out)
++{
++   wsi_win32_surface *surface = (wsi_win32_surface *)icd_surface;
++   struct wsi_win32 *wsi = (struct wsi_win32 *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WIN32];
++
++   if (wsi_win32_d3d11_usable(wsi, surface, create_info)) {
++      VkResult result = wsi_win32_surface_create_swapchain_impl(icd_surface, device, wsi_device, create_info, allocator,
++                                                                swapchain_out, true);
++      if (result == VK_SUCCESS)
++         return result;
++      /* something missing (a host without Vulkan-backed shared textures: Venus' import fails): the copying path
++       * for this surface from now on, without the window's DXGI swap chain, so GDI's drawing shows */
++      wsi_win32_d3d11_destroy(surface->d3d11);
++      surface->d3d11 = NULL;
++      surface->d3d11_failed = true;
++   }
++   return wsi_win32_surface_create_swapchain_impl(icd_surface, device, wsi_device, create_info, allocator,
++                                                  swapchain_out, false);
++}
++
+ static IDXGIFactory4 *
+ dxgi_get_factory(bool debug)
+ {
+@@ -1220,6 +1386,12 @@ wsi_win32_init_wsi(struct wsi_device *wsi_device,
+    wsi->physical_device = physical_device;
+    wsi->alloc = alloc;
+    wsi->wsi = wsi_device;
++   {
++      /* WINBOAT_VK_PRESENT=copy: the copying path (presents through the CPU) as before */
++      VK_FROM_HANDLE(vk_physical_device, pdevice, physical_device);
++      const char *present = getenv("WINBOAT_VK_PRESENT");
++      wsi->venus = pdevice->properties.driverID == VK_DRIVER_ID_MESA_VENUS && !(present && !strcmp(present, "copy"));
++   }
+ 
+    if (!wsi_device->sw) {
+       wsi->dxgi.factory = dxgi_get_factory(WSI_DEBUG & WSI_DEBUG_DXGI);
+diff --git a/src/vulkan/wsi/wsi_common_win32_d3d11.cpp b/src/vulkan/wsi/wsi_common_win32_d3d11.cpp
+new file mode 100644
+index 0000000..13e3154
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_d3d11.cpp
+@@ -0,0 +1,308 @@
++/*
++ * WinBoat: Vulkan presents through Direct3D 11 for Venus (wsi_common_win32.cpp's d3d11 path).
++ *
++ * Venus has no Direct3D 12 queue for DXGI, so its presents went through the CPU: the frame read back into memory
++ * and drawn with GDI (StretchDIBits), ~1 ms a frame at 1080p and more with the size. The GPU driver's own Direct3D 11
++ * driver has a DXGI swap chain for the window instead; each swapchain image gets a shared Direct3D 11 texture whose
++ * host storage is Vulkan memory (VIRGL_BIND_VK_SHARED, the host's VIRGL_CAP_V2_VK_SHARED) that Venus imports by its
++ * host resource id. A present blits the app's image into it on the app's queue, then copies it into the swap chain's
++ * buffer and presents, all on the host's GPU.
++ *
++ * Kept apart from wsi_common_win32.cpp: that file has DirectX-Headers' d3d12.h, this one the SDK's d3d11.h.
++ */
++
++#include <windows.h>
++#include <winternl.h>
++#include <d3dkmthk.h>
++#include <d3d11.h>
++#include <dxgi1_5.h>
++
++#include <stdint.h>
++#include <stdlib.h>
++
++#include "wsi_common_win32_d3d11.h"
++
++/* The kernel driver's escape: an allocation's host resource id (viogpu_wddm_driver.h's VIOGPU_RES_INFO) */
++#pragma pack(push, 1)
++struct viogpu_res_info_escape {
++   USHORT Type;
++   USHORT DataLength;
++   D3DKMT_HANDLE ResHandle;
++   ULONG Id;
++};
++#pragma pack(pop)
++#define VIOGPU_RES_INFO 0x100
++
++typedef NTSTATUS(APIENTRY *PFN_OpenAdapterFromLuid)(D3DKMT_OPENADAPTERFROMLUID *);
++typedef NTSTATUS(APIENTRY *PFN_CloseAdapter)(const D3DKMT_CLOSEADAPTER *);
++typedef NTSTATUS(APIENTRY *PFN_CreateDevice)(D3DKMT_CREATEDEVICE *);
++typedef NTSTATUS(APIENTRY *PFN_DestroyDevice)(const D3DKMT_DESTROYDEVICE *);
++typedef NTSTATUS(APIENTRY *PFN_QueryResourceInfo)(D3DKMT_QUERYRESOURCEINFO *);
++typedef NTSTATUS(APIENTRY *PFN_OpenResource)(D3DKMT_OPENRESOURCE *);
++typedef NTSTATUS(APIENTRY *PFN_DestroyAllocation)(const D3DKMT_DESTROYALLOCATION *);
++typedef NTSTATUS(APIENTRY *PFN_Escape)(const D3DKMT_ESCAPE *);
++
++struct wsi_win32_d3d11 {
++   SRWLOCK lock;
++   ID3D11Device *dev;
++   ID3D11DeviceContext *ctx;
++   IDXGIFactory2 *factory;
++   IDXGISwapChain1 *swapchain;
++   HWND hwnd;
++   UINT width, height;
++   bool tearing;
++   D3DKMT_HANDLE adapter, device;
++   PFN_CloseAdapter CloseAdapter;
++   PFN_DestroyDevice DestroyDevice;
++   PFN_QueryResourceInfo QueryResourceInfo;
++   PFN_OpenResource OpenResource;
++   PFN_DestroyAllocation DestroyAllocation;
++   PFN_Escape Escape;
++};
++
++void
++wsi_win32_d3d11_destroy(struct wsi_win32_d3d11 *d)
++{
++   if (!d)
++      return;
++   if (d->swapchain)
++      d->swapchain->Release();
++   if (d->ctx)
++      d->ctx->Release();
++   if (d->factory)
++      d->factory->Release();
++   if (d->dev)
++      d->dev->Release();
++   if (d->device) {
++      D3DKMT_DESTROYDEVICE destroy = {};
++      destroy.hDevice = d->device;
++      d->DestroyDevice(&destroy);
++   }
++   if (d->adapter) {
++      D3DKMT_CLOSEADAPTER close = {};
++      close.hAdapter = d->adapter;
++      d->CloseAdapter(&close);
++   }
++   free(d);
++}
++
++struct wsi_win32_d3d11 *
++wsi_win32_d3d11_create(HWND hwnd)
++{
++   HMODULE gdi = GetModuleHandleA("gdi32.dll");
++   HMODULE d3d11 = LoadLibraryA("d3d11.dll");
++   if (!gdi || !d3d11)
++      return NULL;
++   PFN_D3D11_CREATE_DEVICE create_device = (PFN_D3D11_CREATE_DEVICE)GetProcAddress(d3d11, "D3D11CreateDevice");
++   PFN_OpenAdapterFromLuid open_adapter = (PFN_OpenAdapterFromLuid)GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid");
++   PFN_CreateDevice create_kmt_device = (PFN_CreateDevice)GetProcAddress(gdi, "D3DKMTCreateDevice");
++
++   struct wsi_win32_d3d11 *d = (struct wsi_win32_d3d11 *)calloc(1, sizeof(*d));
++   if (!d || !create_device || !open_adapter || !create_kmt_device)
++      goto fail;
++   InitializeSRWLock(&d->lock);
++   d->hwnd = hwnd;
++   d->CloseAdapter = (PFN_CloseAdapter)GetProcAddress(gdi, "D3DKMTCloseAdapter");
++   d->DestroyDevice = (PFN_DestroyDevice)GetProcAddress(gdi, "D3DKMTDestroyDevice");
++   d->QueryResourceInfo = (PFN_QueryResourceInfo)GetProcAddress(gdi, "D3DKMTQueryResourceInfo");
++   d->OpenResource = (PFN_OpenResource)GetProcAddress(gdi, "D3DKMTOpenResource");
++   d->DestroyAllocation = (PFN_DestroyAllocation)GetProcAddress(gdi, "D3DKMTDestroyAllocation");
++   d->Escape = (PFN_Escape)GetProcAddress(gdi, "D3DKMTEscape");
++   if (!d->CloseAdapter || !d->DestroyDevice || !d->QueryResourceInfo || !d->OpenResource || !d->DestroyAllocation ||
++       !d->Escape)
++      goto fail;
++
++   {
++      const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
++      if (FAILED(create_device(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, levels, 2, D3D11_SDK_VERSION, &d->dev, NULL,
++                               &d->ctx)))
++         goto fail;
++      IDXGIDevice *dxgi_device = NULL;
++      IDXGIAdapter *adapter = NULL;
++      DXGI_ADAPTER_DESC desc = {};
++      bool ok = SUCCEEDED(d->dev->QueryInterface(IID_PPV_ARGS(&dxgi_device))) &&
++                SUCCEEDED(dxgi_device->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc)) &&
++                SUCCEEDED(adapter->GetParent(IID_PPV_ARGS(&d->factory)));
++      if (adapter)
++         adapter->Release();
++      if (dxgi_device)
++         dxgi_device->Release();
++      if (!ok)
++         goto fail;
++
++      /* tearing (IMMEDIATE) where DXGI has it */
++      IDXGIFactory5 *factory5 = NULL;
++      BOOL tearing = FALSE;
++      if (SUCCEEDED(d->factory->QueryInterface(IID_PPV_ARGS(&factory5)))) {
++         d->tearing = SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing,
++                                                              sizeof(tearing))) &&
++                      tearing;
++         factory5->Release();
++      }
++
++      /* a kernel device of this process's on the adapter: opening the shared textures to name them to Venus */
++      D3DKMT_OPENADAPTERFROMLUID open = {};
++      open.AdapterLuid = desc.AdapterLuid;
++      if (open_adapter(&open) < 0)
++         goto fail;
++      d->adapter = open.hAdapter;
++      D3DKMT_CREATEDEVICE create = {};
++      create.hAdapter = d->adapter;
++      if (create_kmt_device(&create) < 0)
++         goto fail;
++      d->device = create.hDevice;
++   }
++   return d;
++
++fail:
++   wsi_win32_d3d11_destroy(d);
++   return NULL;
++}
++
++/* The window's swap chain, of the swapchain's size (DXGI stretches it to the window): made the first time, resized
++ * after (one flip-model swap chain per window, which a new Vulkan swapchain for the same surface takes over) */
++bool
++wsi_win32_d3d11_resize(struct wsi_win32_d3d11 *d, uint32_t width, uint32_t height)
++{
++   AcquireSRWLockExclusive(&d->lock);
++   bool ok = true;
++   UINT flags = d->tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
++   if (!d->swapchain) {
++      DXGI_SWAP_CHAIN_DESC1 desc = {};
++      desc.Width = width;
++      desc.Height = height;
++      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++      desc.SampleDesc.Count = 1;
++      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++      desc.BufferCount = 2;
++      desc.Scaling = DXGI_SCALING_STRETCH;
++      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++      desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++      desc.Flags = flags;
++      ok = SUCCEEDED(d->factory->CreateSwapChainForHwnd(d->dev, d->hwnd, &desc, NULL, NULL, &d->swapchain));
++   } else if (width != d->width || height != d->height) {
++      ok = SUCCEEDED(d->swapchain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, flags));
++   }
++   if (ok) {
++      d->width = width;
++      d->height = height;
++   }
++   ReleaseSRWLockExclusive(&d->lock);
++   return ok;
++}
++
++/* A shared RGBA8 texture whose host storage Venus can import, and its host resource id; NULL where that isn't so
++ * (the host or the driver without VIRGL_BIND_VK_SHARED: the id comes back, but Venus' import fails) */
++void *
++wsi_win32_d3d11_texture(struct wsi_win32_d3d11 *d, uint32_t width, uint32_t height, uint32_t *res_id)
++{
++   *res_id = 0;
++   D3D11_TEXTURE2D_DESC desc = {};
++   desc.Width = width;
++   desc.Height = height;
++   desc.MipLevels = 1;
++   desc.ArraySize = 1;
++   desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++   desc.SampleDesc.Count = 1;
++   desc.Usage = D3D11_USAGE_DEFAULT;
++   desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++   desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
++
++   AcquireSRWLockExclusive(&d->lock);
++   ID3D11Texture2D *texture = NULL;
++   IDXGIResource *resource = NULL;
++   HANDLE shared = NULL;
++   bool ok = SUCCEEDED(d->dev->CreateTexture2D(&desc, NULL, &texture)) &&
++             SUCCEEDED(texture->QueryInterface(IID_PPV_ARGS(&resource))) &&
++             SUCCEEDED(resource->GetSharedHandle(&shared)) && shared;
++   if (resource)
++      resource->Release();
++   /* the allocation is made when the runtime flushes the creation */
++   if (ok)
++      d->ctx->Flush();
++
++   /* its allocation, opened on this process's kernel device, named by the kernel driver */
++   if (ok) {
++      D3DKMT_QUERYRESOURCEINFO query = {};
++      query.hDevice = d->device;
++      query.hGlobalShare = (D3DKMT_HANDLE)(uintptr_t)shared;
++      ok = d->QueryResourceInfo(&query) >= 0 && query.NumAllocations >= 1;
++      void *runtime = ok ? calloc(1, query.PrivateRuntimeDataSize + 1) : NULL;
++      void *resource_data = ok ? calloc(1, query.ResourcePrivateDriverDataSize + 1) : NULL;
++      void *total = ok ? calloc(1, query.TotalPrivateDriverDataSize + 1) : NULL;
++      D3DDDI_OPENALLOCATIONINFO *allocations =
++         ok ? (D3DDDI_OPENALLOCATIONINFO *)calloc(query.NumAllocations, sizeof(*allocations)) : NULL;
++      D3DKMT_OPENRESOURCE open = {};
++      ok = ok && runtime && resource_data && total && allocations;
++      if (ok) {
++         open.hDevice = d->device;
++         open.hGlobalShare = query.hGlobalShare;
++         open.NumAllocations = query.NumAllocations;
++         open.pOpenAllocationInfo = allocations;
++         open.pPrivateRuntimeData = runtime;
++         open.PrivateRuntimeDataSize = query.PrivateRuntimeDataSize;
++         open.pResourcePrivateDriverData = resource_data;
++         open.ResourcePrivateDriverDataSize = query.ResourcePrivateDriverDataSize;
++         open.pTotalPrivateDriverDataBuffer = total;
++         open.TotalPrivateDriverDataBufferSize = query.TotalPrivateDriverDataSize;
++         ok = d->OpenResource(&open) >= 0;
++      }
++      if (ok) {
++         struct viogpu_res_info_escape info = {};
++         info.Type = VIOGPU_RES_INFO;
++         info.DataLength = sizeof(info.ResHandle) + sizeof(info.Id);
++         info.ResHandle = allocations[0].hAllocation;
++         D3DKMT_ESCAPE escape = {};
++         escape.hAdapter = d->adapter;
++         escape.hDevice = d->device;
++         escape.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
++         escape.pPrivateDriverData = &info;
++         escape.PrivateDriverDataSize = sizeof(info);
++         ok = d->Escape(&escape) >= 0 && info.Id;
++         *res_id = info.Id;
++         /* the texture keeps the allocation: this process's opening of it goes */
++         D3DKMT_DESTROYALLOCATION destroy = {};
++         destroy.hDevice = d->device;
++         destroy.hResource = open.hResource;
++         d->DestroyAllocation(&destroy);
++      }
++      free(runtime);
++      free(resource_data);
++      free(total);
++      free(allocations);
++   }
++   ReleaseSRWLockExclusive(&d->lock);
++   if (!ok && texture) {
++      texture->Release();
++      texture = NULL;
++   }
++   return texture;
++}
++
++void
++wsi_win32_d3d11_texture_release(void *texture)
++{
++   if (texture)
++      ((ID3D11Texture2D *)texture)->Release();
++}
++
++/* The texture (drawn: the app's queue blitted into it, and the caller waited for that) into the swap chain's buffer,
++ * presented. FIFO waits for the vertical blank; MAILBOX doesn't, the newest frame replaces the waiting one;
++ * IMMEDIATE tears where DXGI allows it */
++bool
++wsi_win32_d3d11_present(struct wsi_win32_d3d11 *d, void *texture, VkPresentModeKHR mode)
++{
++   AcquireSRWLockExclusive(&d->lock);
++   ID3D11Texture2D *buffer = NULL;
++   bool ok = d->swapchain && SUCCEEDED(d->swapchain->GetBuffer(0, IID_PPV_ARGS(&buffer)));
++   if (ok) {
++      d->ctx->CopyResource(buffer, (ID3D11Texture2D *)texture);
++      buffer->Release();
++      UINT interval = mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? 1 : 0;
++      UINT flags = mode == VK_PRESENT_MODE_IMMEDIATE_KHR && d->tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
++      HRESULT hr = d->swapchain->Present(interval, flags);
++      ok = SUCCEEDED(hr) || hr == DXGI_STATUS_OCCLUDED;
++   }
++   ReleaseSRWLockExclusive(&d->lock);
++   return ok;
++}
+diff --git a/src/vulkan/wsi/wsi_common_win32_d3d11.h b/src/vulkan/wsi/wsi_common_win32_d3d11.h
+new file mode 100644
+index 0000000..ac7a468
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_win32_d3d11.h
+@@ -0,0 +1,23 @@
++/*
++ * WinBoat: Vulkan presents through Direct3D 11 for Venus (wsi_common_win32_d3d11.cpp)
++ */
++#ifndef WSI_COMMON_WIN32_D3D11_H
++#define WSI_COMMON_WIN32_D3D11_H
++
++#include <windows.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <vulkan/vulkan_core.h>
++
++/* A window surface's Direct3D 11 device, DXGI swap chain and kernel device */
++struct wsi_win32_d3d11;
++
++struct wsi_win32_d3d11 *wsi_win32_d3d11_create(HWND hwnd);
++void wsi_win32_d3d11_destroy(struct wsi_win32_d3d11 *d);
++bool wsi_win32_d3d11_resize(struct wsi_win32_d3d11 *d, uint32_t width, uint32_t height);
++/* an ID3D11Texture2D (shared, RGBA8) and its host resource id */
++void *wsi_win32_d3d11_texture(struct wsi_win32_d3d11 *d, uint32_t width, uint32_t height, uint32_t *res_id);
++void wsi_win32_d3d11_texture_release(void *texture);
++bool wsi_win32_d3d11_present(struct wsi_win32_d3d11 *d, void *texture, VkPresentModeKHR mode);
++
++#endif

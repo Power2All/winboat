@@ -1,0 +1,24 @@
+From: WinBoat
+Subject: [PATCH] wgl: the caller's reference to a new swapchain texture
+
+The DXGI framebuffer's get_resource gave the caller a reference of its own for a texture it had made before, but for
+a new one it returned the reference it kept: the window's framebuffer (stw_st) and the DXGI framebuffer each released
+a texture referenced once. Whichever released it second touched freed memory - mostly unnoticed, now and then an
+access violation in stw_st's release loop while the window was destroyed (0xC000041D, an exception in a window
+procedure: dx-test's OpenGL groups, about one run in five on Windows 10; found with dx-test's exception notes,
+viogpu_wgl.dll+0x272f). New textures get the caller's reference too.
+---
+diff --git a/src/gallium/targets/wgl/dxgi_framebuffer.cpp b/src/gallium/targets/wgl/dxgi_framebuffer.cpp
+index 8b4a853..60d7a5b 100644
+--- a/src/gallium/targets/wgl/dxgi_framebuffer.cpp
++++ b/src/gallium/targets/wgl/dxgi_framebuffer.cpp
+@@ -249,6 +249,9 @@ wgl_dxgi_framebuffer_get_resource(struct stw_winsys_framebuffer *pframebuffer,
+    struct pipe_resource *texture =
+       fb->screen->resource_from_handle(fb->screen, nullptr, &whandle, 0);
+    fb->textures[index] = texture;
++   /* the caller's reference, as for a texture made before (the framebuffer keeps its own: both release theirs) */
++   if (texture)
++      pipe_reference(NULL, &texture->reference);
+    return texture;
+ }
+ 

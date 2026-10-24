@@ -1,0 +1,251 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: 3D-node DMA buffers in flight together
+
+The commander sent a DMA buffer to the host only once the one before it was done there (VIOGPU_MAX_RUNNING 1):
+for each submission the host GPU idled through the reply, the guest's interrupt, DPC and worker thread, and the next
+send. On the 3D node a DMA buffer now starts as soon as all of the running ones were sent (their last command went
+to the host: a context's commands run in order there), up to 8, and while the oldest has run less than 20 ms (long
+lists still don't stack ahead of the desktop). Completions are reported in submission order: a command done before
+the ones ahead of it waits for them (an unfenced transfer's reply can come before an earlier fenced submission's).
+A DMA buffer with more after its submission (a scanout flush, GDI read-backs) still runs alone. The Venus node keeps
+one at a time (its queue lists overlap through markers).
+
+D3D11, one draw per flush: 3.3 -> 4.7 thousand flushes/s; 100 draws per flush 270 -> 378 thousand draws/s (with
+QEMU patch 0011: 6.0 thousand and 479 thousand).
+---
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index 589fbd2..fc7394d 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -105,6 +105,11 @@ void VioGpuCommand::Run()
+                     PBYTE submitCmd = new (NonPagedPoolNx) BYTE[cmdHdr->size];
+                     RtlCopyMemory(submitCmd, cmdBody, cmdHdr->size);
+ 
++                    // the last of it: the next DMA buffer can go while the host runs this one
++                    if (m_pCommand >= m_pEnd && !m_gdiReadBack)
++                    {
++                        m_pCommander->CommandSent(this);
++                    }
+                     m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
+                                                         cmdHdr->size,
+                                                         m_pContext->GetId(),
+@@ -117,6 +122,10 @@ void VioGpuCommand::Run()
+             case VIOGPU_CMD_TRANSFER_FROM_HOST:
+                 {
+                     VIOGPU_TRANSFER_CMD *transferCmd = (VIOGPU_TRANSFER_CMD *)cmdBody;
++                    if (m_pCommand >= m_pEnd && !m_gdiReadBack)
++                    {
++                        m_pCommander->CommandSent(this);
++                    }
+ 
+                     m_pAdapter->ctrlQueue.TransferHostCmd(cmdHdr->type == VIOGPU_CMD_TRANSFER_TO_HOST,
+                                                           m_pContext->GetId(),
+@@ -194,32 +203,8 @@ void VioGpuCommand::Run()
+         delete m_allocations;
+     }
+ 
+-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {}; // Flags and PhysicalAdapterMask zero: this adapter
+-    interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
+-    interrupt.DmaCompleted.SubmissionFenceId = m_FenceId;
+-    interrupt.DmaCompleted.NodeOrdinal = m_pCommander->m_node;
+-    interrupt.DmaCompleted.EngineOrdinal = 0;
+-    // Reported only if no reset came in between (the reset takes the same lock)
+-    KIRQL irql;
+-    m_pCommander->LockQueue(&irql);
+-    bool stale = m_generation != m_pCommander->m_generation;
+-    if (!stale)
+-    {
+-        m_pAdapter->NotifyInterrupt(&interrupt, true);
+-    }
+-    m_pCommander->UnlockQueue(irql);
+-    // not under the lock: paged code and strings
+-    VioGpuSchedLog("done n%u f%u%s", m_pCommander->m_node, m_FenceId, stale ? " stale" : "");
+-    if (stale)
+-    {
+-        m_allocations = NULL; // released above
+-        Discard();
+-        return;
+-    }
+-
+-    m_pCommander->CommandFinished(m_FenceId);
+-
+-    delete this;
++    m_allocations = NULL; // released above
++    m_pCommander->CommandDone(this);
+ }
+ 
+ // An abandoned command: its allocations are no longer busy for it, and it is gone
+@@ -298,9 +283,11 @@ VioGpuCommander::VioGpuCommander(VioGpuAdapter *pAdapter, UINT node)
+     InitializeListHead(&m_SubmittedQueue);
+     InitializeListHead(&m_RunningQueue);
+     InitializeListHead(&m_InFlight);
++    InitializeListHead(&m_Running);
+     KeInitializeSpinLock(&m_Lock);
+ 
+     m_running = 0;
++    m_unsent = 0;
+     m_pending = 0;
+     m_lastCompletedFence = 0;
+     m_preemptionFence = 0;
+@@ -395,7 +382,14 @@ void VioGpuCommander::ThreadWorkRoutine(void)
+             }
+             VioGpuCommand *command = CONTAINING_RECORD(m_SubmittedQueue.Flink, VioGpuCommand, list_entry);
+             bool stale = command->m_generation != m_generation;
+-            if (!stale && !command->m_marker && (m_running >= VIOGPU_MAX_RUNNING || !IsListEmpty(&m_InFlight)))
++            // a command starts once the ones running are all sent, up to VIOGPU_MAX_RUNNING, and while the oldest
++            // has run less than VIOGPU_MARKER_STACK_TIME (long lists aren't stacked: the desktop would wait)
++            LONG maxRunning = m_node == VIOGPU_VENUS_NODE ? 1 : VIOGPU_MAX_RUNNING;
++            if (!stale && !command->m_marker &&
++                (m_running >= maxRunning || m_unsent > 0 || !IsListEmpty(&m_InFlight) ||
++                 (!IsListEmpty(&m_Running) &&
++                  KeQueryInterruptTime() - CONTAINING_RECORD(m_Running.Flink, VioGpuCommand, order_entry)->m_started >
++                      VIOGPU_MARKER_STACK_TIME)))
+             {
+                 UnlockQueue(irql);
+                 break;
+@@ -418,6 +412,9 @@ void VioGpuCommander::ThreadWorkRoutine(void)
+             else if (!stale)
+             {
+                 m_running++;
++                m_unsent++;
++                command->m_started = KeQueryInterruptTime();
++                InsertTailList(&m_Running, &command->order_entry);
+             }
+             UnlockQueue(irql);
+             if (m_node == VIOGPU_VENUS_NODE && m_logged < 16 && command->m_seq <= 16)
+@@ -505,20 +502,76 @@ bool VioGpuCommander::CompleteMarkers()
+     }
+ }
+ 
+-void VioGpuCommander::CommandFinished(UINT fenceId)
++// On the worker thread: all of a running command went to the host
++void VioGpuCommander::CommandSent(VioGpuCommand *cmd)
+ {
+     PAGED_CODE();
+-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+ 
+     KIRQL oldIrql;
+     LockQueue(&oldIrql);
+-    m_running--;
+-    m_pending--;
+-    m_lastCompletedFence = fenceId;
++    if (cmd->m_generation == m_generation && !cmd->m_sent)
++    {
++        cmd->m_sent = true;
++        m_unsent--;
++    }
+     UnlockQueue(oldIrql);
+     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
+ }
+ 
++// On the worker thread: the host did a running command's work. Completions are reported in submission order (a
++// fence reported done means every one before it is): it and the done ones after it wait for those before them
++void VioGpuCommander::CommandDone(VioGpuCommand *cmd)
++{
++    PAGED_CODE();
++
++    LIST_ENTRY retired;
++    InitializeListHead(&retired);
++    KIRQL oldIrql;
++    LockQueue(&oldIrql);
++    // from before a reset (TDR): abandoned, unreported (the reset dropped m_Running)
++    if (cmd->m_generation != m_generation)
++    {
++        UnlockQueue(oldIrql);
++        VioGpuSchedLog("done n%u f%u stale", m_node, cmd->GetFenceId());
++        cmd->Discard();
++        return;
++    }
++    cmd->m_done = true;
++    if (!cmd->m_sent)
++    {
++        cmd->m_sent = true;
++        m_unsent--;
++    }
++    while (!IsListEmpty(&m_Running))
++    {
++        VioGpuCommand *head = CONTAINING_RECORD(m_Running.Flink, VioGpuCommand, order_entry);
++        if (!head->m_done)
++        {
++            break;
++        }
++        RemoveEntryList(&head->order_entry);
++        DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {}; // Flags and PhysicalAdapterMask zero: this adapter
++        interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
++        interrupt.DmaCompleted.SubmissionFenceId = head->GetFenceId();
++        interrupt.DmaCompleted.NodeOrdinal = m_node;
++        interrupt.DmaCompleted.EngineOrdinal = 0;
++        m_pAdapter->NotifyInterrupt(&interrupt, true);
++        m_running--;
++        m_pending--;
++        m_lastCompletedFence = head->GetFenceId();
++        InsertTailList(&retired, &head->list_entry);
++    }
++    UnlockQueue(oldIrql);
++    // not under the lock: paged code and strings
++    while (!IsListEmpty(&retired))
++    {
++        VioGpuCommand *done = CONTAINING_RECORD(RemoveHeadList(&retired), VioGpuCommand, list_entry);
++        VioGpuSchedLog("done n%u f%u", m_node, done->GetFenceId());
++        delete done;
++    }
++    KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
++}
++
+ // On the worker thread, after the completions it notified
+ void VioGpuCommander::NotifyPreemptionIfIdle()
+ {
+@@ -648,6 +701,8 @@ void VioGpuCommander::Reset()
+     bool markers = !IsListEmpty(&m_InFlight), submitted = !IsListEmpty(&m_SubmittedQueue);
+     m_generation++;
+     m_running = 0;
++    m_unsent = 0;
++    InitializeListHead(&m_Running); // its commands are discarded as their replies come
+     m_pending = 0;
+     m_preemptionFence = 0;
+     UnlockQueue(oldIrql);
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+index a97884e..fca20c3 100644
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -3,7 +3,9 @@
+ #include "helper.h"
+ #include "viogpum.h"
+ 
+-#define VIOGPU_MAX_RUNNING 1
++// 3D node: DMA buffers sent to the host before the ones ahead of them are done (the host runs a context's commands
++// in order), so the GPU doesn't idle for each round trip to the guest. The Venus node runs one at a time
++#define VIOGPU_MAX_RUNNING 8
+ // Venus queue lists overlap while the oldest in flight has run less than this (100 ns units: 20 ms).
+ // ponytail: fixed; a per-queue estimate of list durations if 20 ms holds back real workloads
+ #define VIOGPU_MARKER_STACK_TIME (20 * 10000)
+@@ -32,6 +34,10 @@ class VioGpuCommand
+     void AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, UINT allocationListLength);
+ 
+     LIST_ENTRY list_entry;
++    LIST_ENTRY order_entry; // in the commander's m_Running, in submission order, until reported done
++    bool m_sent = false;    // all its commands went to the host: the next may start
++    bool m_done = false;    // the host did them; reported once the ones before it are
++    ULONGLONG m_started = 0;
+     LONG m_generation = 0; // the commander's generation when submitted: a reset (TDR) makes it stale
+ 
+     // A D3D12 queue's marker (VIOGPU_MARKER, the Venus engine): no commands; it opens the queue's gate when the
+@@ -73,7 +79,8 @@ class VioGpuCommander
+     NTSTATUS Start();
+     void Stop();
+ 
+-    void CommandFinished(UINT fenceId);
++    void CommandSent(VioGpuCommand *cmd);
++    void CommandDone(VioGpuCommand *cmd);
+     NTSTATUS PreemptCommand(const DXGKARG_PREEMPTCOMMAND *pPreemptCommand);
+ 
+     NTSTATUS Patch(const DXGKARG_PATCH *pPatch);
+@@ -122,6 +129,8 @@ class VioGpuCommander
+     KSPIN_LOCK m_Lock;
+ 
+     LONG m_running; // under m_Lock
++    LONG m_unsent;  // running and not all sent yet (under m_Lock)
++    LIST_ENTRY m_Running; // the running commands, oldest first (under m_Lock)
+ 
+     // Preemption: the host runs a submitted command to its end, so a preemption request completes when the
+     // commands submitted before it are done (nothing to resubmit). The scheduler waits for that notification.

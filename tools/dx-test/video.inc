@@ -66,12 +66,35 @@ static bool nv12Hash(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2
    return ok;
 }
 
+// A sample's slice control: DXVA_Slice_*_Short entries (location, size, wBadSliceChopping 0) for H.264/HEVC at their
+// start codes and VP9's whole frame, AV1's tiles as they are; count is the number of entries
+static std::vector<uint8_t> sliceControl(const VideoSample &s, UINT &count)
+{
+   std::vector<uint32_t> starts;
+   for (UINT i = 0; s.annexb && i + 3 <= s.streamSize; i++) {
+      if (!s.stream[i] && !s.stream[i + 1] && s.stream[i + 2] == 1) starts.push_back(i);
+   }
+   if (starts.empty()) starts.push_back(0);
+   count = (UINT)starts.size();
+   std::vector<uint8_t> slices(s.tiles, s.tiles + s.tilesSize);
+   for (size_t i = 0; !s.tiles && i < starts.size(); i++) {
+      uint32_t end = i + 1 < starts.size() ? starts[i + 1] : s.streamSize;
+      uint32_t entry[2] = {starts[i], end - starts[i]};
+      uint8_t raw[10] = {};
+      memcpy(raw, entry, 8);
+      slices.insert(slices.end(), raw, raw + 10);
+   }
+   return slices;
+}
+
 // One key frame through the decoder: the picture parameters, quantization matrix, slice control and bitstream as
-// ffmpeg's d3d11va submits them
+// ffmpeg's d3d11va submits them. Shared: into a texture shared with an NT handle, read on another device (as browsers
+// hand decoded frames to their compositor's device)
 static void decodeSample(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11VideoDevice *video, ID3D11VideoContext *vctx,
-                         const VideoProfile &p)
+                         const VideoProfile &p, bool shared = false)
 {
    const VideoSample &s = *p.sample;
+   const std::string name = shared ? std::string(p.name) + " into a shared texture" : p.name;
    const UINT W = SAMPLE_SIZE, H = SAMPLE_SIZE;
    std::string detail;
    ID3D11Texture2D *tex = nullptr;
@@ -80,7 +103,15 @@ static void decodeSample(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Vide
    uint32_t hash = 0;
    bool ok = false;
 
-   D3D11_TEXTURE2D_DESC td = {W, H, 1, 1, p.format, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_DECODER, 0, 0};
+   D3D11_TEXTURE2D_DESC td = {W, H, 1, 1, p.format, {1, 0}, D3D11_USAGE_DEFAULT,
+                              (UINT)(shared ? D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE : D3D11_BIND_DECODER), 0,
+                              (UINT)(shared ? D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE : 0)};
+   ID3D11Device *other = nullptr;
+   ID3D11Device1 *other1 = nullptr;
+   ID3D11DeviceContext *otherCtx = nullptr;
+   ID3D11Texture2D *opened = nullptr;
+   IDXGIResource1 *res = nullptr;
+   HANDLE handle = nullptr;
    D3D11_VIDEO_DECODER_DESC dd = {p.guid, W, H, p.format};
    D3D11_VIDEO_DECODER_CONFIG cfg = {};
    UINT configs = 0;
@@ -95,25 +126,13 @@ static void decodeSample(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Vide
    if (SUCCEEDED(h)) h = video->CreateVideoDecoderOutputView(tex, &vd, &view);
    if (SUCCEEDED(h)) h = vctx->DecoderBeginFrame(decoder, view, 0, nullptr);
    if (FAILED(h)) {
-      report(Status::Fail, p.name, "setting up the decoder failed (" + hrs(h) + ")");
+      report(Status::Fail, name, "setting up the decoder failed (" + hrs(h) + ")");
       goto out;
    }
    {
-      // the slices: H.264/HEVC at their start codes, VP9 the whole frame
       std::vector<D3D11_VIDEO_DECODER_BUFFER_DESC> descs;
-      std::vector<uint32_t> starts;
-      for (UINT i = 0; s.annexb && i + 3 <= s.streamSize; i++) {
-         if (!s.stream[i] && !s.stream[i + 1] && s.stream[i + 2] == 1) starts.push_back(i);
-      }
-      if (starts.empty()) starts.push_back(0);
-      std::vector<uint8_t> slices(s.tiles, s.tiles + s.tilesSize);
-      for (size_t i = 0; !s.tiles && i < starts.size(); i++) {
-         uint32_t end = i + 1 < starts.size() ? starts[i + 1] : s.streamSize;
-         uint32_t entry[2] = {starts[i], end - starts[i]};
-         uint8_t raw[10] = {};
-         memcpy(raw, entry, 8);   // DXVA_Slice_*_Short: location, size, wBadSliceChopping 0
-         slices.insert(slices.end(), raw, raw + 10);
-      }
+      UINT sliceCount = 0;
+      std::vector<uint8_t> slices = sliceControl(s, sliceCount);
       struct Part { D3D11_VIDEO_DECODER_BUFFER_TYPE type; const void *data; UINT size; } parts[] = {
          {D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, s.picture, s.pictureSize},
          {D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, s.qmatrix, s.qmatrixSize},
@@ -134,7 +153,7 @@ static void decodeSample(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Vide
          D3D11_VIDEO_DECODER_BUFFER_DESC d = {};
          d.BufferType = part.type;
          d.DataSize = part.size;
-         if (part.type == D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL) d.NumMBsInBuffer = (UINT)starts.size();
+         if (part.type == D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL) d.NumMBsInBuffer = sliceCount;
          descs.push_back(d);
       }
       if (detail.empty()) {
@@ -143,13 +162,30 @@ static void decodeSample(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Vide
       }
       vctx->DecoderEndFrame(decoder);
    }
+   if (detail.empty() && shared) {
+      ctx->Flush();
+      const D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+      createDevice11(&other, &otherCtx, &fl, 1);
+      h = other ? other->QueryInterface(__uuidof(ID3D11Device1), (void **)&other1) : E_FAIL;
+      if (SUCCEEDED(h)) h = tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&res);
+      if (SUCCEEDED(h)) h = res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
+      if (SUCCEEDED(h)) h = other1->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D), (void **)&opened);
+      if (FAILED(h)) detail = "sharing it with another device failed (" + hrs(h) + ")";
+   }
    if (detail.empty()) {
-      if (!nv12Hash(dev, ctx, tex, W, H, hash)) detail = "reading the picture back failed";
-      else if (hash == s.hash) ok = true, detail = "a key frame decoded on the GPU, identical to the software decoder's";
+      if (!nv12Hash(shared ? other : dev, shared ? otherCtx : ctx, shared ? opened : tex, W, H, hash)) detail = "reading the picture back failed";
+      else if (hash == s.hash) ok = true, detail = shared ? "a key frame decoded on the GPU, read on another device: identical to the software decoder's"
+                                                          : "a key frame decoded on the GPU, identical to the software decoder's";
       else detail = fmt("the decoded picture differs from the software decoder's (hash %08x, expected %08x)", hash, s.hash);
    }
-   check(ok, p.name, detail);
+   check(ok, name, detail);
 out:
+   if (handle) CloseHandle(handle);
+   release(res);
+   release(opened);
+   release(otherCtx);
+   release(other1);
+   release(other);
    release(view);
    release(decoder);
    release(tex);
@@ -459,7 +495,34 @@ static void groupVideo()
       else if (p.sample) decodeSample(dev, ctx, video, vctx, p);
       else report(Status::Pass, p.name, "on the GPU");
    }
+   // (H.264's)
+   const char *sharedName = "H.264 (AVC) decoding into a shared texture";
+   if (startTest(sharedName)) {
+      D3D11_FEATURE_DATA_D3D11_OPTIONS4 o4 = {};
+      bool nv12 = SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS4, &o4, sizeof o4)) &&
+                  o4.ExtendedNV12SharedTextureSupported;
+      bool h264 = std::find(profiles.begin(), profiles.end(), VIDEO_PROFILES[0].guid) != profiles.end();
+      if (!nv12 || !h264) optional(false, sharedName, !nv12 ? "the driver doesn't offer shared NV12 textures (11.4)" : "no H.264 decoding");
+      else decodeSample(dev, ctx, video, vctx, VIDEO_PROFILES[0], true);
+   }
 
+   // (no NV12 textures: Windows 7's Direct3D 11 takes them only from drivers with the 11.1 video DDI, which it has none
+   // of - and reports the format supported all the same, so one is made to see)
+   D3D11_TEXTURE2D_DESC probe = {64, 64, 1, 1, DXGI_FORMAT_NV12, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0};
+   ID3D11Texture2D *nv12Probe = nullptr;
+   bool nv12 = SUCCEEDED(dev->CreateTexture2D(&probe, nullptr, &nv12Probe));
+   release(nv12Probe);
+   if (!nv12) {
+      for (const char *n : {"Video processor (color conversion and scaling)", "Video processor (AYUV input)",
+                            "Video processor (Y410 input)", "Video processor (bob deinterlacing)",
+                            "Video processor (motion-adaptive deinterlacing)", "Shader views of NV12 planes (luma R8, chroma R8G8)"})
+         if (startTest(n)) optional(false, n, "no NV12 textures on this Direct3D 11 (Windows 7: no video driver interface)");
+      release(vctx);
+      release(video);
+      release(ctx);
+      release(dev);
+      return;
+   }
    processorTest(dev, ctx, video, vctx);
    processorTest(dev, ctx, video, vctx, DXGI_FORMAT_AYUV);
    processorTest(dev, ctx, video, vctx, DXGI_FORMAT_Y410);

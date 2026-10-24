@@ -76,6 +76,7 @@ Section
     SetOutPath "$INSTDIR\drivers"
     File /r "${SOURCE}\drivers\spice"
     File /r "${SOURCE}\drivers\gpucheck"
+    File /r "${SOURCE}\drivers\opencl"   ; (Windows 10's OpenCL loader: gpu-driver.ps1 installs it there only)
 !ifdef UCRT
     ${IfNot} ${AtLeastWin10}
         ; The GPU check with the Universal CRT 7 and 8.1 may lack (each half with its own: the 32-bit one in 32\, where

@@ -1,0 +1,29 @@
+From: WinBoat
+Subject: [PATCH] virgl: small discarded buffers through the staging buffer
+
+A busy buffer mapped with discard got a new resource (VIRGL_TRANSFER_MAP_REALLOC) wherever it could be rebound: on
+Windows a new resource is a kernel allocation (D3DKMTCreateAllocation) and a host resource each time, ~5 us, so a
+D3D11 program discarding a constant buffer per draw (most games) drew 134 thousand times a second, slower than
+WARP. Buffers up to 64 KB now take the staging path (a suballocation of the staging buffer and a copy the host does
+in order) whenever the context has one: 256 thousand draws a second on the same benchmark (gpubench), and with
+virglrenderer patch 0018 (no redundant program binds) 675 thousand.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_resource.c b/src/gallium/drivers/virgl/virgl_resource.c
+index 8e211cb..ad8b95c 100644
+--- a/src/gallium/drivers/virgl/virgl_resource.c
++++ b/src/gallium/drivers/virgl/virgl_resource.c
+@@ -227,7 +227,13 @@ virgl_resource_transfer_prepare(struct virgl_context *vctx,
+           */
+          wait = (flush || vws->resource_is_busy(vws, res->hw_res));
+          if (wait) {
+-            map_type = (can_realloc) ?
++            /* Small buffers (constant buffers, small dynamic vertex/index buffers) go through the staging buffer
++             * even where they could be reallocated: on Windows a new resource is a kernel allocation and a host
++             * resource every time, and a game discarding a constant buffer per draw spent ~5 us in each (D3D11
++             * Map(WRITE_DISCARD) per draw ran slower than WARP); the staging path is a suballocation and a copy the
++             * host does in order */
++            bool small = res->b.target == PIPE_BUFFER && res->b.width0 <= 64 * 1024 && vctx->supports_staging;
++            map_type = (can_realloc && !small) ?
+                VIRGL_TRANSFER_MAP_REALLOC :
+                VIRGL_TRANSFER_MAP_WRITE_TO_STAGING;
+ 

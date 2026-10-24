@@ -965,6 +965,44 @@ static bool layerFromAnyShader(Dev &d, std::vector<uint32_t> &o, std::string &e,
    return ok;
 }
 
+// 11.2's tiled resources: the context's 11.2 interface where the driver has them (else an optional feature), a tile
+// pool, and 64 KB of a tile's pattern
+static bool tiled11(Dev &d, ID3D11DeviceContext2 **ctx2, std::string &e)
+{
+   D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
+   d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
+   if (o1.TiledResourcesTier == D3D11_TILED_RESOURCES_NOT_SUPPORTED ||
+       FAILED(d.ctx->QueryInterface(__uuidof(ID3D11DeviceContext2), (void **)ctx2))) {
+      e = "not supported (optional)";
+      return false;
+   }
+   return true;
+}
+
+static ID3D11Buffer *tilePool11(Dev &d, UINT tiles)
+{
+   D3D11_BUFFER_DESC bd = {tiles * 65536, D3D11_USAGE_DEFAULT, 0, 0, D3D11_RESOURCE_MISC_TILE_POOL, 0};
+   ID3D11Buffer *b = nullptr;
+   d.dev->CreateBuffer(&bd, nullptr, &b);
+   return b;
+}
+
+static ID3D11Texture2D *tiledTexture11(Dev &d, UINT w, UINT h, UINT mips, UINT bind)
+{
+   D3D11_TEXTURE2D_DESC td = {w, h, mips, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, bind, 0,
+                              D3D11_RESOURCE_MISC_TILED};
+   ID3D11Texture2D *t = nullptr;
+   d.dev->CreateTexture2D(&td, nullptr, &t);
+   return t;
+}
+
+static std::vector<uint8_t> tilePattern(int seed)
+{
+   std::vector<uint8_t> v(65536);
+   for (size_t i = 0; i < v.size(); i++) v[i] = (uint8_t)(i * 7 + seed * 31 + (i >> 9) * seed);
+   return v;
+}
+
 struct RenderTest {
    const char *name;
    RenderFn fn;
@@ -1206,6 +1244,13 @@ float4 main(float4 p : SV_Position) : SV_Target
        d.ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&ctx1);
        if (!ctx1) {
           e = "no ID3D11DeviceContext1 (optional)";
+          return false;
+       }
+       // (Windows 7's 11.1 runtime over an 11.0 driver: no ClearView, the call does nothing)
+       D3D11_FEATURE_DATA_D3D11_OPTIONS opts = {};
+       if (FAILED(d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opts, sizeof opts)) || !opts.ClearView) {
+          ctx1->Release();
+          e = "the driver has no ClearView (optional)";
           return false;
        }
        std::vector<uint8_t> init(RW * RH * 4);
@@ -1767,6 +1812,411 @@ O main(uint id : SV_VertexID) { O o; float2 uv = float2((id << 1) & 2, id & 2);
        release(cs);
        return ok;
     }, 1, true},
+   {"Conservative rasterization (11.3)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {};
+       d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2);
+       ID3D11Device3 *dev3 = nullptr;
+       d.dev->QueryInterface(__uuidof(ID3D11Device3), (void **)&dev3);
+       if (o2.ConservativeRasterizationTier == D3D11_CONSERVATIVE_RASTERIZATION_NOT_SUPPORTED || !dev3) {
+          e = "not supported (optional)";
+          release(dev3);
+          return false;
+       }
+       // a small triangle in every fourth pixel, away from its center: drawn with conservative rasterization only.
+       // Per triangle whether its pixel was drawn, and whether anything was more than a pixel away from them (tier
+       // 1 may draw the neighbors, within its half a pixel of uncertainty)
+       ID3D11VertexShader *vs = vs11(d, "float4 main(uint v : SV_VertexID) : SV_Position { uint c = v / 3, k = v % 3; "
+                                        "float2 p = float2(c % 8, c / 8) * 4 + 1 + float2(k == 1 ? 0.4 : 0.1, k == 2 ? 0.4 : 0.1); "
+                                        "return float4(p.x / 16 - 1, 1 - p.y / 16, 0, 1); }", e);
+       ID3D11PixelShader *ps = ps11(d, "float4 main() : SV_Target { return 1; }", e);
+       RT11 rt;
+       const float black[4] = {};
+       bool ok = vs && ps && makeRT(d, rt, DXGI_FORMAT_R8G8B8A8_UNORM, 4, black);
+       for (int on = 0; ok && on < 2; on++) {
+          D3D11_RASTERIZER_DESC2 rd = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 0, 0, 0, TRUE, FALSE, FALSE, FALSE, 0,
+                                       on ? D3D11_CONSERVATIVE_RASTERIZATION_MODE_ON : D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF};
+          ID3D11RasterizerState2 *rs = nullptr;
+          HRESULT h = dev3->CreateRasterizerState2(&rd, &rs);
+          if (FAILED(h)) {
+             e = "CreateRasterizerState2: " + hrs(h);
+             ok = false;
+             break;
+          }
+          d.ctx->ClearRenderTargetView(rt.rtv, black);
+          d.ctx->RSSetState(rs);
+          d.ctx->IASetInputLayout(nullptr);
+          d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          d.ctx->VSSetShader(vs, nullptr, 0);
+          d.ctx->PSSetShader(ps, nullptr, 0);
+          d.ctx->Draw(64 * 3, 0);
+          d.ctx->RSSetState(nullptr);
+          rs->Release();
+          std::vector<uint32_t> px;
+          ok = readTexture(d, rt.tex, 0, px);
+          uint32_t away = 0;
+          for (int y = 0; ok && y < RH; y++)
+             for (int x = 0; x < RW; x++)
+                if (px[y * RW + x] && (x % 4 == 3 || y % 4 == 3)) away = 1;
+          for (int c = 0; ok && c < 64; c++) o.push_back(px[(c / 8 * 4 + 1) * RW + c % 8 * 4 + 1] ? 1 : 0);
+          o.push_back(away);
+       }
+       rt.release();
+       release(ps);
+       release(vs);
+       release(dev3);
+       return ok;
+    }, 0, true},
+   {"Rasterizer ordered views (11.3)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {};
+       d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2);
+       if (!o2.ROVsSupported) {
+          e = "not supported (optional)";
+          return false;
+       }
+       // 64 full-screen triangles in one draw, each pixel shader invocation a read-modify-write that depends on the
+       // order (v * 31 + instance): right only when they happen in draw order, pixel by pixel
+       ID3D11VertexShader *vs = vs11(d, "void main(uint v : SV_VertexID, uint i : SV_InstanceID, out float4 p : SV_Position, "
+                                        "out nointerpolation uint o : I) { float2 t = float2((v << 1) & 2, v & 2); "
+                                        "p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o = i; }", e);
+       ID3D11PixelShader *ps = ps11(d, "RasterizerOrderedTexture2D<uint> r : register(u0); "
+                                       "void main(float4 p : SV_Position, nointerpolation uint i : I) "
+                                       "{ uint2 c = (uint2)p.xy; uint v = r[c]; r[c] = v * 31 + i + 1 + c.x; }", e);
+       std::vector<uint32_t> zero(RW * RH);
+       ID3D11Texture2D *t = tex11(d, RW, RH, DXGI_FORMAT_R32_UINT, zero.data(), RW * 4, D3D11_BIND_UNORDERED_ACCESS);
+       ID3D11UnorderedAccessView *uav = nullptr;
+       if (t) d.dev->CreateUnorderedAccessView(t, nullptr, &uav);
+       bool ok = vs && ps && uav;
+       if (ok) {
+          d.ctx->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 1, &uav, nullptr);
+          D3D11_VIEWPORT vp = {0, 0, RW, RH, 0, 1};
+          d.ctx->RSSetViewports(1, &vp);
+          d.ctx->IASetInputLayout(nullptr);
+          d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          d.ctx->VSSetShader(vs, nullptr, 0);
+          d.ctx->PSSetShader(ps, nullptr, 0);
+          d.ctx->DrawInstanced(3, 64, 0, 0);
+          d.ctx->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 0, nullptr, nullptr);
+          ok = readTexture(d, t, 0, o);
+       }
+       release(uav);
+       release(t);
+       release(ps);
+       release(vs);
+       return ok;
+    }, 0, true},
+   {"Tiled resources: tile mappings, UpdateTiles, aliasing and rendering (11.2)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       ID3D11DeviceContext2 *ctx2 = nullptr;
+       if (!tiled11(d, &ctx2, e)) return false;
+       // a 2x2-tile texture on two pool tiles: tile (0,0) on the first, (1,0) and (0,1) both on the second (aliased),
+       // (1,1) unmapped. Tile (0,0) and (1,0) get data, (0,1) a solid color drawn: (1,0) shows it too
+       ID3D11Buffer *pool = tilePool11(d, 2);
+       ID3D11Texture2D *t = tiledTexture11(d, 256, 256, 1, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+       ID3D11RenderTargetView *rtv = nullptr;
+       if (t) d.dev->CreateRenderTargetView(t, nullptr, &rtv);
+       ID3D11PixelShader *ps = ps11(d, "float4 main() : SV_Target { return float4(0.25, 0.5, 0.75, 1); }", e);
+       std::vector<uint8_t> zero(256 * 256 * 4);
+       ID3D11Texture2D *out = tex11(d, 256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, zero.data(), 256 * 4);
+       bool ok = pool && t && rtv && ps && out;
+       HRESULT h = S_OK;
+       if (ok) {
+          D3D11_TILED_RESOURCE_COORDINATE at = {};
+          D3D11_TILE_REGION_SIZE all = {4, TRUE, 2, 2, 1};
+          UINT flags[] = {0, 0, 0, D3D11_TILE_RANGE_NULL}, offsets[] = {0, 1, 1, 0}, counts[] = {1, 1, 1, 1};
+          h = ctx2->UpdateTileMappings(t, 1, &at, &all, pool, 4, flags, offsets, counts, 0);
+          D3D11_TILE_REGION_SIZE one = {1, FALSE};
+          std::vector<uint8_t> a = tilePattern(3), b = tilePattern(7);
+          ctx2->UpdateTiles(t, &at, &one, a.data(), 0);
+          at.X = 1;
+          ctx2->UpdateTiles(t, &at, &one, b.data(), 0);
+          d.ctx->OMSetRenderTargets(1, &rtv, nullptr);
+          D3D11_VIEWPORT vp = {0, 128, 128, 128, 0, 1};
+          d.ctx->RSSetViewports(1, &vp);
+          fullscreen11(d, ps);
+          d.ctx->OMSetRenderTargets(0, nullptr, nullptr);
+          for (UINT tile = 0; tile < 3; tile++) {
+             UINT x = tile == 1 ? 128 : 0, y = tile == 2 ? 128 : 0;
+             D3D11_BOX box = {x, y, 0, x + 128, y + 128, 1};
+             d.ctx->CopySubresourceRegion(out, 0, x, y, 0, t, 0, &box);
+          }
+          ok = SUCCEEDED(h) && readTexture(d, out, 0, o);
+          if (FAILED(h)) e = "UpdateTileMappings: " + hrs(h);
+       }
+       release(out);
+       release(ps);
+       release(rtv);
+       release(t);
+       release(pool);
+       release(ctx2);
+       return ok;
+    }, 1, true},
+   {"Tiled resources: CopyTileMappings, CopyTiles and tiled buffers (11.2)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       ID3D11DeviceContext2 *ctx2 = nullptr;
+       if (!tiled11(d, &ctx2, e)) return false;
+       // texture A's two tiles get data; B takes A's mappings swapped (CopyTileMappings) and CopyTiles writes B's
+       // two tiles to a buffer. A tiled buffer of three tiles: the first two on one pool tile, data in the first
+       ID3D11Buffer *pool = tilePool11(d, 3);
+       ID3D11Texture2D *ta = tiledTexture11(d, 256, 128, 1, D3D11_BIND_SHADER_RESOURCE);
+       ID3D11Texture2D *tb = tiledTexture11(d, 256, 128, 1, D3D11_BIND_SHADER_RESOURCE);
+       D3D11_BUFFER_DESC bd = {2 * 65536, D3D11_USAGE_DEFAULT, 0, 0, 0, 0};
+       ID3D11Buffer *linear = nullptr, *tiledBuf = nullptr, *plain = nullptr, *staging = nullptr;
+       d.dev->CreateBuffer(&bd, nullptr, &linear);
+       D3D11_BUFFER_DESC tbd = {3 * 65536, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_TILED, 0};
+       d.dev->CreateBuffer(&tbd, nullptr, &tiledBuf);
+       D3D11_BUFFER_DESC pbd = {4 * 65536, D3D11_USAGE_DEFAULT, 0, 0, 0, 0};
+       d.dev->CreateBuffer(&pbd, nullptr, &plain);
+       D3D11_BUFFER_DESC sbd = {4 * 65536, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+       d.dev->CreateBuffer(&sbd, nullptr, &staging);
+       bool ok = pool && ta && tb && linear && tiledBuf && plain && staging;
+       if (ok) {
+          D3D11_TILED_RESOURCE_COORDINATE at = {};
+          D3D11_TILE_REGION_SIZE two = {2, FALSE}, one = {1, FALSE};
+          UINT start = 0;
+          ctx2->UpdateTileMappings(ta, 1, &at, &two, pool, 1, nullptr, &start, nullptr, 0);
+          std::vector<uint8_t> a = tilePattern(5), b = tilePattern(9), c = tilePattern(11);
+          ctx2->UpdateTiles(ta, &at, &one, a.data(), 0);
+          D3D11_TILED_RESOURCE_COORDINATE second = {1, 0, 0, 0};
+          ctx2->UpdateTiles(ta, &second, &one, b.data(), 0);
+          ctx2->CopyTileMappings(tb, &at, ta, &second, &one, 0);
+          ctx2->CopyTileMappings(tb, &second, ta, &at, &one, 0);
+          ctx2->CopyTiles(tb, &at, &two, linear, 0, D3D11_TILE_COPY_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+          UINT flags[] = {D3D11_TILE_RANGE_REUSE_SINGLE_TILE, D3D11_TILE_RANGE_NULL}, offsets[] = {2, 0}, counts[] = {2, 1};
+          D3D11_TILE_REGION_SIZE three = {3, FALSE};
+          ctx2->UpdateTileMappings(tiledBuf, 1, &at, &three, pool, 2, flags, offsets, counts, 0);
+          ctx2->UpdateTiles(tiledBuf, &at, &one, c.data(), 0);
+          D3D11_BOX lb = {0, 0, 0, 2 * 65536, 1, 1}, tb2 = {0, 0, 0, 2 * 65536, 1, 1};
+          d.ctx->CopySubresourceRegion(plain, 0, 0, 0, 0, linear, 0, &lb);
+          d.ctx->CopySubresourceRegion(plain, 0, 2 * 65536, 0, 0, tiledBuf, 0, &tb2);
+          d.ctx->CopyResource(staging, plain);
+          D3D11_MAPPED_SUBRESOURCE m;
+          ok = SUCCEEDED(d.ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m));
+          if (ok) {
+             o.assign((const uint32_t *)m.pData, (const uint32_t *)m.pData + 4 * 65536 / 4);
+             d.ctx->Unmap(staging, 0);
+          }
+       }
+       release(staging);
+       release(plain);
+       release(tiledBuf);
+       release(linear);
+       release(tb);
+       release(ta);
+       release(pool);
+       release(ctx2);
+       return ok;
+    }, 0, true},
+   {"Tiled resources: packed mips (11.2)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       ID3D11DeviceContext2 *ctx2 = nullptr;
+       if (!tiled11(d, &ctx2, e)) return false;
+       ID3D11Device2 *dev2 = nullptr;
+       d.dev->QueryInterface(__uuidof(ID3D11Device2), (void **)&dev2);
+       // a 256x256 texture with all 9 mips, every tile mapped (standard and packed ones), each mip cleared to a color
+       // of its own and read back
+       ID3D11Texture2D *t = tiledTexture11(d, 256, 256, 9, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+       UINT total = 0;
+       D3D11_PACKED_MIP_DESC packed = {};
+       D3D11_TILE_SHAPE shape = {};
+       UINT subs = 9;
+       D3D11_SUBRESOURCE_TILING tilings[9] = {};
+       if (t && dev2) dev2->GetResourceTiling(t, &total, &packed, &shape, &subs, 0, tilings);
+       ID3D11Buffer *pool = total ? tilePool11(d, total) : nullptr;
+       D3D11_TEXTURE2D_DESC od = {256, 256, 9, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+       ID3D11Texture2D *out = nullptr;
+       d.dev->CreateTexture2D(&od, nullptr, &out);
+       bool ok = t && dev2 && pool && out;
+       if (ok) {
+          D3D11_TILED_RESOURCE_COORDINATE at = {};
+          D3D11_TILE_REGION_SIZE all = {total, FALSE};
+          UINT start = 0;
+          ctx2->UpdateTileMappings(t, 1, &at, &all, pool, 1, nullptr, &start, nullptr, 0);
+          for (UINT m = 0; m < 9 && ok; m++) {
+             D3D11_RENDER_TARGET_VIEW_DESC rd = {DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_RTV_DIMENSION_TEXTURE2D};
+             rd.Texture2D.MipSlice = m;
+             ID3D11RenderTargetView *rtv = nullptr;
+             ok = SUCCEEDED(d.dev->CreateRenderTargetView(t, &rd, &rtv));
+             float color[4] = {m / 8.0f, 1 - m / 8.0f, 0.5f, 1};
+             if (ok) d.ctx->ClearRenderTargetView(rtv, color);
+             release(rtv);
+          }
+          d.ctx->CopyResource(out, t);
+          for (UINT m = 0; m < 9 && ok; m++) {
+             std::vector<uint32_t> level;
+             ok = readTexture(d, out, m, level);
+             o.push_back(level.empty() ? 0 : level[0]);
+             o.push_back(level.empty() ? 0 : level.back());
+          }
+          e = fmt("%u tiles, %u packed mips in %u tiles", total, packed.NumPackedMips, packed.NumTilesForPackedMips);
+       }
+       release(out);
+       release(pool);
+       release(t);
+       release(dev2);
+       release(ctx2);
+       return ok;
+    }, 1, true},
+   {"Min/max filtering (11.2)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
+       d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
+       if (!o1.MinMaxFiltering) {
+          e = "not supported (optional)";
+          return false;
+       }
+       // a 4x4 texture filtered bilinearly at texel corners (four equal weights: no sub-texel precision in it), with
+       // the minimum (left half) and maximum (right half) reduction
+       std::vector<uint8_t> init(4 * 4 * 4);
+       fillPattern(init, 41);
+       ID3D11Texture2D *t = tex11(d, 4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, init.data(), 16);
+       ID3D11ShaderResourceView *srv = nullptr;
+       if (t) d.dev->CreateShaderResourceView(t, nullptr, &srv);
+       ID3D11SamplerState *smp[2] = {};
+       for (int i = 0; i < 2; i++) {
+          D3D11_SAMPLER_DESC sd = {i ? D3D11_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT : D3D11_FILTER_MINIMUM_MIN_MAG_LINEAR_MIP_POINT,
+                                   D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP};
+          sd.MaxLOD = D3D11_FLOAT32_MAX;
+          d.dev->CreateSamplerState(&sd, &smp[i]);
+       }
+       ID3D11PixelShader *ps = ps11(d, "Texture2D t; SamplerState s0 : register(s0); SamplerState s1 : register(s1); "
+                                       "float4 main(float4 p : SV_Position) : SV_Target { float2 uv = (fmod(floor(p.xy / 4), 3) + 1) / 4; "
+                                       "return p.x < 16 ? t.Sample(s0, uv) : t.Sample(s1, uv); }", e);
+       RT11 rt;
+       const float black[4] = {};
+       bool ok = srv && smp[0] && smp[1] && ps && makeRT(d, rt, DXGI_FORMAT_R8G8B8A8_UNORM, 4, black);
+       if (ok) {
+          d.ctx->PSSetShaderResources(0, 1, &srv);
+          d.ctx->PSSetSamplers(0, 2, smp);
+          fullscreen11(d, ps);
+          ok = readTexture(d, rt.tex, 0, o);
+       }
+       rt.release();
+       release(ps);
+       release(smp[1]);
+       release(smp[0]);
+       release(srv);
+       release(t);
+       return ok;
+    }, 1, true},
+   {"Tiled resources tier 2: residency and unmapped tiles (11.2)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
+       d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
+       ID3D11DeviceContext2 *ctx2 = nullptr;
+       if (o1.TiledResourcesTier < D3D11_TILED_RESOURCES_TIER_2 ||
+           FAILED(d.ctx->QueryInterface(__uuidof(ID3D11DeviceContext2), (void **)&ctx2))) {
+          e = "not supported (optional)";
+          return false;
+       }
+       // a 2x2-tile texture with tiles (0,0) and (1,1) mapped: each pixel point-samples one texel and its status;
+       // unmapped ones read 0 and report it (magenta added)
+       ID3D11Buffer *pool = tilePool11(d, 2);
+       ID3D11Texture2D *t = tiledTexture11(d, 256, 256, 1, D3D11_BIND_SHADER_RESOURCE);
+       ID3D11ShaderResourceView *srv = nullptr;
+       if (t) d.dev->CreateShaderResourceView(t, nullptr, &srv);
+       D3D11_SAMPLER_DESC sd = {D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
+                                D3D11_TEXTURE_ADDRESS_CLAMP};
+       sd.MaxLOD = D3D11_FLOAT32_MAX;
+       ID3D11SamplerState *smp = nullptr;
+       d.dev->CreateSamplerState(&sd, &smp);
+       ID3D11PixelShader *ps = ps11(d, "Texture2D t; SamplerState s; float4 main(float4 p : SV_Position) : SV_Target { "
+                                       "float2 uv = (floor(p.xy) * 8 + 4) / 256; uint status; "
+                                       "float4 c = t.Sample(s, uv, int2(0, 0), 0.0f, status); "
+                                       "return CheckAccessFullyMapped(status) ? c : float4(1, 0, 1, 1) + c; }", e);
+       RT11 rt;
+       const float black[4] = {};
+       bool ok = pool && srv && smp && ps && makeRT(d, rt, DXGI_FORMAT_R8G8B8A8_UNORM, 4, black);
+       if (ok) {
+          D3D11_TILED_RESOURCE_COORDINATE at[2] = {{0, 0, 0, 0}, {1, 1, 0, 0}};
+          UINT start[2] = {0, 1};
+          D3D11_TILE_REGION_SIZE one = {1, FALSE};
+          D3D11_TILE_REGION_SIZE sizes[2] = {one, one};
+          UINT counts[2] = {1, 1};
+          ctx2->UpdateTileMappings(t, 2, at, sizes, pool, 2, nullptr, start, counts, 0);
+          std::vector<uint8_t> a = tilePattern(13), b = tilePattern(17);
+          ctx2->UpdateTiles(t, &at[0], &one, a.data(), 0);
+          ctx2->UpdateTiles(t, &at[1], &one, b.data(), 0);
+          d.ctx->PSSetShaderResources(0, 1, &srv);
+          d.ctx->PSSetSamplers(0, 1, &smp);
+          fullscreen11(d, ps);
+          ok = readTexture(d, rt.tex, 0, o);
+       }
+       rt.release();
+       release(ps);
+       release(smp);
+       release(srv);
+       release(t);
+       release(pool);
+       release(ctx2);
+       return ok;
+    }, 0, true},
+   {"LOD clamp (sample_cl, 11.2)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
+       d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
+       if (o1.TiledResourcesTier < D3D11_TILED_RESOURCES_TIER_2) {
+          e = "not supported (optional)";
+          return false;
+       }
+       // an 8x8 texture whose 4 mips have colors of their own, magnified: Sample clamped to mip 2 (left), SampleBias
+       // with a bias below 0 clamped to mip 1 (right)
+       D3D11_TEXTURE2D_DESC td = {8, 8, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                                  D3D11_BIND_SHADER_RESOURCE, 0, 0};
+       std::vector<uint32_t> mips[4];
+       D3D11_SUBRESOURCE_DATA init[4];
+       for (UINT m = 0; m < 4; m++) {
+          UINT w = 8 >> m;
+          mips[m].assign(w * w, 0xff000000u | (m * 60u) | ((255u - m * 60u) << 8) | (m * 20u << 16));
+          init[m] = {mips[m].data(), w * 4, 0};
+       }
+       ID3D11Texture2D *t = nullptr;
+       d.dev->CreateTexture2D(&td, init, &t);
+       ID3D11ShaderResourceView *srv = nullptr;
+       if (t) d.dev->CreateShaderResourceView(t, nullptr, &srv);
+       D3D11_SAMPLER_DESC sd = {D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP,
+                                D3D11_TEXTURE_ADDRESS_CLAMP};
+       sd.MaxLOD = D3D11_FLOAT32_MAX;
+       ID3D11SamplerState *smp = nullptr;
+       d.dev->CreateSamplerState(&sd, &smp);
+       ID3D11PixelShader *ps = ps11(d, "Texture2D t; SamplerState s; float4 main(float4 p : SV_Position) : SV_Target { "
+                                       "float2 uv = p.xy / 32; return p.x < 16 ? t.Sample(s, uv, int2(0, 0), 2.0f) "
+                                       ": t.SampleBias(s, uv, -4.0f, int2(0, 0), 1.0f); }", e);
+       RT11 rt;
+       const float black[4] = {};
+       bool ok = srv && smp && ps && makeRT(d, rt, DXGI_FORMAT_R8G8B8A8_UNORM, 4, black);
+       if (ok) {
+          d.ctx->PSSetShaderResources(0, 1, &srv);
+          d.ctx->PSSetSamplers(0, 1, &smp);
+          fullscreen11(d, ps);
+          ok = readTexture(d, rt.tex, 0, o);
+       }
+       rt.release();
+       release(ps);
+       release(smp);
+       release(srv);
+       release(t);
+       return ok;
+    }, 0, true},
+   {"ClearView on depth-only formats (11.2)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       D3D11_FEATURE_DATA_D3D11_OPTIONS1 o1 = {};
+       d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS1, &o1, sizeof o1);
+       ID3D11DeviceContext1 *ctx1 = nullptr;
+       d.ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&ctx1);
+       if (!o1.ClearViewAlsoSupportsDepthOnlyFormats || !ctx1) {
+          e = "not supported (optional)";
+          release(ctx1);
+          return false;
+       }
+       ID3D11Texture2D *t = tex11(d, RW, RH, DXGI_FORMAT_D32_FLOAT, nullptr, 0, D3D11_BIND_DEPTH_STENCIL);
+       ID3D11DepthStencilView *dsv = nullptr;
+       if (t) d.dev->CreateDepthStencilView(t, nullptr, &dsv);
+       bool ok = dsv != nullptr;
+       if (ok) {
+          d.ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+          const float depth[4] = {0.25f, 0, 0, 0};
+          D3D11_RECT r[] = {{4, 6, 20, 14}, {10, 18, 30, 28}};
+          ctx1->ClearView(dsv, depth, r, 2);
+          ok = readTexture(d, t, 0, o);
+       }
+       release(dsv);
+       release(t);
+       release(ctx1);
+       return ok;
+    }, 0, true},
    {"Map on default textures (WriteToSubresource, ReadFromSubresource; 11.3)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
        D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {};
        d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2);
@@ -1917,6 +2367,89 @@ static bool sharedTexture(ID3D11Device *a, ID3D11DeviceContext *actx, std::strin
    return ok;
 }
 
+// An NV12 texture (11.4's ExtendedNV12SharedTextureSupported) made on one device, read on another through a shared
+// handle (NT or legacy): both planes as written
+static bool sharedNV12(ID3D11Device *a, bool nt, std::string &detail)
+{
+   const UINT W = 64, H = 32;
+   std::vector<uint8_t> data(W * (H + H / 2));
+   for (UINT y = 0; y < H; y++)
+      for (UINT x = 0; x < W; x++) data[y * W + x] = (uint8_t)(x * 7 + y * 3);
+   for (UINT y = 0; y < H / 2; y++)
+      for (UINT x = 0; x < W; x += 2) data[(H + y) * W + x] = (uint8_t)(64 + x), data[(H + y) * W + x + 1] = (uint8_t)(192 - y);
+   ID3D11Device *b = nullptr;
+   ID3D11DeviceContext *bctx = nullptr;
+   const D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+   createDevice11(&b, &bctx, &fl, 1);
+   D3D11_TEXTURE2D_DESC td = {W, H, 1, 1, DXGI_FORMAT_NV12, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0,
+                              (UINT)(nt ? D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE : D3D11_RESOURCE_MISC_SHARED)};
+   D3D11_SUBRESOURCE_DATA init = {data.data(), W, 0};
+   ID3D11Texture2D *tex = nullptr, *opened = nullptr, *staging = nullptr;
+   ID3D11Device1 *b1 = nullptr;
+   IDXGIResource1 *res = nullptr;
+   HANDLE handle = nullptr;
+   HRESULT h = b ? a->CreateTexture2D(&td, &init, &tex) : E_FAIL;
+   bool ok = false;
+   if (FAILED(h)) {
+      detail = "creating the shared NV12 texture: " + hrs(h);
+   } else {
+      ID3D11DeviceContext *actx = nullptr;
+      a->GetImmediateContext(&actx);
+      actx->Flush();   // (the initial data reaches the texture before the other device reads it, as D3D asks)
+      release(actx);
+      tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&res);
+      h = !res ? E_NOINTERFACE
+          : nt ? res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle)
+               : res->GetSharedHandle(&handle);
+      if (SUCCEEDED(h) && nt) {
+         b->QueryInterface(__uuidof(ID3D11Device1), (void **)&b1);
+         h = b1 ? b1->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D), (void **)&opened) : E_NOINTERFACE;
+      } else if (SUCCEEDED(h)) {
+         h = b->OpenSharedResource(handle, __uuidof(ID3D11Texture2D), (void **)&opened);
+      }
+      if (FAILED(h)) {
+         detail = "sharing it: " + hrs(h);
+      } else {
+         D3D11_TEXTURE2D_DESC od;
+         opened->GetDesc(&od);
+         td.BindFlags = 0;
+         td.MiscFlags = 0;
+         td.Usage = D3D11_USAGE_STAGING;
+         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+         b->CreateTexture2D(&td, nullptr, &staging);
+         if (staging) bctx->CopyResource(staging, opened);
+         D3D11_MAPPED_SUBRESOURCE m;
+         if (od.Format != DXGI_FORMAT_NV12 || od.Width != W || od.Height != H) {
+            detail = fmt("the other device opens a %ux%u texture of format %d", od.Width, od.Height, (int)od.Format);
+         } else if (staging && SUCCEEDED(bctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+            int bad = 0, first = -1;
+            for (UINT y = 0; y < H + H / 2; y++)
+               for (UINT x = 0; x < W; x++)
+                  if (((const uint8_t *)m.pData)[y * m.RowPitch + x] != data[y * W + x] && bad++ == 0) first = (int)(y * W + x);
+            ok = !bad;
+            const uint8_t *p = (const uint8_t *)m.pData;
+            detail = bad ? fmt("%d of %u bytes differ (first at row %d, column %d: %s plane; reads %02x %02x %02x %02x, "
+                               "chroma %02x %02x)", bad, W * (H + H / 2), first / (int)W, first % (int)W,
+                               first / (int)W < (int)H ? "luma" : "chroma", p[0], p[1], p[2], p[3], p[H * m.RowPitch],
+                               p[H * m.RowPitch + 1])
+                         : "both planes read back on the other device";
+            bctx->Unmap(staging, 0);
+         } else {
+            detail = "reading it back failed";
+         }
+      }
+   }
+   if (nt && handle) CloseHandle(handle);
+   release(staging);
+   release(opened);
+   release(b1);
+   release(res);
+   release(tex);
+   release(bctx);
+   release(b);
+   return ok;
+}
+
 static void groupD3D11Render()
 {
    Dev hw, warp;
@@ -1971,6 +2504,17 @@ static void groupD3D11Render()
       check(multithreadedCreation(hw.dev, detail), "Resource creation from several threads", detail);
       detail.clear();
       if (startTest("Textures shared between devices")) check(sharedTexture(hw.dev, hw.ctx, detail), "Textures shared between devices", detail);
+      D3D11_FEATURE_DATA_D3D11_OPTIONS4 o4 = {};
+      bool nv12 = SUCCEEDED(hw.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS4, &o4, sizeof o4)) &&
+                  o4.ExtendedNV12SharedTextureSupported;
+      // (single textures: Direct3D 11 refuses shared NV12 arrays itself, WARP's as well)
+      for (bool nt : {false, true}) {
+         const char *name = nt ? "NV12 textures shared between devices (NT handle)" : "NV12 textures shared between devices";
+         if (!startTest(name)) continue;
+         detail.clear();
+         if (!nv12) optional(false, name, "the driver doesn't offer it (11.4 ExtendedNV12SharedTextureSupported)");
+         else check(sharedNV12(hw.dev, nt, detail), name, detail);
+      }
    }
 }
 

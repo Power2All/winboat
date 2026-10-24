@@ -1,0 +1,33 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: no NV12 textures on Windows 7
+
+Windows 7's Direct3D 11 runtime takes NV12/P010 textures only from drivers with the 11.1 video DDI, which a WDDM 1.1
+driver doesn't get: the driver reported the formats supported (shader sampling, video processor input) and the
+runtime then refused every such texture (E_INVALIDARG). On Windows 7 they are reported unsupported now, as the
+runtime treats them.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Video.cpp b/src/gallium/frontends/d3d10umd/Video.cpp
+index 6a88bd7..eedee8f 100644
+--- a/src/gallium/frontends/d3d10umd/Video.cpp
++++ b/src/gallium/frontends/d3d10umd/Video.cpp
+@@ -25,6 +25,7 @@
+ 
+ #include "Video.h"
+ #include "DxvaDecode.h"
++#include "gdikmt/gdikmt.h"
+ #include "Format.h"
+ #include "State.h"
+ 
+@@ -610,6 +611,12 @@ VideoFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT *pFormatCa
+    if (!IsVideoFormat(Format) && PackedFormat(Format) == PIPE_FORMAT_NONE) {
+       return false;
+    }
++   /* Windows 7: none (its runtime takes NV12/P010 textures only from drivers with the 11.1 video DDI, which a WDDM 1.1
++    * driver doesn't get: it refused them after the format was reported supported) */
++   if (IsVideoFormat(Format) && gdikmt_windows7()) {
++      *pFormatCaps = 0;
++      return true;
++   }
+    /* shader views of the planes, the video processor's input, and decoder output for the profiles in this format */
+    *pFormatCaps = D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_1DDI_FORMAT_SUPPORT_VIDEO_PROCESSOR_INPUT;
+    struct pipe_screen *screen = CastPipeContext(hDevice)->screen;
