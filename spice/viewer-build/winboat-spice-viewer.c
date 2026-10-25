@@ -17,6 +17,9 @@
  * ("track <pid>" lines, also --track). It quits when none of them runs anymore, and shows the whole desktop in one
  * window when the VM has no such port (a VM set up by an older WinBoat) or no tracker answers ("seamless-unavailable"
  * on stdout). It prints "window-shown" when an app's window shows (WinBoat's "Starting …" notice ends).
+ * --span gives Windows' desktop all host monitors (their bounding box) instead of the primary one: windows move to
+ * any monitor, maximized ones fill the work area of the monitor they're on, and full screen windows (games) cover all
+ * monitors, like RDP's /span. Windows' own work area stays the primary monitor's (where apps open and center).
  * In both modes it prints "fps <n>" every two seconds: the frames Windows' screen got (WinBoat's metrics).
  *
  * Windows' desktop shows around and through the app's windows (rounded corners, see-through windows):
@@ -47,7 +50,8 @@
  *   viewer -> guest   track <pid>
  *                     workarea <x> <y> <width> <height>
  *                     background <RRGGBB>              (the desktop's color while the viewer is connected)
- *                     move <hwnd> <x> <y> <width> <height>   (the window's visible frame)
+ *                     move <hwnd> <x> <y> <width> <height> [M]   (the window's visible frame; M: a maximized
+ *                                                      window's, which stays maximized there: --span)
  *                     activate|close|minimize|maximize|restore <hwnd>
  *                     deactivate                       (the user went to a Linux app: menus close)
  *                     order <hwnd>...                  (the app windows as the window manager stacks them, from the
@@ -183,20 +187,22 @@ typedef struct {
     gboolean foreground;   /* as Windows reports it */
     gint64 activated_at;   /* when the viewer last sent activate for it */
     gboolean wm_maximized; /* as the window manager has it */
+    GdkRectangle filled;   /* --span: the monitor work area (guest pixels) the viewer last moved it to, maximized */
     gboolean fullscreen;   /* Windows' screen is all its (borderless full screen, games): full screen here too */
     gchar *title;
 } GuestWindow;
 
 static gboolean seamless;
 static gboolean transparent; /* --background transparent, on a composited screen */
+static gboolean span;        /* --span: Windows' desktop is all host monitors */
 static gboolean debug; /* WINBOAT_SEAMLESS_DEBUG: the port's lines on stderr */
 static GArray *tracks;             /* the pids named (told to every tracker that opens the port) */
 static SpicePortChannel *port;
 static gboolean port_open;         /* a tracker has it open */
 static GString *port_input;
 static GHashTable *guest_windows;  /* hwnd -> GuestWindow */
-static GdkMonitor *screen_monitor; /* the host monitor Windows' desktop stands for */
-static GdkRectangle screen;        /* its geometry, in host (GDK) coordinates */
+static GdkMonitor *screen_monitor; /* the host monitor Windows' desktop stands for (--span: the primary one) */
+static GdkRectangle screen;        /* its geometry, in host (GDK) coordinates (--span: all monitors') */
 static int screen_scale;
 static gboolean screen_applied;
 static guint port_timeout;
@@ -245,7 +251,7 @@ static void track(guint pid)
     port_send("track %u", pid);
 }
 
-/* The host monitor Windows' desktop stands for: the primary one */
+/* The host monitor Windows' desktop stands for: the primary one (--span: all of them) */
 static void pick_screen(void)
 {
     GdkDisplay *display = gdk_display_get_default();
@@ -256,6 +262,12 @@ static void pick_screen(void)
     if (screen_monitor) {
         gdk_monitor_get_geometry(screen_monitor, &screen);
         screen_scale = MAX(gdk_monitor_get_scale_factor(screen_monitor), 1);
+        for (int i = 0; span && i < gdk_display_get_n_monitors(display); i++) {
+            GdkRectangle geometry;
+            gdk_monitor_get_geometry(gdk_display_get_monitor(display, i), &geometry);
+            gdk_rectangle_union(&screen, &geometry, &screen);
+            screen.width = (screen.width + 7) & ~7; /* (a width Windows' display modes take) */
+        }
     } else {
         screen = (GdkRectangle) { 0, 0, 1920, 1080 };
         screen_scale = 1;
@@ -376,6 +388,8 @@ static gboolean guest_window_focus_out(GtkWidget *widget, GdkEvent *event, gpoin
     return FALSE;
 }
 
+static void fill_monitor(GuestWindow *guest);
+
 static gboolean guest_window_state(GtkWidget *widget, GdkEventWindowState *event, gpointer data)
 {
     GuestWindow *guest = find_window(widget);
@@ -399,6 +413,9 @@ static gboolean guest_window_state(GtkWidget *widget, GdkEventWindowState *event
         }
         if (guest->wm_maximized != guest->maximized) {
             port_send("%s %" G_GINT64_MODIFIER "x", guest->wm_maximized ? "maximize" : "restore", guest->hwnd);
+        }
+        if (span && guest->wm_maximized && guest->maximized) {
+            fill_monitor(guest);
         }
     }
     return FALSE;
@@ -435,13 +452,19 @@ static gboolean rect_equal(const GdkRectangle *a, const GdkRectangle *b)
     return a->x == b->x && a->y == b->y && a->width == b->width && a->height == b->height;
 }
 
-/* Full screen on the monitor Windows' screen stands for, or not */
+/* Full screen on the monitor Windows' screen stands for (--span: all of them), or not */
 static void set_fullscreen(GuestWindow *guest)
 {
     if (!guest->fullscreen) {
         gtk_window_unfullscreen(GTK_WINDOW(guest->window));
         /* Back where Windows has it */
         guest->placing_until = g_get_monotonic_time() + RESTORING_MS * 1000;
+        return;
+    }
+    if (span) {
+        gtk_widget_realize(guest->window);
+        gdk_window_set_fullscreen_mode(gtk_widget_get_window(guest->window), GDK_FULLSCREEN_ON_ALL_MONITORS);
+        gtk_window_fullscreen(GTK_WINDOW(guest->window));
         return;
     }
     GdkDisplay *display = gdk_display_get_default();
@@ -454,6 +477,25 @@ static void set_fullscreen(GuestWindow *guest)
     gtk_window_fullscreen_on_monitor(GTK_WINDOW(guest->window), gtk_widget_get_screen(guest->window), monitor);
 }
 
+/* --span: Windows maximizes a window to its work area (the primary monitor's); maximized on another monitor here, it
+ * goes where the window manager maximized it (that monitor's work area), still maximized in Windows */
+static void fill_monitor(GuestWindow *guest)
+{
+    GdkWindow *gdk_window = gtk_widget_get_window(guest->window);
+    if (!gdk_window || !(gdk_window_get_state(gdk_window) & GDK_WINDOW_STATE_MAXIMIZED)) {
+        return; /* not yet: its configure event comes when it is */
+    }
+    GdkRectangle area;
+    gdk_window_get_frame_extents(gdk_window, &area);
+    area = (GdkRectangle) { (area.x - screen.x) * screen_scale, (area.y - screen.y) * screen_scale,
+                            area.width * screen_scale, area.height * screen_scale };
+    if (rect_equal(&area, &guest->rect) || rect_equal(&area, &guest->filled)) {
+        return;
+    }
+    guest->filled = area;
+    port_send("move %" G_GINT64_MODIFIER "x %d %d %d %d M", guest->hwnd, area.x, area.y, area.width, area.height);
+}
+
 /* Puts the Linux window where Windows has the window (force: also when it should be there already) */
 static void place_window(GuestWindow *guest, gboolean force)
 {
@@ -462,6 +504,9 @@ static void place_window(GuestWindow *guest, gboolean force)
                                   guest->rect.height);
     if (guest->fullscreen) {
         return; /* the window manager has it on the whole monitor, which is all of Windows' screen */
+    }
+    if (span && guest->maximized && guest->wm_maximized) {
+        fill_monitor(guest);
     }
     GdkRectangle host = { host_x(guest->rect.x), host_y(guest->rect.y), MAX(guest->rect.width / screen_scale, 1),
                           MAX(guest->rect.height / screen_scale, 1) };
@@ -510,6 +555,9 @@ static gboolean guest_window_configure(GtkWidget *widget, GdkEventConfigure *eve
     GdkWindowState state = gdk_window_get_state(gtk_widget_get_window(widget));
     if (guest->wm_maximized || guest->minimized ||
         (state & (GDK_WINDOW_STATE_MAXIMIZED | GDK_WINDOW_STATE_ICONIFIED))) {
+        if (span && guest->maximized && guest->wm_maximized) {
+            fill_monitor(guest); /* moved to another monitor maximized (the window manager's shortcuts) */
+        }
         return FALSE; /* Windows maximizes or minimizes it itself */
     }
     if (guest->settle) {
@@ -896,6 +944,7 @@ static void handle_window(char **fields)
         if (!guest->popup && maximized != guest->maximized) {
             /* Maximized or restored in Windows (its title bar's button): the window manager too */
             guest->maximized = maximized;
+            guest->filled = (GdkRectangle) { 0 };
             if (maximized != guest->wm_maximized) {
                 guest->wm_maximized = maximized;
                 if (maximized) {
@@ -1284,6 +1333,7 @@ int main(int argc, char **argv)
         { "seamless", 0, 0, G_OPTION_ARG_NONE, &seamless, "Show the windows of tracked apps as windows of their own",
           NULL },
         { "track", 0, 0, G_OPTION_ARG_STRING_ARRAY, &track_args, "An app's process to track (seamless)", "PID" },
+        { "span", 0, 0, G_OPTION_ARG_NONE, &span, "Windows' desktop is all host monitors (seamless)", NULL },
         { "background", 0, 0, G_OPTION_ARG_STRING, &background,
           "What shows around and through app windows: black (default) or transparent (seamless)", "BACKGROUND" },
         { G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_STRING_ARRAY, &uris, NULL, "URI" },

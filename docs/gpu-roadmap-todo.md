@@ -1001,6 +1001,27 @@ compute, DirectML), video (DXVA2/D3D11/D3D12 video, Media Foundation), OpenCL. B
       ok; user VM GPU check 351/0. The setup 59083 on 8.1 476/4 as before. Found there: an update over a running
       viogpuap.exe failed ("being used by another process": Stop-Process doesn't wait) - gpu-driver.ps1 now kills the
       helper and waits for it before copying (setup over a running helper: exit 0)
+- [x] gpu.97 (2026-10-25, AppImage gpu.97, image 6.05-30: QEMU 0012; driver 58893 unchanged): gpu.96's spanned desktop
+      was black - QEMU refused resources backed by more than 16384 pages (64 MB), the 8488x2160 screen's are 73 MB.
+      Raised to 4 GB; host screenshots on the spike and in the user's VM show the windows
+- [x] gpu.96 (2026-10-25, AppImage gpu.96; driver 58893 unchanged): app windows move to every monitor in seamless
+      mode with the Multi-Monitor setting (viewer --span, tracker's maximized moves and kept work area; see
+      hardware-acceleration.md, "App windows on every monitor"); the user's setting set to Span. Real multi-monitor
+      Windows (one Windows monitor per host monitor: per-monitor maximize, full screen and DPI) would need the KMD's
+      MAX_CHILDREN > 1 and QEMU/SPICE heads - not done
+- [x] gpu.94/95 (2026-10-25, driver 58893: mesa-venus 0010; AppImage gpu.95 with the app/guest server change; the setup
+      in dist/): the user's Topaz Video AI 4K export (Proteus, 1080p to 2160p, 4 DirectML instances, VRAM use 100%)
+      crashed ffmpeg with 0xC0000409 in viogpu_vk.dll: Venus allocated plain device memory asynchronously, the host's
+      vkAllocateMemory failed (host GPU 16 GB, ~4 GB free next to the host's programs), and the first use of the
+      missing object made the host ring fatal ("vkr: failed to look up object ... of type 8", "vn_ring_submit abort
+      on fatal" with MESA_LOG_LEVEL=debug) and Venus abort(). mesa-venus 0010: allocations waited for, programs get
+      VK_ERROR_OUT_OF_DEVICE_MEMORY / E_OUTOFMEMORY; the export finishes (72 frames). And the user asked for the 3080's
+      16 GB: WinBoat reads the host GPU's video memory (hostGpuMemoryMB: nvidia-smi by PCI address, amdgpu sysfs) and
+      passes it with /gpu/driver install (memoryMB) to gpu-driver.ps1 -GpuMemoryMB, which writes GpuMemoryLimitMB into
+      the device's driver key: DXGI 16384 MB dedicated, Topaz "VRAM: 16 GB", 7.4 s GPU vs 23.7 s CPU. Note: the
+      AppImage comes from the 0.9.2 worktree (~/Coding/winboat-0.9.2-gpu), whose app and guest server are separate
+      code (only drivers, gpu-driver.ps1 and spice/image are synced): app/server changes go into both. GPU check 385/0,
+      spike 719/0
 - [x] gpu.90-93 (2026-10-24, driver 58789: kvm 0033, Mesa 0042-0045; image 6.05-29 unchanged; the setup in dist/):
       games/apps review (docs/games-and-apps.md) and every report rerun with it. kvm 0033: Windows 11's local segment
       is the GPU memory limit (8 GB) instead of the 4 GB window - Topaz Video AI shows VRAM 8 GB, picks onnx16

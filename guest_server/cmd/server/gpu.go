@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"os/exec"
+	"strconv"
 )
 
 // The virtual GPU driver (viogpu3d) bundled in server\drivers\viogpu3d, managed by scripts\gpu-driver.ps1. The script
@@ -15,11 +16,14 @@ import (
 type GPUDriverRequest struct {
 	Action string `json:"action"` // "install" or "uninstall"
 	Reboot bool   `json:"reboot"` // restart Windows afterwards (both need it)
+	// install: the host GPU's video memory in MB (0: the driver's default), its GpuMemoryLimitMB
+	MemoryMB int `json:"memoryMB"`
 }
 
-func runGPUDriverScript(w http.ResponseWriter, action string) bool {
-	// Positional: executePowerShellScript quotes every argument, so "-Action" would arrive as a value
-	output, err := executePowerShellScript(".\\scripts\\gpu-driver.ps1", true, action)
+func runGPUDriverScript(w http.ResponseWriter, action string, memoryMB int) bool {
+	// Positional (Action, PackageDir, GpuMemoryMB): executePowerShellScript quotes every argument, so "-Action" would
+	// arrive as a value
+	output, err := executePowerShellScript(".\\scripts\\gpu-driver.ps1", true, action, "", strconv.Itoa(memoryMB))
 	var exitErr *exec.ExitError
 	if err != nil && !(errors.As(err, &exitErr) && len(output) > 0) {
 		http.Error(w, "Failed to execute script: "+err.Error(), http.StatusInternalServerError)
@@ -36,7 +40,7 @@ func runGPUDriverScript(w http.ResponseWriter, action string) bool {
 }
 
 func getGPUStatus(w http.ResponseWriter, r *http.Request) {
-	runGPUDriverScript(w, "Status")
+	runGPUDriverScript(w, "Status", 0)
 }
 
 func setGPUDriver(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +59,7 @@ func setGPUDriver(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Unknown action: "+req.Action, http.StatusBadRequest)
 		return
 	}
-	if runGPUDriverScript(w, action) && req.Reboot {
+	if runGPUDriverScript(w, action, req.MemoryMB) && req.Reboot {
 		// Give the response time to reach the host
 		exec.Command("shutdown", "/r", "/t", "10", "/c", "WinBoat: activating the virtual GPU driver").Start()
 	}

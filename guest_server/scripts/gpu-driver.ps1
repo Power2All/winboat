@@ -2,7 +2,7 @@
 <#
 WinBoat virtual GPU driver (viogpu3d: virtio-gpu 3D kernel driver + Mesa OpenGL/D3D9/D3D10/D3D11 user-mode drivers)
 
-    gpu-driver.ps1 -Action Status|Install|Uninstall [-PackageDir <dir>]
+    gpu-driver.ps1 -Action Status|Install|Uninstall [-PackageDir <dir>] [-GpuMemoryMB <MB>]
 
 Prints JSON. The driver is test-signed, so Install:
   - signs the bundled package with a certificate created here and trusts only that certificate: its private key is
@@ -14,6 +14,8 @@ Prints JSON. The driver is test-signed, so Install:
   - installs the SPICE display route's helpers from drivers\spice (idle with RDP): the SPICE agent, which passes the
     viewer's size (and later the clipboard), and viogpuap.exe, which applies the size the driver reports, started at
     logon by a scheduled task;
+  - with -GpuMemoryMB (WinBoat: the host GPU's video memory), sets the driver's GpuMemoryLimitMB to it: what Windows
+    reports as the GPU's dedicated video memory and what the VM's GPU resources may hold (8 GB without it);
   - installs the GPU check from drivers\gpucheck (what the GPU can do: Direct3D 9-12, Vulkan, OpenGL, OpenCL,
     DirectML, video) in Program Files, with a Start menu shortcut.
 Everything Install changes is recorded under HKLM\SOFTWARE\WinBoat\VirtualGPU, and Uninstall reverts only that (test
@@ -28,7 +30,8 @@ SHA-1 signatures (7 without KB3033929 can't check SHA-2 ones) and no SPICE helpe
 #>
 param(
     [ValidateSet("Status", "Install", "Uninstall")] [string] $Action = "Status",
-    [string] $PackageDir
+    [string] $PackageDir,
+    [int] $GpuMemoryMB = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -133,7 +136,8 @@ function Get-GpuDevice {
         # No PnpDevice module: WMI's devices (the present ones)
         return Get-WmiObject Win32_PnPEntity | Where-Object { $_.DeviceID -match "VEN_1AF4&DEV_1050" } |
             Select-Object -First 1 | ForEach-Object {
-                New-Object PSObject -Property @{ FriendlyName = $_.Name; Status = $_.Status; Problem = $_.ConfigManagerErrorCode }
+                New-Object PSObject -Property @{ FriendlyName = $_.Name; Status = $_.Status; Problem = $_.ConfigManagerErrorCode
+                                                 InstanceId = $_.DeviceID }
             }
     }
     Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
@@ -141,6 +145,16 @@ function Get-GpuDevice {
         # The connected one: switching display routes moves the GPU to another PCI slot, and Windows keeps the old
         # one as a disconnected device (problem 45)
         Sort-Object -Property Present -Descending | Select-Object -First 1
+}
+
+# The driver's GpuMemoryLimitMB (read when the driver starts) in the device's driver key, where Windows keeps the
+# device's settings: the host GPU's video memory, reported as the GPU's dedicated video memory (Windows 11)
+function Set-GpuMemoryLimit([int] $MB) {
+    $device = Get-GpuDevice
+    if ($MB -le 0 -or -not $device) { return }
+    $driverKey = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\$($device.InstanceId)" -Name Driver -ErrorAction SilentlyContinue).Driver
+    if (-not $driverKey) { return }
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$driverKey" -Name GpuMemoryLimitMB -Value $MB -Type DWord
 }
 
 function Test-TestSigningActive {
@@ -450,6 +464,8 @@ function Install-Driver {
         if (-not (Test-Path $value.Key)) { New-Item -Path $value.Key -Force | Out-Null }
         Set-ItemProperty -Path $value.Key -Name $value.Name -Value $value.Value -Type DWord
     }
+
+    Set-GpuMemoryLimit $GpuMemoryMB
 
     if (-not $Win7) { Install-SpiceHelpers }  # (Windows 7: no ScheduledTasks module; untested there)
     Install-GpuCheck

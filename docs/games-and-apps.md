@@ -17,8 +17,12 @@ DXVK/vkd3d-proton's issue trackers) on 2026-10-24; measured with dx-test and Top
   OpenCL compatibility pack (OpenCL 1.2's features, images; no extensions such as GL/D3D11 sharing)
 - video: decoding H.264, HEVC (Main, Main 10, range extensions), VP9, AV1, MPEG-2, VC-1 through D3D11/DXVA2/D3D12;
   encoding H.264/HEVC through Media Foundation, D3D12 and an AMF-compatible runtime (amfrt64.dll)
-- dedicated video memory: the VM's GPU memory limit (`GpuMemoryLimitMB`, 8 GB by default), which programs judge the
-  GPU by (Topaz Video AI wants 6-8 GB, DaVinci Resolve 4 GB, newer games 8 GB)
+- dedicated video memory: the host GPU's (WinBoat reads it on the host, `nvidia-smi` or amdgpu's sysfs, and sets the
+  driver's `GpuMemoryLimitMB` to it: 16 GB on an RTX 3080 16 GB), which programs judge the GPU by (Topaz Video AI
+  wants 6-8 GB, DaVinci Resolve 4 GB, newer games 8 GB). It is also how much the VM's GPU resources may hold. The
+  host's own programs share that memory: when the host GPU is full, programs get "out of memory" (Direct3D 12's
+  E_OUTOFMEMORY), as on a full GPU, and can lower their use - Topaz Video AI: Preferences, its GPU memory use. Without
+  WinBoat (the standalone setup): 8 GB, or set `GpuMemoryLimitMB` (MB, DWORD) in the GPU's driver key and restart
 
 Missing, optional in Direct3D and asked for by no known game: stencil reference from pixel shaders and standard
 swizzle layouts (NVIDIA's own drivers have neither), typed UAVs of B8G8R8A8, R32G32B32_FLOAT render targets.
@@ -47,7 +51,7 @@ swizzle layouts (NVIDIA's own drivers have neither), typed UAVs of B8G8R8A8, R32
 | Direct3D 9, 10, 11 | 11_1 | 11_1 | 11_0 | 11_0 |
 | Direct3D 12 | 12_2, SM 6.8 | 12_1, SM 6.5 | - | - |
 | Vulkan, DirectML, OpenCL | yes | yes | - | - |
-| Dedicated video memory (DXGI) | 8 GB | none reported | none reported | none reported |
+| Dedicated video memory (DXGI) | the host GPU's | none reported | none reported | none reported |
 | Topaz Video AI | GPU (DirectML) | CPU (OpenVINO) | doesn't start | installer refuses |
 
 (Windows 11 and 10 on WinBoat's host; 8.1 and 7 measured on a stock QEMU host, where feature level 11_1 and OpenGL

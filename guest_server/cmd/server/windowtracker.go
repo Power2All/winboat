@@ -165,6 +165,10 @@ type windowTracker struct {
 	paths   map[uint32]string // their executables
 	sent    map[uintptr]trackedWindow
 	running bool // a tracked process ran since the last "idle"
+	// The work area the seamless viewer asked for, while it's connected: Windows resets it when its resolution
+	// changes (the viewer's comes after), and the screen size it was set for
+	workArea       windows.Rect
+	workAreaScreen [2]uintptr
 
 	// Windows shown since adoptSince (the first "track" since the last "idle") are adopted. The latest "track"'s app
 	// may take until launchUntil to show its window (one shown since launchSince)
@@ -185,7 +189,7 @@ type windowTracker struct {
 
 	// Where the viewer moved windows to (the latest per window; mover applies them)
 	movesMu  sync.Mutex
-	moves    map[uintptr]windows.Rect
+	moves    map[uintptr]pendingMove
 	moveWake chan struct{}
 
 	icons map[string]string // "icon" data per executable
@@ -349,7 +353,7 @@ func runWindowTracker() error {
 		exes:     map[uint32]string{},
 		paths:    map[uint32]string{},
 		sent:     map[uintptr]trackedWindow{},
-		moves:    map[uintptr]windows.Rect{},
+		moves:    map[uintptr]pendingMove{},
 		moveWake: make(chan struct{}, 1),
 		icons:    map[string]string{},
 		borders:  map[uintptr][4]int32{},
@@ -505,6 +509,10 @@ func (t *windowTracker) readCommandsUntilError() {
 					v[i] = int32(n)
 				}
 				area := windows.Rect{Left: v[0], Top: v[1], Right: v[0] + v[2], Bottom: v[1] + v[3]}
+				t.mu.Lock()
+				t.workArea = area
+				t.workAreaScreen = screenSize()
+				t.mu.Unlock()
 				procSystemParametersInfoW.Call(spiSetWorkArea, 0, uintptr(unsafe.Pointer(&area)), spifSendChange)
 			}
 		case "activate", "close", "minimize", "maximize", "restore":
@@ -542,8 +550,10 @@ func (t *windowTracker) readCommandsUntilError() {
 			t.order = order
 			t.mu.Unlock()
 		case "move":
-			// move <hwnd> <x> <y> <width> <height>: the visible frame's new place
-			if len(fields) == 6 {
+			// move <hwnd> <x> <y> <width> <height> [M]: the visible frame's new place (M: a maximized window's, which
+			// stays maximized there: the host monitor its Linux window is on, when Windows' desktop spans several)
+			maximized := len(fields) == 7 && fields[6] == "M"
+			if len(fields) == 6 || maximized {
 				hwnd, err := strconv.ParseUint(fields[1], 16, 64)
 				var v [4]int
 				for i := range v {
@@ -552,8 +562,8 @@ func (t *windowTracker) readCommandsUntilError() {
 					}
 				}
 				if err == nil && v[2] > 0 && v[3] > 0 && t.isTracked(uintptr(hwnd)) {
-					t.queueMove(uintptr(hwnd), windows.Rect{Left: int32(v[0]), Top: int32(v[1]),
-						Right: int32(v[0] + v[2]), Bottom: int32(v[1] + v[3])})
+					t.queueMove(uintptr(hwnd), pendingMove{windows.Rect{Left: int32(v[0]), Top: int32(v[1]),
+						Right: int32(v[0] + v[2]), Bottom: int32(v[1] + v[3])}, maximized})
 				}
 			}
 			continue // the window reports its new place by itself
@@ -588,9 +598,9 @@ func windowCommand(command string, hwnd uintptr) {
 
 // queueMove has mover put a window somewhere. While the Linux window manager drags it, the viewer reports every step:
 // only the latest one counts (the app redraws at every size it gets).
-func (t *windowTracker) queueMove(hwnd uintptr, frame windows.Rect) {
+func (t *windowTracker) queueMove(hwnd uintptr, move pendingMove) {
 	t.movesMu.Lock()
-	t.moves[hwnd] = frame
+	t.moves[hwnd] = move
 	t.movesMu.Unlock()
 	select {
 	case t.moveWake <- struct{}{}:
@@ -602,10 +612,10 @@ func (t *windowTracker) mover() {
 	for range t.moveWake {
 		t.movesMu.Lock()
 		moves := t.moves
-		t.moves = map[uintptr]windows.Rect{}
+		t.moves = map[uintptr]pendingMove{}
 		t.movesMu.Unlock()
-		for hwnd, frame := range moves {
-			moveWindow(hwnd, frame)
+		for hwnd, move := range moves {
+			moveWindow(hwnd, move.frame, move.maximized)
 		}
 	}
 }
@@ -651,9 +661,15 @@ func visibleFrame(hwnd uintptr) windows.Rect {
 	return rect
 }
 
-// moveWindow gives a window's visible frame a new place and size (its invisible borders stay around it)
-func moveWindow(hwnd uintptr, frame windows.Rect) {
-	if zoomed, _, _ := procIsZoomed.Call(hwnd); zoomed != 0 {
+type pendingMove struct {
+	frame     windows.Rect
+	maximized bool
+}
+
+// moveWindow gives a window's visible frame a new place and size (its invisible borders stay around it); maximized:
+// a maximized window's, which stays maximized (not one that isn't maximized anymore, nor the other way round)
+func moveWindow(hwnd uintptr, frame windows.Rect, maximized bool) {
+	if zoomed, _, _ := procIsZoomed.Call(hwnd); (zoomed != 0) != maximized {
 		return
 	}
 	if iconic, _, _ := procIsIconic.Call(hwnd); iconic != 0 {
@@ -1160,6 +1176,26 @@ func (t *windowTracker) snapshot() {
 	}
 }
 
+func screenSize() [2]uintptr {
+	width, _, _ := procGetSystemMetrics.Call(smCxScreen)
+	height, _, _ := procGetSystemMetrics.Call(smCyScreen)
+	return [2]uintptr{width, height}
+}
+
+// keepWorkArea puts the viewer's work area back once Windows has a new resolution (which resets it), if it fits
+func (t *windowTracker) keepWorkArea() {
+	size := screenSize()
+	t.mu.Lock()
+	want, changed := t.workArea, size != t.workAreaScreen
+	t.workAreaScreen = size
+	t.mu.Unlock()
+	if !changed || want.Right <= want.Left || want.Right > int32(size[0]) || want.Bottom > int32(size[1]) {
+		return
+	}
+	logTracker("work area %v again (a new resolution: %dx%d)", want, size[0], size[1])
+	procSystemParametersInfoW.Call(spiSetWorkArea, 0, uintptr(unsafe.Pointer(&want)), spifSendChange)
+}
+
 func (t *windowTracker) run() error {
 	// Window events arrive on the thread that hooked them, while it pumps messages
 	runtime.LockOSThread()
@@ -1215,7 +1251,13 @@ func (t *windowTracker) run() error {
 					if !connected {
 						// The viewer went: the user's own desktop again
 						t.restoreBackground()
+						t.mu.Lock()
+						t.workArea = windows.Rect{}
+						t.mu.Unlock()
 					}
+				}
+				if viewerConnected {
+					t.keepWorkArea()
 				}
 			}
 			if time.Since(lastProcesses) >= 250*time.Millisecond {

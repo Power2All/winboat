@@ -353,7 +353,9 @@
                     <template v-slot:desc>
                         Controls how multiple monitors are handled. MultiMon creates separate displays for each
                         monitor, while Span stretches the display across all monitors. Note: Span or MultiMon may
-                        work better depending on your setup.
+                        work better depending on your setup. With GPU acceleration (app windows of their own), MultiMon and
+                        Span both let them move to every monitor (Windows' desktop spans them all; full screen games then cover
+                        all of them too), None keeps them on the primary monitor.
                     </template>
                 </ConfigCard>
 

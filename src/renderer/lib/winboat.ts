@@ -16,6 +16,7 @@ import {
     isVirtualGpuEnabled,
     onViewerFps,
     virtualGpuRenderNode,
+    hostGpuMemoryMB,
 } from "./virtualGpu";
 import { GpuMonitor, type GpuMetrics } from "./gpuMetrics";
 import { setIntervalImmediately } from "../utils/interval";
@@ -691,6 +692,8 @@ export class Winboat {
             this.containerMgr!.containerName,
             pid,
             this.#wbConfig?.config.seamlessBackground ?? "black",
+            // The Multi-Monitor setting: Windows' desktop spans all monitors
+            [MultiMonitorMode.MultiMon, MultiMonitorMode.Span].includes(this.#wbConfig?.config.multiMonitor!),
             rate => void this.matchRefreshRate(rate),
         );
     }
@@ -733,11 +736,19 @@ export class Winboat {
     }
 
     async setVirtualGpuDriver(action: "install" | "uninstall", reboot: boolean): Promise<GuestGpuStatus> {
-        logger.info(`Virtual GPU: ${action} the driver in Windows${reboot ? " and restart it" : ""}`);
+        // The host GPU's video memory, which the driver reports and allows (older guest servers ignore it)
+        const memoryMB =
+            action === "install"
+                ? hostGpuMemoryMB(virtualGpuRenderNode(Winboat.readCompose(this.containerMgr!.composeFilePath)))
+                : 0;
+        logger.info(
+            `Virtual GPU: ${action} the driver in Windows${reboot ? " and restart it" : ""}` +
+                (memoryMB ? ` (video memory: ${memoryMB} MB, the host GPU's)` : ""),
+        );
         const res = await nodeFetch(`${WINBOAT_API_URL}/gpu/driver`, {
             method: "POST",
             headers: { ...guestAuthHeaders(), "Content-Type": "application/json" },
-            body: JSON.stringify({ action, reboot }),
+            body: JSON.stringify({ action, reboot, memoryMB }),
             signal: AbortSignal.timeout(VIRTUAL_GPU_SCRIPT_TIMEOUT_MS),
         });
         const body = (await res.json()) as GuestGpuStatus & { error?: string };

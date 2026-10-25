@@ -84,6 +84,11 @@ after signing. It also lets RDP sessions use the GPU and installs the SPICE agen
 Everything it changes is recorded and put back by the uninstaller (Settings > Apps > "WinBoat GPU Driver", or
 `uninstall.exe /S`), which also turns test mode off if it was off before.
 
+Video memory: the driver reports 8 GB of dedicated video memory (Windows 11) and lets the VM's GPU resources hold that
+much. To match your host GPU (WinBoat does this by itself), set `GpuMemoryLimitMB` (DWORD, in MB, 512-65536) in the
+GPU's driver key, `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\00NN` (the key whose
+DriverDesc is the VirtIO GPU), and restart; `gpu-driver.ps1 -Action Install -GpuMemoryMB <MB>` does it too.
+
 ## Not covered (yet)
 
 Windows 8.0, 32-bit Windows, Windows on ARM, attestation signing (no test mode): see standalone-gpu-driver.md.

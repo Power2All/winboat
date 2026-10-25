@@ -1,0 +1,45 @@
+From: WinBoat
+Subject: [PATCH] venus: device memory allocations waited for
+
+Plain device memory (no export, no host-visible guest VRAM) was allocated asynchronously: the guest assumed success.
+The host GPU's memory is shared with the host's own programs, so the host's vkAllocateMemory does fail, and then no
+object existed: the first use of it (vkBindBufferMemory2, "vkr: failed to look up object ... of type 8") made the
+host's ring fatal and Venus abort() the program (vn_ring_submit abort on fatal: 0xC0000409). Topaz Video AI's 4K
+exports (Proteus, four DirectML instances) crashed so. Now every allocation waits for the host's result, and the
+program sees VK_ERROR_OUT_OF_DEVICE_MEMORY (Direct3D 12: E_OUTOFMEMORY). Allocations are few (vkd3d-proton
+suballocates heaps): the roundtrip costs nothing measurable.
+---
+diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
+index 5039267..9df8122 100644
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -29,22 +29,15 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
+                               struct vn_device_memory *mem,
+                               const VkMemoryAllocateInfo *alloc_info)
+ {
++   /* WinBoat: waited for, never asynchronous. The host GPU's memory is shared with the host's own programs, so its
++    * vkAllocateMemory does fail; an asynchronous allocation that failed left no object, and the first use of it
++    * (vkBindBufferMemory2: "failed to look up object") made the host's ring fatal and Venus abort() the program -
++    * Topaz Video AI's 4K exports crashed (0xC0000409) where the program should see VK_ERROR_OUT_OF_DEVICE_MEMORY
++    * (Direct3D 12: E_OUTOFMEMORY). Allocations are few (vkd3d-proton suballocates heaps), the roundtrip is cheap */
+    VkDevice dev_handle = vn_device_to_handle(dev);
+    VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
+-   if (VN_PERF(NO_ASYNC_MEM_ALLOC)) {
+-      return vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,
+-                                      alloc_info, NULL, &mem_handle);
+-   }
+-
+-   struct vn_ring_submit_command ring_submit;
+-   vn_submit_vkAllocateMemory(dev->primary_ring, 0, dev_handle, alloc_info,
+-                              NULL, &mem_handle, &ring_submit);
+-   if (!ring_submit.ring_seqno_valid)
+-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+-
+-   mem->bo_ring_seqno_valid = true;
+-   mem->bo_ring_seqno = ring_submit.ring_seqno;
+-   return VK_SUCCESS;
++   return vn_call_vkAllocateMemory(dev->primary_ring, dev_handle, alloc_info,
++                                   NULL, &mem_handle);
+ }
+ 
+ static inline void

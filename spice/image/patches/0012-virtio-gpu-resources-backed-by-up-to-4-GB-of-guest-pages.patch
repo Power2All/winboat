@@ -1,0 +1,40 @@
+From: WinBoat
+Subject: [PATCH] virtio-gpu: resources backed by up to 4 GB of guest pages
+
+A resource's guest memory is attached as one entry per 4 KB page (the guest's pages aren't contiguous), and both GPU
+devices refused more than 16384 entries: 64 MB. An 8488x2160 Windows desktop (two monitors side by side, WinBoat's
+seamless mode with --span) needs 73 MB per screen-sized surface: Windows' compositor couldn't create them
+("vg_create_mapping_iov_at: nr_entries is too big (17905 > 16384)"), its contexts failed on the missing resources and
+the screen stayed black. Now up to 1048576 entries (4 GB); the entry list that takes is 16 MB at most.
+---
+diff -ru a/contrib/vhost-user-gpu/vhost-user-gpu.c b/contrib/vhost-user-gpu/vhost-user-gpu.c
+--- a/contrib/vhost-user-gpu/vhost-user-gpu.c	2026-10-25 09:15:13.066929938 +0100
++++ b/contrib/vhost-user-gpu/vhost-user-gpu.c	2026-10-25 09:15:13.077091651 +0100
+@@ -520,8 +520,9 @@
+     size_t esize, s;
+     int i;
+ 
+-    if (nr_entries > 16384) {
+-        g_critical("%s: nr_entries is too big (%d > 16384)",
++    /* WinBoat: a 4 KB page per entry: 16384 were 64 MB, less than an 8488x2160 screen's 73 */
++    if (nr_entries > 1048576) {
++        g_critical("%s: nr_entries is too big (%d > 1048576)",
+                    __func__, nr_entries);
+         return -1;
+     }
+diff -ru a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+--- a/hw/display/virtio-gpu.c	2026-10-25 09:15:13.067532041 +0100
++++ b/hw/display/virtio-gpu.c	2026-10-25 09:15:13.077198260 +0100
+@@ -884,9 +884,10 @@
+     size_t esize, s;
+     int e, v;
+ 
+-    if (nr_entries > 16384) {
++    /* WinBoat: a 4 KB page per entry: 16384 were 64 MB, less than an 8488x2160 screen's 73 */
++    if (nr_entries > 1048576) {
+         qemu_log_mask(LOG_GUEST_ERROR,
+-                      "%s: nr_entries is too big (%d > 16384)\n",
++                      "%s: nr_entries is too big (%d > 1048576)\n",
+                       __func__, nr_entries);
+         return -1;
+     }

@@ -524,6 +524,24 @@ encoding in Windows). Whole desktop only, no RemoteApp windows.
   (`TFruityLoopsMainForm`, a VCL form drawing its own title bar) is `WS_POPUP` without the caption bits, which the
   tracker's popup rule (menus, tooltips) matched, but it has `WS_EX_APPWINDOW`, which asks Windows for a taskbar
   button. Windows with `WS_EX_APPWINDOW` are app windows now, whatever their style; tooltips and menus don't set it.
+- **App windows on every monitor** (WinBoat 0.9.2-gpu.96): Windows' desktop was the primary monitor, and the
+  viewer kept Windows' window on it, so a window dragged to another monitor came back. The Multi-Monitor setting
+  (MultiMon or Span) now starts the viewer with `--span`: Windows' desktop gets all monitors' bounding box (the
+  user's 5120x2160 + 3360x1890 under Xwayland: 8488x2160, width rounded up to 8) and windows go wherever the window
+  manager puts them. Windows has one monitor, so it maximizes to its work area (the primary monitor's); maximized on
+  another monitor here, the viewer moves the maximized window to where KWin maximized it (`move ... M`, which the
+  tracker applies to maximized windows only). The tracker puts the work area back after Windows' resolution changes
+  (which resets it). Full screen windows (games) cover all monitors then, like RDP's /span; None keeps the old
+  behaviour. Tested on the spike with xdotool: moved to the second monitor (Windows follows, no snap back),
+  maximized there from KWin and from Windows (IsZoomed, the monitor's area within Windows' 2 px border), restored,
+  moved back.
+  gpu.96 showed black (and flickering) app windows: QEMU's virtio-gpu devices refused resources backed by more than
+  16384 guest pages (64 MB; `vg_create_mapping_iov_at: nr_entries is too big (17905 > 16384)` in the container log),
+  and every screen-sized surface of the 8488x2160 desktop is 73 MB, so Windows' compositor lost its surfaces and its
+  contexts failed ("Illegal resource") until Windows restarted. The gpu.96 test had only compared positions; GDI
+  screenshots inside Windows are black with this driver anyway, so the check is a host screenshot. Image 6.05-30
+  (QEMU patch 0012) takes up to 1048576 entries (4 GB); WinBoat 0.9.2-gpu.97 uses it. Verified with host screenshots
+  on the spike (Notepad on the second monitor, maximized there) and in the user's VM.
 - **Windows' stacking follows KDE's** (WinBoat 0.9.2-gpu.22): every Linux window shows its part of Windows' one
   screen, so where two app windows overlap in Windows, both Linux windows showed whichever was on top there, e.g.
   after raising a window in KDE without clicking into it, or two apps on different virtual desktops at the same

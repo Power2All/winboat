@@ -70,6 +70,10 @@ if [ -f drivers/viogpu3d/viogpu3d.inf ]; then
     if [ -d drivers/gpucheck ]; then
         cp -r drivers/gpucheck "$DIST/oem/server/drivers/"
     fi
+    # Khronos' OpenCL loader for Windows 10 (gpu-driver.ps1 installs it where Windows has none)
+    if [ -d drivers/opencl ]; then
+        cp -r drivers/opencl "$DIST/oem/server/drivers/"
+    fi
 else
     echo "No virtual GPU driver package in guest_server/drivers/viogpu3d, building without it"
 fi

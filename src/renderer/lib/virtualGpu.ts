@@ -47,7 +47,7 @@ export enum DisplayRoute {
     SPICE = "spice",
 }
 
-export const SPICE_IMAGE = "winboat-windows-spice:6.05-29";
+export const SPICE_IMAGE = "winboat-windows-spice:6.05-30";
 // Every version of it (older WinBoats built older ones)
 const SPICE_IMAGE_NAME = SPICE_IMAGE.slice(0, SPICE_IMAGE.indexOf(":") + 1);
 const SPICE_HOST_DIR = path.join(WINBOAT_DIR, "spice");
@@ -368,7 +368,8 @@ export async function openSpiceViewer(
 
 /**
  * Shows the windows of an app started on the VM's desktop (its process id) as Linux windows of their own, like RDP's
- * RemoteApp: Windows' desktop gets the size of the primary monitor and the Guest Server's window tracker reports the
+ * RemoteApp: Windows' desktop gets the size of the primary monitor (span: of all monitors, so windows move to any of
+ * them) and the Guest Server's window tracker reports the
  * app's windows (and those of what it starts) to the viewer, which places a window where each of them is. The
  * viewer shows several apps, and quits when none runs anymore. Without the tracker (a VM set up by an older
  * WinBoat) it shows the whole desktop instead.
@@ -378,9 +379,10 @@ export async function showSeamlessApp(
     containerName: string,
     pid: number,
     background: SeamlessBackground,
+    span: boolean,
     onRefreshRate?: (rate: number) => void,
 ): Promise<void> {
-    // A running viewer keeps its background until it quits (it shows other apps' windows too)
+    // A running viewer keeps its background and monitors until it quits (it shows other apps' windows too)
     if (spiceViewer && spiceViewer.exitCode === null && spiceViewerTitle === SEAMLESS_VIEWER) {
         spiceViewer.stdin!.write(`track ${pid}\n`);
         return;
@@ -389,7 +391,7 @@ export async function showSeamlessApp(
         executable,
         containerName,
         SEAMLESS_VIEWER,
-        ["--seamless", "--background", background, "--track", `${pid}`],
+        ["--seamless", "--background", background, ...(span ? ["--span"] : []), "--track", `${pid}`],
         onRefreshRate,
     );
 }
@@ -469,6 +471,35 @@ export function detectHostGpu(): HostGpuInfo {
             modeset: readTrimmed("/sys/module/nvidia_drm/parameters/modeset") === "Y",
         },
     };
+}
+
+/**
+ * The video memory of the host GPU the VM renders on, in MB (0: unknown). The guest's driver reports it as the GPU's
+ * dedicated video memory and lets the VM's GPU resources hold that much (GpuMemoryLimitMB; 8 GB without it).
+ * amdgpu says it in sysfs, NVIDIA through nvidia-smi (the render node's PCI address picks the GPU)
+ */
+export function hostGpuMemoryMB(renderNode?: string): number {
+    const node = path.basename(renderNode ?? detectHostGpu().renderNodes[0]?.node ?? "");
+    if (!node) return 0;
+    const vram = readTrimmed(`/sys/class/drm/${node}/device/mem_info_vram_total`);
+    if (vram && /^\d+$/.test(vram)) return Math.floor(Number(vram) / 2 ** 20);
+    if (readTrimmed(`/sys/class/drm/${node}/device/vendor`) !== "0x10de") return 0;
+    try {
+        const pci = path.basename(fs.realpathSync(`/sys/class/drm/${node}/device`)).toLowerCase();
+        const out = childProcess.execFileSync(
+            "nvidia-smi",
+            ["--query-gpu=pci.bus_id,memory.total", "--format=csv,noheader,nounits"],
+            { encoding: "utf-8", timeout: 10_000 },
+        );
+        for (const line of out.trim().split("\n")) {
+            const [bus, mb] = line.split(",").map(field => field.trim());
+            // (nvidia-smi: 00000000:01:00.0, sysfs: 0000:01:00.0)
+            if (bus.toLowerCase().endsWith(pci)) return parseInt(mb) || 0;
+        }
+    } catch {
+        // no nvidia-smi: the driver's default
+    }
+    return 0;
 }
 
 /** Problems that keep the virtual GPU from working on this host, empty if none */
