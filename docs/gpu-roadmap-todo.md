@@ -1001,6 +1001,13 @@ compute, DirectML), video (DXVA2/D3D11/D3D12 video, Media Foundation), OpenCL. B
       ok; user VM GPU check 351/0. The setup 59083 on 8.1 476/4 as before. Found there: an update over a running
       viogpuap.exe failed ("being used by another process": Stop-Process doesn't wait) - gpu-driver.ps1 now kills the
       helper and waits for it before copying (setup over a running helper: exit 0)
+- [x] gpu.99 (2026-10-25, AppImage gpu.99): Home's GPU tile measured QEMU's process only, but WinBoat's image renders
+      in vhost-user-gpu (QEMU 28 MB, vhost-user-gpu ~750 MB): busy % and video memory now add up the container's
+      qemu-system and vhost-user-gpu processes (pmon and fdinfo); the dial to 0.1%. Checked through the app's DevTools
+      protocol: 4.6% idle, 5.2% during the GPU check (385/0)
+- [x] gpu.98 (2026-10-25, AppImage gpu.98; image 6.05-30 and driver 58893 unchanged): Home's GPU dial shows the share
+      of the VM's video memory in use (QEMU's, out of the host GPU's: the driver's GpuMemoryLimitMB, 8 GB if unknown),
+      the text "used / total GB"; the GPU's busy % is in the tooltip
 - [x] gpu.97 (2026-10-25, AppImage gpu.97, image 6.05-30: QEMU 0012; driver 58893 unchanged): gpu.96's spanned desktop
       was black - QEMU refused resources backed by more than 16384 pages (64 MB), the 8488x2160 screen's are 73 MB.
       Raised to 4 GB; host screenshots on the spike and in the user's VM show the windows

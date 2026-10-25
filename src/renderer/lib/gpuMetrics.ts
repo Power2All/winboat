@@ -2,21 +2,23 @@ const fs: typeof import("fs") = require("node:fs");
 const path: typeof import("path") = require("node:path");
 const childProcess: typeof import("child_process") = require("node:child_process");
 const { promisify }: typeof import("util") = require("node:util");
-import { detectHostGpu } from "./virtualGpu";
+import { detectHostGpu, hostGpuMemoryMB } from "./virtualGpu";
 
 const execFileAsync = promisify(childProcess.execFile);
 
 /**
  * The VM's use of the host GPU. Windows can't tell (the virtual GPU driver doesn't report its engines' busy time, its
- * counters stay at 0), and the work is done on the host anyway: virglrenderer runs it in QEMU's process. NVIDIA's
- * driver reports per process (nvidia-smi pmon); other drivers report per DRM client in /proc/<pid>/fdinfo, which only
- * root can read for QEMU's process: it's read inside the container.
+ * counters stay at 0), and the work is done on the host anyway: virglrenderer runs it in QEMU's process, or in
+ * vhost-user-gpu's when the GPU has a process of its own (WinBoat's image). NVIDIA's driver reports per process
+ * (nvidia-smi pmon); other drivers report per DRM client in /proc/<pid>/fdinfo, which only root can read for the
+ * container's processes: it's read inside the container.
  */
 export type GpuMetrics = {
     state: "off" | "measuring" | "ok" | "unavailable";
     usage: number; // % of the GPU's time the VM uses
     name: string; // the host GPU
     memoryUsed: number | null; // MB of video memory the VM uses
+    memoryTotal: number | null; // MB of video memory the VM has: the host GPU's (the driver's GpuMemoryLimitMB)
     hostUsage: number | null; // % of the time the GPU is busy, the host's own apps included
     commandsPerSecond: number | null; // commands Windows' driver puts on the virtual GPU's queue (QEMU counts them)
 };
@@ -77,22 +79,24 @@ for i in range(${SAMPLES_PER_RUN}):
 `;
 
 /**
- * QEMU's process of the container (on the host), found by the container's id in its cgroup. Its command line tells
- * it's QEMU: its name is the VM's (dockur: -name windows,process=windows).
+ * The container's processes (on the host) that use the GPU, found by the container's id in their cgroup: QEMU, and
+ * vhost-user-gpu when the GPU runs in a process of its own (it does the rendering then). Their command lines tell
+ * them: QEMU's name is the VM's (dockur: -name windows,process=windows).
  */
-async function qemuPid(executable: string, containerName: string): Promise<number | null> {
+async function gpuPids(executable: string, containerName: string): Promise<number[]> {
     const { stdout } = await execFileAsync(executable, ["inspect", "-f", "{{.Id}}", containerName]);
     const id = stdout.trim();
-    if (!id) return null;
+    if (!id) return [];
+    const pids: number[] = [];
     for (const name of fs.readdirSync("/proc")) {
         if (!/^\d+$/.test(name)) continue;
         try {
-            const program = fs.readFileSync(`/proc/${name}/cmdline`, "utf-8").split("\0")[0];
-            if (!path.basename(program).startsWith("qemu-system")) continue;
-            if (fs.readFileSync(`/proc/${name}/cgroup`, "utf-8").includes(id)) return parseInt(name);
+            const program = path.basename(fs.readFileSync(`/proc/${name}/cmdline`, "utf-8").split("\0")[0]);
+            if (!program.startsWith("qemu-system") && program !== "vhost-user-gpu") continue;
+            if (fs.readFileSync(`/proc/${name}/cgroup`, "utf-8").includes(id)) pids.push(parseInt(name));
         } catch {}
     }
-    return null;
+    return pids;
 }
 
 /** Calls onLine with every line a helper prints until it ends, then starts it again (until stopped) */
@@ -147,11 +151,12 @@ export class GpuMonitor {
         usage: 0,
         name: "",
         memoryUsed: null,
+        memoryTotal: null,
         hostUsage: null,
         commandsPerSecond: null,
     };
     #helpers: { stop: () => void }[] = [];
-    #pid: number | null = null;
+    #pids: number[] = [];
     #pidCheck: NodeJS.Timeout | null = null;
     #stopped = false;
 
@@ -167,11 +172,15 @@ export class GpuMonitor {
         void this.#findPid();
         // QEMU restarts with the container
         this.#pidCheck = setInterval(() => {
-            if (!this.#pid || !fs.existsSync(`/proc/${this.#pid}`)) void this.#findPid();
+            if (!this.#pids.length || !this.#pids.every(pid => fs.existsSync(`/proc/${pid}`))) void this.#findPid();
         }, 10_000);
         this.#watchQueue();
         if (node?.vendorId === "0x10de") this.#watchNvidia();
-        else if (node) this.#watchFdinfo(node.node);
+        else if (node) {
+            // (the driver's default without it: 8 GB)
+            this.#metrics.memoryTotal = hostGpuMemoryMB(node.node) || 8192;
+            this.#watchFdinfo(node.node);
+        }
         else this.#update({ state: "unavailable" });
     }
 
@@ -183,9 +192,9 @@ export class GpuMonitor {
 
     async #findPid() {
         try {
-            this.#pid = await qemuPid(this.executable, this.containerName);
+            this.#pids = await gpuPids(this.executable, this.containerName);
         } catch {
-            this.#pid = null;
+            this.#pids = [];
         }
     }
 
@@ -223,6 +232,8 @@ export class GpuMonitor {
         let header: string[] = [];
         let dmonHeader: string[] = [];
         let gpuIndex = "0";
+        // The latest sample of each of the VM's processes (its rows come one by one)
+        const samples = new Map<number, { sm: number; fb: number }>();
         const failed = () => this.#update({ state: "unavailable" });
         this.#helpers.push(
             keepRunning(
@@ -237,10 +248,19 @@ export class GpuMonitor {
                     if (line.startsWith("#") || !header.length) return;
                     const fields = line.trim().split(/\s+/);
                     const value = (column: string) => fields[header.indexOf(column)];
-                    if (!this.#pid || value("pid") !== `${this.#pid}`) return;
+                    const pid = parseInt(value("pid"));
+                    if (!this.#pids.includes(pid)) return;
                     gpuIndex = value("gpu") ?? "0";
                     const number = (text: string | undefined) => (text && /^\d+$/.test(text) ? parseInt(text) : 0);
-                    this.#update({ state: "ok", usage: number(value("sm")), memoryUsed: number(value("fb")) });
+                    samples.set(pid, { sm: number(value("sm")), fb: number(value("fb")) });
+                    let usage = 0;
+                    let memoryUsed = 0;
+                    for (const [known, sample] of samples) {
+                        if (!this.#pids.includes(known)) continue;
+                        usage += sample.sm;
+                        memoryUsed += sample.fb;
+                    }
+                    this.#update({ state: "ok", usage: Math.min(100, usage), memoryUsed });
                 },
                 failed,
             ),
@@ -262,11 +282,11 @@ export class GpuMonitor {
                 failed,
             ),
         );
-        execFileAsync("nvidia-smi", ["--query-gpu=index,name", "--format=csv,noheader"])
+        execFileAsync("nvidia-smi", ["--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"])
             .then(({ stdout }) => {
                 for (const line of stdout.split("\n")) {
-                    const [index, name] = line.split(",").map(field => field.trim());
-                    if (index === gpuIndex && name) this.#update({ name });
+                    const [index, name, total] = line.split(",").map(field => field.trim());
+                    if (index === gpuIndex && name) this.#update({ name, memoryTotal: parseInt(total) || null });
                 }
             })
             .catch(() => {});
@@ -281,7 +301,7 @@ export class GpuMonitor {
         const script =
             `i=0; while [ $i -lt ${SAMPLES_PER_RUN} ]; do ` +
             `for p in /proc/[0-9]*; do case "$(head -c 64 $p/cmdline 2>/dev/null | tr '\\0' ' ')" in ` +
-            `qemu-system*|*/qemu-system*) grep -h -e '^drm-' -e '^pos:' $p/fdinfo/* 2>/dev/null;; esac; done; ` +
+            `qemu-system*|*/qemu-system*|*vhost-user-gpu*) grep -h -e '^drm-' -e '^pos:' $p/fdinfo/* 2>/dev/null;; esac; done; ` +
             `echo @@; i=$((i+1)); sleep ${SAMPLE_S}; done`;
         type Sample = { at: number; engines: Map<string, number>; cycles: Map<string, [number, number]> };
         let previous: Sample | null = null;

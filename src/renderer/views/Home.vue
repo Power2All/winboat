@@ -203,7 +203,7 @@
                     class="translate-y-2"
                     type="radialBar"
                     :options="chartOptions"
-                    :series="[winboat.gpuMetrics.value.usage]"
+                    :series="[gpuMemoryPercentage]"
                     :width="120"
                     :height="120"
                 />
@@ -234,7 +234,11 @@
                             class="!my-0 text-gray-400 h-6 overflow-hidden truncate"
                             :title="hostUsageTitle"
                         >
-                            {{ (winboat.gpuMetrics.value.memoryUsed / 1024).toFixed(2) }} GB Video Memory
+                            {{ (winboat.gpuMetrics.value.memoryUsed / 1024).toFixed(2) }}
+                            <template v-if="winboat.gpuMetrics.value.memoryTotal">
+                                / {{ (winboat.gpuMetrics.value.memoryTotal / 1024).toFixed(0) }}
+                            </template>
+                            GB Video Memory
                         </p>
                         <p v-else class="!my-0 text-gray-400 h-6 overflow-hidden truncate">{{ hostUsageTitle }}</p>
                         <p
@@ -283,11 +287,18 @@ const gpuTrafficText = computed(() => {
     if (framesPerSecond !== null) parts.push(`${framesPerSecond} fps`);
     return parts.join(" · ");
 });
-const hostUsageTitle = computed(() =>
-    winboat.gpuMetrics.value.hostUsage === null
-        ? "The VM's share of the host GPU"
-        : `Host GPU ${winboat.gpuMetrics.value.hostUsage}% busy in all`,
+const hostUsageTitle = computed(
+    () =>
+        `The VM keeps the GPU ${winboat.gpuMetrics.value.usage}% busy` +
+        (winboat.gpuMetrics.value.hostUsage === null
+            ? ""
+            : `, the host GPU is ${winboat.gpuMetrics.value.hostUsage}% busy in all`),
 );
+// The dial: the share of the VM's video memory in use
+const gpuMemoryPercentage = computed(() => {
+    const { memoryUsed, memoryTotal } = winboat.gpuMetrics.value;
+    return memoryUsed !== null && memoryTotal ? Math.min(100, Math.round((memoryUsed / memoryTotal) * 1000) / 10) : 0;
+});
 const wallpaper = ref("");
 
 onMounted(async () => {

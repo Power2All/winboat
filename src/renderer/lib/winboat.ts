@@ -249,6 +249,7 @@ export class Winboat {
         usage: 0,
         name: "",
         memoryUsed: null,
+        memoryTotal: null,
         hostUsage: null,
         commandsPerSecond: null,
     });
