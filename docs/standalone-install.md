@@ -12,7 +12,7 @@ The VM needs a virtio-gpu device with 3D and a display that does OpenGL:
 
 | Setup | Settings |
 |---|---|
-| QEMU command line | `-device virtio-vga-gl -display gtk,gl=on` (or `sdl,gl=on`; SPICE: `-spice gl=on,...`; headless: `-display egl-headless` with VNC) |
+| QEMU command line | `-device virtio-vga-gl -display gtk,gl=on` (or `sdl,gl=on`; SPICE: `-spice gl=on,...`; headless: `-display egl-headless` with VNC; which is fastest: "Which display: measured" below) |
 | virt-manager / libvirt | Video: model Virtio, "3D acceleration" on; Display: SPICE, "OpenGL" on, listen type None (if the console stays black, e.g. NVIDIA on Wayland: SPICE without OpenGL plus an `<graphics type='egl-headless'>` device, below) |
 | Proxmox | Hardware > Display: "VirGL GPU" (needs `libgl1` and `libegl1` on the host) |
 | GNOME Boxes | 3D acceleration on in the VM's preferences |
@@ -50,6 +50,33 @@ frames; the guest's 3D (virgl, Venus) is the same:
     <graphics type='spice'><listen type='none'/></graphics>
     <graphics type='egl-headless'><gl rendernode='/dev/dri/renderD128'/></graphics>
 
+### Which display: measured
+
+The display decides how fast what Windows renders reaches the screen. Measured 2026-10-25 with the host's stock QEMU
+11.1.2 and virglrenderer 1.3.0 (Arch), an RTX 3080 Laptop GPU on KDE Wayland, Windows 10 with driver 58893 in a
+1920x1080 game-like window (`lagtest.exe` from `tools/gpu-bench`: Direct3D 11, full screen, flip model, vsync; it shows
+its frame number as stripes and flips its color on a key press). `lagmeter` (`tools/gpu-spike/deploy/tools`) reads the
+client window's pixels through X11: the frames that arrive, and the time from a key press (XTest) to the color change.
+Windows rendered 59 frames per second in every case.
+
+| Display | Picture | Frames shown per second | Key to pixels (median, p90) |
+|---|---|---|---|
+| SPICE with OpenGL (`-spice gl=on`; virt-manager's default for 3D) | black: spice-gtk 0.43 can't import QEMU's buffer ("failed to create EGL image from DMA-BUF"), 0.42 can't start EGL under X11 | - | - |
+| QEMU's GTK window (`-display gtk,gl=on`) | under Wayland; under X11 QEMU aborts ("eglCreateWindowSurface failed") | not measured (a Wayland window) | not measured |
+| QEMU's SDL window (`-display sdl,gl=on`, X11) | yes | 59.4, none lost, 16.8 ms apart (p99 18.0) | 75 ms, 97 ms; 13 of 40 presses never reached Windows |
+| egl-headless + SPICE without OpenGL (the black-console workaround above), spicy 0.42 | yes, with parts of different frames (SPICE sends changed areas one by one) | 33, 26 lost, up to 51 ms apart | 97 ms, 114 ms |
+| WinBoat's SPICE route, for comparison (its image and viewer, Windows 11, same host) | yes | 59.0, none lost, 17.0 ms apart (p99 18.4) | 46 ms, 55 ms |
+
+- **egl-headless** copies every frame from the GPU into memory and SPICE compresses and sends the parts that changed:
+  over half the frames are lost, and it's the slowest to answer a key. Fine for desktop work, not for games.
+- **SDL** shows every frame, but answers keys 30 ms later than WinBoat's route (QEMU reads SDL's input on its 30 ms
+  display timer) and lost a third of the synthetic key presses. On NVIDIA it's the best of the stock options measured.
+- **SPICE with OpenGL** is the one that passes the frame without a copy, as WinBoat's route does, but on NVIDIA neither
+  client shows it with stock QEMU. Where it does show (AMD and Intel hosts, not measured here), stock QEMU holds
+  Windows' GPU after every frame until the viewer has drawn it: WinBoat measured Windows composing at 20 frames per
+  second that way, before its QEMU patch `spice/image/patches/0001`.
+- Every row is measured up to the client window's pixels; the desktop's compositor adds the same frame or so to each.
+
 What stock QEMU and virglrenderer lack and WinBoat's image has (`spice/image`: QEMU and virglrenderer with patches, the
 GPU in its own process). Measured on QEMU 11.1.2 and virglrenderer 1.3.0 as Arch ships them, NVIDIA host, the flags
 above with Venus, Windows 11 (2026-10-21): the GPU check passes 624 tests and fails 4, and these are missing:
@@ -65,6 +92,10 @@ above with Venus, Windows 11 (2026-10-21): the GPU check passes 624 tests and fa
 - through Venus: Direct3D 12 ExecuteIndirect with state changes (root constants, vertex/index buffers) draws and
   dispatches with wrong arguments (VK_EXT_device_generated_commands, 0013: the 4 failed tests, 64- and 32-bit),
   ExecuteIndirect tier 1.1, shader model 6.8's SampleCmpGrad (VK_KHR_maintenance8, 0011), Vulkan Video
+- draw-call speed on NVIDIA hosts: stock virglrenderer binds the shader program again for every draw, ~1 us each in
+  NVIDIA's driver (0018: 2.3-5x the draws per second)
+- a display that passes every frame without a copy and answers keys quickly (above: QEMU 0001 and spice-gtk 0.43 with
+  the buffer's format modifier)
 - Direct3D 12 swap chains copy each frame (zero-copy needs 0012/0017; ~2 ms a present at 1440p instead of 0.1)
 - smooth sound under heavy drawing (stock QEMU runs virglrenderer on its main loop: prefer 60 Hz and moderate
   resolutions)

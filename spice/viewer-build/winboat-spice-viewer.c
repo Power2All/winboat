@@ -21,6 +21,8 @@
  * any monitor, maximized ones fill the work area of the monitor they're on, and full screen windows (games) cover all
  * monitors, like RDP's /span. Windows' own work area stays the primary monitor's (where apps open and center).
  * In both modes it prints "fps <n>" every two seconds: the frames Windows' screen got (WinBoat's metrics).
+ * Windows' picture shows 1:1; when it keeps another size than the window (a game switched Windows to another
+ * resolution: in the desktop window, or a full screen window in seamless mode), it is scaled to fit, its aspect kept.
  *
  * Windows' desktop shows around and through the app's windows (rounded corners, see-through windows):
  * --background black gives it one color while the viewer is connected (the tracker puts the wallpaper back), and
@@ -92,6 +94,7 @@
 #define PARK_POINTER_MS 150
 
 static GtkWidget *window;
+static SpiceDisplay *desktop_display; /* its display */
 static gchar *window_title;
 static SpiceSession *session;
 static SpiceMainChannel *main_channel;
@@ -114,6 +117,87 @@ static void report_refresh_rate(GdkMonitor *monitor)
         printf("refresh-rate %d\n", rate);
         fflush(stdout);
     }
+}
+
+/* ------------------------------------------------------------------------------------------------------------------
+ * Pictures scaled to fit
+ */
+
+/* A display shows Windows' picture 1:1. When the picture keeps another size than the window (a game switched Windows
+ * to another resolution), it is scaled to fit instead, its aspect kept, as a monitor shows it. A resize Windows
+ * follows (the desktop window resized, a window going full screen) doesn't count: the sizes have to differ for
+ * FIT_DELAY_MS; and a few pixels never do (Windows rounds a width to 8) */
+#define FIT_DELAY_MS 1000
+#define FIT_SLACK 8
+
+typedef struct {
+    int width, height; /* the picture's size (guest pixels); 0: a display that isn't scaled */
+    guint timer;
+} Fit;
+
+static gboolean fit_differs(SpiceDisplay *display, const Fit *fit)
+{
+    GtkWidget *widget = GTK_WIDGET(display);
+    int scale = gtk_widget_get_scale_factor(widget);
+    int width = gtk_widget_get_allocated_width(widget) * scale, height = gtk_widget_get_allocated_height(widget) * scale;
+    return fit->width > 0 && width > 1 &&
+           (ABS(fit->width - width) > FIT_SLACK || ABS(fit->height - height) > FIT_SLACK);
+}
+
+static gboolean fit_timeout(gpointer data)
+{
+    Fit *fit = g_object_get_data(G_OBJECT(data), "fit");
+    fit->timer = 0;
+    if (fit_differs(data, fit)) {
+        g_object_set(data, "scaling", TRUE, NULL);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void fit_check(SpiceDisplay *display)
+{
+    Fit *fit = g_object_get_data(G_OBJECT(display), "fit");
+    gboolean scaling = FALSE;
+    g_object_get(display, "scaling", &scaling, NULL);
+    if (!fit_differs(display, fit)) {
+        if (fit->timer) {
+            g_source_remove(fit->timer);
+            fit->timer = 0;
+        }
+        if (scaling) {
+            g_object_set(display, "scaling", FALSE, NULL);
+        }
+    } else if (!scaling && !fit->timer) {
+        fit->timer = g_timeout_add(FIT_DELAY_MS, fit_timeout, display);
+    }
+}
+
+static void fit_allocated(GtkWidget *widget, GdkRectangle *allocation, gpointer data)
+{
+    fit_check(SPICE_DISPLAY(widget));
+}
+
+static void fit_free(gpointer data)
+{
+    Fit *fit = data;
+    if (fit->timer) {
+        g_source_remove(fit->timer);
+    }
+    g_free(fit);
+}
+
+/* The picture a display shows has this size now (0: never scaled) */
+static void fit_display(SpiceDisplay *display, int width, int height)
+{
+    Fit *fit = g_object_get_data(G_OBJECT(display), "fit");
+    if (!fit) {
+        fit = g_new0(Fit, 1);
+        g_object_set_data_full(G_OBJECT(display), "fit", fit, fit_free);
+        g_signal_connect(display, "size-allocate", G_CALLBACK(fit_allocated), NULL);
+    }
+    fit->width = width;
+    fit->height = height;
+    fit_check(display);
 }
 
 /* ------------------------------------------------------------------------------------------------------------------
@@ -153,8 +237,9 @@ static void show_desktop_window(void)
 
     SpiceDisplay *display = spice_display_new(session, 0);
     /* Like a native window: the guest's resolution follows the window's size, and the picture is never stretched
-     * (while Windows catches up with a resize it shows 1:1) */
+     * (while Windows catches up with a resize it shows 1:1; scaled to fit only when it keeps another size) */
     g_object_set(display, "resize-guest", TRUE, "scaling", FALSE, "grab-keyboard", TRUE, NULL);
+    desktop_display = display;
     gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(display));
     gtk_widget_show_all(window);
     gtk_widget_grab_focus(GTK_WIDGET(display));
@@ -502,6 +587,8 @@ static void place_window(GuestWindow *guest, gboolean force)
     /* The part of the display it shows: where Windows has it now, also while the Linux window is elsewhere */
     spice_display_set_window_area(guest->display, guest->rect.x, guest->rect.y, guest->rect.width,
                                   guest->rect.height);
+    /* A full screen window is all of Windows' screen: a game's resolution fills the monitor */
+    fit_display(guest->display, guest->fullscreen ? guest->rect.width : 0, guest->fullscreen ? guest->rect.height : 0);
     if (guest->fullscreen) {
         return; /* the window manager has it on the whole monitor, which is all of Windows' screen */
     }
@@ -1158,6 +1245,10 @@ static void display_gl_draw(SpiceDisplayChannel *channel, guint x, guint y, guin
                             gpointer data)
 {
     frames++;
+    const SpiceGlScanout2 *scanout = desktop_display ? spice_display_channel_get_gl_scanout2(channel) : NULL;
+    if (scanout) {
+        fit_display(desktop_display, scanout->width, scanout->height);
+    }
     if (!window && g_hash_table_size(guest_windows) == 0) {
         spice_display_channel_gl_draw_done(channel);
     }

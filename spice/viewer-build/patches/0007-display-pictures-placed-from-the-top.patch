@@ -1,0 +1,25 @@
+display: pictures placed from the top, as the input has them
+
+spice_display_get_scaling gives the picture's place from the widget's top, and the input uses it that way, but the
+EGL drawing used it as OpenGL's y (from the bottom). Centered pictures came out the same, the others didn't: a guest
+display larger than an unscaled widget showed its bottom left while the pointer went to its top left (a game that
+switched Windows to a larger resolution than the window showed a black part of its screen), and window areas needed
+a case of their own (0002). The y is converted instead.
+
+--- a/src/spice-widget-egl.c
++++ b/src/spice-widget-egl.c
+@@ -670,10 +670,10 @@
+     spice_egl_prepare_default_framebuffer();
+ 
+     spice_display_get_scaling(display, &s, &x, &y, &w, &h);
+-    /* A window area stays at the top left (OpenGL counts from the bottom) */
+-    if (d->window_area_set)
+-        y = gtk_widget_get_allocated_height(GTK_WIDGET(display)) *
+-            gtk_widget_get_scale_factor(GTK_WIDGET(display)) - h;
++    /* OpenGL counts from the bottom: the picture goes where spice_display_get_scaling has it from the top, as the
++     * input does (a window area at the top left, a picture larger than the widget from its top left) */
++    y = gtk_widget_get_allocated_height(GTK_WIDGET(display)) *
++        gtk_widget_get_scale_factor(GTK_WIDGET(display)) - y - h;
+ 
+     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+     glClear(GL_COLOR_BUFFER_BIT);

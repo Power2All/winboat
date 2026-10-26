@@ -333,7 +333,10 @@ encoding in Windows). Whole desktop only, no RemoteApp windows.
 - **Large windows crashed QEMU**, a driver bug (kvm patch 0006): the 2D frame buffer segment is sized at start (16 MB
   or the BAR), so a maximized window on a 5120x2160 display (5106x2051, 42 MB) failed `VioGpuObj::Init`, whose error
   message dereferenced a NULL segment; the 2D resource was left without backing and QEMU segfaulted on it. The
-  segment now grows with the mode. The viewer no longer scales: Windows' resolution follows the window.
+  segment now grows with the mode. The viewer no longer scales: Windows' resolution follows the window. When Windows
+  keeps another resolution than the window (a game switched it) for a second, the picture is scaled to fit, its
+  aspect kept, as a monitor shows it (WinBoat 0.9.2-gpu.100; before, a larger picture showed its bottom left and
+  looked black: spice-gtk patch 0007).
 - QEMU's `info virtio-status` crashes QEMU 11.1 (`hmp_virtio_dump_features`) on this device: don't use it.
 - **Windows composed at 20 fps over SPICE** (user's VM, measured with QEMU trace events and a 60 fps test window):
   without a viewer DWM submitted a frame every 17 ms, with one every 50 ms (every third vblank), although the app

@@ -17,7 +17,8 @@ FIRMWARE="-drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_
 # PLAIN_SOFT=1: the host GPU hidden from QEMU (bubblewrap), so virglrenderer renders with Mesa's llvmpipe - a host GPU
 # without NVIDIA's extensions (and no Venus: no Vulkan driver for it); PLAIN_GL=3.3 makes it an older GPU (GL 3.3,
 # extensions up to 2010)
-GLDISPLAY="-display egl-headless,rendernode=/dev/dri/renderD128 -vnc 127.0.0.1:5" WRAP=()
+# PLAIN_DISPLAY replaces the display options (measuring display paths, docs/standalone-install.md)
+GLDISPLAY="${PLAIN_DISPLAY:--display egl-headless,rendernode=/dev/dri/renderD128 -vnc 127.0.0.1:5}" WRAP=()
 if [ "${PLAIN_SOFT:-}" = 1 ]; then
    # (no VNC: QEMU takes none with SDL's GL context)
    GLDISPLAY="-display sdl,gl=on"

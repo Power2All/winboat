@@ -1001,6 +1001,28 @@ compute, DirectML), video (DXVA2/D3D11/D3D12 video, Media Foundation), OpenCL. B
       ok; user VM GPU check 351/0. The setup 59083 on 8.1 476/4 as before. Found there: an update over a running
       viogpuap.exe failed ("being used by another process": Stop-Process doesn't wait) - gpu-driver.ps1 now kills the
       helper and waits for it before copying (setup over a running helper: exit 0)
+- [x] Display paths on stock QEMU measured (2026-10-25; docs/standalone-install.md, "Which display: measured"): a
+      standalone user (RTX 3070 Ti, own QEMU) saw little speed-up. New tools: tools/gpu-bench/lagtest.cpp (full-screen
+      D3D11 window: frame number as stripes, color flip per key) and deploy/tools/lagmeter.c + lag.sh (X11: frames that
+      reach the client window, XTest key to pixels); plain-qemu.sh takes PLAIN_DISPLAY. Windows 10 test VM, Arch QEMU
+      11.1.2 / virglrenderer 1.3.0, 1920x1080, 59 presents/s everywhere: SPICE gl=on black on NVIDIA (0.43: EGL import
+      of QEMU's dmabuf fails; 0.42: no EGL under X11); GTK gl=on aborts under X11 (eglCreateWindowSurface), shows under
+      Wayland (not measurable with X11 tools); SDL gl=on 59.4 fps shown, none lost, key 75 ms (13/40 presses lost);
+      egl-headless + SPICE 33 fps shown (26 lost, mixed frames), key 97 ms. WinBoat's route (spike, same tools):
+      59.0 fps, none lost, key 46 ms
+- [x] gpu.100 (2026-10-26, AppImage gpu.100; image 6.05-30 and driver 58893 unchanged): the viewer showed black while
+      Windows ran another resolution than its window (lagtest switching to 1920x1080 in a 1280x800 window). Not black:
+      spice-gtk drew an unscaled picture larger than the widget from its bottom left (it used the top-based y of
+      spice_display_get_scaling as OpenGL's), while the pointer went to its top left; the bottom of a game's screen is
+      often dark. spice-gtk 0007 converts the y (window areas lose their special case), and the viewer scales the
+      picture to fit, aspect kept, when it keeps another size than the window for a second (fit_display: the desktop
+      window by the GL scanout's size, full screen windows in seamless mode by Windows' screen; 8 px slack for Windows'
+      width rounding), so window resizes Windows follows stay 1:1. Spike: desktop 1280x800 window shows the whole
+      1920x1080 picture (59.2 fps, key 50 ms), sharp 1:1 again after; seamless full screen 1920x1080 on the 5120x2160
+      monitor fills its height (3840x2160 centered)
+- [ ] After Windows switches resolution in a seamless full screen window, key to pixels is ~148 ms in some runs
+      instead of ~50 (2026-10-26, spike: 3 of 6 runs, with the old viewer too; 3 runs at the monitor's resolution all
+      ~49 ms): a fixed ~100 ms more, cause not known yet
 - [x] gpu.99 (2026-10-25, AppImage gpu.99): Home's GPU tile measured QEMU's process only, but WinBoat's image renders
       in vhost-user-gpu (QEMU 28 MB, vhost-user-gpu ~750 MB): busy % and video memory now add up the container's
       qemu-system and vhost-user-gpu processes (pmon and fdinfo); the dial to 0.1%. Checked through the app's DevTools
