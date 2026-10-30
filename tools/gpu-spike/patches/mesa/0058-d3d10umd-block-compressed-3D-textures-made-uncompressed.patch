@@ -1,0 +1,153 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: block-compressed 3D textures made uncompressed
+
+Direct3D 10 has BC1-BC5 3D textures, GL doesn't (S3TC and RGTC are 2D formats; NVIDIA's VTC 3D layout isn't
+D3D's), so virgl refuses them and creating one failed with E_OUTOFMEMORY: 3DMark Vantage's fog volumes
+(Pictures/fog/color1/col.dds, BC1) stopped Jane Nash's loading. Such a texture is now made in an uncompressed
+format (BC1-BC3: RGBA8, BC4: R8, BC5: RG8, sRGB kept), its initial data and UpdateSubresourceUP writes are
+decompressed with util_format_translate, and its shader resource views use the uncompressed format. Maps of one
+still hand out the uncompressed data.
+---
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -224,6 +224,8 @@
+    void *sysmem;                     /* decoder buffers: the memory programs fill and the decoder reads */
+    UINT sysmem_size;
+    struct TiledInfo *tiled;          /* tiled resources and tile pools (Tiled.cpp) */
++   enum pipe_format compressed;      /* a block-compressed 3D texture the host can't make (GL has no S3TC/RGTC 3D
++                                      * textures): made uncompressed, this is its format (DecompressedFormat) */
+ };
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Resource.h b/src/gallium/frontends/d3d10umd/Resource.h
+--- a/src/gallium/frontends/d3d10umd/Resource.h
++++ b/src/gallium/frontends/d3d10umd/Resource.h
+@@ -57,6 +57,8 @@
+ 
+ void APIENTRY DestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource);
+ 
++enum pipe_format DecompressedFormat(enum pipe_format format);
++
+ void APIENTRY ResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
+                  UINT SubResource, D3D10_DDI_MAP DDIMap, UINT Flags,
+                  __out D3D10DDI_MAPPED_SUBRESOURCE *pMappedSubResource);
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -48,6 +48,38 @@
+ #include "util/u_surface.h"
+ 
+ 
++
++/* The uncompressed format a block-compressed one is made in where the host has no such textures (BC1-BC5 3D
++ * textures); the format itself otherwise */
++enum pipe_format
++DecompressedFormat(enum pipe_format format)
++{
++   const struct util_format_description *desc = util_format_description(format);
++   if (desc->layout == UTIL_FORMAT_LAYOUT_S3TC)
++      return util_format_is_srgb(format) ? PIPE_FORMAT_R8G8B8A8_SRGB : PIPE_FORMAT_R8G8B8A8_UNORM;
++   switch (format) {
++   case PIPE_FORMAT_RGTC1_UNORM: return PIPE_FORMAT_R8_UNORM;
++   case PIPE_FORMAT_RGTC1_SNORM: return PIPE_FORMAT_R8_SNORM;
++   case PIPE_FORMAT_RGTC2_UNORM: return PIPE_FORMAT_R8G8_UNORM;
++   case PIPE_FORMAT_RGTC2_SNORM: return PIPE_FORMAT_R8G8_SNORM;
++   default: return format;
++   }
++}
++
++
++/* Data written into a mapped slice of a resource: decompressed for a block-compressed one made uncompressed.
++ * ponytail: ResourceMap of such a texture hands out the uncompressed data; compress on unmap if a game maps one */
++static void
++CopyRectIn(const Resource *pResource, uint8_t *dst, unsigned dst_stride, unsigned width, unsigned height,
++           const uint8_t *src, unsigned src_stride)
++{
++   if (pResource->compressed != PIPE_FORMAT_NONE)
++      util_format_translate(pResource->resource->format, dst, dst_stride, 0, 0,
++                            pResource->compressed, src, src_stride, 0, 0, width, height);
++   else
++      util_copy_rect(dst, pResource->resource->format, dst_stride, 0, 0, width, height, src, src_stride, 0, 0);
++}
++
+ /*
+  * ----------------------------------------------------------------------
+  *
+@@ -336,6 +368,16 @@
+       goto unlock;
+    }
+ 
++   /* Direct3D has BC1-BC5 3D textures (3DMark Vantage's fog volumes), GL hasn't: made uncompressed, the data
++    * decompressed as it's written (CopyRectIn) */
++   pResource->compressed = PIPE_FORMAT_NONE;
++   if (templat.target == PIPE_TEXTURE_3D && DecompressedFormat(templat.format) != templat.format &&
++       !screen->is_format_supported(screen, templat.format, templat.target, templat.nr_samples,
++                                    templat.nr_storage_samples, templat.bind)) {
++      pResource->compressed = templat.format;
++      templat.format = DecompressedFormat(templat.format);
++   }
++
+    if (templat.target != PIPE_BUFFER) {
+       /* (as an image: whether a UAV format works as one shows when it's bound) */
+       if (!screen->is_format_supported(screen,
+@@ -412,13 +454,8 @@
+                for (int z = 0; z < box.depth; ++z) {
+                   uint8_t *dst = (uint8_t*)map + z*transfer->layer_stride;
+                   const uint8_t *src = (const uint8_t*)pInitialDataUP->pSysMem + z*pInitialDataUP->SysMemSlicePitch;
+-                  util_copy_rect(dst,
+-                                 templat.format,
+-                                 transfer->stride,
+-                                 0, 0, box.width, box.height,
+-                                 src,
+-                                 pInitialDataUP->SysMemPitch,
+-                                 0, 0);
++                  CopyRectIn(pResource, dst, transfer->stride, box.width, box.height, src,
++                             pInitialDataUP->SysMemPitch);
+                }
+                pipe_texture_unmap(pipe, transfer);
+             }
+@@ -1146,13 +1183,7 @@
+       for (int z = 0; z < box.depth; ++z) {
+          uint8_t *dst = (uint8_t*)map + z*transfer->layer_stride;
+          const uint8_t *src = (const uint8_t*)pSysMemUP + z*DepthPitch;
+-         util_copy_rect(dst,
+-                        dst_resource->format,
+-                        transfer->stride,
+-                        0, 0, box.width, box.height,
+-                        src,
+-                        RowPitch,
+-                        0, 0);
++         CopyRectIn(pDstResource, dst, transfer->stride, box.width, box.height, src, RowPitch);
+       }
+       if (pDstResource->buffer) {
+          pipe_buffer_unmap(pipe, transfer);
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -38,6 +38,7 @@
+ 
+ #include "Debug.h"
+ #include "Format.h"
++#include "Resource.h"
+ 
+ #include "tgsi/tgsi_ureg.h"
+ #include "util/u_memory.h"
+@@ -1579,6 +1580,8 @@
+    memset(&desc, 0, sizeof desc);
+    resource = CastPipeResource(pCreateSRView->hDrvResource);
+    format = FormatTranslate(pCreateSRView->Format, false);
++   if (pSRView->resource->compressed != PIPE_FORMAT_NONE)
++      format = DecompressedFormat(format);
+ 
+    u_sampler_view_default_template(&desc,
+                                    resource,
+@@ -1665,6 +1668,8 @@
+    memset(&desc, 0, sizeof desc);
+    resource = CastPipeResource(pCreateSRView->hDrvResource);
+    format = FormatTranslate(pCreateSRView->Format, false);
++   if (pSRView->resource->compressed != PIPE_FORMAT_NONE)
++      format = DecompressedFormat(format);
+ 
+    u_sampler_view_default_template(&desc,
+                                    resource,

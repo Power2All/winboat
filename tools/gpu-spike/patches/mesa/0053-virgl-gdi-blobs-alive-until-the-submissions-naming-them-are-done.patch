@@ -1,0 +1,128 @@
+From: WinBoat
+Subject: [PATCH] virgl/gdi: blobs alive until the submissions naming them are done
+
+A host blob (a persistently mapped buffer: Direct3D 9 dynamic vertex buffers through nine) has no allocation in
+the command buffer's list, so a command buffer kept no reference to the blobs its commands named, and the blob's
+destroy escape, which the host gets at once, could come before a draw still in the buffer, or still queued in
+another context (the core context's empty submission doesn't order those): the host had no such resource when the
+draw came and put the context in error (3DMark06 froze in its first test; Illegal resource in DRAW_VBO). Command
+buffers now hold a reference to every blob they name until submitted, the submission's fence goes with each blob,
+and destroying a blob waits for that fence first.
+---
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+index 6d27f22..72b85e6 100644
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+@@ -386,10 +386,17 @@ virgl_gdi_winsys_resource_create_blob(struct virgl_winsys *qws, enum pipe_textur
+    return res;
+ }
+ 
+-/* Commands still on their way may name it: the host gets the context's commands first */
++/* Commands still on their way may name it: they must reach the host before the escape that destroys it, which the
++ * host gets at once. Each context submits on its own and the scheduler orders nothing across them, so this waits for
++ * the last submission naming it (an application context's draw: 3DMark06's dynamic vertex buffers were destroyed
++ * before the draw reading them, which put the host context in error), then for the core context's */
+ static void
+ virgl_gdi_blob_destroy(struct virgl_gdi_winsys *qdws, struct virgl_hw_res *res)
+ {
++   if (res->blob_fence) {
++      virgl_gdi_fence_wait(&qdws->base, res->blob_fence, OS_TIMEOUT_INFINITE);
++      virgl_gdi_fence_reference(&qdws->base, &res->blob_fence, NULL);
++   }
+    mtx_lock(&qdws->coreMtx);
+    struct pipe_fence_handle *fence = NULL;
+    qdws->coreCtx->cdw = 0;
+@@ -754,10 +761,26 @@ virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
+    struct virgl_gdi_cmd_buf *cbuf = virgl_gdi_cmd_buf(_cbuf);
+    boolean already_in_list = false;
+ 
+-   /* a blob is the host resource alone: attached to the context since it was made */
++   /* a blob is the host resource alone (attached to the context since it was made), kept alive until these commands
++    * are submitted and done (virgl_gdi_blob_destroy waits for their fence): destroyed earlier, a draw still in the
++    * buffer named a resource the host no longer had, which put the context in error (3DMark06) */
+    if (res->blob) {
+       if (write_buf)
+          cbuf->base.buf[cbuf->base.cdw++] = res->res_handle;
++      for (int i = 0; i < cbuf->blob_count; i++) {
++         if (cbuf->blob_bo[i] == res)
++            return;
++      }
++      if (cbuf->blob_count == cbuf->max_blob) {
++         int max = MAX2(16, cbuf->max_blob * 2);
++         struct virgl_hw_res **bo = REALLOC(cbuf->blob_bo, cbuf->max_blob * sizeof(*bo), max * sizeof(*bo));
++         if (!bo)
++            return;
++         cbuf->blob_bo = bo;
++         cbuf->max_blob = max;
++      }
++      cbuf->blob_bo[cbuf->blob_count] = NULL;
++      virgl_gdi_resource_reference(&qdws->base, &cbuf->blob_bo[cbuf->blob_count++], res);
+       return;
+    }
+ 
+@@ -866,6 +889,9 @@ virgl_gdi_cmd_buf_destroy(struct virgl_cmd_buf *_cbuf)
+       p_atomic_dec(&cbuf->res_bo[i]->num_cs_references);
+       virgl_gdi_resource_reference(cbuf->ws, &cbuf->res_bo[i], NULL);
+    }
++   for (int i = 0; i < cbuf->blob_count; i++)
++      virgl_gdi_resource_reference(cbuf->ws, &cbuf->blob_bo[i], NULL);
++   FREE(cbuf->blob_bo);
+ 
+    cbuf->ctx->destroy(cbuf->ctx);
+    FREE(cbuf);
+@@ -893,6 +919,11 @@ virgl_gdi_winsys_submit_cmd(struct virgl_winsys *qws,
+    render.AllocationCount = cbuf->alloc_count;
+    render.PatchLocationCount = cbuf->alloc_count;
+ 
++   /* a submission naming blobs gets a fence they keep (virgl_gdi_blob_destroy waits for it) */
++   struct pipe_fence_handle *own = NULL;
++   if (cbuf->blob_count && !fence)
++      fence = &own;
++
+    if (fence) {
+       HANDLE event = CreateEventA(NULL, TRUE, FALSE, NULL);
+       if (event) {
+@@ -906,9 +937,18 @@ virgl_gdi_winsys_submit_cmd(struct virgl_winsys *qws,
+       _debug_printf(
+          "Failed to submit cmdbuf(D3DKMTRender) with status code: %lx\n",
+          Status);
++      virgl_gdi_fence_reference(qws, &own, NULL);
+       return -1;
+    }
+ 
++   for (int i = 0; i < cbuf->blob_count; i++) {
++      if (*fence)
++         virgl_gdi_fence_reference(qws, &cbuf->blob_bo[i]->blob_fence, *fence);
++      virgl_gdi_resource_reference(cbuf->ws, &cbuf->blob_bo[i], NULL);
++   }
++   cbuf->blob_count = 0;
++   virgl_gdi_fence_reference(qws, &own, NULL);
++
+    cbuf->base.buf =
+       (uint8_t *)cbuf->ctx->pCommandBuffer + sizeof(VIOGPU_COMMAND_HDR);
+    cbuf->base.cdw = 0;
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
+index a068155..4ef0306 100644
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
+@@ -65,6 +65,8 @@ struct virgl_hw_res {
+    uint32_t blob_mem;
+    /* a host blob (persistently mapped buffers): no allocation, mapped and destroyed through the driver's escapes */
+    bool blob;
++   /* blobs: the last submission naming it, which its destruction waits for (no allocation for WDDM to track) */
++   struct pipe_fence_handle *blob_fence;
+ };
+ 
+ struct virgl_gdi_winsys
+@@ -101,6 +103,11 @@ struct virgl_gdi_cmd_buf {
+    int max_alloc;
+    struct virgl_hw_res **res_bo;
+ 
++   /* blobs named by the commands (no allocation list entries): referenced until submitted */
++   int blob_count;
++   int max_blob;
++   struct virgl_hw_res **blob_bo;
++
+    UINT driver_length;
+ };
+ 

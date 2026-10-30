@@ -349,6 +349,7 @@ struct Dev {
    ID3D11ShaderResourceView *srv[10] = {};
    ID3D11SamplerState *samp[3] = {};
    ID3D11Buffer *cb = nullptr;
+   bool warp = false;   // the reference device (WARP)
 };
 
 static ID3DBlob *compile(const std::string &src, const char *profile)
@@ -415,6 +416,7 @@ static bool setup(Dev &d, bool warp)
    // 11_1 where offered (its tests check), else 11_0
    const D3D_FEATURE_LEVEL fl[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
    D3D_FEATURE_LEVEL got;
+   d.warp = warp;
    CHECK(D3D11CreateDevice(nullptr, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, fl, 2,
                            D3D11_SDK_VERSION, &d.dev, &got, &d.ctx));
    ID3DBlob *vs = compile(VS, "vs_4_0");

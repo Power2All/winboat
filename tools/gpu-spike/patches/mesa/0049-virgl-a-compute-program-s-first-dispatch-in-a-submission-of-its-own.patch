@@ -1,0 +1,91 @@
+From: WinBoat
+Subject: [PATCH] virgl: a compute program's first dispatch in a submission of its own
+
+virglrenderer compiles a compute program at its first dispatch, and NVIDIA's GL takes seconds for some: the first
+frame of GravityMark's OpenGL benchmark dispatched dozens of new programs in one submission, which took about 18 s on
+the host, and Windows reset the GPU after 10 (TdrDelay), so the program crashed on the removed device. The first
+dispatch of each compute shader now goes in a submission of its own (a flush before and after it); later ones batch
+as before.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+index d49af35..916985e 100644
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -1625,6 +1625,7 @@ static void virgl_bind_compute_state(struct pipe_context *ctx, void *state)
+    uint32_t handle = (unsigned long)state;
+    struct virgl_context *vctx = virgl_context(ctx);
+ 
++   vctx->cs_handle = handle;
+    virgl_encode_bind_shader(vctx, handle, PIPE_SHADER_COMPUTE);
+ }
+ 
+@@ -1633,6 +1634,7 @@ static void virgl_delete_compute_state(struct pipe_context *ctx, void *state)
+    uint32_t handle = (unsigned long)state;
+    struct virgl_context *vctx = virgl_context(ctx);
+ 
++   _mesa_set_remove_key(vctx->cs_dispatched, (void *)(uintptr_t)handle);
+    virgl_encode_delete_object(vctx, handle, VIRGL_OBJECT_SHADER);
+ }
+ 
+@@ -1641,11 +1643,24 @@ static void virgl_launch_grid(struct pipe_context *ctx,
+ {
+    struct virgl_context *vctx = virgl_context(ctx);
+ 
++   /* The host's GL compiles a compute program at its first dispatch, which can take seconds (NVIDIA): a frame with
++    * many new programs was one submission that outlasted Windows' GPU timeout (GravityMark's OpenGL renderer). A
++    * first dispatch goes in a submission of its own */
++   void *key = (void *)(uintptr_t)vctx->cs_handle;
++   bool first = vctx->cs_handle && !_mesa_set_search(vctx->cs_dispatched, key);
++   if (first) {
++      _mesa_set_add(vctx->cs_dispatched, key);
++      virgl_flush_eq(vctx, vctx, NULL);
++   }
++
+    if (!vctx->num_compute)
+       virgl_reemit_compute_resources(vctx);
+    vctx->num_compute++;
+ 
+    virgl_encode_launch_grid(vctx, info);
++
++   if (first)
++      virgl_flush_eq(vctx, vctx, NULL);
+ }
+ 
+ static void
+@@ -1714,6 +1729,7 @@ virgl_context_destroy( struct pipe_context *ctx )
+    virgl_transfer_queue_fini(&vctx->queue);
+ 
+    slab_destroy_child(&vctx->transfer_pool);
++   _mesa_set_destroy(vctx->cs_dispatched, NULL);
+    FREE(vctx);
+ }
+ 
+@@ -1907,6 +1923,7 @@ struct pipe_context *virgl_context_create(struct pipe_screen *pscreen,
+    virgl_init_so_functions(vctx);
+ 
+    slab_create_child(&vctx->transfer_pool, &rs->transfer_pool);
++   vctx->cs_dispatched = _mesa_pointer_set_create(NULL);
+    virgl_transfer_queue_init(&vctx->queue, vctx);
+    vctx->encoded_transfers = (rs->vws->supports_encoded_transfers &&
+                        (rs->caps.caps.v2.capability_bits & VIRGL_CAP_TRANSFER));
+diff --git a/src/gallium/drivers/virgl/virgl_context.h b/src/gallium/drivers/virgl/virgl_context.h
+index b3c84b1..2fed4b6 100644
+--- a/src/gallium/drivers/virgl/virgl_context.h
++++ b/src/gallium/drivers/virgl/virgl_context.h
+@@ -27,6 +27,7 @@
+ #include "pipe/p_context.h"
+ #include "util/slab.h"
+ #include "util/list.h"
++#include "util/set.h"
+ 
+ #include "virgl_staging_mgr.h"
+ #include "virgl_transfer_queue.h"
+@@ -99,6 +100,8 @@ struct virgl_context {
+    unsigned num_so_targets;
+ 
+    uint32_t num_draws, num_compute;
++   uint32_t cs_handle;          /* the bound compute shader */
++   struct set *cs_dispatched;   /* compute shaders dispatched already (the host compiled them) */
+ 
+    struct primconvert_context *primconvert;
+    uint32_t hw_sub_ctx_id;

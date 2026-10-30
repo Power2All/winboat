@@ -1,0 +1,52 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: the aperture segment half the VM's memory
+
+Every allocation of the Direct3D 9-11 and OpenGL drivers lives in the aperture segment, which was 1 GB: a process
+whose allocations outgrew it had its device faulted (STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE at the next present;
+GravityMark's Direct3D 11 renderer, and a test with 64 MB buffers at 960 MB). On Windows 10 and 11 (WDDM 2) it is now
+half the VM's memory, what Windows gives integrated GPUs to share, and at least 1 GB; the local segment moves up after
+it. The WDDM 1.x builds (Windows 7, 8.1) keep 1 GB, their primary segment sits right after it. A blob the host refuses
+is now logged (kmlog), with the host's answer.
+---
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 7c44e41..3609d80 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -878,8 +878,12 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 pSegmentDesc->Flags.CacheCoherent = TRUE;
+                 pSegmentDesc->Flags.CpuVisible = FALSE;
+                 pSegmentDesc->Flags.DirectFlip = TRUE;
+-                pSegmentDesc->Size = 256 * 1024 * 4096;
+-                pSegmentDesc->CommitLimit = 256 * 1024 * 4096;
++                // Half the VM's memory (what Windows gives integrated GPUs to share), at least 1 GB: a process whose
++                // allocations outgrew the segment had its device faulted (1 GB: GravityMark's D3D11 renderer)
++                const ULONGLONG gb = 1ULL << 30;
++                const ULONGLONG aperture = max(gb, (ULONGLONG)m_DeviceInfo.SystemMemorySize.QuadPart / 2 & ~(gb - 1));
++                pSegmentDesc->Size = (SIZE_T)aperture;
++                pSegmentDesc->CommitLimit = (SIZE_T)aperture;
+                 if (m_LocalSegment)
+                 {
+                     SIZE_T stride = pSegmentInfo->SegmentDescriptorStride ? pSegmentInfo->SegmentDescriptorStride
+@@ -889,7 +893,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                     // Not CPU-visible: most of the window has nothing mapped until Venus maps blobs there. Its size:
+                     // the VM's GPU memory limit (GpuMemoryLimitMB), what the VM's GPU resources may hold - programs
+                     // read it as the card's video memory (Topaz Video AI wants 6-8 GB, games size texture streaming by it)
+-                    pLocal->BaseAddress.QuadPart = 0x100000000; // after the aperture's GPU addresses
++                    pLocal->BaseAddress.QuadPart = 0xC0000000 + aperture; // after the aperture's GPU addresses
+                     pLocal->Flags.LocalBudgetGroup = TRUE;
+                     pLocal->Size = (SIZE_T)max((ULONGLONG)m_HostmemSize, m_AllocationLimit);
+                     pLocal->CommitLimit = pLocal->Size;
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index b14900b..36177c3 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -117,7 +117,8 @@ NTSTATUS VioGpuDevice::BlobCreate(_Inout_ VIOGPU_BLOB_CREATE_REQ *req)
+                                                   blob->size);
+     if (type != VIRTIO_GPU_RESP_OK_NODATA)
+     {
+-        DbgPrint(TRACE_LEVEL_ERROR, ("%s host refused blob %I64u: %x\n", __FUNCTION__, req->BlobId, type));
++        VioGpuLog("BlobCreate: host refused blob %I64u (resource %u, context %u, %I64u bytes): 0x%x", req->BlobId,
++                  blob->resId, m_id, blob->size, type);
+         m_pAdapter->resourceIdr.PutId(blob->resId);
+         delete blob;
+         return STATUS_UNSUCCESSFUL;

@@ -1,0 +1,28 @@
+From: WinBoat
+Subject: [PATCH] vrend: a DrawAuto in a capturing draw pauses the capture first
+
+A DrawAuto (glDrawTransformFeedback) ends the capture that wrote its vertex buffer, binding that capture's transform
+feedback object for the End. The draw's own capture is begun or resumed before that, and GL binds no other object
+while a capture runs unpaused: the bind failed, the End ended the draw's own capture, and the source stayed active.
+Stream output ping-ponged between two buffers with DrawAuto (3DMark Vantage's GPU cloth and particles) then failed
+every later Begin (GL_INVALID_OPERATION) and lost the context. The running capture is now paused around the bind and
+resumed after.
+---
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -5983,9 +5983,15 @@
+       return false;
+ 
+    if (found->xfb_state == XFB_STATE_PAUSED || found->xfb_state == XFB_STATE_STARTED) {
++      /* the draw's own capture already runs: GL binds no other object while it isn't paused (the End then ends it) */
++      bool resume = sub_ctx->current_so && sub_ctx->current_so->xfb_state == XFB_STATE_STARTED;
++      if (resume)
++         glPauseTransformFeedback();
+       glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, found->id);
+       glEndTransformFeedback();
+       glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, sub_ctx->current_so ? sub_ctx->current_so->id : 0);
++      if (resume)
++         glResumeTransformFeedback();
+       found->xfb_state = XFB_STATE_STARTED_NEED_BEGIN;
+       found->ended = true;
+    }

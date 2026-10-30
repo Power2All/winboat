@@ -1,0 +1,75 @@
+From: WinBoat
+Subject: [PATCH] virgl: a buffer a staging discard left dirty reallocates its discards
+
+Patch 0034 sends small busy buffers' discards through the staging buffer, which leaves the resource's guest copy
+behind (marked dirty). Direct3D maps whole buffers: a dynamic vertex or index buffer filled with WRITE_DISCARD and
+then appended to with WRITE_NO_OVERWRITE had every append read the whole buffer back from the host first, a
+synchronous round trip per map: 3DMark Vantage's Jane Nash read one 16 KB index buffer back ~800 times a second and
+ran at 7 fps, with guest and host mostly idle. A buffer that needs such a read-back now reallocates on its later
+discards (as before 0034; ring buffers discard rarely), and a reallocated buffer is clean. Constant buffers
+discarded per draw keep the staging path. Jane Nash: no read-backs, ~23-37 fps.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_resource.h b/src/gallium/drivers/virgl/virgl_resource.h
+--- a/src/gallium/drivers/virgl/virgl_resource.h
++++ b/src/gallium/drivers/virgl/virgl_resource.h
+@@ -70,7 +70,12 @@
+ 
+    uint16_t clean_mask;
+    uint16_t use_staging : 1;
+-   uint16_t reserved : 15;
++   /* buffers: dirty because a discard went through the staging buffer (its guest copy wasn't written) */
++   uint16_t staging_written : 1;
++   /* buffers: that made a later map read the whole buffer back (D3D maps whole buffers: WRITE_DISCARD then
++    * WRITE_NO_OVERWRITE appends to a dynamic vertex/index buffer): its discards reallocate instead */
++   uint16_t discard_realloc : 1;
++   uint16_t reserved : 13;
+ };
+ 
+ struct virgl_transfer {
+diff --git a/src/gallium/drivers/virgl/virgl_resource.c b/src/gallium/drivers/virgl/virgl_resource.c
+--- a/src/gallium/drivers/virgl/virgl_resource.c
++++ b/src/gallium/drivers/virgl/virgl_resource.c
+@@ -233,7 +233,8 @@
+              * resource every time, and a game discarding a constant buffer per draw spent ~5 us in each (D3D11
+              * Map(WRITE_DISCARD) per draw ran slower than WARP); the staging path is a suballocation and a copy the
+              * host does in order */
+-            bool small = res->b.target == PIPE_BUFFER && res->b.width0 <= 64 * 1024 && vctx->supports_staging;
++            bool small = res->b.target == PIPE_BUFFER && res->b.width0 <= 64 * 1024 && vctx->supports_staging &&
++                         !res->discard_realloc;
+             map_type = (can_realloc && !small) ?
+                VIRGL_TRANSFER_MAP_REALLOC :
+                VIRGL_TRANSFER_MAP_WRITE_TO_STAGING;
+@@ -251,6 +252,12 @@
+       }
+    }
+ 
++   /* A buffer a staging write left dirty is read back whole by a map that doesn't discard (a synchronous round
++    * trip per map: 3DMark Vantage's Jane Nash read one 16 KB index buffer back ~800 times a second); its discards
++    * reallocate from now on, which keeps its guest copy current */
++   if (readback && res->b.target == PIPE_BUFFER && res->staging_written)
++      res->discard_realloc = 1;
++
+    /* readback has some implications */
+    if (readback) {
+       /* If we are performing readback for textures and renderer supports
+@@ -400,6 +407,8 @@
+        * hence the two will diverge.
+        */
+       virgl_resource_dirty(vres, vtransfer->base.level);
++      if (vres->b.target == PIPE_BUFFER)
++         vres->staging_written = 1;
+ 
+       /* We are using the minimum required size to hold the contents,
+        * possibly using a layout different from the layout of the resource,
+@@ -482,6 +491,11 @@
+     */
+    util_range_set_empty(&res->valid_buffer_range);
+ 
++   /* A new resource: nothing on the host differs from its guest copy (what a staging write or the GPU left dirty
++    * belonged to the old one) */
++   res->clean_mask = (1 << VR_MAX_TEXTURE_2D_LEVELS) - 1;
++   res->staging_written = 0;
++
+    /* count toward the staging resource size limit */
+    vctx->queued_staging_res_size += res->metadata.total_size;
+ 

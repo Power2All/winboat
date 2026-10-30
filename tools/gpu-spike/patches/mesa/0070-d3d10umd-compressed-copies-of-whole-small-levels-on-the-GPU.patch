@@ -1,0 +1,32 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: compressed copies of whole small levels on the GPU
+
+Mesa 0050 sends compressed copies whose box goes past a level smaller than a block (2x2, 1x1) through the CPU, as one
+GL copy can't cover both sides. When both levels are the same size and the box covers each whole from the corner, the
+box clamped to the level is the same copy, and GL copies a compressed region that reaches the level's edge: on the
+host's GPU. GravityMark streams BC7 mips that way, ~200 copies a second, each a read-back on the CPU path.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -1000,6 +1013,20 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
+                   DstX + src_box.width > u_minify(dst_resource->width0, dst_level) ||
+                   DstY + src_box.height > u_minify(dst_resource->height0, dst_level));
+ 
++   /* Both levels the same size and the box covering all of each from the same corner (a 2x2 or 1x1 level copied
++    * whole: GravityMark's streamed BC7 mips, ~200 a second): the box clamped to the level is the same copy, and GL
++    * copies a compressed region that reaches the level's edge */
++   if (blocks) {
++      unsigned sw = u_minify(src_resource->width0, src_level), sh = u_minify(src_resource->height0, src_level);
++      unsigned dw = u_minify(dst_resource->width0, dst_level), dh = u_minify(dst_resource->height0, dst_level);
++      if (sw == dw && sh == dh && src_box.x == 0 && src_box.y == 0 && DstX == 0 && DstY == 0 &&
++          src_box.width >= (int)sw && src_box.height >= (int)sh) {
++         src_box.width = sw;
++         src_box.height = sh;
++         blocks = false;
++      }
++   }
++
+    if (areResourcesCompatible(src_resource, dst_resource) && !blocks) {
+       pipe->resource_copy_region(pipe,
+                                  dst_resource, dst_level,

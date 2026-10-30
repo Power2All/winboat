@@ -1,0 +1,36 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: views outside the rotation lists destroyed safely
+
+Patch 0059 keeps render target and shader resource views in lists (a swap chain's rotation moves them) and took
+each out at its destruction. Shader resource views made elsewhere are zeroed and in no list: an NV12/P010 plane's
+(VideoCreateShaderResourceView) and raw/structured buffer views. Destroying one unlinked NULL pointers: dx-test's
+video group crashed at the device's release after "Shader views of NV12 planes" (0xC0000005). A view is taken out
+of its list only if it is in one.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -1757,7 +1757,9 @@
+ 
+    ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
+ 
+-   list_del(&pSRView->link);
++   /* (views made elsewhere aren't in the list: NV12/P010 planes and raw/structured buffer views, zeroed) */
++   if (pSRView->link.next)
++      list_del(&pSRView->link);
+    pipe_sampler_view_reference(&pSRView->handle, NULL);
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+--- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
++++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+@@ -186,7 +186,8 @@
+ 
+    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
+ 
+-   list_del(&pRTView->link);
++   if (pRTView->link.next)
++      list_del(&pRTView->link);
+    pipe_surface_reference(&pRTView->surface, NULL);
+ }
+ 

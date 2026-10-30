@@ -1,0 +1,25 @@
+From: WinBoat
+Subject: [PATCH] spirv: size and sample queries on a sampled image
+
+OpImageQuerySizeLod (and the other image queries) take an image; GravityMark's OpenGL shaders (GL_ARB_gl_spirv,
+Tellusim's compiler) give them the combined image-sampler, which NVIDIA's and AMD's drivers accept. spirv_to_nir
+failed the module, and the WGL driver then read through the missing NIR shader (an access violation in
+_mesa_spirv_to_nir). Such a query now queries the sampled image's image.
+---
+diff --git a/src/compiler/spirv/spirv_to_nir.c b/src/compiler/spirv/spirv_to_nir.c
+index 0cf3a3f..bc5e1f8 100644
+--- a/src/compiler/spirv/spirv_to_nir.c
++++ b/src/compiler/spirv/spirv_to_nir.c
+@@ -6171,6 +6171,12 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
+    case SpvOpImageQuerySizeLod:
+    case SpvOpImageQuerySize: {
+       struct vtn_type *image_type = vtn_get_value_type(b, w[3]);
++      /* A query on a sampled image isn't valid SPIR-V, but other drivers take it (GravityMark's OpenGL shaders):
++       * query its image */
++      if (image_type->base_type == vtn_base_type_sampled_image) {
++         vtn_handle_texture(b, opcode, w, count);
++         break;
++      }
+       vtn_assert(image_type->base_type == vtn_base_type_image);
+       if (glsl_type_is_image(image_type->glsl_image)) {
+          vtn_handle_image(b, opcode, w, count);

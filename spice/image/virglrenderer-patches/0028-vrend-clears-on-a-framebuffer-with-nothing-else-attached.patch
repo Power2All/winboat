@@ -1,0 +1,41 @@
+From: WinBoat
+Subject: [PATCH] vrend: clears on a framebuffer with nothing else attached
+
+A resource copy done by blitting detached its framebuffers with only the read framebuffer bound, so both detaches
+went to the draw framebuffer and the source stayed attached to blit_fb_ids[0]. Surface clears use that framebuffer
+and attach just their surface, and a framebuffer's area is its smallest attachment's: once a 1024x600 frame had been
+copied, a 4096x4096 depth clear only cleared 1024x600 of it. GravityMark's Direct3D 11 shadow atlas (cleared every
+frame, its casters drawn with depth test GREATER) kept every older frame's casters: doubled Earths, smeared asteroids,
+and asteroids in their own old shadows - no sunlight on them, flat grey, flickering. The copy now detaches from each
+framebuffer, and a clear detaches the attachment kind it doesn't use, as blits do.
+---
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -4976,6 +4976,12 @@
+ 
+    // Do clear on blit framebuffer to avoid messing with main fb
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->blit_fb_ids[0]);
++   /* Nothing else attached: a framebuffer's area is its smallest attachment's, and a color texture left on it
++    * cleared only that much of a bigger depth surface (GravityMark's D3D11 shadow atlas kept old frames' casters) */
++   if (vrend_format_is_ds(surf->format))
++      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++   else
++      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    vrend_fb_bind_texture_id(
+        surf->texture, surf->gl_id, 0, surf->level,
+        surf->first_layer != surf->last_layer ? -1 : (GLint)surf->first_layer,
+@@ -11247,10 +11253,12 @@
+                      dy2,
+                      glmask, GL_NEAREST);
+ 
+-   glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->sub->blit_fb_ids[0]);
++   /* GL_FRAMEBUFFER: binding only the read framebuffer left both detaches on the draw one (blit_fb_ids[1]), and
++    * the source stayed on blit_fb_ids[0], limiting the clears done on it to its size */
++   glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->blit_fb_ids[0]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, 0, 0);
+-   glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->sub->blit_fb_ids[1]);
++   glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->blit_fb_ids[1]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, 0, 0);
+ 

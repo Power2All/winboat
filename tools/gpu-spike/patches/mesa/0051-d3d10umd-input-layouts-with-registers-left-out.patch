@@ -1,0 +1,33 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: input layouts with registers left out
+
+An input layout may leave out the registers its shader doesn't read; gallium's vertex elements are indexed by
+register, so a gap was an element of format NONE, which virglrenderer refuses (VIRGL_ERROR_CTX_ILLEGAL_VERTEX_FORMAT):
+the layout wasn't created and the draws used the one bound before. GravityMark's Direct3D 11 asteroid shadow casters
+(v0 and v3 only) read their positions in another layout's format, misplaced in the shadow map: the Earth's day side
+was in shadow. A gap is now one float from a buffer the layout already reads, which the shader never does.
+---
+diff --git a/src/gallium/frontends/d3d10umd/InputAssembly.cpp b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
+index d94ac5e..115878a 100644
+--- a/src/gallium/frontends/d3d10umd/InputAssembly.cpp
++++ b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
+@@ -312,9 +312,16 @@ CreateElementLayout(
+       max_elements = MAX2(max_elements, pVertexElement->InputRegister + 1);
+    }
+ 
+-   /* XXX: What do we do when there's a gap? */
+-   if (max_elements != num_elements) {
+-      DebugPrintf("%s: gap\n", __func__);
++   /* Registers the shader doesn't read may be left out (GravityMark's asteroid shadows: v0 and v3), but gallium's
++    * elements are indexed by register: a gap is an element of no format, and virglrenderer fails a layout with one,
++    * so the draws kept the previous layout (another position format: shadow casters misplaced, the Earth's day side
++    * in shadow). A gap gets one float from a buffer the layout reads; the shader never does. */
++   for (unsigned i = 0; i < max_elements; i++) {
++      struct pipe_vertex_element *ve = &pElementLayout->state.velems[i];
++      if (ve->src_format == PIPE_FORMAT_NONE) {
++         ve->src_format = PIPE_FORMAT_R32_FLOAT;
++         ve->vertex_buffer_index = pCreateElementLayout->pVertexElements[0].InputSlot;
++      }
+    }
+ 
+    pElementLayout->state.count = max_elements;

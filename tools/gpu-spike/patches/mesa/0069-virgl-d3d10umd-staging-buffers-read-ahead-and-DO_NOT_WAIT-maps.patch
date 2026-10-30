@@ -1,0 +1,81 @@
+From: WinBoat
+Subject: [PATCH] virgl, d3d10umd: staging buffers read ahead, DO_NOT_WAIT maps
+
+A staging buffer the GPU copied into is read by the CPU later (Direct3D: CopyResource into a staging buffer, Map(READ)
+a frame or more on). virgl read it back at the map: a transfer queued behind everything submitted since, so each map
+drained the guest-host pipeline (GravityMark's D3D11 ~150 maps a second). The host's data now comes into the guest copy
+right behind the copy, in the same command stream (a TRANSFER3D from the host), and the copy is clean again: the map
+only waits for that submission. ResourceMap ignored D3D10_DDI_MAP_FLAG_DONOTWAIT and blocked; a busy resource is
+WASSTILLDRAWING now, as Direct3D has it.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -1421,6 +1421,7 @@ static void virgl_resource_copy_region(struct pipe_context *ctx,
+       return;
+    }
+ 
++   bool was_clean = dres->clean_mask & 1;
+    if (dres->b.target == PIPE_BUFFER)
+       util_range_add(&dres->b, &dres->valid_buffer_range, dstx, dstx + src_box->width);
+    virgl_resource_dirty(dres, dst_level);
+@@ -1429,6 +1430,29 @@ static void virgl_resource_copy_region(struct pipe_context *ctx,
+                                     dst_level, dstx, dsty, dstz,
+                                     sres, src_level,
+                                     src_box);
++
++   /* A staging buffer the GPU copied into is read by the CPU later (Direct3D: CopyResource into a staging buffer,
++    * Map(READ) a frame or more on). The host's data comes into its guest copy right behind the copy, in the same
++    * command stream, and the copy is clean again: the map only waits for that submission, done by then. Read back
++    * at the map, it waited behind everything submitted since (GravityMark's D3D11 ~150 maps a second, each one
++    * draining the pipeline). Only the copied range when the rest was clean, else the whole buffer */
++   if (dres->b.target == PIPE_BUFFER && dres->b.usage == PIPE_USAGE_STAGING && !dres->blob_mem) {
++      struct virgl_screen *vs = virgl_screen(ctx->screen);
++      struct pipe_box box;
++      if (was_clean)
++         u_box_1d(dstx, src_box->width, &box);
++      else
++         u_box_1d(0, dres->b.width0, &box);
++      struct virgl_transfer *trans = virgl_resource_create_transfer(vctx, &dres->b, &dres->metadata, 0,
++                                                                    PIPE_MAP_READ, &box);
++      if (trans) {
++         if (vctx->cbuf->cdw + VIRGL_TRANSFER3D_SIZE + 1 > VIRGL_MAX_CMDBUF_DWORDS)
++            ctx->flush(ctx, NULL, 0);
++         virgl_encode_transfer(vs, vctx->cbuf, trans, VIRGL_TRANSFER_FROM_HOST);
++         virgl_resource_destroy_transfer(vctx, trans);
++         dres->clean_mask |= 1;
++      }
++   }
+ }
+ 
+ static void
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -710,6 +710,15 @@ ResourceMap(D3D10DDI_HDEVICE hDevice,                                // IN
+       }
+    }
+ 
++   /* DO_NOT_WAIT: busy is WASSTILLDRAWING, the application tries again (it blocked here) */
++#ifndef D3D10_DDI_MAP_FLAG_DONOTWAIT
++#define D3D10_DDI_MAP_FLAG_DONOTWAIT 0x100000
++#endif
++   bool dontwait = (Flags & D3D10_DDI_MAP_FLAG_DONOTWAIT) && !(usage & PIPE_MAP_UNSYNCHRONIZED);
++   if (dontwait) {
++      usage |= PIPE_MAP_DONTBLOCK;
++   }
++
+    void *map;
+    if (pResource->buffer) {
+       map = pipe->buffer_map(pipe,
+@@ -727,6 +736,10 @@ ResourceMap(D3D10DDI_HDEVICE hDevice,                                // IN
+                               &pResource->transfers[SubResource]);
+    }
+    if (!map) {
++      if (dontwait) {
++         SetError(hDevice, DXGI_DDI_ERR_WASSTILLDRAWING);
++         return;
++      }
+       DebugPrintf("%s: failed to map resource\n", __func__);
+       SetError(hDevice, E_FAIL);
+       return;

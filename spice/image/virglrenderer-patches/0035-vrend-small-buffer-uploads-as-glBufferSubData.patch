@@ -1,0 +1,41 @@
+From: WinBoat
+Subject: [PATCH] vrend: small buffer uploads as glBufferSubData
+
+The guest stages small buffer writes (constant buffers, dynamic vertex and index buffers; Mesa 0034) and the host
+copies each into its GL buffer (COPY_TRANSFER3D): thousands a second in games, 12000 a second in 3DMark Vantage's
+Jane Nash. Each went through glMapBufferRange and glUnmapBuffer of a buffer the GPU still reads, ~28 us apiece on
+NVIDIA (60% of the host thread). Uploads up to 16 MB are a glBufferSubData now (the driver queues it in its command
+stream): ~1.7 us each. Jane Nash and New Calico ~2.6x with the guest's 0065.
+---
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -9718,6 +9718,8 @@
+    }
+ }
+ 
++#define VREND_SUBDATA_MAX (16 * 1024 * 1024)
++
+ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
+                                              struct vrend_resource *res,
+                                              const struct iovec *iov, int num_iovs,
+@@ -9760,6 +9762,20 @@
+          map_flags |= GL_MAP_UNSYNCHRONIZED_BIT;
+ 
+       glBindBufferARB(res->target, res->gl_id);
++      /* Small uploads (the guest's staging copies of constant buffers and dynamic vertex/index buffers, thousands a
++       * second) as glBufferSubData: a map and unmap of a buffer the GPU still reads cost ~25 us each on NVIDIA, the
++       * driver queues a small sub-data in its command stream */
++      if (info->box->width <= VREND_SUBDATA_MAX) {
++         static __thread char *tmp;
++         if (!tmp)
++            tmp = malloc(VREND_SUBDATA_MAX);
++         if (tmp) {
++            vrend_read_from_iovec(iov, num_iovs, info->offset, tmp, info->box->width);
++            glBufferSubData(res->target, info->box->x, info->box->width, tmp);
++            glBindBufferARB(res->target, 0);
++            return 0;
++         }
++      }
+       data = glMapBufferRange(res->target, info->box->x, info->box->width, map_flags);
+       if (data == NULL) {
+          virgl_error("Map failed for element buffer\n");

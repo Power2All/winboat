@@ -1,0 +1,27 @@
+From: WinBoat
+Subject: [PATCH] spirv: OpenGL's SPIR-V fragment shaders take gl_FragCoord from the lower left
+
+NVIDIA's OpenGL gives a SPIR-V fragment shader gl_FragCoord from the lower left whatever origin it declares
+(OriginUpperLeft has no effect there; checked on the host's driver: dFdy(gl_FragCoord.y) stays positive, with a GLSL
+layout(origin_upper_left) it turns negative); Mesa honoured the declaration. Applications are written against those
+drivers: GravityMark's OpenGL renderer declares OriginUpperLeft and fetches its final picture by gl_FragCoord.y, so it
+showed upside down. In the OpenGL environment the origin is now lower left; Vulkan's SPIR-V is unchanged.
+---
+diff --git a/src/compiler/spirv/spirv_to_nir.c b/src/compiler/spirv/spirv_to_nir.c
+index bc5e1f8..e1f7695 100644
+--- a/src/compiler/spirv/spirv_to_nir.c
++++ b/src/compiler/spirv/spirv_to_nir.c
+@@ -5079,8 +5079,12 @@ vtn_handle_execution_mode(struct vtn_builder *b, struct vtn_value *entry_point,
+    case SpvExecutionModeOriginUpperLeft:
+    case SpvExecutionModeOriginLowerLeft:
+       vtn_assert(b->shader->info.stage == MESA_SHADER_FRAGMENT);
++      /* WinBoat: OpenGL's SPIR-V shaders get gl_FragCoord from the lower left whatever they declare, as NVIDIA's GL
++       * gives it (OriginUpperLeft has no effect there; Mesa honoured it): applications are written against those
++       * drivers. GravityMark's OpenGL renderer declares OriginUpperLeft and fetches its final picture by
++       * gl_FragCoord.y: upside down here */
+       b->shader->info.fs.origin_upper_left =
+-         (mode->exec_mode == SpvExecutionModeOriginUpperLeft);
++         (mode->exec_mode == SpvExecutionModeOriginUpperLeft) && b->options->environment != NIR_SPIRV_OPENGL;
+       break;
+ 
+    case SpvExecutionModeEarlyFragmentTests:

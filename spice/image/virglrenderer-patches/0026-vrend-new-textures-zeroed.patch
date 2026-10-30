@@ -1,0 +1,30 @@
+From: WinBoat
+Subject: [PATCH] vrend: new textures zeroed
+
+Windows' drivers give new video memory zeroed, and apps come to depend on it: GravityMark's Direct3D 11 renderer
+samples a shadow map (a 4096x4096 2-layer depth texture) it never renders or clears, which is zero depth - lit - on
+Windows. The host driver leaves a new texture with whatever its memory held: NaN depths in one layer, every
+comparison failing, the sun's light gone and the exposure hunting (the scene flat, too bright, flickering). New
+textures are now cleared to zero (glClearTexImage, each level). Sparse textures have no memory of their own, and
+compressed formats can't be cleared (they come with their data). This also keeps one guest's texture memory from
+showing another's leftovers.
+---
+--- a/src/vrend/vrend_renderer.c	2026-10-26 13:49:22.376962488 +0100
++++ b/src/vrend/vrend_renderer.c	2026-10-26 16:47:13.910229095 +0100
+@@ -9138,6 +9138,16 @@
+       glTexParameteri(gr->target, GL_TEXTURE_MAX_LEVEL, pr->last_level);
+    }
+ 
++   /* Zeroed, as Windows' drivers give new video memory: apps may sample a texture they never drew or uploaded
++    * (GravityMark's Direct3D 11 renderer: a shadow map it doesn't render, where zero depths mean lit), and the host
++    * driver leaves a new texture with whatever its memory held (NaN depths there: everything in shadow). Sparse
++    * textures have no memory of their own; compressed formats can't be cleared (and come with their data) */
++   if (!image_oes && !vrend_state.use_gles && has_feature(feat_clear_texture) && glformat &&
++       !(gr->tiled & VIRGL_BIND_SPARSE) && !util_format_is_compressed(pr->format)) {
++      for (level = 0; level <= pr->last_level; level++)
++         glClearTexImage(gr->gl_id, level, glformat, gltype, NULL);
++   }
++
+    /* where a sparse texture's mip tail begins (the levels from it on bind together) */
+    if (gr->tiled & VIRGL_BIND_SPARSE)
+       glGetTexParameteriv(gr->target, GL_NUM_SPARSE_LEVELS_ARB, &gr->sparse_levels);

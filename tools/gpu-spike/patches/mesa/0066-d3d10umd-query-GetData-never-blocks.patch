@@ -1,0 +1,23 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: query GetData never blocks
+
+QueryGetData waited for the result when the runtime passed D3D10_DDI_GET_DATA_DO_NOT_FLUSH: the flag only says not
+to flush, and GetData never blocks in Direct3D 10/11 (the runtime polls until the data is there). A game polling
+its occlusion or event queries each frame with that flag drained the whole guest-host pipeline every time. Not
+ready is WASSTILLDRAWING now, flushed or not.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Query.cpp b/src/gallium/frontends/d3d10umd/Query.cpp
+--- a/src/gallium/frontends/d3d10umd/Query.cpp
++++ b/src/gallium/frontends/d3d10umd/Query.cpp
+@@ -268,7 +268,10 @@ QueryGetData(D3D10DDI_HDEVICE hDevice,                      // IN
+       return;
+    }
+ 
+-   bool wait = !!(Flags & D3D10_DDI_GET_DATA_DO_NOT_FLUSH);
++   /* GetData never blocks: the runtime polls until the data is there. DO_NOT_FLUSH only says not to flush (it made
++    * this wait: a game polling its queries once a frame drained the whole guest-host pipeline each time, 3DMark
++    * Vantage's Jane Nash ~100 times a second, half its time spent waiting) */
++   bool wait = false;
+    union pipe_query_result result;
+ 
+    memset(&result, 0, sizeof result);

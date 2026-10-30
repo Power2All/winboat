@@ -1,0 +1,124 @@
+From: WinBoat
+Subject: [PATCH] viogpu_umd: placed resources in the heaps the runtime makes with a buffer, mip packing
+
+The runtime makes an app's heap as a heap and a buffer over it, and names that buffer (ReuseBufferGPUVA's resource)
+for the resources placed in it, with no heap handle. The UMD made such a heap as a committed buffer (no heap of its
+own) and took a placed resource without a heap handle for a reserved one: GravityMark's Direct3D 12 textures, placed
+in 128 MB heaps, became reserved textures nothing was ever mapped to, and the frame stayed black (UpdateTileMappings
+onto such a heap read a NULL heap). A GPU heap textures may be placed in now has a vkd3d-proton heap with the buffer
+placed at its start, and placed resources find it through the buffer they name. GetMipPacking (the runtime's
+GetResourceTiling asks for the packed mips of reserved resources) was missing: it is vkd3d-proton's. The resource
+trace (VIOGPU_D3D12_TRACE_RESOURCES) shows the placement.
+---
+diff --git a/libs/viogpu_umd/umd_private.h b/libs/viogpu_umd/umd_private.h
+index 1aae9ea4..abb43350 100644
+--- a/libs/viogpu_umd/umd_private.h
++++ b/libs/viogpu_umd/umd_private.h
+@@ -115,6 +115,9 @@ struct viogpu_heap {
+  * opens: presents copy the image into it, through a readback buffer */
+ struct viogpu_resource {
+    ID3D12Resource *resource;
++   /* a committed resource's heap (the runtime makes the app's heaps as a buffer over a heap; placed resources name
++    * that buffer) */
++   struct viogpu_heap *heap;
+    D3D12_RESOURCE_DESC desc;
+    D3D12DDI_HRTRESOURCE hRT;
+    D3DKMT_HANDLE kmAllocation;
+diff --git a/libs/viogpu_umd/umd_resource.cpp b/libs/viogpu_umd/umd_resource.cpp
+index 2e1a646d..3e43301e 100644
+--- a/libs/viogpu_umd/umd_resource.cpp
++++ b/libs/viogpu_umd/umd_resource.cpp
+@@ -481,14 +481,16 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+    HRESULT hr = S_OK;
+    if (getenv("VIOGPU_D3D12_TRACE_RESOURCES"))
+       viogpu_log("CreateHeapAndResource: heap %s (pool %d, cpu %d, flags 0x%x, %llu bytes), heap handle %p, rt %p, "
+-                 "resource %s (type %d, %llux%u, format %d, flags 0x%x, layout %d)",
++                 "resource %s (type %d, %llux%u, format %d, flags 0x%x, layout %d), placement %p + %llu",
+                  heapDesc ? "yes" : "no", heapDesc ? (int)heapDesc->MemoryPool : -1,
+                  heapDesc ? (int)heapDesc->CPUPageProperty : -1, heapDesc ? (UINT)heapDesc->Flags : 0,
+                  heapDesc ? (unsigned long long)heapDesc->ByteSize : 0ull, hHeap.pDrvPrivate, hRTResource.handle,
+                  resDesc ? "yes" : "no", resDesc ? (int)resDesc->ResourceType : 0,
+                  resDesc ? (unsigned long long)resDesc->Width : 0ull, resDesc ? resDesc->Height : 0,
+                  resDesc ? (int)resDesc->Format : 0, resDesc ? (UINT)resDesc->Flags : 0,
+-                 resDesc ? (int)resDesc->Layout : 0);
++                 resDesc ? (int)resDesc->Layout : 0,
++                 resDesc ? resDesc->ReuseBufferGPUVA.BaseAddress.UMD.hResource.pDrvPrivate : NULL,
++                 resDesc ? (unsigned long long)resDesc->ReuseBufferGPUVA.BaseAddress.UMD.Offset : 0ull);
+ 
+    viogpu_resource *res = NULL;
+    D3D12_RESOURCE_DESC desc = {};
+@@ -523,6 +525,21 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+       bool shared = (heapDesc->Flags & D3D12DDI_HEAP_FLAG_PRIMARY) && shared_swap_chain_buffer(device, res, desc);
+       if (res->resource) {
+          /* made above */
++      } else if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
++                 props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
++                 (heapDesc->Flags & (D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES | D3D12DDI_HEAP_FLAG_RT_DS_TEXTURES)) &&
++                 !(heapDesc->Flags & (D3D12DDI_HEAP_FLAG_PRIMARY | D3D12DDI_HEAP_FLAG_COHERENT_SYSTEMWIDE))) {
++         /* a GPU heap textures may be placed in, with a buffer over it: how the runtime makes the app's heaps (a
++          * committed buffer looks the same). A heap of vkd3d-proton's own, which placed resources and tile mappings
++          * use, and the buffer at its start */
++         D3D12_HEAP_DESC hd = {};
++         hd.SizeInBytes = heapDesc->ByteSize;
++         hd.Properties = props;
++         hd.Alignment = heapDesc->Alignment;
++         hd.Flags = heap_flags(heapDesc);
++         hr = device->vkd3d->CreateHeap(&hd, IID_PPV_ARGS(&heap->heap));
++         if (SUCCEEDED(hr))
++            hr = device->vkd3d->CreatePlacedResource(heap->heap, 0, &desc, state, NULL, IID_PPV_ARGS(&res->resource));
+       } else if (device10) {
+          D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
+          hr = device10->CreateCommittedResource3(&props, D3D12_HEAP_FLAG_NONE, &d, layout, clearValue, NULL, castCount,
+@@ -537,6 +554,7 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+       }
+       heap->committed = res->resource;
+       heap->committedResource = res;
++      res->heap = heap;
+       if (SUCCEEDED(hr) && (heapDesc->Flags & D3D12DDI_HEAP_FLAG_PRIMARY) && !shared) {
+          res->desc = res->resource->GetDesc();
+          hr = create_km_allocation(device, res);
+@@ -564,10 +582,16 @@ create_heap_and_resource(D3D12DDI_HDEVICE hDevice, const D3D12DDIARG_CREATEHEAP_
+                                                         IID_PPV_ARGS(&heap->mapBuffer))))
+             heap->mapBuffer = NULL;
+       }
+-   } else if (resDesc && hHeap.pDrvPrivate) {
+-      viogpu_heap *heap = (viogpu_heap *)hHeap.pDrvPrivate;
++   } else if (resDesc && (hHeap.pDrvPrivate || resDesc->ReuseBufferGPUVA.BaseAddress.UMD.hResource.pDrvPrivate)) {
++      /* placed: in hHeap, or in the heap of the buffer ReuseBufferGPUVA names (a heap the runtime made with a buffer
++       * over it gives no hHeap) */
++      viogpu_heap *heap = hHeap.pDrvPrivate
++         ? (viogpu_heap *)hHeap.pDrvPrivate
++         : ((viogpu_resource *)resDesc->ReuseBufferGPUVA.BaseAddress.UMD.hResource.pDrvPrivate)->heap;
+       UINT64 offset = resDesc->ReuseBufferGPUVA.BaseAddress.UMD.Offset;
+-      if (device10) {
++      if (!heap || !heap->heap)
++         hr = E_INVALIDARG;
++      else if (device10) {
+          D3D12_RESOURCE_DESC1 d = desc1(desc, res->mipRegion);
+          hr = device10->CreatePlacedResource2(heap->heap, offset, &d, layout, clearValue, castCount, castFormats,
+                                               IID_PPV_ARGS(&res->resource));
+@@ -1349,11 +1373,24 @@ create_scheduling_group(D3D12DDI_HDEVICE, const D3D12DDIARG_CREATESCHEDULINGGROU
+    return E_NOINTERFACE;
+ }
+ 
++/* A reserved resource's packed mips (its mip tail): the runtime's GetResourceTiling reports them, and apps map their
++ * tiles by it */
++static VOID APIENTRY
++get_mip_packing(D3D12DDI_HDEVICE hDevice, D3D12DDI_HRESOURCE hResource, UINT *numPackedMips, UINT *numTilesForPackedMips)
++{
++   D3D12_PACKED_MIP_INFO packed = {};
++   if (ID3D12Resource *resource = resource_of(hResource))
++      device_from(hDevice)->vkd3d->GetResourceTiling(resource, NULL, &packed, NULL, NULL, 0, NULL);
++   *numPackedMips = packed.NumPackedMips;
++   *numTilesForPackedMips = packed.NumTilesForPackedMips;
++}
++
+ /* ---------------------------------------------------------------------------------------------------------------- */
+ 
+ void
+ viogpu_fill_resource_funcs(viogpu_device_funcs *f)
+ {
++   f->pfnGetMipPacking = get_mip_packing;
+    f->pfnCalcPrivateHeapAndResourceSizes = calc_heap_and_resource_sizes;
+    f->pfnCreateHeapAndResource = create_heap_and_resource;
+    f->pfnDestroyHeapAndResource = destroy_heap_and_resource;

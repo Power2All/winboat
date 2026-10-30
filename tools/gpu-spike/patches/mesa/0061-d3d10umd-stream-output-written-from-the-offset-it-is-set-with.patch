@@ -1,0 +1,38 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: stream output written from the offset it is set with
+
+SoSetTargets' offsets say where in each buffer a new capture starts (-1: after what the last capture into it
+wrote). d3d10umd made every target at offset 0 and passed the offsets on, where virgl takes only -1 (the append
+bit): a capture set at an offset wrote at the buffer's start. 3DMark Vantage's GPU particles write each frame's new
+particles at an offset into a ring in the particle buffer: they overwrote the first particles instead, the rest
+never got written, and the test showed black. A target now starts at its offset (made again when the offset
+changes; an append keeps the target, so the capture goes on). ponytail: a DrawAuto from a capture that started at
+an offset draws what the capture wrote, not the offset's vertices before it.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -1304,16 +1304,19 @@
+ 
+       if (buffer) {
+          unsigned buffer_size = buffer->width0;
++         /* Writing from an offset into the buffer (D3D's offsets other than -1, which appends): the target starts
++          * there (the driver writes a new capture from its target's start; 3DMark Vantage's GPU particles write each
++          * frame's new particles at an offset into a ring) */
++         bool append = pOffsets && pOffsets[i] == (UINT)-1;
++         unsigned offset = !append && pOffsets && pOffsets[i] < buffer_size ? pOffsets[i] & ~3u : 0;
+ 
+          if (!so_target ||
+              so_target->buffer != buffer ||
+-             so_target->buffer_size != buffer_size) {
++             (!append && (so_target->buffer_offset != offset || so_target->buffer_size != buffer_size - offset))) {
+             if (so_target) {
+                pipe_so_target_reference(&so_target, NULL);
+             }
+-            so_target = pipe->create_stream_output_target(pipe, buffer,
+-                                                          0,/*buffer offset*/
+-                                                          buffer_size);
++            so_target = pipe->create_stream_output_target(pipe, buffer, offset, buffer_size - offset);
+             resource->so_target = so_target;
+          }
+       }

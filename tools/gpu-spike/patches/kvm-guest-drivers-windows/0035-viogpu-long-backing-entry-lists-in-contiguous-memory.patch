@@ -1,0 +1,84 @@
+From: WinBoat
+Subject: [PATCH] viogpu: long backing entry lists in contiguous memory
+
+A resource's guest pages go to the host as a list of 16-byte entries, and the command carrying it had one scatter-
+gather element per page of the list, 256 at most: the list of a resource over 254 MB couldn't be queued. The host
+never got the memory, failed the context at the resource's first transfer, and the process' rendering stopped there (a
+Direct3D 11 buffer of 255 MB or more: every buffer of the process read back as zeros after it). A list over 16 pages
+is now copied into physically contiguous memory, which the queue sends as one element (physically adjacent pages of a
+buffer now make one element); contiguous memory can only be freed below DISPATCH_LEVEL, so the command waits for the
+host and frees it itself.
+---
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -586,6 +586,35 @@
+     vbuf->data_buf = ents;
+     vbuf->data_size = sizeof(*ents) * nents;
+ 
++    // The entry list goes to the host as one scatter-gather element per page it touches, and a command has 256 at
++    // most: the list of a resource over 254 MB (GravityMark's 256 MB buffer) couldn't be queued, the host never got
++    // the resource's memory and failed the context at its first transfer. A long list goes in contiguous memory
++    // (one element), which can only be freed below DISPATCH_LEVEL: this waits for the host and frees it here.
++    SIZE_T size = sizeof(*ents) * nents;
++    PHYSICAL_ADDRESS highest;
++    highest.QuadPart = -1;
++    PVOID contiguous = size > 16 * PAGE_SIZE ? MmAllocateContiguousMemory(size, highest) : NULL;
++    if (contiguous)
++    {
++        RtlCopyMemory(contiguous, ents, size);
++        delete[] ents;
++        vbuf->data_buf = contiguous;
++
++        KEVENT event;
++        KeInitializeEvent(&event, NotificationEvent, FALSE);
++        vbuf->complete_cb = NotifyEventCompleteCB;
++        vbuf->complete_ctx = &event;
++        vbuf->auto_release = false;
++        if (QueueBuffer(vbuf) == 0)
++        {
++            KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
++        }
++        vbuf->data_buf = NULL;
++        ReleaseBuffer(vbuf);
++        MmFreeContiguousMemory(contiguous);
++        return;
++    }
++
+     QueueBuffer(vbuf);
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+@@ -933,16 +962,30 @@
+ // into the next would give the host the wrong physical page for the rest
+ static BOOLEAN AddSGElements(VirtIOBufferDescriptor *sg, UINT *count, UINT max, PVOID buf, ULONG size)
+ {
++    UINT first = *count;
+     while (size)
+     {
+-        if (*count >= max || !MmIsAddressValid(buf))
++        if (!MmIsAddressValid(buf))
+         {
+             return FALSE;
+         }
+         ULONG length = min(size, PAGE_SIZE - BYTE_OFFSET(buf));
+-        sg[*count].length = length;
+-        sg[*count].physAddr = MmGetPhysicalAddress(buf);
+-        (*count)++;
++        PHYSICAL_ADDRESS phys = MmGetPhysicalAddress(buf);
++        // Physically contiguous pages of the buffer make one element
++        if (*count > first && sg[*count - 1].physAddr.QuadPart + sg[*count - 1].length == phys.QuadPart)
++        {
++            sg[*count - 1].length += length;
++        }
++        else
++        {
++            if (*count >= max)
++            {
++                return FALSE;
++            }
++            sg[*count].length = length;
++            sg[*count].physAddr = phys;
++            (*count)++;
++        }
+         buf = (PVOID)((ULONG_PTR)buf + length);
+         size -= length;
+     }

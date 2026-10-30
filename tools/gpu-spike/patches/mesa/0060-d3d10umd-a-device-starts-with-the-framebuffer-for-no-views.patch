@@ -1,0 +1,24 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: a device starts with the framebuffer for no views
+
+A new device's framebuffer state was all zeroes, never sent: a draw before the first SetRenderTargets (stream output
+only, no render target, as a GPU simulation's first pass can be) ran on a GL framebuffer without attachments or size,
+which is incomplete (GL_INVALID_FRAMEBUFFER_OPERATION): nothing was written, and the DrawAuto that read it next lost
+the context. The device now starts with the framebuffer SetRenderTargets makes for no views (D3D's largest size).
+---
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -182,6 +182,12 @@
+    pipe->bind_vs_state(pipe, pDevice->empty_vs);
+    pipe->bind_fs_state(pipe, pDevice->empty_fs);
+ 
++   /* No views bound yet: the framebuffer SetRenderTargets makes for none (a draw before any, e.g. stream output
++    * only, finds GL's framebuffer complete) */
++   pDevice->fb.width = pDevice->fb.height = 16384;
++   pDevice->fb.layers = 1;
++   pipe->set_framebuffer_state(pipe, &pDevice->fb);
++
+    pDevice->max_dual_source_render_targets =
+          screen->get_param(screen, PIPE_CAP_MAX_DUAL_SOURCE_RENDER_TARGETS);
+ 

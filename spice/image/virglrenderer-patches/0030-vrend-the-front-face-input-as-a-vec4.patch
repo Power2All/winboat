@@ -1,0 +1,21 @@
+From: WinBoat
+Subject: [PATCH] vrend: the front face input as a vec4
+
+A fragment shader's FACE input became the scalar (gl_FrontFacing ? 1.0 : -1.0), its swizzle dropped, where every
+other source is a vec4. Direct3D 10 shaders read it without a swizzle (d3d10umd's TGSI: CMP TEMP[1].x, IN[4], ...),
+which made greaterThanEqual(float, vec4) and NVIDIA refused the shader: 3DMark Vantage's Jane Nash stopped with a
+context error (Illegal shader). It's now vec4(gl_FrontFacing ? 1.0 : -1.0) with the source's swizzle, as the
+primitive ID is.
+---
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -4876,7 +4876,8 @@
+          else if (input->name == TGSI_SEMANTIC_PRIMID)
+             strbuf_fmt(src_buf, "%s(vec4(intBitsToFloat(%s)))", get_string(stypeprefix), input->glsl_name);
+          else if (input->name == TGSI_SEMANTIC_FACE)
+-            strbuf_fmt(src_buf, "%s(%s ? 1.0 : -1.0)", get_string(stypeprefix), input->glsl_name);
++            /* a vec4 as the other sources (Direct3D's shaders read it unswizzled: greaterThanEqual(float, vec4)) */
++            strbuf_fmt(src_buf, "%s(vec4(%s ? 1.0 : -1.0)%s)", get_string(stypeprefix), input->glsl_name, swizzle);
+          else if (input->name == TGSI_SEMANTIC_CLIPDIST) {
+             if (ctx->prog_type == TGSI_PROCESSOR_FRAGMENT)
+                load_clipdist_fs(ctx, src_buf, src, j, get_string(stypeprefix), input->first);

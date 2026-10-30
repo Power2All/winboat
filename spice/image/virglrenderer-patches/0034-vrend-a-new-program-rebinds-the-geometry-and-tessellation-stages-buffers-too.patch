@@ -1,0 +1,27 @@
+From: WinBoat
+Subject: [PATCH] vrend: a new program rebinds the geometry and tessellation stages' buffers too
+
+On a program change vrend marks the constant buffers and sampler views dirty, so the draw binds them again: the
+binding points are handed out per program (counting through its stages), and they hold whatever the last program
+put there. The loop went from PIPE_SHADER_VERTEX to PIPE_SHADER_FRAGMENT, which in pipe_shader_type are 0 and 1:
+the geometry and tessellation stages (2-4) weren't marked, and kept the last program's buffers at their binding
+points. 3DMark Vantage's GPU cloth runs a vertex shader with a constant buffer, then geometry shaders with their
+own: the geometry shader's first block read the vertex shader's constants (time step and gravity instead of the
+primitive count and stiffness), the cloth's constraints went wrong, it blew up within two seconds and the flags
+vanished. Every graphics stage is marked now.
+---
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -5880,8 +5880,10 @@
+       sub_ctx->prog_ids[PIPE_SHADER_COMPUTE] = 0;
+       sub_ctx->prog = prog;
+ 
+-      /* mark all constbufs and sampler views as dirty */
+-      for (int stage = PIPE_SHADER_VERTEX; stage <= PIPE_SHADER_FRAGMENT; stage++) {
++      /* mark all constbufs and sampler views as dirty: of every graphics stage, not just up to the fragment shader
++       * (the geometry and tessellation stages come after it in pipe_shader_type), as the new program's binding points
++       * hold what the last program's stages left there */
++      for (int stage = PIPE_SHADER_VERTEX; stage < PIPE_SHADER_COMPUTE; stage++) {
+          sub_ctx->const_bufs_dirty[stage] = ~0;
+          sub_ctx->views[stage].dirty_mask = ~0;
+       }

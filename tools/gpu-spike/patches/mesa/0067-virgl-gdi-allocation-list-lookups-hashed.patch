@@ -1,0 +1,62 @@
+From: WinBoat
+Subject: [PATCH] virgl/gdi: allocation list lookups hashed
+
+virgl_gdi_emit_res searched the command buffer's whole allocation list for each resource a command names, to add it
+once: lists of hundreds of entries, a quarter of the driver's CPU time in 3DMark Vantage's New Calico (sampled in
+the render thread, which was at ~94%). A 1024-slot table keeps where each allocation went; the list is searched only
+when another allocation took the slot.
+---
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+@@ -784,10 +784,17 @@ virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
+       return;
+    }
+ 
+-   for (int i = 0; i < cbuf->alloc_count; i++) {
+-      if (cbuf->ctx->pAllocationList[i].hAllocation == res->hAllocation) {
+-         already_in_list = true;
+-         break;
++   unsigned hash = ((unsigned)res->hAllocation * 2654435761u) >> 22;
++   int hashed = cbuf->alloc_hash[hash] - 1;
++   if (hashed >= 0 && cbuf->ctx->pAllocationList[hashed].hAllocation == res->hAllocation) {
++      already_in_list = true;
++   } else if (hashed >= 0) {
++      /* another allocation hashed there: the list itself (one hashed into an empty slot is in no list) */
++      for (int i = 0; i < cbuf->alloc_count; i++) {
++         if (cbuf->ctx->pAllocationList[i].hAllocation == res->hAllocation) {
++            already_in_list = true;
++            break;
++         }
+       }
+    }
+ 
+@@ -820,6 +827,7 @@ virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
+ 
+       p_atomic_inc(&res->num_cs_references);
+ 
++      cbuf->alloc_hash[hash] = cbuf->alloc_count + 1;
+       cbuf->alloc_count++;
+    }
+ }
+@@ -969,6 +977,7 @@ virgl_gdi_winsys_submit_cmd(struct virgl_winsys *qws,
+    }
+ 
+    cbuf->alloc_count = 0;
++   memset(cbuf->alloc_hash, 0, sizeof(cbuf->alloc_hash));
+    cbuf->base.needs_flush = false;
+    return 0;
+ }
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
+@@ -102,6 +102,9 @@ struct virgl_gdi_cmd_buf {
+    int alloc_count;
+    int max_alloc;
+    struct virgl_hw_res **res_bo;
++   /* where an allocation is in the list (index + 1, 0: none hashed there): emit_res searched the whole list for
++    * each resource a command names, lists of hundreds (3DMark Vantage: a quarter of the driver's time) */
++   uint16_t alloc_hash[1024];
+ 
+    /* blobs named by the commands (no allocation list entries): referenced until submitted */
+    int blob_count;

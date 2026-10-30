@@ -91,9 +91,11 @@ static void sm5_result(bool pass, const std::string &name, const std::string &de
 static bool setupPair(Dev &hw, Dev &warp)
 {
    bool ok = setup(hw, g_warp);
-   if (!ok) checkAtLevel(D3D_FEATURE_LEVEL_11_0, false, "Create the Direct3D 11 device (feature level 11_0) with the test inputs");
+   // (the test inputs are compiled shaders: Windows 7 without KB4019990 has no compiler, a skip rather than a failure)
+   if (!ok) checkAtLevel(D3D_FEATURE_LEVEL_11_0, false, "Create the Direct3D 11 device (feature level 11_0) with the test inputs",
+                         haveHlslCompiler() ? "" : NO_HLSL_COMPILER);
    if (!setup(warp, true)) {
-      report(Status::Skip, "The tests of this group", "WARP (the reference) failed");
+      report(Status::Skip, "The tests of this group", haveHlslCompiler() ? "WARP (the reference) failed" : NO_HLSL_COMPILER);
       return false;
    }
    return ok;
@@ -289,7 +291,10 @@ static void groupD3D11Device()
    release(video);
    ID3D11Device1 *dev1 = nullptr;
    dev->QueryInterface(__uuidof(ID3D11Device1), (void **)&dev1);
-   check(dev1 != nullptr, "Direct3D 11.1 interfaces (ID3D11Device1)");
+   if (!dev1 && isWindows7())
+      optional(false, "Direct3D 11.1 interfaces (ID3D11Device1)", "Windows 7: they come with its Platform Update (KB2670838)");
+   else
+      check(dev1 != nullptr, "Direct3D 11.1 interfaces (ID3D11Device1)");
    release(dev1);
    ctx->Release();
    dev->Release();
@@ -447,7 +452,8 @@ static bool readTexture(Dev &d, ID3D11Texture2D *tex, UINT sub, std::vector<uint
       case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R32G32_FLOAT: bpp = 8; break;
       case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R32G32B32A32_UINT: bpp = 16; break;
       case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_UINT: bpp = 1; break;
-      case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_B5G6R5_UNORM: bpp = 2; break;
+      case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_B5G6R5_UNORM:
+      case DXGI_FORMAT_D16_UNORM: bpp = 2; break;
       default: break;
       }
       UINT row = w * bpp;
@@ -1128,6 +1134,24 @@ float4 main(float4 p : SV_Position) : SV_Target
        if (!opts.ExtendedDoublesShaderInstructions) {
           e = "not supported (optional)";
           return false;
+       }
+       if (d.warp) {
+          // The reference computed here rather than by WARP: Windows 8.1's WARP gets dfma wrong (fma(1.5, 0.5, 1.5)
+          // as 1.57 instead of 2.25), which made the GPU's right results a failure there. The shader's math in
+          // doubles, then the UNORM8 render target's rounding (the tolerance covers drcp's 1 ULP)
+          auto unorm = [](double v) { return (uint32_t)lround(std::min(1.0, std::max(0.0, (double)(float)v)) * 255.0); };
+          o.clear();
+          for (int py = 0; py < RH; py++) {
+             for (int px = 0; px < RW; px++) {
+                double x = px + 0.5 + 1, y = py + 0.5 + 1;
+                int i = (int)(x * -3.7);
+                unsigned u = (unsigned)(y * 2.2);
+                double back = (double)i + (double)u;
+                o.push_back(unorm(x / y / 33.0) | unorm((x * 0.5 + y) / 50.0) << 8 | unorm(1.0 / y * 2.0) << 16 |
+                            unorm((back + 120.0) / 240.0) << 24);
+             }
+          }
+          return true;
        }
        RT11 rt;
        const float clear[4] = {0, 0, 0, 0};
@@ -2217,6 +2241,45 @@ O main(uint id : SV_VertexID) { O o; float2 uv = float2((id << 1) & 2, id & 2);
        release(ctx1);
        return ok;
     }, 0, true},
+   {"Depth bias (DepthBias on a 16-bit depth buffer)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
+       // a triangle at depth 0.25 with a bias of 100 units: each texel as 0 (cleared), 1 (the triangle, biased) or 2
+       // (the triangle, not biased). Classes, not depths: GL leaves the unit to the implementation (NVIDIA's is twice
+       // D3D's 1/65536)
+       ID3D11Texture2D *t = tex11(d, RW, RH, DXGI_FORMAT_D16_UNORM, nullptr, 0, D3D11_BIND_DEPTH_STENCIL);
+       ID3D11DepthStencilView *dsv = nullptr;
+       if (t) d.dev->CreateDepthStencilView(t, nullptr, &dsv);
+       D3D11_RASTERIZER_DESC rd = {D3D11_FILL_SOLID, D3D11_CULL_NONE, FALSE, 100, 0.0f, 0.0f, TRUE, FALSE, FALSE, FALSE};
+       ID3D11RasterizerState *rs = nullptr;
+       d.dev->CreateRasterizerState(&rd, &rs);
+       ID3D11VertexShader *vs = vs11(d, "float4 main(uint id : SV_VertexID) : SV_Position { "
+                                        "float2 v[3] = {float2(-0.9, -0.8), float2(0.7, 0.95), float2(0.95, -0.6)}; "
+                                        "return float4(v[id], 0.25, 1); }", e);
+       bool ok = dsv && rs && vs;
+       if (ok) {
+          d.ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+          d.ctx->OMSetRenderTargets(0, nullptr, dsv);
+          D3D11_VIEWPORT vp = {0, 0, RW, RH, 0, 1};
+          d.ctx->RSSetViewports(1, &vp);
+          d.ctx->RSSetState(rs);
+          d.ctx->IASetInputLayout(nullptr);
+          d.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          d.ctx->VSSetShader(vs, nullptr, 0);
+          d.ctx->PSSetShader(nullptr, nullptr, 0);
+          d.ctx->Draw(3, 0);
+          std::vector<uint32_t> raw;
+          ok = readTexture(d, t, 0, raw);
+          o.clear();
+          for (size_t i = 0; ok && i < (size_t)RW * RH; i++) {
+             uint16_t v = ((const uint16_t *)raw.data())[i];
+             o.push_back(v == 0xffff ? 0 : v >= 16384 + 50 ? 1 : 2);
+          }
+       }
+       release(vs);
+       release(rs);
+       release(dsv);
+       release(t);
+       return ok;
+    }, 0, false},
    {"Map on default textures (WriteToSubresource, ReadFromSubresource; 11.3)", [](Dev &d, std::vector<uint32_t> &o, std::string &e) {
        D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2 = {};
        d.dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2);
@@ -2542,7 +2605,8 @@ static void groupD3D11Present()
    dxgiDev->GetAdapter(&adapter);
    adapter->GetParent(__uuidof(IDXGIFactory2), (void **)&factory);
    if (!factory) {
-      check(false, "DXGI 1.2 factory");
+      if (isWindows7()) optional(false, "DXGI 1.2 factory", "Windows 7: DXGI 1.2 comes with its Platform Update (KB2670838)");
+      else check(false, "DXGI 1.2 factory");
       return;
    }
    struct Mode {

@@ -25,6 +25,7 @@
 // D3D12 methods returning structures (descriptor handles, resource descriptions) with the right calling convention
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
+#include <versionhelpers.h>
 #include <shellapi.h>
 #include <GL/gl.h>
 #include <d3d9.h>
@@ -239,6 +240,18 @@ static HRESULT compileD3D(const void *src, SIZE_T size, const char *name, const 
    static auto compile = (pD3DCompile)GetProcAddress(LoadLibraryA("d3dcompiler_47.dll"), "D3DCompile");
    if (!compile) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
    return compile(src, size, name, nullptr, nullptr, entry, profile, flags, 0, code, errors);
+}
+
+static bool haveHlslCompiler()
+{
+   static bool have = GetProcAddress(LoadLibraryA("d3dcompiler_47.dll"), "D3DCompile") != nullptr;
+   return have;
+}
+
+// Windows 7 (its Platform Update, KB2670838, brings Direct3D 11.1's interfaces, DXGI 1.2 and Direct2D 1.1)
+static bool isWindows7()
+{
+   return !IsWindows8OrGreater();
 }
 
 static ID3DBlob *compileHlsl(const std::string &src, const char *profile, std::string *error = nullptr,

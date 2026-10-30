@@ -1,0 +1,64 @@
+From: WinBoat
+Subject: [PATCH] vrend: read back just the box of textures it can't render to
+
+A copy transfer from the host reads a texture the host can't render to (compressed formats) with
+glGet[Compressed]TexImage, which return the whole level, and refused unless the guest's buffer held the whole level
+(every face of a cube map) - a staging buffer is sized for the box the guest maps. A write to part of a compressed
+texture's level after an upload reads that part back first, so D3D11 programs that did it (GravityMark: a 4096x4096
+BC1 cube map) had their context put in error, and drew nothing more. With GL 4.5 (ARB_get_texture_sub_image) the
+host reads just the box (glGet[Compressed]TextureSubImage); without it, as before.
+---
+diff --color -ru a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+--- a/src/vrend/vrend_renderer.c	2026-10-26 13:48:39.431711746 +0100
++++ b/src/vrend/vrend_renderer.c	2026-10-26 13:49:22.376962488 +0100
+@@ -165,6 +165,7 @@
+    feat_framebuffer_fetch,
+    feat_framebuffer_fetch_non_coherent,
+    feat_geometry_shader,
++   feat_get_texture_sub_image,
+    feat_gl_conditional_render,
+    feat_gl_prim_restart,
+    feat_gles_khr_robustness,
+@@ -287,6 +288,7 @@
+    FEAT(framebuffer_fetch, UNAVAIL, UNAVAIL,  "GL_EXT_shader_framebuffer_fetch" ),
+    FEAT(framebuffer_fetch_non_coherent, UNAVAIL, UNAVAIL,  "GL_EXT_shader_framebuffer_fetch_non_coherent" ),
+    FEAT(geometry_shader, 32, 32, "GL_EXT_geometry_shader", "GL_OES_geometry_shader"),
++   FEAT(get_texture_sub_image, 45, UNAVAIL, "GL_ARB_get_texture_sub_image"),
+    FEAT(gl_conditional_render, 30, UNAVAIL, NULL),
+    FEAT(gl_prim_restart, 31, 30, NULL),
+    FEAT(gles_khr_robustness, UNAVAIL, UNAVAIL,  "GL_KHR_robustness" ),
+@@ -10004,6 +10006,34 @@
+    if (compressed)
+       format = tex_conv_table[res->base.format].internalformat;
+ 
++   /* GL 4.5 reads just the box (z: a cube face, an array layer). glGet[Compressed]TexImage read the whole level, which
++    * the guest's staging buffer, sized for the box, doesn't hold: a write to part of a compressed texture's level after
++    * an upload (D3D11, GravityMark's 4096x4096 BC1 cube map) failed here and put the context in error */
++   if (has_feature(feat_get_texture_sub_image)) {
++      struct pipe_box box = *info->box;
++      uint32_t size = util_format_get_nblocks(res->base.format, box.width, box.height) * elsize * box.depth;
++
++      if (res->target == GL_TEXTURE_1D_ARRAY) {
++         /* GL's 1D array layers are its y */
++         box.y = box.z; box.height = box.depth;
++         box.z = 0; box.depth = 1;
++      }
++      data = malloc(size);
++      if (!data)
++         return ENOMEM;
++      glPixelStorei(GL_PACK_ALIGNMENT, 1);
++      if (compressed)
++         glGetCompressedTextureSubImage(res->gl_id, info->level, box.x, box.y, box.z, box.width, box.height, box.depth,
++                                        size, data);
++      else
++         glGetTextureSubImage(res->gl_id, info->level, box.x, box.y, box.z, box.width, box.height, box.depth, format,
++                              type, size, data);
++      glPixelStorei(GL_PACK_ALIGNMENT, 4);
++      write_transfer_data(&res->base, iov, num_iovs, data, info->stride, info->box, info->level, info->offset, false);
++      free(data);
++      return 0;
++   }
++
+    uint64_t tex_size = util_format_get_nblocks(res->base.format,
+                                                u_minify(res->base.width0, info->level),
+                                                u_minify(res->base.height0, info->level));

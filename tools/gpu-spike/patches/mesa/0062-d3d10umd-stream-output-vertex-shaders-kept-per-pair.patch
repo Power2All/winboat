@@ -1,0 +1,123 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: stream output vertex shaders kept per pair
+
+Stream output without a geometry shader (an "empty" one, with only the declaration) runs a translation of the vertex
+shader carrying the declaration, made at draw time for the pair. The device kept one: a game alternating such
+pairs from draw to draw had a new shader made, sent, compiled and linked on the host for almost every draw.
+3DMark Vantage's New Calico (Graphics test 2) made ~1850 a second and ran at 0.06 fps. The pairs' shaders are now
+kept (32, the oldest replaced; DestroyShader drops a shader's): no shader made during the test, ~11-17 fps.
+---
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -124,9 +124,14 @@
+    struct RasterizerState *bound_rasterizer;
+    void *bound_rasterizer_handle;   /* the variant bound (ResolveState) */
+    /* Stream output without a geometry shader (an "empty" one, with only the declaration): the vertex shader with
+-    * the declaration, made at draw time for that pair (ResolveState) */
+-   void *so_vs_handle;
+-   Shader *so_vs_vs, *so_vs_gs;
++    * the declaration, made at draw time for that pair and kept for it (ResolveState; DestroyShader drops a shader's):
++    * games alternate several such pairs from draw to draw (3DMark Vantage's New Calico: one made per draw, 0.06 fps) */
++   struct {
++      Shader *vs, *gs;
++      void *handle;
++   } so_vs_cache[32];
++   unsigned so_vs_next;       /* the entry a full cache replaces next */
++   void *so_vs_handle;        /* the one bound */
+    bool so_vs_bound;
+    Shader *bound_shader[PIPE_SHADER_TYPES];      /* whose bindings to bind (Shader_bindings) */
+    bool bindings_dirty[PIPE_SHADER_TYPES];
+diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/Draw.cpp
+@@ -116,24 +116,35 @@
+    Shader *vs = pDevice->bound_vs;
+    if (pDevice->bound_empty_gs && vs && vs->state.tokens) {
+       Shader *gs = pDevice->bound_empty_gs;
+-      if (!pDevice->so_vs_handle || pDevice->so_vs_vs != vs || pDevice->so_vs_gs != gs) {
+-         if (pDevice->so_vs_handle) {
+-            if (pDevice->so_vs_bound)
++      unsigned n = ARRAY_SIZE(pDevice->so_vs_cache), e;
++      for (e = 0; e < n; e++) {
++         if (pDevice->so_vs_cache[e].handle && pDevice->so_vs_cache[e].vs == vs && pDevice->so_vs_cache[e].gs == gs)
++            break;
++      }
++      if (e == n) {
++         for (e = 0; e < n && pDevice->so_vs_cache[e].handle; e++)
++            ;
++         if (e == n) {
++            /* full: replace the oldest made (unbound first if it is bound) */
++            e = pDevice->so_vs_next++ % n;
++            if (pDevice->so_vs_bound && pDevice->so_vs_handle == pDevice->so_vs_cache[e].handle) {
+                pipe->bind_vs_state(pipe, pDevice->empty_vs);
+-            pipe->delete_vs_state(pipe, pDevice->so_vs_handle);
++               pDevice->so_vs_bound = false;
++            }
++            pipe->delete_vs_state(pipe, pDevice->so_vs_cache[e].handle);
+          }
+          struct pipe_shader_state state = vs->state;
+          state.stream_output = gs->state.stream_output;
+          for (unsigned i = 0; i < state.stream_output.num_outputs; ++i)
+             state.stream_output.output[i].register_index =
+                ShaderFindOutputMapping(vs, gs->state.stream_output.output[i].register_index);
+-         pDevice->so_vs_handle = pipe->create_vs_state(pipe, &state);
+-         pDevice->so_vs_vs = vs;
+-         pDevice->so_vs_gs = gs;
+-         pDevice->so_vs_bound = false;
++         pDevice->so_vs_cache[e].handle = pipe->create_vs_state(pipe, &state);
++         pDevice->so_vs_cache[e].vs = vs;
++         pDevice->so_vs_cache[e].gs = gs;
+       }
+-      if (!pDevice->so_vs_bound) {
+-         pipe->bind_vs_state(pipe, pDevice->so_vs_handle);
++      if (!pDevice->so_vs_bound || pDevice->so_vs_handle != pDevice->so_vs_cache[e].handle) {
++         pipe->bind_vs_state(pipe, pDevice->so_vs_cache[e].handle);
++         pDevice->so_vs_handle = pDevice->so_vs_cache[e].handle;
+          pDevice->so_vs_bound = true;
+       }
+    } else if (pDevice->so_vs_bound) {
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -608,16 +608,18 @@
+    struct pipe_context *pipe = CastPipeContext(hDevice);
+    Shader *pShader = CastShader(hShader);
+ 
+-   /* The stream output vertex shader made with it */
+-   if (pDevice->so_vs_handle && (pDevice->so_vs_vs == pShader || pDevice->so_vs_gs == pShader)) {
+-      if (pDevice->so_vs_bound) {
++   /* The stream output vertex shaders made with it */
++   for (unsigned e = 0; e < ARRAY_SIZE(pDevice->so_vs_cache); e++) {
++      if (!pDevice->so_vs_cache[e].handle || (pDevice->so_vs_cache[e].vs != pShader && pDevice->so_vs_cache[e].gs != pShader))
++         continue;
++      if (pDevice->so_vs_bound && pDevice->so_vs_handle == pDevice->so_vs_cache[e].handle) {
+          pipe->bind_vs_state(pipe, pDevice->bound_vs && pDevice->bound_vs->handle ? pDevice->bound_vs->handle
+                                                                                   : pDevice->empty_vs);
+          pDevice->so_vs_bound = false;
+       }
+-      pipe->delete_vs_state(pipe, pDevice->so_vs_handle);
+-      pDevice->so_vs_handle = NULL;
+-      pDevice->so_vs_vs = pDevice->so_vs_gs = NULL;
++      pipe->delete_vs_state(pipe, pDevice->so_vs_cache[e].handle);
++      pDevice->so_vs_cache[e].handle = NULL;
++      pDevice->so_vs_cache[e].vs = pDevice->so_vs_cache[e].gs = NULL;
+    }
+    if (pDevice->bound_empty_gs == pShader)
+       pDevice->bound_empty_gs = NULL;
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -410,8 +410,10 @@
+ 
+    pipe->bind_fs_state(pipe, NULL);
+    pipe->bind_vs_state(pipe, NULL);
+-   if (pDevice->so_vs_handle)
+-      pipe->delete_vs_state(pipe, pDevice->so_vs_handle);
++   for (unsigned e = 0; e < ARRAY_SIZE(pDevice->so_vs_cache); e++) {
++      if (pDevice->so_vs_cache[e].handle)
++         pipe->delete_vs_state(pipe, pDevice->so_vs_cache[e].handle);
++   }
+    cso_destroy_context(pDevice->cso);
+ 
+    DeleteEmptyShader(pDevice, PIPE_SHADER_FRAGMENT, pDevice->empty_fs);

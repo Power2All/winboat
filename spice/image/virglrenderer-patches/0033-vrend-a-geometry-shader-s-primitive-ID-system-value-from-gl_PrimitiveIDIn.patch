@@ -1,0 +1,22 @@
+From: WinBoat
+Subject: [PATCH] vrend: a geometry shader's primitive ID system value from gl_PrimitiveIDIn
+
+A geometry shader's SV_PrimitiveID declared as a system value (DCL SV[n], PRIM_ID, as Direct3D's shaders come
+through d3d10umd) became gl_PrimitiveID, which in a geometry shader is the output it may write for the fragment
+shader, not the input: every primitive read the same undefined value (0 on NVIDIA). 3DMark Vantage's GPU cloth
+applies its constraints to primitives below a count and passes the rest (the flags' edges) through: all of them got
+the constraints, the cloth crumpled into stripes and blew up within seconds (the test showed bare poles). The
+geometry shader's system value is now gl_PrimitiveIDIn, as its primitive ID input already was.
+---
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -2006,6 +2006,9 @@
+       if (decl->Semantic.Name < TGSI_SEMANTIC_COUNT) {
+          struct syvalue_prop_map *svmap = &sysvalue_map[decl->Semantic.Name];
+          name_prefix = svmap->glsl_name;
++         /* a geometry shader's input primitive ID: its gl_PrimitiveID is the output it writes for the fragment shader */
++         if (decl->Semantic.Name == TGSI_SEMANTIC_PRIMID && iter->processor.Processor == TGSI_PROCESSOR_GEOMETRY)
++            name_prefix = "gl_PrimitiveIDIn";
+          if (!name_prefix) {
+             virgl_error("Unsupported system value %d\n", decl->Semantic.Name);
+             return false;

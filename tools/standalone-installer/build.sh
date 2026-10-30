@@ -49,7 +49,16 @@ fi
     echo "Direct3D 12 and Vulkan also need Venus (QEMU 9.2 or later, virglrenderer with Venus):"
     echo "  -machine memory-backend=mem -object memory-backend-memfd,id=mem,size=<the VM's memory>"
     echo "  -device virtio-vga-gl,hostmem=4G,blob=true,venus=true"
-    echo "With libvirt, Venus also needs seccomp_sandbox = 0 in qemu.conf. Without Venus, Direct3D 9-11 and OpenGL work."
+    echo "Without Venus, Direct3D 9-11 and OpenGL work; Direct3D 12 and Vulkan programs say \"not supported\"."
+    echo
+    echo "VENUS UNDER LIBVIRT (virt-manager, GNOME Boxes): SECCOMP"
+    echo
+    echo "Venus starts a helper process on the host (virgl_render_server). libvirt runs QEMU in a seccomp sandbox that forbids starting processes, so with Venus on, ALL 3D fails (the VM's log says \"failed to initialize venus renderer\"). Turn the sandbox off on the host:"
+    echo "1. In /etc/libvirt/qemu.conf (system VMs) or ~/.config/libvirt/qemu.conf (user session VMs, qemu:///session), add the line:"
+    echo "     seccomp_sandbox = 0"
+    echo "2. Shut the VMs down and restart libvirt: sudo systemctl restart virtqemud (or libvirtd). A user session's daemon: pkill -u \$USER virtqemud (it starts again by itself)."
+    echo "3. Start the VM. Check: the QEMU command line (ps -ef | grep qemu) has no -sandbox ...spawn=deny."
+    echo "This turns off a security layer around every QEMU libvirt starts on that host; leave it on if you don't need Direct3D 12/Vulkan. Plain QEMU: just don't pass -sandbox with spawn=deny."
     echo
     echo "WINDOWS VERSIONS (64-bit)"
     echo

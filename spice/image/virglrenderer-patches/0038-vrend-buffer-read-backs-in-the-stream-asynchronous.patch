@@ -1,0 +1,159 @@
+From: WinBoat
+Subject: [PATCH] vrend: buffer read-backs in the command stream asynchronous
+
+Mesa reads a staging buffer back right behind the GPU's copy into it (guest 0069: TRANSFER3D FROM_HOST in the same
+command stream). Each mapped the GL buffer at the transfer, which waited for the GPU to catch up with the stream on the
+thread that runs every context: GravityMark's OpenGL test ~140 a second, ~1 ms each. Such a read-back is now a GPU
+copy into a buffer of its own (glCopyNamedBufferSubData + a fence), copied into the guest's memory once done, before
+the fence that follows it is signaled to the guest (GL fences in a context pass in order); a later transfer of the
+resource waits for it. GravityMark OpenGL 1024x600: 136.7 to ~153 fps, the host thread 48% to 31%. GL 4.5, desktop GL,
+fences retired on the main thread only (otherwise the old path).
+---
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1529,8 +1529,8 @@
+        transfer_mode != VIRGL_TRANSFER_FROM_HOST)
+       return EINVAL;
+ 
+-   return vrend_renderer_transfer_iov(ctx, dst_handle, &info,
+-                                      transfer_mode);
++   return vrend_renderer_transfer_iov_in_stream(ctx, dst_handle, &info,
++                                                transfer_mode);
+ }
+ 
+ static int check_copy_transfer3d_handles(struct vrend_context *ctx, uint32_t src_handle,  uint32_t dst_handle,
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -10564,6 +10564,95 @@
+    return 0;
+ }
+ 
++/* WinBoat: a buffer read back to the guest in the command stream (TRANSFER3D FROM_HOST: Mesa reads a staging buffer
++ * ahead, right behind the GPU's copy into it) is copied on the GPU into a buffer of its own, and into the guest's
++ * memory once that copy is done, before the fence that follows it is signaled to the guest (GL fences in a context
++ * pass in order). Mapped at the transfer, each one waited for the GPU to catch up with the stream, on the thread that
++ * runs every context (GravityMark's OpenGL test: ~140 a second, ~1 ms each) */
++struct vrend_readback {
++   struct list_head head;
++   struct vrend_resource *res;
++   GLuint buffer;
++   GLsync sync;
++   uint64_t offset;
++   uint32_t size;
++};
++
++static struct list_head vrend_readbacks = { &vrend_readbacks, &vrend_readbacks };
++
++/* the read-backs whose copy is done into guest memory, or (res) all of res's, waiting for them */
++static void vrend_readbacks_finish(struct vrend_resource *res)
++{
++   list_for_each_entry_safe(struct vrend_readback, rb, &vrend_readbacks, head) {
++      if (res && rb->res != res)
++         continue;
++      GLenum ret;
++      do {
++         ret = glClientWaitSync(rb->sync, 0, res ? 1000000000 : 0);
++      } while (ret == GL_TIMEOUT_EXPIRED && res);
++      if (ret == GL_TIMEOUT_EXPIRED)
++         continue;
++
++      void *data = glMapNamedBufferRange(rb->buffer, 0, rb->size, GL_MAP_READ_BIT);
++      if (data) {
++         if (rb->res->iov)
++            vrend_write_to_iovec(rb->res->iov, rb->res->num_iovs, rb->offset, data, rb->size);
++         glUnmapNamedBuffer(rb->buffer);
++      } else {
++         virgl_error("Unable to map a read-back buffer\n");
++      }
++      glDeleteBuffers(1, &rb->buffer);
++      glDeleteSync(rb->sync);
++      vrend_resource_reference(&rb->res, NULL);
++      list_del(&rb->head);
++      free(rb);
++   }
++}
++
++static bool vrend_readback_start(struct vrend_context *ctx, struct vrend_resource *res,
++                                 const struct vrend_transfer_info *info)
++{
++   if (vrend_state.use_gles || epoxy_gl_version() < 45 || vrend_state.use_async_fence_cb ||
++       !has_bit(res->storage_bits, VREND_STORAGE_GL_BUFFER) ||
++       has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY) || !res->iov ||
++#ifdef ENABLE_VENUS
++       res->vk_buffer ||
++#endif
++       !info->box || info->level || info->box->width <= 0 || (info->iovec && info->iovec_cnt) ||
++       !resource_contains_box(res, info->box, info->level) ||
++       !check_iov_bounds(res, info, res->iov, res->num_iovs) ||
++       !vrend_hw_switch_context(ctx, true))
++      return false;
++
++   struct vrend_readback *rb = calloc(1, sizeof(*rb));
++   if (!rb)
++      return false;
++   rb->offset = info->offset;
++   rb->size = info->box->width;
++   glCreateBuffers(1, &rb->buffer);
++   glNamedBufferStorage(rb->buffer, rb->size, NULL, GL_MAP_READ_BIT | GL_CLIENT_STORAGE_BIT);
++   glCopyNamedBufferSubData(res->gl_id, rb->buffer, info->box->x, 0, rb->size);
++   rb->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++   /* a wait from another context (a transfer of res there) sees it */
++   glFlush();
++   vrend_resource_reference(&rb->res, res);
++   list_addtail(&rb->head, &vrend_readbacks);
++   return true;
++}
++
++int vrend_renderer_transfer_iov_in_stream(struct vrend_context *ctx,
++                                          uint32_t dst_handle,
++                                          const struct vrend_transfer_info *info,
++                                          int transfer_mode)
++{
++   if (transfer_mode == VIRGL_TRANSFER_FROM_HOST) {
++      struct vrend_resource *res = vrend_renderer_ctx_res_lookup(ctx, dst_handle);
++      if (res && vrend_readback_start(ctx, res, info))
++         return 0;
++   }
++   return vrend_renderer_transfer_iov(ctx, dst_handle, info, transfer_mode);
++}
++
+ int vrend_renderer_transfer_iov(struct vrend_context *ctx,
+                                 uint32_t dst_handle,
+                                 const struct vrend_transfer_info *info,
+@@ -10586,6 +10675,10 @@
+       }
+    }
+ 
++   /* a read-back still on its way would land on top of this */
++   if (!list_is_empty(&vrend_readbacks))
++      vrend_readbacks_finish(res);
++
+    return vrend_renderer_transfer_internal(ctx, res, info,
+                                            transfer_mode);
+ }
+@@ -12074,6 +12167,10 @@
+ 
+    vrend_renderer_check_queries();
+ 
++   /* the read-backs before these fences are done: into guest memory before the guest hears of them */
++   if (!list_is_empty(&vrend_readbacks))
++      vrend_readbacks_finish(NULL);
++
+    list_for_each_entry_safe(struct vrend_fence, fence, &retired_fences, fences) {
+       struct vrend_context *ctx = fence->ctx;
+       ctx->fence_retire(fence->fence_id, ctx->fence_retire_data);
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -415,6 +415,12 @@
+                                 const struct vrend_transfer_info *info,
+                                 int transfer_mode);
+ 
++/* a transfer from the command stream: a buffer's read-back (FROM_HOST) lands in guest memory by the next fence */
++int vrend_renderer_transfer_iov_in_stream(struct vrend_context *ctx,
++                                          uint32_t dst_handle,
++                                          const struct vrend_transfer_info *info,
++                                          int transfer_mode);
++
+ int vrend_renderer_transfer_pipe(struct pipe_resource *pres,
+                                  const struct vrend_transfer_info *info,
+                                  int transfer_mode);

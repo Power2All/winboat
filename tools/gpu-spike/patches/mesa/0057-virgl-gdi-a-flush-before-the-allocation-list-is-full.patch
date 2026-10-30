@@ -1,0 +1,62 @@
+From: WinBoat
+Subject: [PATCH] virgl: gdi: a flush before the allocation list is full
+
+The GDI winsys's allocation and patch location lists have 1024 entries, and adding a resource to them had only an
+assert for room: a command buffer naming more than 1024 resources wrote past them. 3DMark Vantage's loading names
+more between flushes, and crashed in virgl_gdi_emit_res (an access violation in viogpu_d3d10_x86.dll). With a
+command's worth of room left (one names at most ~128 resources) the winsys asks for a flush, which the encoder
+makes before the next command; the lists are never written past.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_winsys.h b/src/gallium/drivers/virgl/virgl_winsys.h
+--- a/src/gallium/drivers/virgl/virgl_winsys.h
++++ b/src/gallium/drivers/virgl/virgl_winsys.h
+@@ -43,6 +43,8 @@
+ struct virgl_cmd_buf {
+    unsigned cdw;
+    uint32_t *buf;
++   /* the winsys has little room left for the resources commands name: flushed before the next command */
++   bool needs_flush;
+ };
+ 
+ struct virgl_winsys {
+diff --git a/src/gallium/drivers/virgl/virgl_encode.c b/src/gallium/drivers/virgl/virgl_encode.c
+--- a/src/gallium/drivers/virgl/virgl_encode.c
++++ b/src/gallium/drivers/virgl/virgl_encode.c
+@@ -501,7 +501,7 @@
+ {
+    int len = (dword >> 16);
+ 
+-   if ((ctx->cbuf->cdw + len + 1) > VIRGL_MAX_CMDBUF_DWORDS)
++   if ((ctx->cbuf->cdw + len + 1) > VIRGL_MAX_CMDBUF_DWORDS || ctx->cbuf->needs_flush)
+       ctx->base.flush(&ctx->base, NULL, 0);
+ 
+    virgl_encoder_write_dword(ctx->cbuf, dword);
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+@@ -793,8 +793,16 @@
+ 
+    if (write_buf)
+       cbuf->base.buf[cbuf->base.cdw++] = res->res_handle;
++   /* the allocation list has a fixed size: a command buffer naming more resources (3DMark Vantage's loading, over
++    * 1024) wrote past it. Flushed before the next command when a command's worth of room is left (one names at most
++    * ~128: sampler views), and never written past */
++   if (!already_in_list && cbuf->alloc_count >= cbuf->max_alloc - 256)
++      cbuf->base.needs_flush = true;
++   if (!already_in_list && cbuf->alloc_count == cbuf->max_alloc) {
++      _debug_printf("virgl_gdi_emit_res: allocation list full (%d)\n", cbuf->max_alloc);
++      return;
++   }
+    if (!already_in_list) {
+-      assert(cbuf->alloc_count <= cbuf->max_alloc);
+ 
+       memset(&cbuf->ctx->pAllocationList[cbuf->alloc_count], 0,
+              sizeof(D3DDDI_ALLOCATIONLIST));
+@@ -961,6 +969,7 @@
+    }
+ 
+    cbuf->alloc_count = 0;
++   cbuf->base.needs_flush = false;
+    return 0;
+ }
+ 

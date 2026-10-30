@@ -1,0 +1,64 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd, virgl: depth to color copies on the host's GPU
+
+Direct3D copies between formats of a family: 3DMark Vantage's Jane Nash copies its D32_FLOAT depth buffer into an
+R32_FLOAT texture ~100 times a second. d3d10umd took such a pair as incompatible and copied it on the CPU
+(util_resource_copy_region): a read-back of the whole texture (5 MB at 1280x1024) and a synchronous round trip each
+time, half the test's time spent waiting. A Z32_FLOAT or Z16_UNORM texture and a one-channel color texture of its
+texel size now go to resource_copy_region; virgl sends them to the host when it has VIRGL_CAP_V2_COPY_DEPTH_COLOR
+(virglrenderer 0036 copies through a pixel buffer on the GPU, bit for bit) and copies on the CPU otherwise (a stock
+host). Jane Nash 38.9 -> 102 fps with the host's 0035/0036 (spike); dcopy11 (D32_FLOAT -> R32_FLOAT, D16_UNORM ->
+R16_UNORM) bit for bit as WARP.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -839,6 +839,18 @@ areResourcesCompatible(const struct pipe_resource *src_resource, // IN
+       assert(src_format_desc->block.height == dst_format_desc->block.height);
+       assert(src_format_desc->block.bits   == dst_format_desc->block.bits);
+ 
++      /* a 32-bit float or 16-bit depth texture and a one-channel color texture of its size (D32_FLOAT <-> R32_FLOAT,
++       * D16_UNORM <-> R16_UNORM: Direct3D copies within a format family): bit for bit, on the host's GPU when it
++       * can (virgl_resource_copy_region takes the CPU otherwise). A CPU copy read the whole texture back, a round
++       * trip each time (3DMark Vantage's Jane Nash: its depth buffer ~100 times a second, half its time waiting) */
++      bool src_depth = src_resource->format == PIPE_FORMAT_Z32_FLOAT || src_resource->format == PIPE_FORMAT_Z16_UNORM;
++      bool dst_depth = dst_resource->format == PIPE_FORMAT_Z32_FLOAT || dst_resource->format == PIPE_FORMAT_Z16_UNORM;
++      const struct util_format_description *color = src_depth ? dst_format_desc : src_format_desc;
++      if (src_depth != dst_depth && !util_format_is_depth_or_stencil(src_depth ? dst_resource->format : src_resource->format) &&
++          color->nr_channels == 1 && !util_format_is_compressed(color->format) &&
++          src_resource->nr_samples <= 1 && dst_resource->nr_samples <= 1)
++         return true;
++
+       return util_is_format_compatible(src_format_desc, dst_format_desc);
+    }
+ }
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -1413,6 +1413,14 @@ static void virgl_resource_copy_region(struct pipe_context *ctx,
+    struct virgl_resource *dres = virgl_resource(dst);
+    struct virgl_resource *sres = virgl_resource(src);
+ 
++   /* a depth texture to a color one of the same texel size or back (Direct3D's copies within a format family): on
++    * the host's GPU when it can, else through the CPU */
++   if (util_format_is_depth_or_stencil(src->format) != util_format_is_depth_or_stencil(dst->format) &&
++       !(virgl_screen(ctx->screen)->caps.caps.v2.capability_bits_v2 & VIRGL_CAP_V2_COPY_DEPTH_COLOR)) {
++      util_resource_copy_region(ctx, dst, dst_level, dstx, dsty, dstz, src, src_level, src_box);
++      return;
++   }
++
+    if (dres->b.target == PIPE_BUFFER)
+       util_range_add(&dres->b, &dres->valid_buffer_range, dstx, dstx + src_box->width);
+    virgl_resource_dirty(dres, dst_level);
+diff --git a/src/virtio/virtio-gpu/virgl_hw.h b/src/virtio/virtio-gpu/virgl_hw.h
+--- a/src/virtio/virtio-gpu/virgl_hw.h
++++ b/src/virtio/virtio-gpu/virgl_hw.h
+@@ -606,6 +606,8 @@ enum virgl_formats {
+ #define VIRGL_CAP_V2_SAMPLER_REDUCTION    (1u << 25)
+ /* WinBoat: TGSI's SPARSE (the next texture lookup's residency and LOD clamp: tiled resources tier 2) */
+ #define VIRGL_CAP_V2_SPARSE_FEEDBACK      (1u << 24)
++/* WinBoat: resource_copy_region between a depth format and a color format of the same texel size (Z32_FLOAT, Z16_UNORM) */
++#define VIRGL_CAP_V2_COPY_DEPTH_COLOR     (1u << 23)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.

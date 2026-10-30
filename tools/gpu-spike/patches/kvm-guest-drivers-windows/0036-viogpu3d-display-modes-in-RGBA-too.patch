@@ -1,0 +1,46 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: display modes in RGBA too
+
+The source modes were all A8R8G8B8, and DXGI lists an output's modes for a format from the driver's source modes:
+GetDisplayModeList(R8G8B8A8_UNORM) found none, and full-screen DXGI applications asking for one failed (3DMark
+Vantage: "dxgi::output: No display mode for requested format available"). Every mode is offered in A8B8G8R8 as
+well; a flip scans out the application's own resource, in its own format.
+---
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -563,7 +563,8 @@
+     }
+     else
+     {
+-        if (pSourceMode->Format.Graphics.PixelFormat == D3DDDIFMT_A8R8G8B8)
++        if (pSourceMode->Format.Graphics.PixelFormat == D3DDDIFMT_A8R8G8B8 ||
++            pSourceMode->Format.Graphics.PixelFormat == D3DDDIFMT_A8B8G8R8)
+         {
+             return STATUS_SUCCESS;
+         }
+@@ -976,10 +977,14 @@
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+     UNREFERENCED_PARAMETER(SourceId);
+ 
+-    for (ULONG idx = 0; idx < GetModeCount(); ++idx)
++    // Each mode in BGRA and RGBA: DXGI lists a format's display modes from these, and full-screen DXGI applications
++    // asking for R8G8B8A8_UNORM ones found none (3DMark Vantage: "No display mode for requested format available").
++    // A flip scans out the application's own resource, in its own format
++    static const D3DDDIFORMAT formats[] = {D3DDDIFMT_A8R8G8B8, D3DDDIFMT_A8B8G8R8};
++    for (ULONG idx = 0; idx < GetModeCount() * ARRAYSIZE(formats); ++idx)
+     {
+         D3DKMDT_VIDPN_SOURCE_MODE *pVidPnSourceModeInfo = NULL;
+-        PVIDEO_MODE_INFORMATION pModeInfo = &m_ModeInfo[idx];
++        PVIDEO_MODE_INFORMATION pModeInfo = &m_ModeInfo[idx / ARRAYSIZE(formats)];
+         NTSTATUS Status = pVidPnSourceModeSetInterface->pfnCreateNewModeInfo(hVidPnSourceModeSet,
+                                                                              &pVidPnSourceModeInfo);
+         if (!NT_SUCCESS(Status))
+@@ -996,7 +1001,7 @@
+         pVidPnSourceModeInfo->Format.Graphics.PrimSurfSize.cy = pModeInfo->VisScreenHeight;
+         pVidPnSourceModeInfo->Format.Graphics.VisibleRegionSize = pVidPnSourceModeInfo->Format.Graphics.PrimSurfSize;
+         pVidPnSourceModeInfo->Format.Graphics.Stride = pModeInfo->ScreenStride;
+-        pVidPnSourceModeInfo->Format.Graphics.PixelFormat = D3DDDIFMT_A8R8G8B8;
++        pVidPnSourceModeInfo->Format.Graphics.PixelFormat = formats[idx % ARRAYSIZE(formats)];
+         pVidPnSourceModeInfo->Format.Graphics.ColorBasis = D3DKMDT_CB_SCRGB;
+         pVidPnSourceModeInfo->Format.Graphics.PixelValueAccessMode = D3DKMDT_PVAM_DIRECT;
+ 

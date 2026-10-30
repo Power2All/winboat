@@ -27,6 +27,23 @@ DXVK/vkd3d-proton's issue trackers) on 2026-10-24; measured with dx-test and Top
 Missing, optional in Direct3D and asked for by no known game: stencil reference from pixel shaders and standard
 swizzle layouts (NVIDIA's own drivers have neither), typed UAVs of B8G8R8A8, R32G32B32_FLOAT render targets.
 
+## Benchmarks
+
+GravityMark 1.89 (the user's WinBoat VM, Windows 11, RTX 3080 Laptop host, 1600x900 window, 200,000 asteroids,
+gpu.103: image 6.05-32, driver 58536, 2026-10-26; no viewer attached):
+
+| API | Score | FPS |
+|---|---|---|
+| Vulkan | 37,859 | 226.7 |
+| Direct3D 12 | 36,791 | 220.3 |
+| OpenGL | 22,296 | 133.5 |
+| Direct3D 11 | 7,238 | 43.3 |
+
+Vulkan, Direct3D 12 and OpenGL render correctly (checked against each other on screen). Direct3D 11 still renders
+without sunlight (flat, over-exposed asteroids; see `docs/gpu-roadmap-todo.md`) and is slow. Earlier figures
+(gpu.101) were wrong: Direct3D 11 drew nothing after a host error and Direct3D 12 sampled empty textures, and frames
+like that still count.
+
 ## What no driver of this kind can give
 
 - **Anti-cheat.** Riot Vanguard (Valorant, League of Legends), many Easy Anti-Cheat and BattlEye titles (Fortnite,

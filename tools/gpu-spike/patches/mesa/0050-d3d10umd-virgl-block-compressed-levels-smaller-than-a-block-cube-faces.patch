@@ -1,0 +1,84 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd, virgl: block-compressed levels smaller than a block, 2D views of cube faces
+
+D3D's boxes over a block-compressed level cover whole blocks, also past the edge of a level smaller than a block
+(a 2x2 level's box is 4x4); virglrenderer takes boxes within the level's texels and puts the context in error
+otherwise (GravityMark's Direct3D 11 renderer: its copies of BC7 mips into texture arrays and uploads of BC6H cube
+array mips, after which it drew nothing). virgl's maps clamp such a box to the level (the same blocks); a copy whose
+box passes either level's edge copies the blocks on the CPU (one GL copy can't be within both levels at once).
+A 2D (array) shader resource view of a cube's faces was a cube view of one face, which GL's texture views refuse
+(GL_INVALID_VALUE, the context in error): it is a 2D view of one face, a 2D array view of several (the host's GL
+samplers want the view's target: as a 2D array, GravityMark's per-face passes over its environment cube maps read
+nothing, and its asteroids were lit dim and pink).
+---
+diff --git a/src/gallium/drivers/virgl/virgl_texture.c b/src/gallium/drivers/virgl/virgl_texture.c
+index 7412d86..8c25a70 100644
+--- a/src/gallium/drivers/virgl/virgl_texture.c
++++ b/src/gallium/drivers/virgl/virgl_texture.c
+@@ -241,6 +241,17 @@ void *virgl_texture_transfer_map(struct pipe_context *ctx,
+                                  const struct pipe_box *box,
+                                  struct pipe_transfer **transfer)
+ {
++   /* D3D's boxes cover whole blocks, past the edge of a level smaller than a block (a 2x2 BC level's box is 4x4); the
++    * host wants the level's texels, which are the same blocks */
++   struct pipe_box clamped;
++   const int width = u_minify(resource->width0, level), height = u_minify(resource->height0, level);
++   if (util_format_is_compressed(resource->format) &&
++       ((box->x < width && box->x + box->width > width) || (box->y < height && box->y + box->height > height))) {
++      clamped = *box;
++      clamped.width = MIN2(clamped.width, width - clamped.x);
++      clamped.height = MIN2(clamped.height, height - clamped.y);
++      box = &clamped;
++   }
+    if (needs_resolve(ctx->screen, resource, usage))
+       return texture_transfer_map_resolve(ctx, resource, level, usage, box,
+                                           transfer);
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index dc8c99f..8b9c659 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -939,7 +939,17 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
+       src_box.depth  = u_minify(src_resource->depth0,  src_level);
+    }
+ 
+-   if (areResourcesCompatible(src_resource, dst_resource)) {
++   /* D3D's boxes cover whole blocks, past the edge of a level smaller than a block (GravityMark copies 4x4 BC blocks
++    * into 2x2 and 1x1 levels). The host copies within both levels' texels, which one GL copy can't give both sides:
++    * such copies go through the CPU, block by block */
++   bool blocks = util_format_is_compressed(src_resource->format) &&
++                 util_format_is_compressed(dst_resource->format) &&
++                 (src_box.x + src_box.width > (int)u_minify(src_resource->width0, src_level) ||
++                  src_box.y + src_box.height > (int)u_minify(src_resource->height0, src_level) ||
++                  DstX + src_box.width > u_minify(dst_resource->width0, dst_level) ||
++                  DstY + src_box.height > u_minify(dst_resource->height0, dst_level));
++
++   if (areResourcesCompatible(src_resource, dst_resource) && !blocks) {
+       pipe->resource_copy_region(pipe,
+                                  dst_resource, dst_level,
+                                  DstX, DstY, DstZ + dst_layer,
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+index bd27fc3..8600088 100644
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -1606,6 +1606,10 @@ CreateShaderResourceView(
+       desc.u.tex.last_level = pCreateSRView->Tex2D.MipLevels - 1 + desc.u.tex.first_level;
+       desc.u.tex.first_layer = pCreateSRView->Tex2D.FirstArraySlice;
+       desc.u.tex.last_layer = pCreateSRView->Tex2D.ArraySize - 1 + desc.u.tex.first_layer;
++      /* a 2D (array) view of a cube's faces: a 2D texture of one face, a 2D array of several (the host's GL views
++       * of cubes take whole cubes, and its samplers want the view's target) */
++      if (resource->target == PIPE_TEXTURE_CUBE || resource->target == PIPE_TEXTURE_CUBE_ARRAY)
++         desc.target = pCreateSRView->Tex2D.ArraySize == 1 ? PIPE_TEXTURE_2D : PIPE_TEXTURE_2D_ARRAY;
+       assert(pCreateSRView->Tex2D.MipLevels != 0 && pCreateSRView->Tex2D.MipLevels != (UINT)-1);
+       assert(pCreateSRView->Tex2D.ArraySize != 0 && pCreateSRView->Tex2D.ArraySize != (UINT)-1);
+       break;
+@@ -1688,6 +1692,10 @@ CreateShaderResourceView1(
+       desc.u.tex.last_level = pCreateSRView->Tex2D.MipLevels - 1 + desc.u.tex.first_level;
+       desc.u.tex.first_layer = pCreateSRView->Tex2D.FirstArraySlice;
+       desc.u.tex.last_layer = pCreateSRView->Tex2D.ArraySize - 1 + desc.u.tex.first_layer;
++      /* a 2D (array) view of a cube's faces: a 2D texture of one face, a 2D array of several (the host's GL views
++       * of cubes take whole cubes, and its samplers want the view's target) */
++      if (resource->target == PIPE_TEXTURE_CUBE || resource->target == PIPE_TEXTURE_CUBE_ARRAY)
++         desc.target = pCreateSRView->Tex2D.ArraySize == 1 ? PIPE_TEXTURE_2D : PIPE_TEXTURE_2D_ARRAY;
+       assert(pCreateSRView->Tex2D.MipLevels != 0 && pCreateSRView->Tex2D.MipLevels != (UINT)-1);
+       assert(pCreateSRView->Tex2D.ArraySize != 0 && pCreateSRView->Tex2D.ArraySize != (UINT)-1);
+       break;

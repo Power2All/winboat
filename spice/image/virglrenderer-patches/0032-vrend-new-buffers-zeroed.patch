@@ -1,0 +1,25 @@
+From: WinBoat
+Subject: [PATCH] vrend: new buffers zeroed
+
+Windows' drivers give new video memory zeroed, and apps come to depend on it (patch 0026 zeroes new textures for
+the same reason). 3DMark Vantage's GPU cloth creates its normals buffer without data and reads it in its first
+frame, before its normals pass has written it: the host driver had left that buffer with whatever its memory held
+(huge numbers and NaNs), the wind force made from those normals blew the cloth up, and every flag turned to NaN
+within a frame (the test showed bare poles). New buffers are now cleared to zero (glClearBufferData). Sparse
+buffers have no memory of their own. This also keeps one guest's buffer memory from showing another's leftovers.
+---
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8544,6 +8544,12 @@
+    } else
+       glBufferData(gr->target, width, NULL, GL_STREAM_DRAW);
+ 
++   /* Zeroed, as Windows' drivers give new video memory (as new textures are): apps read buffers they haven't written
++    * yet (3DMark Vantage's GPU cloth: last frame's normals, at its first frame), and the host driver leaves a new
++    * buffer with whatever its memory held (huge numbers and NaNs there: the cloth blew up) */
++   if (!vrend_state.use_gles && has_feature(feat_clear_texture))
++      glClearBufferData(gr->target, GL_R8, GL_RED, GL_UNSIGNED_BYTE, NULL);
++
+    glBindBufferARB(gr->target, 0);
+ }
+ 

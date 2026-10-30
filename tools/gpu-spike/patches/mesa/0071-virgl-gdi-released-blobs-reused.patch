@@ -1,0 +1,137 @@
+From: WinBoat
+Subject: [PATCH] virgl/gdi: released blobs reused
+
+Making a host blob (a persistently mapped buffer) waits for the host twice (the resource made by a command, then the
+blob by an escape), destroying one waits for its last submission and the host again. Direct3D 9 makes and releases them
+all the time (nine's upload buffers): 3DMark06's Deep Freeze and Firefly Forest spent nearly all their time in it. A
+released blob goes into a cache (16 blobs, 256 MB at most); one of the same kind whose last submission is done is handed
+out again, still mapped, without a host round trip. Deep Freeze 23.5 -> 85.6 fps.
+---
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.c
+@@ -184,6 +184,58 @@ virgl_gdi_resource_is_busy(struct virgl_winsys *vws, struct virgl_hw_res *res)
+    return resid_escape.ResourceBusy.IsBusy;
+ }
+ 
++static void virgl_gdi_fence_reference(struct virgl_winsys *vws, struct pipe_fence_handle **dst,
++                                      struct pipe_fence_handle *src);
++
++/* A released blob of the same kind whose last submission is done, from the cache: no host round trips. Its contents
++ * are what they were (a new buffer's are undefined); it stays mapped */
++static struct virgl_hw_res *
++virgl_gdi_blob_cache_take(struct virgl_gdi_winsys *qdws, const uint32_t key[10], uint32_t size)
++{
++   struct virgl_hw_res *res = NULL;
++   mtx_lock(&qdws->cacheMtx);
++   for (unsigned i = 0; i < qdws->blob_cache_count; i++) {
++      struct virgl_hw_res *c = qdws->blob_cache[i];
++      if (c->size != size || memcmp(c->blob_key, key, sizeof(c->blob_key)))
++         continue;
++      if (c->blob_fence && WaitForSingleObject(((struct virgl_gdi_fence *)c->blob_fence)->handle, 0) != WAIT_OBJECT_0)
++         continue;
++      res = c;
++      qdws->blob_cache[i] = qdws->blob_cache[--qdws->blob_cache_count];
++      break;
++   }
++   mtx_unlock(&qdws->cacheMtx);
++   if (res) {
++      virgl_gdi_fence_reference(&qdws->base, &res->blob_fence, NULL);
++      pipe_reference_init(&res->reference, 1);
++   }
++   return res;
++}
++
++/* A released blob into the cache; past its limits the oldest are destroyed (which waits for their last submissions) */
++static void
++virgl_gdi_blob_cache_put(struct virgl_gdi_winsys *qdws, struct virgl_hw_res *res)
++{
++   struct virgl_hw_res *old[VIRGL_GDI_BLOB_CACHE];
++   unsigned n_old = 0;
++   uint64_t bytes = res->size;
++   mtx_lock(&qdws->cacheMtx);
++   for (unsigned i = 0; i < qdws->blob_cache_count; i++)
++      bytes += qdws->blob_cache[i]->size;
++   /* at most VIRGL_GDI_BLOB_CACHE blobs and 256 MB of host memory: the oldest go */
++   while (qdws->blob_cache_count &&
++          (qdws->blob_cache_count == VIRGL_GDI_BLOB_CACHE || bytes > 256ull * 1024 * 1024)) {
++      old[n_old] = qdws->blob_cache[0];
++      bytes -= old[n_old++]->size;
++      memmove(&qdws->blob_cache[0], &qdws->blob_cache[1], (qdws->blob_cache_count - 1) * sizeof(old[0]));
++      qdws->blob_cache_count--;
++   }
++   qdws->blob_cache[qdws->blob_cache_count++] = res;
++   mtx_unlock(&qdws->cacheMtx);
++   for (unsigned i = 0; i < n_old; i++)
++      virgl_hw_res_destroy(qdws, old[i]);
++}
++
+ static void
+ virgl_gdi_resource_reference(struct virgl_winsys *qws,
+                              struct virgl_hw_res **dres,
+@@ -193,7 +245,9 @@ virgl_gdi_resource_reference(struct virgl_winsys *qws,
+    struct virgl_hw_res *old = *dres;
+ 
+    if (pipe_reference(&(*dres)->reference, &sres->reference)) {
+-      if (!can_cache_resource(old->bind) || p_atomic_read(&old->shared) || old->blob) {
++      if (old->blob && !p_atomic_read(&old->shared)) {
++         virgl_gdi_blob_cache_put(qdws, old);
++      } else if (!can_cache_resource(old->bind) || p_atomic_read(&old->shared) || old->blob) {
+          virgl_hw_res_destroy(qdws, old);
+       } else {
+          mtx_lock(&qdws->cacheMtx);
+@@ -330,6 +384,10 @@ virgl_gdi_winsys_resource_create_blob(struct virgl_winsys *qws, enum pipe_textur
+    const uint32_t page = 4096;
+    width = align(width, page);
+    size = align(size, page);
++   const uint32_t key[10] = {target, format, bind, width, height, depth, array_size, last_level, nr_samples, flags};
++   struct virgl_hw_res *cached = virgl_gdi_blob_cache_take(qdws, key, size);
++   if (cached)
++      return cached;
+    uint32_t blob_id = p_atomic_inc_return(&qdws->blob_id);
+ 
+    mtx_lock(&qdws->coreMtx);
+@@ -377,6 +435,7 @@ virgl_gdi_winsys_resource_create_blob(struct virgl_winsys *qws, enum pipe_textur
+       return NULL;
+    res->blob = true;
+    res->blob_mem = VIRGL_BLOB_MEM_HOST3D;
++   memcpy(res->blob_key, key, sizeof(res->blob_key));
+    res->bind = bind;
+    res->res_handle = escape.BlobCreate.ResId;
+    res->size = size;
+@@ -1183,6 +1242,9 @@ virgl_gdi_winsys_destroy(struct virgl_winsys *qws)
+    struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
+ 
+    virgl_resource_cache_flush(&qdws->cache);
++   for (unsigned i = 0; i < qdws->blob_cache_count; i++)
++      virgl_hw_res_destroy(qdws, qdws->blob_cache[i]);
++   qdws->blob_cache_count = 0;
+ 
+    virgl_gdi_cmd_buf_destroy(qdws->coreCtx);
+    qdws->device->destroy(qdws->device);
+diff --git a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
+--- a/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
++++ b/src/gallium/winsys/virgl/gdi/virgl_gdi_winsys.h
+@@ -67,6 +67,9 @@ struct virgl_hw_res {
+    bool blob;
+    /* blobs: the last submission naming it, which its destruction waits for (no allocation for WDDM to track) */
+    struct pipe_fence_handle *blob_fence;
++   /* blobs: what it was made with (target, format, bind, width, height, depth, layers, levels, samples, flags), to
++    * hand a released one out again for the same request (virgl_gdi_blob_cache_take) */
++   uint32_t blob_key[10];
+ };
+ 
+ struct virgl_gdi_winsys
+@@ -83,6 +86,12 @@ struct virgl_gdi_winsys
+    mtx_t cacheMtx;
+ 
+    uint32_t blob_id;
++
++   /* released blobs, kept for reuse (under cacheMtx): making one waits for the host twice and destroying one for
++    * its last submission, and nine releases and remakes its 4 MB upload buffers all the time */
++#define VIRGL_GDI_BLOB_CACHE 16
++   struct virgl_hw_res *blob_cache[VIRGL_GDI_BLOB_CACHE];
++   unsigned blob_cache_count;
+ };
+ 
+ struct virgl_gdi_fence {

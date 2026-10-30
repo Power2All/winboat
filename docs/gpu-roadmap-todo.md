@@ -1023,6 +1023,194 @@ compute, DirectML), video (DXVA2/D3D11/D3D12 video, Media Foundation), OpenCL. B
 - [ ] After Windows switches resolution in a seamless full screen window, key to pixels is ~148 ms in some runs
       instead of ~50 (2026-10-26, spike: 3 of 6 runs, with the old viewer too; 3 runs at the monitor's resolution all
       ~49 ms): a fixed ~100 ms more, cause not known yet
+- [x] gpu.103 (2026-10-26, AppImage gpu.103, image 6.05-32, driver 58536): GravityMark's rendering (user: OpenGL
+      "very glitched", D3D11 lighting off and blinking)
+  - OpenGL: saturated blue and black speckles on lit surfaces, changing per frame (not TAA: they stay with
+    -temporal 0). vrend declared its GLSL temporaries without a value; NIR-made shaders read ones no path wrote, and
+    NVIDIA keeps whatever the register held (zero-initialized temporaries in a debug library made them vanish).
+    virglrenderer 0025: temporaries zeroed. OpenGL also got faster (~86 to ~120 fps at 1024x600)
+  - D3D11: 2D views of one cube face (GravityMark's per-face passes over its environment cubes) went to the host as
+    2D arrays, which the shaders' 2D samplers read as nothing: dim, pink lighting. Mesa 0050 (redone): one face is a
+    2D view, several a 2D array
+  - virglrenderer 0026: new textures zeroed (glClearTexImage), as Windows' drivers give memory: GravityMark's D3D11
+    shadow map had NaN depths in a layer (never cleared by the app)
+  - virglrenderer 0027 (image 6.05-33, spike only so far): a dispatch that switches compute programs marks its
+    sampler views and constant buffers dirty as a draw does (a new compute program read its textures through unit 0
+    and its shadow lookups as 0)
+  - tools: tiled12.cpp (D3D12 reserved textures through UpdateTileMappings), shadowcmp11.cpp (D3D11
+    SampleCmpLevelZero on a depth 2D array from compute: passes), presentbench "tear" option; gm-run.ps1's dbwin
+    lifetime was "secs"+"5" as text (old catchers stayed and swallowed messages)
+- [x] gpu.102 (2026-10-26, AppImage gpu.102, image 6.05-31, driver 58464): gpu.101's D3D12 and D3D11 still failed in
+      the user VM (D3D12: a frame with nothing in it; D3D11: frozen after 1.4 s). gpu.101's spike scores were wrong:
+      D3D11 drew nothing after a host context error and D3D12 sampled empty textures
+  - D3D12: the runtime makes an app's heap as a heap with a buffer over it and names that buffer (ReuseBufferGPUVA's
+    resource), with no heap handle, for resources placed in it; the UMD made such heaps as committed buffers and took
+    those placed resources for reserved ones. gpu.101's vkd3d-proton 0019 (a tiled layout for "reserved" textures)
+    made GravityMark's placed textures into reserved ones nothing was mapped to: black. vkd3d-proton 0019 replaced:
+    GPU heaps textures may be placed in get a vkd3d-proton heap with the buffer at its start, placed resources find
+    it through the buffer; GetMipPacking implemented (was a stub)
+  - D3D11: four host context errors, each ending the context's drawing: a read-back of part of a BC1 cube level
+    (virglrenderer 0024: glGet[Compressed]TextureSubImage reads just the box), copies and uploads of BC levels
+    smaller than a block with D3D's whole-block boxes (Mesa 0050: virgl clamps maps, such copies go through the
+    CPU), a cube view of one face (GL_INVALID_VALUE; Mesa 0050)
+- [x] gpu.101 (2026-10-26, AppImage gpu.101, driver 58242; image 6.05-30 unchanged): GravityMark 1.89 ran only on
+      Vulkan (user report). Started on all four (its spike scores were wrong, see gpu.102):
+  - D3D12 "device removed" at a 2D BC7 2560x1440 texture: refused by vkd3d-proton as a reserved texture. gpu.101's
+    vkd3d-proton 0019 (a tiled layout) was the wrong fix - they are placed textures (gpu.102)
+  - D3D11 "device removed" at its first present after ~7 s of scene setup: STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE
+    (cdb on d3d11!NDXGI::CDevice::NTStatusToHResult). Every D3D9-11/OpenGL allocation lives in the 1 GB aperture
+    segment; a process outgrowing it gets its device faulted (memtest: 64 MB buffers fail at 960 MB). kvm 0034: on
+    WDDM 2 the aperture is half the VM's memory (at least 1 GB; Win7/8.1 keep 1 GB), and the KMD logs blobs the
+    host refuses (kmlog)
+  - OpenGL (SPIR-V shaders through GL_ARB_gl_spirv), one after the other: an access violation in _mesa_spirv_to_nir
+    (spirv_to_nir failed on OpImageQuerySizeLod over a sampled image: Mesa 0046 takes it), "Unknown NIR opcode:
+    unpack_snorm_2x16" (Mesa 0047: virgl lowers the [su]norm pack built-ins, ntt scalarizes the pack_uvec ops
+    that leaves), a host shader error "textureLod(samplerCube, vec2, float)" that put the host context in error, so
+    its later blobs failed ("can't map buffer"; ntt named ops without a sampler by sampler index 0: Mesa 0048 uses
+    the texture's unit), then a GPU timeout: NVIDIA's GL compiled ~dozens of compute programs at their first
+    dispatch, all in the first frame's submission, ~18 s on the host (gdb in the container: vrend_launch_grid in
+    libnvidia-eglcore), past TdrDelay 10. Mesa 0049 puts each compute shader's first dispatch in a submission of
+    its own
+  - tools (tools/gpu-spike/deploy/tools, MinGW): dbwin.cpp (catches OutputDebugString, Mesa's release-build log),
+    memtest.cpp (D3D11 allocations past the aperture), glpersist(_mt).cpp (persistent GL buffers), gm-run.ps1
+    (GravityMark with the drivers' logs on)
+- [x] GravityMark D3D11: no sunlight, flat grey blinking asteroids, dark Earth (2026-10-27: fixed on the spike, image
+      6.05-34 + driver with Mesa 0051/0052 and kvm 0035; in the user VM since gpu.104). The 4096x4096 2-layer shadow atlas
+      was cleared each frame only in its top-left 1024x600: every older frame's casters stayed in it (doubled Earths,
+      smeared asteroids), so the receivers were in their own old shadows. Causes, each fixed:
+  - virglrenderer 0028: a resource copy done by blitting (the present surface is an EGL image, no CopyImageSubData)
+    detached its framebuffers with only the read one bound, so the source stayed on blit_fb_ids[0]; surface clears
+    use that framebuffer, whose area is its smallest attachment's. The copy detaches from each framebuffer, a clear
+    detaches the attachment kind it doesn't use
+  - Mesa 0051: an input layout leaving out registers the shader doesn't read (the asteroid shadow VS: v0 and v3) was
+    a gallium element of format NONE, refused by the host: the draws kept the previous layout (the Earth's day side
+    in shadow). A gap is one float from a buffer the layout reads
+  - Mesa 0052: DepthBias was copied but polygon offset never enabled (GravityMark uses none; dx-test "Depth bias")
+  - kvm 0035: a resource over 254 MB couldn't be attached (its page list took more than the queue's 256
+    scatter-gather elements): the host failed the context at its first transfer and every buffer read back zeros
+    (bufinit11). Long lists go in contiguous memory
+  - tools: csreplay.cpp (one dispatch from captured buffers on the GPU, WARP or D3D11-on-12: vkd3d-proton is the
+    reference, WARP got GravityMark's compute wrong), bufinit11.cpp (initial data of buffers alive at once),
+    dxbcdis.cpp (GravityMark's shader cache disassembled)
+- [ ] D3D bias units on NVIDIA hosts: glPolygonOffset's unit is twice D3D's (D16 and D32F measured), so DepthBias
+      biases twice as much. GL leaves r to the implementation; a per-vendor scale in vrend would be needed
+- [ ] D3D11 D24_UNORM_S8_UINT read back through a staging copy comes in GL's packing (depth in the high 24 bits:
+      cleared 1.0 reads 0xffffff00, WARP 0x00ffffff)
+- [ ] GravityMark D3D11 is slow (~22-25 fps vs D3D12 ~170-200): full barriers after every dispatch (Compute.cpp) and
+      per-frame read-backs are candidates
+- [x] 3DMark Vantage (Direct3D 10, 2026-10-27/28): every test renders on the spike (WARP frames as the reference:
+      devcon-disable the GPU and the Basic Render Driver runs it); in the user VM as gpu.104 (2026-10-28: driver 58027,
+      image 6.05-35, GPU check 386/0). Fixes, by symptom:
+  - start-up stopped (out of memory): R32G32B32_FLOAT textures (Mesa 0055, sampled only); BC1-BC5 3D textures
+    decompressed in the UMD (Mesa 0058: GL has no 3D S3TC/RGTC); a crash in virgl_gdi_emit_res past the 1024-entry
+    allocation list (Mesa 0057 flushes before it is full)
+  - Jane Nash: GL errors on stream output left bound for other shaders' draws (vrend 0029, Mesa 0056 append bits);
+    an illegal shader from the FACE input as a scalar (vrend 0030); the full-screen frames never shown: immediate
+    flips need FlipImmediateMmIo (kvm 0039; without it Windows made DMA-buffer flips Present doesn't do, ETW Flip
+    events with MMIOFlip false) and RotateResourceIdentities must move the views to the new textures (Mesa 0059)
+  - Feature test 4 (GPU cloth, bare poles): a draw before any SetRenderTargets had a 0x0 GL framebuffer (Mesa 0060);
+    a DrawAuto inside a capturing draw ended the wrong transform feedback object (vrend 0031); new buffers held the
+    host's leftovers, NaN normals blew the cloth up (vrend 0032 zeroes them, as 0026 textures); a geometry shader's
+    SV_PrimitiveID declared as a system value read gl_PrimitiveID, its output (vrend 0033: gl_PrimitiveIDIn); a new
+    program marked only the vertex and fragment stages' constant buffers dirty, so the geometry shader read the last
+    program's vertex shader constants (vrend 0034). Found by capturing one pass and running its TGSI on the CPU
+  - Feature test 5 (GPU particles, black): stream output targets ignored D3D's byte offsets (Mesa 0061; the emitter
+    writes new particles at an offset into a ring)
+  - vhost-user-gpu crashed (get_display_info_cb) when the viewer disconnected with rendering in flight: a fence
+    answered the pending GET_DISPLAY_INFO (QEMU 0013)
+  - tests (tools/gpu-spike/deploy/tools, MinGW): so10 (stream output ping-pong, append, offsets), soadj10 (adjacency
+    primitives into stream output), gscb10 (a geometry shader's constants and primitive ID after another program),
+    vtxint10/gsint10 (integer vertex data through VS/GS), fs10 (full-screen flips)
+  - speed (counters in a perf build of vrend: draws, shaders made, compiles, links, submits, transfers each way):
+    New Calico (GT2) made ~1850 shaders a second, all seen before: the stream output vertex shader d3d10umd makes
+    for a VS + "empty" GS pair was one per device, remade at every switch between particle systems (Mesa 0062 keeps
+    32 pairs): 0.06 -> ~11-17 fps. Jane Nash (GT1) read a 16 KB index buffer back ~800 times a second, guest and
+    host mostly idle: Mesa 0034's staging discards left the buffer dirty and each WRITE_NO_OVERWRITE map of the
+    whole buffer read it back (Mesa 0063: such buffers reallocate their discards): 7 -> ~23-37 fps. Full rounds on
+    image 6.05-35: before these two P1670 (GT1 7.30, GT2 0.06, FT1 200.5, FT3 49.4, FT4 18.1, FT5 5.18, FT6 467),
+    after P15624 (GT1 30.14, GT2 58.63, FT1 267.6, FT3 114.9, FT4 24.75, FT5 50.76, FT6 582.5; every test's frames
+    checked). The CPU tests came out lower in the second round (2847 -> 2295, 32.2 -> 26.7 ops): not looked into
+  - Mesa 0064: 0059's view lists crashed destroying views made outside them (NV12 plane and raw/structured buffer
+    shader resource views): dx-test's video group at the device's release. dx-test 721/0 after
+- [x] Performance round for Direct3D 9/10/11 (2026-10-28; asked after gpu.104: "performance is a little lacking
+      compared to DX11/DX12/Vulkan"). In the user VM as gpu.105 (driver 58390, image 6.05-36, GPU check 386/0). Method: host counters per command type in vhost-user-gpu (perf build of vrend:
+      time per VIRGL_CCMD, submits, fences, transfers each way), gdb stack samples of vhost-user-gpu inside the
+      container (perf is refused there), and temporary guest diagnostics in the UMD (timers around every kernel call,
+      the call stacks of read-backs, a 1 ms sampling profiler of the thread that submits most, symbolized from a
+      /Zi build with llvm-symbolizer); thread CPU from /proc and Get-Process. Fixes:
+  - vrend 0035: small buffer uploads (the guest's staging copies, thousands a second) as glBufferSubData instead of a
+    map and unmap of a busy buffer: ~28 -> ~1.7 us each
+  - Mesa 0065 + vrend 0036 (VIRGL_CAP_V2_COPY_DEPTH_COLOR): D32_FLOAT/D16_UNORM <-> one-channel color copies on the
+    host's GPU through a pixel buffer, bit for bit (dcopy11 vs WARP); before, a CPU copy with a whole read-back each
+    (Vantage's Jane Nash: its depth buffer ~100 times a second, half the time waiting)
+  - Mesa 0066: D3D10/11 GetData never blocks (it waited when the runtime said DO_NOT_FLUSH)
+  - vrend 0037: SET_FRAMEBUFFER_STATE_NO_ATTACH only sets GL state when it changes (~10% of the host thread)
+  - Mesa 0067/0068: allocation list lookups hashed (a quarter of the driver's CPU time), small discarded buffers
+    staged without a busy-check escape
+  - Mesa 0069/0070: staging buffers read ahead right behind the copy into them, DO_NOT_WAIT maps honored, compressed
+    copies of whole small levels on the GPU
+  - Mesa 0071/0072: released host blobs reused (cache of 16, 256 MB) and the stream uploader's buffers 8 MB: Direct3D
+    9 (nine) made and destroyed a blob per draw for system-memory dynamic buffers, each waiting for the host
+  - Results on the spike: 3DMark Vantage P15624 -> P34609 (Jane Nash 30.1 -> 109.8, New Calico 58.6 -> 155.7, POM
+    115 -> 374, cloth 24.8 -> 30.2, particles 50.8 -> 80.2); 3DMark06 12206 -> 21835 (Firefly Forest 2.6 -> 52.7,
+    Deep Freeze 23.5 -> 92.6, Canyon Flight 91 -> 132, Proxycon 58.8 -> 64.4). Every Vantage test's frames checked;
+    dx-test 721/0. GravityMark D3D11 35.9 -> ~39 fps: what's left there is the implicit UAV barrier D3D11 needs
+    between draws that read and write a pixel-shader UAV (every asteroid draw; a full barrier each, ~50000 a
+    second, measured 38.9 with vs 53.4 fps without). Native drivers barrier there too; GravityMark's engine skips
+    them on real NVIDIA/AMD cards through vendor extensions (NvAPI UAV overlap), which a virtual GPU doesn't have
+  - GravityMark 1.89 at 1280x720 on the spike after the round: D3D12 223.2 fps, Vulkan 212.1, OpenGL 137.8, D3D11
+    38.7 (D3D11 the same at 1600x900: the barriers, not the resolution). Vulkan at 1600x900 cancels on the spike
+    ("Resolution Changed": Windows shrinks the window to the 1280x1024 desktop and Vulkan reports the real size);
+    gm-run720.ps1 (deploy/perf) runs 1280x720
+  - Not done: the D3D11 present path waits ~15 ms per frame when the GPU side is the limit (throttling, as
+    expected); 3DMark06 loads its tests slowly (host resource creation ~1 ms each, zeroing new resources); OpenCL
+    and DirectML ride the D3D12/Venus path (D3D12 GravityMark at ~1.6x OpenGL) and were not profiled this round
+- [x] Performance round for D3D12/Vulkan/OpenGL (2026-10-28/29; asked after gpu.105: "see if we could optimize DX12,
+      Vulkan and OpenGL"). In the user VM as gpu.106 (2026-10-29: AppImage gpu.106, image 6.05-37, driver 58204,
+      GPU check 386/0). D3D12 and Vulkan are GPU-bound on the spike (~97% GPU busy in
+      GravityMark: nothing on the virtualization side to win there). OpenGL had the host thread at 48%:
+  - vrend 0038: read-backs in the command stream (Mesa 0069's staging read-ahead, ~140 a second in GravityMark GL)
+    mapped the GL buffer at the transfer, ~1 ms each waiting for the GPU on the thread that runs every context. Now a
+    GPU copy into a buffer of its own, written to guest memory when its fence passes. vrend 0035's glBufferSubData
+    limit 256 KB -> 16 MB. GravityMark OpenGL 1024x600: 136.7 -> ~153 fps, host thread 48% -> 31%
+  - Checking the frames against Vulkan found GravityMark's OpenGL rendering wrong since at least gpu.103 (not a
+    regression; the earlier GL checks looked at speckles, not at the picture as a whole):
+    - black asteroids: vrend had no translation for TGSI UP2H/PK2H (GLSL/SPIR-V unpackHalf2x16/packHalf2x16) and
+      left them out of the GLSL: the asteroid vertex shader's normals and tangents (half floats) stayed zero.
+      vrend 0039 emits unpackHalf2x16/packHalf2x16 (ARB_shading_language_packing). Every OpenGL application using
+      those built-ins was affected (Direct3D's f16tof32/f32tof16 are emulated with integer ops in d3d10umd)
+    - the scene upside down: NVIDIA's GL gives SPIR-V fragment shaders gl_FragCoord from the lower left even when
+      they declare OriginUpperLeft (checked on the host's driver with GLSL and SPIR-V shaders: dFdy(gl_FragCoord.y)
+      stays positive for SPIR-V, turns negative for GLSL origin_upper_left); Mesa honoured the declaration and
+      GravityMark fetches its final picture by gl_FragCoord.y. Mesa 0073: OpenGL SPIR-V shaders take the lower
+      left (Vulkan's SPIR-V unchanged)
+    - found by bisecting the frame on the host: a debug vrend (perf/vsrc-gl/hackdyn.py) dumps every GLSL shader with
+      a hash, tints chosen shaders' outputs, edits GLSL by find/replace from a file and logs per-draw state
+  - tools: gldfdy.cpp (dFdy signs in the window and an FBO, packHalf2x16/unpackHalf2x16 on known values)
+  - spike: dx-test 721/0 on the release pair (6.05-37 + driver 58204); GravityMark OpenGL frames match Vulkan's,
+    153.2 fps at 1024x600 (gpu.105: 136.7 with the broken frames)
+- [x] Final step: the standalone setup on fresh test VMs (2026-10-29/30; Windows 11 skipped by the user: download size).
+      Setup 58204 (dist/, SHA256SUMS, dist/README.txt: QEMU setup for Linux, Windows and macOS hosts, per-version
+      notes) on winboat-test-win10/win81/win7 (libvirt session, stock QEMU 11.1 + virglrenderer 1.3, Venus off: the
+      user session's seccomp sandbox blocks it). GPU check: Windows 10 259/0, 8.1 242/0, 7 96/0 (stock 7 without its
+      KB updates: those checks optional/skipped with the KB named). Fixes found on the way:
+  - setup: finish page "Reboot now" (selected), /REBOOT switch (silent; shutdown.exe /r /f, as ExitWindowsEx fails
+    from a non-interactive run); /S /REBOOT measured: Windows 7 69 s and Windows 10 87 s from setup start to restart
+  - Windows 7: the Program Compatibility Assistant showed "Windows requires a digitally signed driver" after the
+    install (the driver is refused until test signing is active at the restart) and held up the restart:
+    gpu-driver.ps1 stops PcaSvc for that boot
+  - GPU check: Windows 8.1's WARP gets dfma wrong (the doubles 11.1 check failed there with right GPU results): the
+    reference is computed on the CPU; Windows 7 without KB2670838/KB4019990: optional/skipped, not failed
+  - stock QEMU limits: feature level 11_0 and OpenGL 4.2, so GravityMark doesn't start there (needs 11_1 / GL 4.5 /
+    Venus); 3DMark06 and Vantage installed on the Windows 10 test VM (answer files tools/gpu-spike/deploy/*.iss;
+    Vantage's registration screen takes no synthetic input: run by hand)
+  - harness: tvm.sh (start/ps/run/keys/click/shot on a test VM), testvm-gui.sh SETUP_ARGS + boot-time restart check,
+    testvm-dialog.sh (the desktop after a silent install)
+- [x] No NVIDIA GL shader disk cache in the container (no ~/.cache/nvidia for vhost-user-gpu): every run compiled
+      its GL programs again. gpu.107 (2026-10-29, image 6.05-38, driver 58204 unchanged; GPU check 386/0, spike
+      721/0): qemu-wrapper.sh starts vhost-user-gpu with NVIDIA's shader cache (GL programs and Vulkan pipelines, 1 GB,
+      its own cleanup) and Mesa's in /storage/glcache, kept with the VM. The first GravityMark run after a VM start
+      took the GPU thread 31.2 s (OpenGL) and 38.8 s (D3D11) of CPU with an empty cache, 17.0 s and 26.2 s with it
 - [x] gpu.99 (2026-10-25, AppImage gpu.99): Home's GPU tile measured QEMU's process only, but WinBoat's image renders
       in vhost-user-gpu (QEMU 28 MB, vhost-user-gpu ~750 MB): busy % and video memory now add up the container's
       qemu-system and vhost-user-gpu processes (pmon and fdinfo); the dial to 0.1%. Checked through the app's DevTools

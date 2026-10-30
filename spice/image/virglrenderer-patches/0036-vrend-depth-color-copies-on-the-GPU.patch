@@ -1,0 +1,123 @@
+From: WinBoat
+Subject: [PATCH] vrend: depth <-> color copies on the GPU
+
+Direct3D copies between a depth format and a color format of a family (D32_FLOAT -> R32_FLOAT: 3DMark Vantage's
+Jane Nash copies its depth buffer ~100 times a second), which the guest did on its CPU, a read-back of the whole
+texture each time. GL copies neither way (glCopyImageSubData wants identical depth formats, a blit converts): a
+Z32_FLOAT or Z16_UNORM texture and a one-channel color texture of its texel size are copied through a pixel buffer
+on the GPU (glGetTextureSubImage, glTextureSubImage, GL 4.5), bit for bit, and VIRGL_CAP_V2_COPY_DEPTH_COLOR tells
+the guest (Mesa 0065).
+---
+--- a/src/virgl_hw.h
++++ b/src/virgl_hw.h
+@@ -649,6 +649,8 @@
+ /* WinBoat: the TGSI instruction SPARSE (the next texture lookup's residency and LOD clamp: D3D's tiled resources tier 2;
+  * ARB_sparse_texture2, ARB_sparse_texture_clamp) */
+ #define VIRGL_CAP_V2_SPARSE_FEEDBACK      (1u << 24)
++/* WinBoat: resource_copy_region between a depth format and a color format of the same texel size (Z32_FLOAT, Z16_UNORM) */
++#define VIRGL_CAP_V2_COPY_DEPTH_COLOR     (1u << 23)
+ 
+ /* virgl bind flags - these are compatible with mesa 10.5 gallium.
+  * but are fixed, no other should be passed to virgl either.
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -379,6 +379,8 @@
+ 
+    int gl_major_ver;
+    int gl_minor_ver;
++   /* GL 4.5 texture sub-image calls: depth <-> color copies on the GPU (vrend_copy_depth_color) */
++   bool copy_depth_color;
+ 
+    mtx_t fence_mutex;
+    thrd_t sync_thread;
+@@ -7920,6 +7922,8 @@
+    vrend_state.use_egl_fence = virgl_egl_supports_fences(egl);
+ #endif
+ 
++   vrend_state.copy_depth_color = !vrend_state.use_gles && epoxy_gl_version() >= 45;
++
+    if (!vrend_check_no_error(vrend_state.ctx0)) {
+       virgl_error("vrend context creation resulted in errors\n");
+       goto cleanup_and_fail;
+@@ -11191,6 +11195,61 @@
+    return resource_contains_box(dst_res, &dst_box, dst_level);
+ }
+ 
++
++/* A depth texture copied into a color texture of the same texel size, or back: Direct3D copies within a format
++ * family (D32_FLOAT <-> R32_FLOAT; 3DMark Vantage's Jane Nash copies its depth buffer ~100 times a second), which
++ * the guest otherwise did on its CPU, a read-back of the whole texture each time. GL copies neither way
++ * (glCopyImageSubData wants identical depth formats, a blit converts), so the texels go through a pixel buffer on
++ * the GPU, bit for bit */
++static bool vrend_copy_depth_color(struct vrend_resource *src_res, struct vrend_resource *dst_res,
++                                   uint32_t src_level, const struct pipe_box *src_box,
++                                   uint32_t dst_level, uint32_t dstx, uint32_t dsty, uint32_t dstz)
++{
++   static GLuint pbo;
++   static GLsizeiptr pbo_size;
++   enum virgl_formats sf = src_res->base.format, df = dst_res->base.format;
++   bool sd = sf == VIRGL_FORMAT_Z32_FLOAT || sf == VIRGL_FORMAT_Z16_UNORM;
++   bool dd = df == VIRGL_FORMAT_Z32_FLOAT || df == VIRGL_FORMAT_Z16_UNORM;
++
++   if (!(vrend_state.copy_depth_color && sd != dd))
++      return false;
++   const struct util_format_description *color = util_format_description(sd ? df : sf);
++   if (util_format_is_depth_or_stencil(sd ? df : sf) || color->nr_channels != 1 ||
++       util_format_get_blocksize(sf) != util_format_get_blocksize(df) ||
++       src_res->base.nr_samples > 1 || dst_res->base.nr_samples > 1 ||
++       src_res->y_0_top || dst_res->y_0_top ||
++       !has_bit(src_res->storage_bits, VREND_STORAGE_GL_TEXTURE) ||
++       !has_bit(dst_res->storage_bits, VREND_STORAGE_GL_TEXTURE))
++      return false;
++
++   GLsizeiptr size = (GLsizeiptr)src_box->width * src_box->height * src_box->depth * util_format_get_blocksize(sf);
++   if (!pbo)
++      glGenBuffers(1, &pbo);
++   glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
++   if (size > pbo_size) {
++      glBufferData(GL_PIXEL_PACK_BUFFER, size, NULL, GL_STREAM_COPY);
++      pbo_size = size;
++   }
++   glPixelStorei(GL_PACK_ALIGNMENT, 1);
++   glGetTextureSubImage(src_res->gl_id, src_level, src_box->x, src_box->y, src_box->z,
++                        src_box->width, src_box->height, src_box->depth,
++                        tex_conv_table[sf].glformat, tex_conv_table[sf].gltype, (GLsizei)size, NULL);
++   glPixelStorei(GL_PACK_ALIGNMENT, 4);
++   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++
++   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
++   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++   if (dst_res->target == GL_TEXTURE_2D || dst_res->target == GL_TEXTURE_RECTANGLE)
++      glTextureSubImage2D(dst_res->gl_id, dst_level, dstx, dsty, src_box->width, src_box->height,
++                          tex_conv_table[df].glformat, tex_conv_table[df].gltype, NULL);
++   else
++      glTextureSubImage3D(dst_res->gl_id, dst_level, dstx, dsty, dstz, src_box->width, src_box->height, src_box->depth,
++                          tex_conv_table[df].glformat, tex_conv_table[df].gltype, NULL);
++   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++   return true;
++}
++
+ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
+                                          uint32_t dst_handle, uint32_t dst_level,
+                                          uint32_t dstx, uint32_t dsty, uint32_t dstz,
+@@ -11246,6 +11305,9 @@
+       return;
+    }
+ 
++   if (vrend_copy_depth_color(src_res, dst_res, src_level, src_box, dst_level, dstx, dsty, dstz))
++      return;
++
+    comp_flags = VREND_COPY_COMPAT_FLAG_ALLOW_COMPRESSED;
+    if (src_res->egl_image)
+       comp_flags |= VREND_COPY_COMPAT_FLAG_ONE_IS_EGL_IMAGE;
+@@ -13405,6 +13467,9 @@
+    if (has_feature(feat_sparse_texture2) && has_feature(feat_sparse_texture_clamp))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_SPARSE_FEEDBACK;
+ 
++   if (vrend_state.copy_depth_color)
++      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_COPY_DEPTH_COLOR;
++
+    if (has_feature(feat_pipeline_statistics_query))
+       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_PIPELINE_STATISTICS_QUERY;
+ 

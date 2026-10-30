@@ -1,0 +1,24 @@
+From: WinBoat
+Subject: [PATCH] virgl: 8 MB upload buffers
+
+An upload bigger than what the stream uploader's current buffer has left gets a buffer of its own size, a host blob.
+Direct3D 9 draws from system-memory dynamic buffers upload 1-8 MB per draw through it (nine): 3DMark06's Firefly
+Forest made a blob of a different size for nearly every draw (0.1 fps; the blob cache doesn't help with sizes that
+vary). In 8 MB buffers they share, and the buffers are all one size, which the blob cache (0071) reuses: ~8 fps.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_context.c b/src/gallium/drivers/virgl/virgl_context.c
+--- a/src/gallium/drivers/virgl/virgl_context.c
++++ b/src/gallium/drivers/virgl/virgl_context.c
+@@ -1941,7 +1965,11 @@ struct pipe_context *virgl_context_create(struct pipe_screen *pscreen,
+       vctx->cbuf->cdw = VIRGL_MAX_TBUF_DWORDS;
+ 
+    vctx->primconvert = util_primconvert_create(&vctx->base, rs->caps.caps.v1.prim_mask);
+-   vctx->uploader = u_upload_create(&vctx->base, 1024 * 1024,
++   /* 8 MB: an upload bigger than what the current buffer has left gets a buffer of its own size, and a buffer here
++    * is a host blob (persistent mapping), which costs host round trips to make and to destroy. Direct3D 9 draws from
++    * system-memory dynamic buffers upload 1-8 MB per draw through this (nine; 3DMark06's Firefly Forest: a blob per
++    * draw, 0.1 fps); in 8 MB buffers they share, and the buffers are all one size for the winsys's blob cache */
++   vctx->uploader = u_upload_create(&vctx->base, 8 * 1024 * 1024,
+                                      PIPE_BIND_INDEX_BUFFER, PIPE_USAGE_STREAM, 0);
+    if (!vctx->uploader)
+            goto fail;

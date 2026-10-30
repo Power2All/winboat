@@ -1,0 +1,32 @@
+From: WinBoat
+Subject: [PATCH] virgl: stream output targets' append bits
+
+The append bits of set_stream_output_targets were always 0, so the host couldn't tell D3D's SoSetTargets offset -1
+(go on writing after the last capture) from a new capture at the start of the buffer. They're now set for the
+targets whose offset is -1.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_streamout.c b/src/gallium/drivers/virgl/virgl_streamout.c
+--- a/src/gallium/drivers/virgl/virgl_streamout.c
++++ b/src/gallium/drivers/virgl/virgl_streamout.c
+@@ -75,6 +75,7 @@
+                                 const unsigned *offset)
+ {
+    struct virgl_context *vctx = virgl_context(ctx);
++   unsigned append_bitmask = 0;
+    int i;
+ 
+    /* Unbinding comes as NULL targets (D3D's SoSetTargets): without the trailing ones. virglrenderer makes a transform
+@@ -98,7 +99,12 @@
+    for (i = num_targets; i < vctx->num_so_targets; i++)
+       pipe_resource_reference(&vctx->so_targets[i].base.buffer, NULL);
+    vctx->num_so_targets = num_targets;
+-   virgl_encoder_set_so_targets(vctx, num_targets, targets, 0);//append_bitmask);
++   /* an offset of -1 appends to what the target's last capture wrote (D3D's SoSetTargets) */
++   for (i = 0; offset && i < num_targets; i++) {
++      if (offset[i] == (unsigned)-1)
++         append_bitmask |= 1u << i;
++   }
++   virgl_encoder_set_so_targets(vctx, num_targets, targets, append_bitmask);
+ }
+ 
+ void virgl_init_so_functions(struct virgl_context *vctx)

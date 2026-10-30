@@ -1,0 +1,22 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: depth bias
+
+The rasterizer state copied DepthBias, SlopeScaledDepthBias and DepthBiasClamp but never enabled polygon offset
+(offset_tri/line/point), so no bias was ever applied: shadow maps drawn with one shadowed their own casters (acne).
+D3D biases every primitive type and fill mode, so all three are on when either bias is set.
+---
+diff --git a/src/gallium/frontends/d3d10umd/Rasterizer.cpp b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+index ea0b256..9e3cfab 100644
+--- a/src/gallium/frontends/d3d10umd/Rasterizer.cpp
++++ b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+@@ -233,6 +233,10 @@ CreateRasterizerStateForced(D3D10DDI_HDEVICE hDevice, const D3D10_DDI_RASTERIZER
+    state.offset_units = (float)pRasterizerDesc->DepthBias;
+    state.offset_scale = pRasterizerDesc->SlopeScaledDepthBias;
+    state.offset_clamp = pRasterizerDesc->DepthBiasClamp;
++   /* Without these the bias was never applied: shadow maps drawn with one shadow their own casters (acne). D3D
++    * biases every primitive type and fill mode. */
++   state.offset_tri = state.offset_line = state.offset_point =
++      pRasterizerDesc->DepthBias != 0 || pRasterizerDesc->SlopeScaledDepthBias != 0.0f;
+    /* As feature level 10_1 and up: MultisampleEnable only picks the line algorithm, triangles on multisampled
+     * targets are always multisampled (10_0 left them aliased without it). No effect on single-sampled targets. */
+    state.multisample = 1;

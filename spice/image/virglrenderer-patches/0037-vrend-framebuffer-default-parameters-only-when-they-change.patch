@@ -1,0 +1,45 @@
+From: WinBoat
+Subject: [PATCH] vrend: framebuffer default parameters set only when they change
+
+The guest sends SET_FRAMEBUFFER_STATE_NO_ATTACH with every framebuffer state (3DMark Vantage ~12000 a second), and
+each set the framebuffer's four default parameters again, which made NVIDIA's driver check the framebuffer again:
+~10% of the host thread in New Calico (sampled with gdb). The sub context keeps the values last set and only changes
+go to GL.
+---
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -734,6 +734,9 @@
+ #define VREND_PROGRAM_NQUEUE_MASK (VREND_PROGRAM_NQUEUES - 1)
+ 
+ struct vrend_sub_context {
++   /* the framebuffer's default size, layers and samples last set (vrend_set_framebuffer_state_no_attach) */
++   bool fb_no_attach_set;
++   uint32_t fb_no_attach[4];
+    struct list_head head;
+ 
+    virgl_gl_context gl_context;
+@@ -3301,11 +3304,23 @@
+    sub_ctx->blend_state_dirty = true;
+ }
+ 
+-void vrend_set_framebuffer_state_no_attach(UNUSED struct vrend_context *ctx,
++void vrend_set_framebuffer_state_no_attach(struct vrend_context *ctx,
+                                            uint32_t width, uint32_t height,
+                                            uint32_t layers, uint32_t samples)
+ {
+    int gl_ver = vrend_state.gl_major_ver * 10 + vrend_state.gl_minor_ver;
++   struct vrend_sub_context *sub = ctx->sub;
++
++   /* The guest sends this with every framebuffer state (3DMark Vantage ~12000 a second); setting the framebuffer's
++    * parameters again made the GL driver check it again, ~10% of the host thread. Only changes go to GL */
++   if (sub->fb_no_attach_set && sub->fb_no_attach[0] == width && sub->fb_no_attach[1] == height &&
++       sub->fb_no_attach[2] == layers && sub->fb_no_attach[3] == samples)
++      return;
++   sub->fb_no_attach_set = true;
++   sub->fb_no_attach[0] = width;
++   sub->fb_no_attach[1] = height;
++   sub->fb_no_attach[2] = layers;
++   sub->fb_no_attach[3] = samples;
+ 
+    if (has_feature(feat_fb_no_attach)) {
+       glFramebufferParameteri(GL_FRAMEBUFFER,

@@ -435,6 +435,10 @@ function Install-Driver {
     # out of the store. Removing them first (with /uninstall) put the device on the 2D VioGpuDod driver, and a device
     # still waiting for its restart could keep that one: the new package installed onto nothing present
     $earlier = @(Get-InstalledPackages | ForEach-Object { $_.Driver })
+    # Test signing comes on at the restart, and until then Windows refuses the new driver it tries to start on the
+    # device right away: Windows 7's Program Compatibility Assistant then showed "Windows requires a digitally signed
+    # driver" (blaming the setup), which also held up the restart. It is stopped until then (it starts with Windows)
+    if (-not (Test-TestSigningActive)) { Stop-Service PcaSvc -Force -ErrorAction SilentlyContinue }
     # (Windows 8.1's pnputil has the older switches, and exits with 259 when it installed the package on no device:
     # none there, or the device has it already)
     if ($Win81) {

@@ -1,0 +1,33 @@
+From: WinBoat
+Subject: [PATCH] vrend: zeroed temporaries
+
+The GLSL made from TGSI declares its temporaries (temp<N>, temp<N>[]) without a value. Shaders that come from NIR
+(nir_to_tgsi: SPIR-V shaders through GL_ARB_gl_spirv, Mesa's own) can read a temporary no path wrote - an undefined
+value, which native drivers usually make zero - and NVIDIA's GLSL compiler leaves it with whatever its register held:
+GravityMark's OpenGL frames had saturated blue and black speckles on lit surfaces (infinite or NaN lighting from the
+garbage), changing from frame to frame. Temporaries are now declared as zero.
+---
+--- a/src/vrend/vrend_shader.c	2026-10-26 13:48:39.432380352 +0100
++++ b/src/vrend/vrend_shader.c	2026-10-26 16:12:16.865175049 +0100
+@@ -6757,13 +6757,18 @@
+    const char *sname = tgsi_proc_to_prefix(ctx->prog_type);
+    int glsl_ver_required = ctx->glsl_ver_required;
+ 
++   /* Zeroed: shaders from NIR (SPIR-V, nir_to_tgsi) read temporaries no path wrote (undefined values), which NVIDIA
++    * leaves with whatever the registers held - GravityMark's OpenGL frames had saturated and black speckles */
+    for (i = 0; i < ctx->num_temp_ranges; i++) {
+       const char *precise = ctx->temp_ranges[i].precise_result ? "precise" : "";
+       if (ctx->temp_ranges[i].array_id > 0) {
+-         emit_hdrf(glsl_strbufs, "%s vec4 temp%d[%d];\n", precise, ctx->temp_ranges[i].first,
+-                   ctx->temp_ranges[i].last - ctx->temp_ranges[i].first + 1);
++         int len = ctx->temp_ranges[i].last - ctx->temp_ranges[i].first + 1;
++         emit_hdrf(glsl_strbufs, "%s vec4 temp%d[%d] = vec4[%d](", precise, ctx->temp_ranges[i].first, len, len);
++         for (int j = 0; j < len; j++)
++            emit_hdr(glsl_strbufs, j ? ", vec4(0.0)" : "vec4(0.0)");
++         emit_hdr(glsl_strbufs, ");\n");
+       } else {
+-         emit_hdrf(glsl_strbufs, "%s vec4 temp%d;\n", precise, ctx->temp_ranges[i].first);
++         emit_hdrf(glsl_strbufs, "%s vec4 temp%d = vec4(0.0);\n", precise, ctx->temp_ranges[i].first);
+       }
+    }
+ 

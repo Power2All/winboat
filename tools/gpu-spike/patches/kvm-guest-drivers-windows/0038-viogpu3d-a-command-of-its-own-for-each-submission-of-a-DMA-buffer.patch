@@ -1,0 +1,88 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: a command of its own for each submission of a DMA buffer
+
+Render and Present leave their command in the DMA buffer's private data, and every submission of that buffer took
+it. Windows can submit one DMA buffer in several parts (paging in between) or again after a preemption: the second
+submission queued the same command again, which the first had completed and freed - a use after free (3DMark Vantage
+at its first test: bugcheck 0x13A, KERNEL_MODE_HEAP_CORRUPTION; with Driver Verifier's special pool, 0xD1 reading the
+freed command at the head of the submitted queue in ThreadWorkRoutine). The private data now holds the command and
+the DMA buffer: the first submission takes the command, later ones get a new command over the same DMA buffer.
+---
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -14,6 +14,16 @@
+ class VioGpuDevice;
+ class VioGpuAllocation;
+ class VioGpuCommander;
++class VioGpuCommand;
++
++// A DMA buffer's private data (ContextInfo.DmaBufferPrivateDataSize), as Render and Present leave it. Windows can
++// submit one DMA buffer in several parts (paging between them) or again after a preemption: each submission gets a
++// command of its own, Render's (with the allocations) going to the first
++struct VIOGPU_DMA_PRIVATE
++{
++    VioGpuCommand *cmd;
++    char *dmaBuffer;
++};
+ 
+ class VioGpuCommand
+ {
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -650,19 +650,24 @@
+ 
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s fence_id=%d\n", __FUNCTION__, pSubmitCommand->SubmissionFenceId));
+ 
++    // Render's command once: queued, it may be done and freed when the same DMA buffer comes again (another part
++    // of it, or after a preemption), which then got that freed command queued (3DMark Vantage: bugchecks 0x13A
++    // and, with Driver Verifier's special pool, 0xD1 in ThreadWorkRoutine)
+     VioGpuCommand *cmd = NULL;
+-    if (pSubmitCommand->pDmaBufferPrivateData)
++    VIOGPU_DMA_PRIVATE *priv = (VIOGPU_DMA_PRIVATE *)pSubmitCommand->pDmaBufferPrivateData;
++    if (priv && !pSubmitCommand->Flags.Paging)
+     {
+-        VioGpuCommand **priv = (VioGpuCommand **)pSubmitCommand->pDmaBufferPrivateData;
+-        if (*priv != NULL)
+-        {
+-            cmd = *priv;
+-        }
++        cmd = priv->cmd;
++        priv->cmd = NULL;
+     }
+ 
+     if (!cmd)
+     {
+         cmd = new (NonPagedPoolNx) VioGpuCommand(m_pAdapter);
++        if (priv && !pSubmitCommand->Flags.Paging)
++        {
++            cmd->SetDmaBuf(priv->dmaBuffer);
++        }
+     }
+ 
+     cmd->PrepareSubmit(pSubmitCommand);
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -601,8 +601,9 @@
+     VioGpuCommand *cmd = new (NonPagedPoolNx) VioGpuCommand(m_pAdapter);
+     if (pPresent->pDmaBuffer)
+     {
+-        VioGpuCommand **privateData = (VioGpuCommand **)pPresent->pDmaBufferPrivateData;
+-        *privateData = cmd;
++        VIOGPU_DMA_PRIVATE *privateData = (VIOGPU_DMA_PRIVATE *)pPresent->pDmaBufferPrivateData;
++        privateData->cmd = cmd;
++        privateData->dmaBuffer = (char *)pPresent->pDmaBuffer;
+     }
+ 
+     cmd->SetDmaBuf((char *)pPresent->pDmaBuffer);
+@@ -728,8 +729,9 @@
+     VioGpuCommand *cmd = new (NonPagedPoolNx) VioGpuCommand(m_pAdapter);
+     if (pRender->pDmaBuffer)
+     {
+-        VioGpuCommand **privateData = (VioGpuCommand **)pRender->pDmaBufferPrivateData;
+-        *privateData = cmd;
++        VIOGPU_DMA_PRIVATE *privateData = (VIOGPU_DMA_PRIVATE *)pRender->pDmaBufferPrivateData;
++        privateData->cmd = cmd;
++        privateData->dmaBuffer = pDmaBufStart;
+     }
+     cmd->SetDmaBuf(pDmaBufStart);
+     cmd->AttachAllocations(pRender->pAllocationList, pRender->AllocationListSize);

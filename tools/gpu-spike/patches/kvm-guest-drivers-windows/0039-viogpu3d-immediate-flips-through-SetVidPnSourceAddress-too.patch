@@ -1,0 +1,24 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: immediate flips through SetVidPnSourceAddress too
+
+The driver flipped only on vsync by MMIO (FlipOnVSyncMmIo). A flip with sync interval 0 (a full-screen swap chain
+presenting without vsync, as 3DMark Vantage's tests do) Windows then makes a DMA buffer flip, which Present
+doesn't do: the frames never reached the display, which kept the tests' loading screen (ETW: Flip events with
+MMIOFlip false). FlipImmediateMmIo has those flips go through SetVidPnSourceAddress as well. Not on Windows 7, whose
+WDDM 1.1 caps don't have it.
+---
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -680,6 +680,12 @@
+                 pDriverCaps->HighestAcceptableAddress.QuadPart = (ULONG64)-1;
+ 
+                 pDriverCaps->FlipCaps.FlipOnVSyncMmIo = TRUE;
++#if !VIOGPU_WIN7
++                // Immediate flips (sync interval 0) through SetVidPnSourceAddress as well: without it Windows made them
++                // DMA buffer flips, which Present doesn't do, and a full-screen game presenting so never reached the
++                // display (3DMark Vantage's tests showed their loading screen)
++                pDriverCaps->FlipCaps.FlipImmediateMmIo = TRUE;
++#endif
+ 
+                 pDriverCaps->MaxQueuedFlipOnVSync = 1;
+ 

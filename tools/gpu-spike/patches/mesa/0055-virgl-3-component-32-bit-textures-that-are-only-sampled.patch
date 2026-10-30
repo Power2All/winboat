@@ -1,0 +1,56 @@
+From: WinBoat
+Subject: [PATCH] virgl: 3-component 32-bit textures that are only sampled
+
+Direct3D 10 requires R32G32B32_FLOAT textures (and the SINT and UINT ones with D3D10.1), but virgl allowed the
+3-component 32-bit formats for texture buffers only: 3DMark Vantage's R32G32B32_FLOAT 1D textures failed to create
+(out of memory) and the benchmark stopped at start-up. GL has RGB32F/RGB32I/RGB32UI textures for sampling; they're
+refused still as render targets, depth, images and shared or displayed surfaces. d3d10umd's messages for a format or
+resource it can't create now say which (through OutputDebugString, as the others).
+---
+diff --git a/src/gallium/drivers/virgl/virgl_screen.c b/src/gallium/drivers/virgl/virgl_screen.c
+index a841e17..e996248 100644
+--- a/src/gallium/drivers/virgl/virgl_screen.c
++++ b/src/gallium/drivers/virgl/virgl_screen.c
+@@ -826,11 +826,15 @@ virgl_is_format_supported( struct pipe_screen *screen,
+    if (util_format_is_compressed(format) && target == PIPE_BUFFER)
+       return false;
+ 
+-   /* Allow 3-comp 32 bit textures only for TBOs (needed for ARB_tbo_rgb32) */
++   /* Allow 3-comp 32 bit textures for TBOs (needed for ARB_tbo_rgb32), and textures that are only sampled where the
++    * host samples them: Direct3D 10 requires them (3DMark Vantage's R32G32B32_FLOAT 1D textures, refused as out
++    * of memory) */
+    if ((format == PIPE_FORMAT_R32G32B32_FLOAT ||
+        format == PIPE_FORMAT_R32G32B32_SINT ||
+        format == PIPE_FORMAT_R32G32B32_UINT) &&
+-       target != PIPE_BUFFER)
++       target != PIPE_BUFFER &&
++       (bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SHADER_IMAGE |
++                PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)))
+       return false;
+ 
+    if ((format_desc->layout == UTIL_FORMAT_LAYOUT_RGTC ||
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -344,8 +344,8 @@
+                                        templat.nr_samples,
+                                        templat.nr_storage_samples,
+                                        templat.bind & ~(PIPE_BIND_SHADER_IMAGE | PIPE_BIND_SHADER_BUFFER))) {
+-         debug_printf("%s: unsupported format %s\n",
+-                     __func__, util_format_name(templat.format));
++         DebugPrintf("%s: unsupported format %s (target %u, %u samples, bind 0x%x)\n", __func__,
++                     util_format_name(templat.format), templat.target, templat.nr_samples, templat.bind);
+          SetError(hDevice, E_OUTOFMEMORY);
+          goto unlock;
+       }
+@@ -353,7 +353,9 @@
+ 
+    pResource->resource = screen->resource_create(screen, &templat);
+    if (!pResource->resource) {
+-      DebugPrintf("%s: failed to create resource\n", __func__);
++      DebugPrintf("%s: failed to create resource %s (target %u, %ux%ux%u, %u layers, %u levels, bind 0x%x)\n",
++                  __func__, util_format_name(templat.format), templat.target, templat.width0, templat.height0,
++                  templat.depth0, templat.array_size, templat.last_level + 1, templat.bind);
+       SetError(hDevice, E_OUTOFMEMORY);
+       goto unlock;
+    }

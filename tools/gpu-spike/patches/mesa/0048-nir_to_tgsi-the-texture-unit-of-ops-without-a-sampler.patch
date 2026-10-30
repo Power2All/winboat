@@ -1,0 +1,29 @@
+From: WinBoat
+Subject: [PATCH] nir_to_tgsi: the texture unit of ops without a sampler
+
+GLSL gives a texture op its unit as both the texture and the sampler index; SPIR-V shaders give ops without a
+sampler (textureSize, texelFetch and the other queries and fetches) only a texture, and their sampler index stays 0,
+which nir_to_tgsi named the TGSI sampler by. A size query on a cube map at unit 1 became a TXQ on unit 0, and
+virglrenderer then declared unit 0 a cube map and its 2D lookups failed to compile ("textureLod(samplerCube, vec2,
+float)"); the host context went into error and dropped everything after, persistent buffers among them (GravityMark's
+OpenGL renderer). Those ops now name their texture's unit.
+---
+diff --git a/src/gallium/auxiliary/nir/nir_to_tgsi.c b/src/gallium/auxiliary/nir/nir_to_tgsi.c
+index 9cb32e6..4a072f0 100644
+--- a/src/gallium/auxiliary/nir/nir_to_tgsi.c
++++ b/src/gallium/auxiliary/nir/nir_to_tgsi.c
+@@ -2742,8 +2742,12 @@ ntt_emit_texture(struct ntt_compile *c, nir_tex_instr *instr)
+       assert(nir_tex_instr_src_index(instr, nir_tex_src_sampler_offset) == -1);
+    } else {
+       assert(tex_handle_src == -1 && sampler_handle_src == -1);
+-      sampler = ureg_DECL_sampler(c->ureg, instr->sampler_index);
+-      int sampler_src = nir_tex_instr_src_index(instr, nir_tex_src_sampler_offset);
++      /* GLSL gives every op its unit as both indices; SPIR-V gives ops without a sampler (size queries, fetches)
++       * only the texture's, and their sampler index stays 0 */
++      const bool texture_only = !nir_tex_instr_need_sampler(instr);
++      sampler = ureg_DECL_sampler(c->ureg, texture_only ? instr->texture_index : instr->sampler_index);
++      int sampler_src = nir_tex_instr_src_index(instr, texture_only ? nir_tex_src_texture_offset
++                                                                    : nir_tex_src_sampler_offset);
+       if (sampler_src >= 0) {
+          struct ureg_src reladdr = ntt_get_src(c, instr->src[sampler_src].src);
+          sampler = ureg_src_indirect(sampler, ntt_reladdr(c, reladdr, 2));

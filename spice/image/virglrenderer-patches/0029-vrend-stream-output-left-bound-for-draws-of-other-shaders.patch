@@ -1,0 +1,104 @@
+From: WinBoat
+Subject: [PATCH] vrend: stream output left bound for draws of other shaders
+
+D3D keeps stream output targets bound across draws with any shader. vrend began or resumed the capture for every
+draw while targets were bound, so a draw whose program writes no stream output (no varyings) failed
+glBeginTransformFeedback, and a draw with another program or primitive mode than the paused capture's failed
+glResumeTransformFeedback; the pause after it failed too. Setting the same targets again also resumed the capture
+paused before, where D3D starts writing at the given offset unless it is -1 (append), and NVIDIA refuses to resume a
+capture paused with other state ("glResumeTransformFeedback requires the same active GLSL program object and
+pipeline state as when paused"). 3DMark Vantage's Jane Nash load ended in a context error at DRAW_VBO.
+
+A draw now touches the capture only when its last vertex stage has stream output, a paused capture with another
+program or mode is ended and begun again, and targets set without their append bits end the paused capture so the
+next draw begins a new one.
+---
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -713,6 +713,9 @@
+    /* when it last captured (vrend_sub_context's so_captures), and whether a capture ended (draws can use its count) */
+    uint64_t last_capture;
+    bool ended;
++   /* the program and primitive mode its capture began with (Resume needs both unchanged) */
++   GLuint xfb_program;
++   GLenum xfb_mode;
+ };
+ 
+ #define XFB_STATE_OFF 0
+@@ -6138,21 +6141,40 @@
+    } else
+       glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+ 
+-   if (sub_ctx->current_so) {
+-      if (sub_ctx->current_so->xfb_state == XFB_STATE_STARTED_NEED_BEGIN) {
+-         if (sub_ctx->shaders[PIPE_SHADER_GEOMETRY])
+-            glBeginTransformFeedback(get_gs_xfb_mode(sub_ctx->shaders[PIPE_SHADER_GEOMETRY]->sinfo.gs_out_prim));
+-     else if (sub_ctx->shaders[PIPE_SHADER_TESS_EVAL])
+-            glBeginTransformFeedback(get_tess_xfb_mode(sub_ctx->shaders[PIPE_SHADER_TESS_EVAL]->sinfo.tes_prim,
+-                               sub_ctx->shaders[PIPE_SHADER_TESS_EVAL]->sinfo.tes_point_mode));
+-         else
+-            glBeginTransformFeedback(get_xfb_mode(info->mode));
+-         sub_ctx->current_so->xfb_state = XFB_STATE_STARTED;
+-      } else if (sub_ctx->current_so->xfb_state == XFB_STATE_PAUSED) {
++   /* D3D keeps stream output targets bound for draws with any shader: a draw whose last vertex stage writes no stream
++    * output leaves the capture as it is (GL's Begin fails without varyings), and one with another program or
++    * primitive mode than the paused capture's starts a new capture (GL's Resume fails) */
++   struct vrend_shader *so_stage = sub_ctx->prog->ss[PIPE_SHADER_GEOMETRY] ? sub_ctx->prog->ss[PIPE_SHADER_GEOMETRY] :
++                                   sub_ctx->prog->ss[PIPE_SHADER_TESS_EVAL] ? sub_ctx->prog->ss[PIPE_SHADER_TESS_EVAL] :
++                                   sub_ctx->prog->ss[PIPE_SHADER_VERTEX];
++   if (sub_ctx->current_so && so_stage && so_stage->sel->sinfo.so_info.num_outputs) {
++      struct vrend_streamout_object *so = sub_ctx->current_so;
++      GLenum xfb_mode;
++      if (sub_ctx->shaders[PIPE_SHADER_GEOMETRY])
++         xfb_mode = get_gs_xfb_mode(sub_ctx->shaders[PIPE_SHADER_GEOMETRY]->sinfo.gs_out_prim);
++      else if (sub_ctx->shaders[PIPE_SHADER_TESS_EVAL])
++         xfb_mode = get_tess_xfb_mode(sub_ctx->shaders[PIPE_SHADER_TESS_EVAL]->sinfo.tes_prim,
++                                      sub_ctx->shaders[PIPE_SHADER_TESS_EVAL]->sinfo.tes_point_mode);
++      else
++         xfb_mode = get_xfb_mode(info->mode);
++      if (so->xfb_state == XFB_STATE_PAUSED &&
++          (so->xfb_program != sub_ctx->bound_program_id || so->xfb_mode != xfb_mode)) {
++         /* ponytail: the new capture starts over at the targets' offsets, not after what the last one wrote
++          * (D3D appends); carry the written size over (a primitives-written query) if a game needs it */
++         glEndTransformFeedback();
++         so->xfb_state = XFB_STATE_STARTED_NEED_BEGIN;
++         so->ended = true;
++      }
++      if (so->xfb_state == XFB_STATE_STARTED_NEED_BEGIN) {
++         glBeginTransformFeedback(xfb_mode);
++         so->xfb_program = sub_ctx->bound_program_id;
++         so->xfb_mode = xfb_mode;
++         so->xfb_state = XFB_STATE_STARTED;
++      } else if (so->xfb_state == XFB_STATE_PAUSED) {
+          glResumeTransformFeedback();
+-         sub_ctx->current_so->xfb_state = XFB_STATE_STARTED;
++         so->xfb_state = XFB_STATE_STARTED;
+       }
+-      sub_ctx->current_so->last_capture = ++sub_ctx->so_captures;
++      so->last_capture = ++sub_ctx->so_captures;
+    }
+ 
+    if (info->primitive_restart) {
+@@ -10816,7 +10838,7 @@
+ }
+ 
+ void vrend_set_streamout_targets(struct vrend_context *ctx,
+-                                 UNUSED uint32_t append_bitmask,
++                                 uint32_t append_bitmask,
+                                  uint32_t num_targets,
+                                  uint32_t *handles)
+ {
+@@ -10832,6 +10854,13 @@
+             if (!memcmp(handles, obj->handles, num_targets * 4)) {
+                ctx->sub->current_so = obj;
+                glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, obj->id);
++               /* targets set again without appending (D3D's offset other than -1): a new capture, from the start */
++               if ((append_bitmask & BITFIELD_MASK(num_targets)) != BITFIELD_MASK(num_targets) &&
++                   (obj->xfb_state == XFB_STATE_PAUSED || obj->xfb_state == XFB_STATE_STARTED)) {
++                  glEndTransformFeedback();
++                  obj->xfb_state = XFB_STATE_STARTED_NEED_BEGIN;
++                  obj->ended = true;
++               }
+                return;
+             }
+          }

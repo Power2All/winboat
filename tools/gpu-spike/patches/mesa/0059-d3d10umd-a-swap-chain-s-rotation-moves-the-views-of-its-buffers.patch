@@ -1,0 +1,194 @@
+From: WinBoat
+Subject: [PATCH] d3d10umd: a swap chain's rotation moves the views of its buffers
+
+A full-screen swap chain presents by flipping, and DXGI rotates the buffers' identities after each flip
+(RotateResourceIdentities): the resource a game renders to as buffer 0 gets the next texture. The render target and
+shader resource views made on those buffers kept the old textures, so the game kept rendering into one texture while
+the flips showed the others, never rendered: 3DMark Vantage's tests showed the loading screen. The device now keeps
+its render target and shader resource views in lists, and a rotation makes the rotated buffers' views again on their
+new textures and binds them again where they were bound.
+---
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -31,6 +31,7 @@
+  */
+ 
+ 
++#include "util/list.h"
+ #include "DriverIncludes.h"
+ #include "pipe/p_screen.h"
+ #include "util/u_hash_table.h"
+@@ -132,6 +133,7 @@
+    struct pipe_context *video_pipe;              /* decoding and the video processor (Video.cpp), created at first use */
+    struct VideoCompositor *compositor;
+    struct ShaderResourceView *srvs[PIPE_SHADER_TYPES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
++   struct list_head rtvs, srvs_made;             /* every render target and shader resource view (_RotateResourceIdentities) */
+    struct UnorderedAccessView *uavs[PIPE_SHADER_TYPES][D3D11_1_UAV_SLOT_COUNT];
+    unsigned patch_vertices;                      /* control points per patch of a patch list topology */
+    unsigned bound_images[PIPE_SHADER_TYPES];     /* how many were bound last, to unbind */
+@@ -275,6 +277,7 @@
+    struct pipe_surface *surface;
+    Resource *resource;
+    D3D10DDI_HRTRENDERTARGETVIEW hRTRenderTargetView;
++   struct list_head link;   /* Device::rtvs (a swap chain's rotation moves the views of its buffers) */
+ };
+ 
+ 
+@@ -455,6 +458,7 @@
+    Resource *resource;
+    unsigned buffer_offset;             /* raw and structured buffer views, bytes */
+    unsigned buffer_size;
++   struct list_head link;              /* Device::srvs_made (a swap chain's rotation moves the views of its buffers) */
+ };
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -147,6 +147,8 @@
+ 
+    Device *pDevice = CastDevice(pCreateData->hDrvDevice);
+    memset(pDevice, 0, sizeof *pDevice);
++   list_inithead(&pDevice->rtvs);
++   list_inithead(&pDevice->srvs_made);
+ 
+    pDevice->device.hRTAdapter = (HANDLE)pAdapter->hRTAdapter;
+    pDevice->device.hRTDevice = (HANDLE)pCreateData->hRTDevice.handle;
+diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+--- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
++++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+@@ -115,6 +115,7 @@
+    struct pipe_resource *resource = CastPipeResource(pCreateRenderTargetView->hDrvResource);
+    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
+    pRTView->resource = CastResource(pCreateRenderTargetView->hDrvResource);
++   list_inithead(&pRTView->link);
+ 
+    struct pipe_surface desc;
+ 
+@@ -161,6 +162,7 @@
+ 
+    pRTView->surface = pipe->create_surface(pipe, resource, &desc);
+    assert(pRTView->surface);
++   list_addtail(&pRTView->link, &CastDevice(hDevice)->rtvs);
+ }
+ 
+ 
+@@ -184,6 +186,7 @@
+ 
+    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
+ 
++   list_del(&pRTView->link);
+    pipe_surface_reference(&pRTView->surface, NULL);
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -1575,6 +1575,7 @@
+    enum pipe_format format;
+    
+    pSRView->resource = CastResource(pCreateSRView->hDrvResource);
++   list_inithead(&pSRView->link);
+ 
+    struct pipe_sampler_view desc;
+    memset(&desc, 0, sizeof desc);
+@@ -1634,6 +1635,7 @@
+    }
+ 
+    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
++   list_addtail(&pSRView->link, &CastDevice(hDevice)->srvs_made);
+ }
+ 
+ 
+@@ -1663,6 +1665,7 @@
+    enum pipe_format format;
+ 
+    pSRView->resource = CastResource(pCreateSRView->hDrvResource);
++   list_inithead(&pSRView->link);
+ 
+    struct pipe_sampler_view desc;
+    memset(&desc, 0, sizeof desc);
+@@ -1724,6 +1727,7 @@
+    }
+ 
+    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
++   list_addtail(&pSRView->link, &CastDevice(hDevice)->srvs_made);
+ }
+ 
+ 
+@@ -1748,6 +1752,7 @@
+ 
+    ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
+ 
++   list_del(&pSRView->link);
+    pipe_sampler_view_reference(&pSRView->handle, NULL);
+ }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/DxgiFns.cpp b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
+--- a/src/gallium/frontends/d3d10umd/DxgiFns.cpp
++++ b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
+@@ -215,6 +215,63 @@
+    Resource *lastResource = CastResource(hResources[NumResources - 1]);
+    lastResource->resource = firstResource;
+ 
++   /* A view names a buffer, not its storage: the render target and shader resource views made on the rotated
++    * buffers are made again on their new textures, and bound again where bound. Kept on the old ones, a game kept
++    * rendering into one texture while every other present flipped to one never rendered (3DMark Vantage's tests
++    * showed the loading screen). ponytail: depth stencil and unordered access views don't follow (swap chain
++    * buffers are render targets) */
++   Device *pDevice = CastDevice(RotateResourceIdentities->hDevice);
++   struct pipe_context *pipe = pDevice->pipe;
++   auto rotated = [&](const Resource *r) {
++      for (UINT i = 0; i < NumResources; ++i) {
++         if (CastResource(hResources[i]) == r)
++            return true;
++      }
++      return false;
++   };
++
++   bool fb_dirty = false;
++   list_for_each_entry(RenderTargetView, view, &pDevice->rtvs, link) {
++      if (!view->surface || !rotated(view->resource))
++         continue;
++      struct pipe_surface *surface = pipe->create_surface(pipe, view->resource->resource, view->surface);
++      for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; ++i) {
++         if (pDevice->fb.cbufs[i] == view->surface) {
++            pipe_surface_reference(&pDevice->fb.cbufs[i], surface);
++            fb_dirty = true;
++         }
++      }
++      pipe_surface_reference(&view->surface, NULL);
++      view->surface = surface;
++   }
++   if (fb_dirty)
++      pipe->set_framebuffer_state(pipe, &pDevice->fb);
++
++   bool views_dirty[PIPE_SHADER_TYPES] = {};
++   list_for_each_entry(ShaderResourceView, view, &pDevice->srvs_made, link) {
++      if (!view->handle || !rotated(view->resource))
++         continue;
++      struct pipe_sampler_view *handle = pipe->create_sampler_view(pipe, view->resource->resource, view->handle);
++      for (unsigned s = 0; s < PIPE_SHADER_TYPES; ++s) {
++         for (unsigned i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; ++i) {
++            if (pDevice->sampler_views[s][i] == view->handle) {
++               pDevice->sampler_views[s][i] = handle;
++               views_dirty[s] = true;
++            }
++         }
++      }
++      pipe_sampler_view_reference(&view->handle, NULL);
++      view->handle = handle;
++   }
++   for (unsigned s = 0; s < PIPE_SHADER_TYPES; ++s) {
++      if (!views_dirty[s])
++         continue;
++      /* (with shader texture slots the next draw binds them again: ShaderBindStage) */
++      pDevice->bindings_dirty[s] = true;
++      pipe->set_sampler_views(pipe, (enum pipe_shader_type)s, 0, PIPE_MAX_SHADER_SAMPLER_VIEWS, 0, false,
++                              pDevice->sampler_views[s]);
++   }
++
+    return S_OK;
+ }
+ 

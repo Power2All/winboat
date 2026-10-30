@@ -1,0 +1,833 @@
+From: WinBoat
+Subject: [PATCH] d3d9umd: one device call at a time
+
+With batching, the Direct3D 9 runtime calls LockAsync and UnlockAsync from the application's thread while its worker
+thread makes the other device calls, and nine isn't thread safe: an unlock adding its buffer to the device's list of
+buffers to upload while a draw walked that list left the walk on an unlinked node, calling NineBuffer9_Upload on it
+forever (3DMark06 froze, a core busy in NineBuffer9_RebindIfRequired). Every device entry point now holds one
+recursive mutex.
+---
+diff --git a/src/gallium/frontends/d3d9umd/d3d9umd.h b/src/gallium/frontends/d3d9umd/d3d9umd.h
+index 38044f4..baecc17 100644
+--- a/src/gallium/frontends/d3d9umd/d3d9umd.h
++++ b/src/gallium/frontends/d3d9umd/d3d9umd.h
+@@ -84,6 +84,19 @@ static inline D3D9UmdResource *D3D9UmdCastResource(HANDLE h) { return (D3D9UmdRe
+ void D3D9UmdLog(const char *format, ...);
+ bool D3D9UmdTracing(void);
+ void D3D9UmdTraceLog(const char *format, ...);
++/* The runtime makes LockAsync and UnlockAsync calls from the application's thread while its worker thread makes the
++ * others, and nine isn't thread safe (a buffer unlocked during a draw's walk of the managed buffers to upload left
++ * that walk looping on an unlinked node: 3DMark06 froze). Every device call holds this, recursively. */
++#include <mutex>
++static inline std::recursive_mutex &D3D9UmdDeviceMutex()
++{
++   static std::recursive_mutex mutex;
++   return mutex;
++}
++struct D3D9UmdDeviceLock {
++   std::lock_guard<std::recursive_mutex> guard{D3D9UmdDeviceMutex()};
++};
++
+ #define D3D9UMD_TRACE(...) do { if (D3D9UmdTracing()) D3D9UmdTraceLog(__VA_ARGS__); } while (0)
+ 
+ /* For DDI entry points that aren't implemented yet: logs the first call of each and returns S_OK */
+diff --git a/src/gallium/frontends/d3d9umd/decode.cpp b/src/gallium/frontends/d3d9umd/decode.cpp
+index a74d6eb..3cac0da 100644
+--- a/src/gallium/frontends/d3d9umd/decode.cpp
++++ b/src/gallium/frontends/d3d9umd/decode.cpp
+@@ -429,6 +429,7 @@ D3D9UmdDecodeReleaseResource(D3D9UmdDevice *dev, D3D9UmdResource *res)
+ static HRESULT APIENTRY
+ CreateDecodeDevice(HANDLE hDevice, D3DDDIARG_CREATEDECODEDEVICE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    const VideoProfileInfo *profile = OfferedProfile(dev->screen, p->pGuid);
+    D3D9UmdDecodeState *s = profile ? DecodeState(dev) : NULL;
+@@ -469,6 +470,7 @@ CreateDecodeDevice(HANDLE hDevice, D3DDDIARG_CREATEDECODEDEVICE *p)
+ static HRESULT APIENTRY
+ DestroyDecodeDevice(HANDLE hDevice, HANDLE hDecode)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDecoder *dec = (D3D9UmdDecoder *)hDecode;
+    dec->codec->destroy(dec->codec);
+    delete dec;
+@@ -478,6 +480,7 @@ DestroyDecodeDevice(HANDLE hDevice, HANDLE hDecode)
+ static HRESULT APIENTRY
+ SetDecodeRenderTarget(HANDLE hDevice, const D3DDDIARG_SETDECODERENDERTARGET *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDecoder *dec = (D3D9UmdDecoder *)p->hDecode;
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hRenderTarget);
+    if (res->format != NV12_FOURCC || p->SubResourceIndex >= res->surfCount)
+@@ -490,6 +493,7 @@ SetDecodeRenderTarget(HANDLE hDevice, const D3DDDIARG_SETDECODERENDERTARGET *p)
+ static HRESULT APIENTRY
+ DecodeBeginFrame(HANDLE hDevice, D3DDDIARG_DECODEBEGINFRAME *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDecoder *dec = (D3D9UmdDecoder *)p->hDecode;
+    DxvaBeginFrame(dec);
+    return S_OK;
+@@ -498,6 +502,7 @@ DecodeBeginFrame(HANDLE hDevice, D3DDDIARG_DECODEBEGINFRAME *p)
+ static HRESULT APIENTRY
+ DecodeExecute(HANDLE hDevice, const D3DDDIARG_DECODEEXECUTE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDecoder *dec = (D3D9UmdDecoder *)p->hDecode;
+    const uint8_t *slice_control = NULL, *bitstream = NULL;
+    unsigned slice_control_size = 0, bitstream_size = 0;
+@@ -539,6 +544,7 @@ DecodeExecute(HANDLE hDevice, const D3DDDIARG_DECODEEXECUTE *p)
+ static HRESULT APIENTRY
+ DecodeEndFrame(HANDLE hDevice, D3DDDIARG_DECODEENDFRAME *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdDecoder *dec = (D3D9UmdDecoder *)p->hDecode;
+    if (!dec->target || dec->stream.empty())
+diff --git a/src/gallium/frontends/d3d9umd/device.cpp b/src/gallium/frontends/d3d9umd/device.cpp
+index 82795f1..6a8a16a 100644
+--- a/src/gallium/frontends/d3d9umd/device.cpp
++++ b/src/gallium/frontends/d3d9umd/device.cpp
+@@ -20,6 +20,7 @@
+ static HRESULT APIENTRY
+ DestroyDevice(HANDLE hDevice)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UMD_TRACE("DestroyDevice");
+    D3D9UmdDecodeDestroyDevice(dev);
+@@ -32,6 +33,7 @@ DestroyDevice(HANDLE hDevice)
+ static HRESULT APIENTRY
+ Flush(HANDLE hDevice)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    struct pipe_context *pipe = nddi_flush(dev->nine);
+    pipe->flush(pipe, NULL, 0);
+@@ -68,6 +70,7 @@ UsageFromFlags(D3DDDI_RESOURCEFLAGS f)
+ static HRESULT APIENTRY
+ CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    const D3DDDI_SURFACEINFO &s0 = p->pSurfList[0];
+    D3D9UMD_TRACE("CreateResource format %u pool %u flags 0x%x surfaces %u mips %u %ux%ux%u ms %u fvf 0x%x",
+@@ -172,6 +175,7 @@ CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *p)
+ static HRESULT APIENTRY
+ OpenResource(HANDLE hDevice, D3DDDIARG_OPENRESOURCE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *res = new (std::nothrow) D3D9UmdResource();
+    if (!res)
+@@ -207,12 +211,14 @@ OpenResource(HANDLE hDevice, D3DDDIARG_OPENRESOURCE *p)
+ static HRESULT APIENTRY
+ QueryResourceResidency(HANDLE hDevice, const D3DDDIARG_QUERYRESOURCERESIDENCY *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+ static HRESULT APIENTRY
+ DestroyResource(HANDLE hDevice, HANDLE hResource)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *res = D3D9UmdCastResource(hResource);
+    D3D9UMD_TRACE("DestroyResource %p", res);
+@@ -260,6 +266,7 @@ LockBox(const Flags &f, const Arg *p, nddi_box *box)
+ static HRESULT APIENTRY
+ Lock(HANDLE hDevice, D3DDDIARG_LOCK *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
+    if (res->decodeBuffer) {
+       p->pSurfData = res->decodeBuffer;
+@@ -290,6 +297,7 @@ Lock(HANDLE hDevice, D3DDDIARG_LOCK *p)
+ static HRESULT APIENTRY
+ Unlock(HANDLE hDevice, const D3DDDIARG_UNLOCK *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
+    D3D9UMD_TRACE("Unlock resource %p sub %u flags 0x%x", res, p->SubResourceIndex, p->Flags.Value);
+    if (res->decodeBuffer)
+@@ -301,10 +309,11 @@ Unlock(HANDLE hDevice, const D3DDDIARG_UNLOCK *p)
+    return nddi_resource_unlock(res->nine, p->SubResourceIndex);
+ }
+ 
+-/* Locks from the application's thread while the runtime's own thread renders. Nine serializes the two. */
++/* Locks from the application's thread while the runtime's own thread renders (D3D9UmdDeviceLock serializes them) */
+ static HRESULT APIENTRY
+ LockAsync(HANDLE hDevice, D3DDDIARG_LOCKASYNC *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
+    p->hCookie = NULL;
+    if (p->Flags.NotifyOnly) {
+@@ -335,6 +344,7 @@ LockAsync(HANDLE hDevice, D3DDDIARG_LOCKASYNC *p)
+ static HRESULT APIENTRY
+ UnlockAsync(HANDLE hDevice, const D3DDDIARG_UNLOCKASYNC *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
+    D3D9UMD_TRACE("UnlockAsync resource %p sub %u flags 0x%x", res, p->SubResourceIndex, p->Flags.Value);
+    if (p->Flags.NotifyOnly) {
+@@ -347,6 +357,7 @@ UnlockAsync(HANDLE hDevice, const D3DDDIARG_UNLOCKASYNC *p)
+ static HRESULT APIENTRY
+ Blt(HANDLE hDevice, const D3DDDIARG_BLT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource), *dst = D3D9UmdCastResource(p->hDstResource);
+    nddi_rect sr = {p->SrcRect.left, p->SrcRect.top, p->SrcRect.right, p->SrcRect.bottom};
+@@ -361,6 +372,7 @@ Blt(HANDLE hDevice, const D3DDDIARG_BLT *p)
+ static HRESULT APIENTRY
+ ColorFill(HANDLE hDevice, const D3DDDIARG_COLORFILL *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    nddi_rect r = {p->DstRect.left, p->DstRect.top, p->DstRect.right, p->DstRect.bottom};
+    return nddi_color_fill(dev->nine, D3D9UmdCastResource(p->hResource)->nine, p->SubResourceIndex, &r, p->Color);
+@@ -371,6 +383,7 @@ ColorFill(HANDLE hDevice, const D3DDDIARG_COLORFILL *p)
+ static HRESULT APIENTRY
+ SetRenderState(HANDLE hDevice, const D3DDDIARG_RENDERSTATE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UMD_TRACE("SetRenderState %u = 0x%x", (UINT)p->State, p->Value);
+    switch ((UINT)p->State) {
+@@ -403,6 +416,7 @@ SetRenderState(HANDLE hDevice, const D3DDDIARG_RENDERSTATE *p)
+ static HRESULT APIENTRY
+ SetRenderTarget(HANDLE hDevice, const D3DDDIARG_SETRENDERTARGET *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hRenderTarget);
+    if (p->RenderTargetIndex == 0)
+@@ -415,6 +429,7 @@ SetRenderTarget(HANDLE hDevice, const D3DDDIARG_SETRENDERTARGET *p)
+ static HRESULT APIENTRY
+ SetDepthStencil(HANDLE hDevice, const D3DDDIARG_SETDEPTHSTENCIL *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hZBuffer);
+    return nddi_set_depth_stencil(dev->nine, res ? res->nine : NULL);
+@@ -423,6 +438,7 @@ SetDepthStencil(HANDLE hDevice, const D3DDDIARG_SETDEPTHSTENCIL *p)
+ static HRESULT APIENTRY
+ SetViewport(HANDLE hDevice, const D3DDDIARG_VIEWPORTINFO *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    dev->viewport.x = p->X;
+    dev->viewport.y = p->Y;
+@@ -435,6 +451,7 @@ SetViewport(HANDLE hDevice, const D3DDDIARG_VIEWPORTINFO *p)
+ static HRESULT APIENTRY
+ SetZRange(HANDLE hDevice, const D3DDDIARG_ZRANGE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    dev->viewport.min_z = p->MinZ;
+    dev->viewport.max_z = p->MaxZ;
+@@ -445,6 +462,7 @@ SetZRange(HANDLE hDevice, const D3DDDIARG_ZRANGE *p)
+ static HRESULT APIENTRY
+ SetScissorRect(HANDLE hDevice, const RECT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    nddi_rect r = {p->left, p->top, p->right, p->bottom};
+    return nddi_set_scissor(dev->nine, &r);
+@@ -455,6 +473,7 @@ SetScissorRect(HANDLE hDevice, const RECT *p)
+ static HRESULT APIENTRY
+ Clear(HANDLE hDevice, const D3DDDIARG_CLEAR *p, UINT NumRect, const RECT *pRect)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    static_assert(sizeof(RECT) == sizeof(nddi_rect), "RECT layout");
+    HRESULT hr = nddi_clear(dev->nine, NumRect, (const nddi_rect *)pRect,
+@@ -467,6 +486,7 @@ Clear(HANDLE hDevice, const D3DDDIARG_CLEAR *p, UINT NumRect, const RECT *pRect)
+ static HRESULT APIENTRY
+ Present(HANDLE hDevice, const D3DDDIARG_PRESENT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource);
+    unsigned level = 0, layer = 0;
+@@ -490,6 +510,7 @@ Present(HANDLE hDevice, const D3DDDIARG_PRESENT *p)
+ static HRESULT APIENTRY
+ SetDisplayMode(HANDLE hDevice, const D3DDDIARG_SETDISPLAYMODE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *res = D3D9UmdCastResource(p->hResource);
+    unsigned level = 0, layer = 0;
+@@ -513,6 +534,7 @@ SetDisplayMode(HANDLE hDevice, const D3DDDIARG_SETDISPLAYMODE *p)
+ static HRESULT APIENTRY
+ Flush1(HANDLE hDevice, UINT FlushFlags)
+ {
++   D3D9UmdDeviceLock lock;
+    return Flush(hDevice);
+ }
+ 
+@@ -520,6 +542,7 @@ Flush1(HANDLE hDevice, UINT FlushFlags)
+ static HRESULT APIENTRY
+ Present1(HANDLE hDevice, D3DDDIARG_PRESENT1 *p)
+ {
++   D3D9UmdDeviceLock lock;
+    if (!p->SrcResources)
+       return E_INVALIDARG;
+    D3DDDIARG_PRESENT one;
+@@ -537,6 +560,7 @@ Present1(HANDLE hDevice, D3DDDIARG_PRESENT1 *p)
+ static HRESULT APIENTRY
+ DepthFill(HANDLE hDevice, const D3DDDIARG_DEPTHFILL *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    nddi_rect r = {p->DstRect.left, p->DstRect.top, p->DstRect.right, p->DstRect.bottom};
+    return nddi_depth_fill(dev->nine, D3D9UmdCastResource(p->hResource)->nine, p->SubResourceIndex, &r, p->Depth);
+@@ -546,12 +570,14 @@ DepthFill(HANDLE hDevice, const D3DDDIARG_DEPTHFILL *p)
+ static HRESULT APIENTRY
+ ResolveSharedResource(HANDLE hDevice, const D3DDDIARG_RESOLVESHAREDRESOURCE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return Flush(hDevice);
+ }
+ 
+ static HRESULT APIENTRY
+ UpdateSubresourceUP(HANDLE hDevice, const D3DDDIARG_UPDATESUBRESOURCEUP *p)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_box box = {p->DstBox.Left, p->DstBox.Top, p->DstBox.Right, p->DstBox.Bottom, p->DstBox.Front,
+                    p->DstBox.Back};
+    return nddi_update_subresource(D3D9UmdCastResource(p->hResource)->nine, p->SubResourceIndex, &box, p->pSysMemUP,
+@@ -562,6 +588,7 @@ UpdateSubresourceUP(HANDLE hDevice, const D3DDDIARG_UPDATESUBRESOURCEUP *p)
+ static VOID APIENTRY
+ CheckCounterInfo(HANDLE hDevice, D3DDDIARG_COUNTER_INFO *p)
+ {
++   D3D9UmdDeviceLock lock;
+    p->LastDeviceDependentCounter = (D3DDDIQUERYTYPE)0;
+    p->NumSimultaneousCounters = 0;
+ }
+@@ -570,6 +597,7 @@ static HRESULT APIENTRY
+ CheckCounter(HANDLE hDevice, D3DDDIQUERYTYPE, D3DDDI_COUNTER_TYPE *, UINT *, LPSTR, UINT *, LPSTR, UINT *, LPSTR,
+              UINT *)
+ {
++   D3D9UmdDeviceLock lock;
+    return E_INVALIDARG;
+ }
+ 
+@@ -579,6 +607,7 @@ CheckCounter(HANDLE hDevice, D3DDDIQUERYTYPE, D3DDDI_COUNTER_TYPE *, UINT *, LPS
+ static HRESULT APIENTRY
+ TrimResidencySet(HANDLE hDevice, D3DDDIARG_TRIMRESIDENCYSET *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+@@ -586,17 +615,20 @@ TrimResidencySet(HANDLE hDevice, D3DDDIARG_TRIMRESIDENCYSET *p)
+ static VOID APIENTRY
+ AcquireResource(HANDLE hDevice, CONST D3DDDIARG_SYNCTOKEN *p)
+ {
++   D3D9UmdDeviceLock lock;
+ }
+ 
+ static VOID APIENTRY
+ ReleaseResource(HANDLE hDevice, CONST D3DDDIARG_SYNCTOKEN *p)
+ {
++   D3D9UmdDeviceLock lock;
+ }
+ 
+ /* CreateResource with Windows 8's second flags word (IsDisplayable, ...): nothing of it changes how it's made */
+ static HRESULT APIENTRY
+ CreateResource2(HANDLE hDevice, D3DDDIARG_CREATERESOURCE2 *p)
+ {
++   D3D9UmdDeviceLock lock;
+    static_assert(offsetof(D3DDDIARG_CREATERESOURCE2, Rotation) == offsetof(D3DDDIARG_CREATERESOURCE, Rotation),
+                  "CREATERESOURCE2 extends CREATERESOURCE");
+    return CreateResource(hDevice, reinterpret_cast<D3DDDIARG_CREATERESOURCE *>(p));
+@@ -606,6 +638,7 @@ CreateResource2(HANDLE hDevice, D3DDDIARG_CREATERESOURCE2 *p)
+ static HRESULT APIENTRY
+ Discard(HANDLE hDevice, const D3DDDIARG_DISCARD *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+@@ -613,12 +646,14 @@ Discard(HANDLE hDevice, const D3DDDIARG_DISCARD *p)
+ static HRESULT APIENTRY
+ OfferResources(HANDLE hDevice, const D3DDDIARG_OFFERRESOURCES *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+ static HRESULT APIENTRY
+ ReclaimResources(HANDLE hDevice, const D3DDDIARG_RECLAIMRESOURCES *p)
+ {
++   D3D9UmdDeviceLock lock;
+    if (p->pDiscarded) {
+       for (UINT i = 0; i < p->Resources; i++)
+          p->pDiscarded[i] = FALSE;
+@@ -630,6 +665,7 @@ ReclaimResources(HANDLE hDevice, const D3DDDIARG_RECLAIMRESOURCES *p)
+ static HRESULT APIENTRY
+ CheckDirectFlipSupport(HANDLE hDevice, D3DDDIARG_CHECKDIRECTFLIPSUPPORT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    p->Supported = FALSE;
+    return S_OK;
+ }
+@@ -637,6 +673,7 @@ CheckDirectFlipSupport(HANDLE hDevice, D3DDDIARG_CHECKDIRECTFLIPSUPPORT *p)
+ static HRESULT APIENTRY
+ CheckMultiPlaneOverlaySupport(HANDLE hDevice, D3DDDIARG_CHECKMULTIPLANEOVERLAYSUPPORT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    p->Supported = FALSE;
+    return S_OK;
+ }
+@@ -644,6 +681,7 @@ CheckMultiPlaneOverlaySupport(HANDLE hDevice, D3DDDIARG_CHECKMULTIPLANEOVERLAYSU
+ static HRESULT APIENTRY
+ CheckPresentDurationSupport(HANDLE hDevice, D3DDDIARG_CHECKPRESENTDURATIONSUPPORT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    p->ClosestSmallerDuration = 0;
+    p->ClosestLargerDuration = 0;
+    return S_OK;
+@@ -653,12 +691,14 @@ CheckPresentDurationSupport(HANDLE hDevice, D3DDDIARG_CHECKPRESENTDURATIONSUPPOR
+ static HRESULT APIENTRY
+ SetMarker(HANDLE hDevice)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+ static HRESULT APIENTRY
+ SetMarkerMode(HANDLE hDevice, D3DDDI_MARKERTYPE Type, UINT Flags)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+diff --git a/src/gallium/frontends/d3d9umd/pipeline.cpp b/src/gallium/frontends/d3d9umd/pipeline.cpp
+index 602c30e..64b7cd6 100644
+--- a/src/gallium/frontends/d3d9umd/pipeline.cpp
++++ b/src/gallium/frontends/d3d9umd/pipeline.cpp
+@@ -22,6 +22,7 @@ Obj(HANDLE h)
+ static HRESULT APIENTRY
+ SetStreamSource(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *vb = D3D9UmdCastResource(p->hVertexBuffer);
+    if (p->Stream < ARRAYSIZE(dev->streamStride))
+@@ -33,6 +34,7 @@ SetStreamSource(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCE *p)
+ static HRESULT APIENTRY
+ SetStreamSourceUm(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCEUM *p, const VOID *pUMBuffer)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    if (p->Stream < ARRAYSIZE(dev->streamStride))
+       dev->streamStride[p->Stream] = p->Stride;
+@@ -43,12 +45,14 @@ SetStreamSourceUm(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCEUM *p, const VO
+ static HRESULT APIENTRY
+ SetStreamSourceFreq(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCEFREQ *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return nddi_set_stream_source_freq(D3D9UmdCastDevice(hDevice)->nine, p->Stream, p->Divider);
+ }
+ 
+ static HRESULT APIENTRY
+ SetIndices(HANDLE hDevice, const D3DDDIARG_SETINDICES *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    dev->indexBuffer = D3D9UmdCastResource(p->hIndexBuffer);
+    dev->memoryIndices = NULL;
+@@ -58,6 +62,7 @@ SetIndices(HANDLE hDevice, const D3DDDIARG_SETINDICES *p)
+ static HRESULT APIENTRY
+ SetIndicesUm(HANDLE hDevice, UINT IndexSize, const VOID *pIndexBuffer)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    dev->memoryIndices = pIndexBuffer;
+    dev->memoryIndexSize = IndexSize;
+@@ -69,6 +74,7 @@ SetIndicesUm(HANDLE hDevice, UINT IndexSize, const VOID *pIndexBuffer)
+ static HRESULT APIENTRY
+ DrawPrimitive(HANDLE hDevice, const D3DDDIARG_DRAWPRIMITIVE *p, const UINT *pFlagBuffer)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    HRESULT hr = nddi_draw_primitive(dev->nine, p->PrimitiveType, p->VStart, p->PrimitiveCount);
+    D3D9UMD_TRACE("DrawPrimitive type %u start %u count %u -> 0x%08lx", p->PrimitiveType, p->VStart,
+@@ -81,6 +87,7 @@ DrawPrimitive(HANDLE hDevice, const D3DDDIARG_DRAWPRIMITIVE *p, const UINT *pFla
+ static HRESULT APIENTRY
+ DrawIndexedPrimitive(HANDLE hDevice, const D3DDDIARG_DRAWINDEXEDPRIMITIVE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    HRESULT hr = nddi_draw_indexed_primitive(dev->nine, p->PrimitiveType, p->BaseVertexIndex, p->MinIndex,
+                                             p->NumVertices, p->StartIndex, p->PrimitiveCount);
+@@ -94,6 +101,7 @@ DrawIndexedPrimitive(HANDLE hDevice, const D3DDDIARG_DRAWINDEXEDPRIMITIVE *p)
+ static HRESULT APIENTRY
+ DrawPrimitive2(HANDLE hDevice, const D3DDDIARG_DRAWPRIMITIVE2 *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    UINT stride = dev->streamStride[0];
+    UINT start = stride ? p->FirstVertexOffset / stride : 0;
+@@ -110,6 +118,7 @@ static HRESULT APIENTRY
+ DrawIndexedPrimitive2(HANDLE hDevice, const D3DDDIARG_DRAWINDEXEDPRIMITIVE2 *p, UINT dwIndicesSize,
+                       const VOID *pIndexBuffer, const UINT *pFlagBuffer)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    UINT stride = dev->streamStride[0];
+    INT base = stride ? p->BaseVertexOffset / (INT)stride : 0;
+@@ -131,6 +140,7 @@ DrawIndexedPrimitive2(HANDLE hDevice, const D3DDDIARG_DRAWINDEXEDPRIMITIVE2 *p,
+ static HRESULT APIENTRY
+ CreateVertexShaderDecl(HANDLE hDevice, D3DDDIARG_CREATEVERTEXSHADERDECL *p, const D3DDDIVERTEXELEMENT *pElements)
+ {
++   D3D9UmdDeviceLock lock;
+    static_assert(sizeof(D3DDDIVERTEXELEMENT) == sizeof(nddi_vertex_element), "vertex element layout");
+    nddi_object *decl = NULL;
+    HRESULT hr = nddi_create_vertex_declaration(D3D9UmdCastDevice(hDevice)->nine,
+@@ -143,6 +153,7 @@ CreateVertexShaderDecl(HANDLE hDevice, D3DDDIARG_CREATEVERTEXSHADERDECL *p, cons
+ static HRESULT APIENTRY
+ SetVertexShaderDecl(HANDLE hDevice, HANDLE hShader)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UMD_TRACE("SetVertexShaderDecl %p", hShader);
+    return nddi_set_vertex_declaration(D3D9UmdCastDevice(hDevice)->nine, Obj(hShader));
+ }
+@@ -150,6 +161,7 @@ SetVertexShaderDecl(HANDLE hDevice, HANDLE hShader)
+ static HRESULT APIENTRY
+ DeleteVertexShaderDecl(HANDLE hDevice, HANDLE hShader)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_object_destroy(Obj(hShader));
+    return S_OK;
+ }
+@@ -157,6 +169,7 @@ DeleteVertexShaderDecl(HANDLE hDevice, HANDLE hShader)
+ static HRESULT APIENTRY
+ CreateVertexShaderFunc(HANDLE hDevice, D3DDDIARG_CREATEVERTEXSHADERFUNC *p, const UINT *pCode)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_object *shader = NULL;
+    /* The code first: the translation is what may fail */
+    if (D3D9UmdTracing()) {
+@@ -178,6 +191,7 @@ CreateVertexShaderFunc(HANDLE hDevice, D3DDDIARG_CREATEVERTEXSHADERFUNC *p, cons
+ static HRESULT APIENTRY
+ SetVertexShaderFunc(HANDLE hDevice, HANDLE hShader)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UMD_TRACE("SetVertexShaderFunc %p", hShader);
+    return nddi_set_vertex_shader(D3D9UmdCastDevice(hDevice)->nine, Obj(hShader));
+ }
+@@ -185,6 +199,7 @@ SetVertexShaderFunc(HANDLE hDevice, HANDLE hShader)
+ static HRESULT APIENTRY
+ DeleteVertexShaderFunc(HANDLE hDevice, HANDLE hShader)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_object_destroy(Obj(hShader));
+    return S_OK;
+ }
+@@ -192,6 +207,7 @@ DeleteVertexShaderFunc(HANDLE hDevice, HANDLE hShader)
+ static HRESULT APIENTRY
+ CreatePixelShader(HANDLE hDevice, D3DDDIARG_CREATEPIXELSHADER *p, const UINT *pCode)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_object *shader = NULL;
+    HRESULT hr = nddi_create_pixel_shader(D3D9UmdCastDevice(hDevice)->nine, (const uint32_t *)pCode, &shader);
+    D3D9UMD_TRACE("CreatePixelShader %u bytes -> 0x%08lx", p->CodeSize, hr);
+@@ -202,6 +218,7 @@ CreatePixelShader(HANDLE hDevice, D3DDDIARG_CREATEPIXELSHADER *p, const UINT *pC
+ static HRESULT APIENTRY
+ SetPixelShader(HANDLE hDevice, HANDLE hShader)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UMD_TRACE("SetPixelShader %p", hShader);
+    return nddi_set_pixel_shader(D3D9UmdCastDevice(hDevice)->nine, Obj(hShader));
+ }
+@@ -209,6 +226,7 @@ SetPixelShader(HANDLE hDevice, HANDLE hShader)
+ static HRESULT APIENTRY
+ DeletePixelShader(HANDLE hDevice, HANDLE hShader)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_object_destroy(Obj(hShader));
+    return S_OK;
+ }
+@@ -218,6 +236,7 @@ DeletePixelShader(HANDLE hDevice, HANDLE hShader)
+ static HRESULT APIENTRY
+ SetVertexShaderConst(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONST *p, const VOID *pData)
+ {
++   D3D9UmdDeviceLock lock;
+    const float *f = (const float *)pData;
+    D3D9UMD_TRACE("SetVertexShaderConst c%u x%u", p->Register, p->Count);
+    if (D3D9UmdTracing()) {
+@@ -231,6 +250,7 @@ SetVertexShaderConst(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONST *p, co
+ static HRESULT APIENTRY
+ SetVertexShaderConstI(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONSTI *p, const INT *pData)
+ {
++   D3D9UmdDeviceLock lock;
+    return nddi_set_shader_constants_i(D3D9UmdCastDevice(hDevice)->nine, false, p->Register,
+                                       (const int32_t *)pData, p->Count);
+ }
+@@ -238,6 +258,7 @@ SetVertexShaderConstI(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONSTI *p,
+ static HRESULT APIENTRY
+ SetVertexShaderConstB(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONSTB *p, const BOOL *pData)
+ {
++   D3D9UmdDeviceLock lock;
+    return nddi_set_shader_constants_b(D3D9UmdCastDevice(hDevice)->nine, false, p->Register,
+                                       (const int32_t *)pData, p->Count);
+ }
+@@ -245,6 +266,7 @@ SetVertexShaderConstB(HANDLE hDevice, const D3DDDIARG_SETVERTEXSHADERCONSTB *p,
+ static HRESULT APIENTRY
+ SetPixelShaderConst(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONST *p, const FLOAT *pData)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UMD_TRACE("SetPixelShaderConst c%u x%u: %g %g %g %g", p->Register, p->Count, pData[0], pData[1], pData[2],
+                  pData[3]);
+    return nddi_set_shader_constants_f(D3D9UmdCastDevice(hDevice)->nine, true, p->Register, pData, p->Count);
+@@ -253,6 +275,7 @@ SetPixelShaderConst(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONST *p, cons
+ static HRESULT APIENTRY
+ SetPixelShaderConstI(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONSTI *p, const INT *pData)
+ {
++   D3D9UmdDeviceLock lock;
+    return nddi_set_shader_constants_i(D3D9UmdCastDevice(hDevice)->nine, true, p->Register, (const int32_t *)pData,
+                                       p->Count);
+ }
+@@ -260,6 +283,7 @@ SetPixelShaderConstI(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONSTI *p, co
+ static HRESULT APIENTRY
+ SetPixelShaderConstB(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONSTB *p, const BOOL *pData)
+ {
++   D3D9UmdDeviceLock lock;
+    return nddi_set_shader_constants_b(D3D9UmdCastDevice(hDevice)->nine, true, p->Register, (const int32_t *)pData,
+                                       p->Count);
+ }
+@@ -269,6 +293,7 @@ SetPixelShaderConstB(HANDLE hDevice, const D3DDDIARG_SETPIXELSHADERCONSTB *p, co
+ static HRESULT APIENTRY
+ SetTexture(HANDLE hDevice, UINT Stage, HANDLE hTexture)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdResource *tex = D3D9UmdCastResource(hTexture);
+    D3D9UMD_TRACE("SetTexture %u = %p", Stage, tex);
+    return nddi_set_texture(D3D9UmdCastDevice(hDevice)->nine, Stage, tex ? tex->nine : NULL);
+@@ -299,6 +324,7 @@ SamplerStateFor(D3DDDITEXTURESTAGESTATETYPE state)
+ static HRESULT APIENTRY
+ SetTextureStageState(HANDLE hDevice, const D3DDDIARG_TEXTURESTAGESTATE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    int sampler = SamplerStateFor(p->State);
+    D3D9UMD_TRACE("SetTextureStageState %u %u = 0x%x", p->Stage, (UINT)p->State, p->Value);
+@@ -313,6 +339,7 @@ SetTextureStageState(HANDLE hDevice, const D3DDDIARG_TEXTURESTAGESTATE *p)
+ static HRESULT APIENTRY
+ GenerateMipSubLevels(HANDLE hDevice, const D3DDDIARG_GENERATEMIPSUBLEVELS *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return nddi_generate_mip_sublevels(D3D9UmdCastResource(p->hResource)->nine);
+ }
+ 
+@@ -320,6 +347,7 @@ GenerateMipSubLevels(HANDLE hDevice, const D3DDDIARG_GENERATEMIPSUBLEVELS *p)
+ static HRESULT APIENTRY
+ TexBlt(HANDLE hDevice, const D3DDDIARG_TEXBLT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource), *dst = D3D9UmdCastResource(p->hDstResource);
+    bool cube = src->flags.CubeMap;
+@@ -347,6 +375,7 @@ TexBlt(HANDLE hDevice, const D3DDDIARG_TEXBLT *p)
+ static HRESULT APIENTRY
+ VolBlt(HANDLE hDevice, const D3DDDIARG_VOLUMEBLT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource), *dst = D3D9UmdCastResource(p->hDstResource);
+    UINT skip = src->surfCount > dst->surfCount ? src->surfCount - dst->surfCount : 0;
+@@ -366,6 +395,7 @@ VolBlt(HANDLE hDevice, const D3DDDIARG_VOLUMEBLT *p)
+ static HRESULT APIENTRY
+ TexBlt1(HANDLE hDevice, const D3DDDIARG_TEXBLT1 *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3DDDIARG_TEXBLT b = {p->hDstResource, p->hSrcResource, p->CubeMapFace, p->DstPoint, p->SrcRect};
+    return TexBlt(hDevice, &b);
+ }
+@@ -373,6 +403,7 @@ TexBlt1(HANDLE hDevice, const D3DDDIARG_TEXBLT1 *p)
+ static HRESULT APIENTRY
+ VolBlt1(HANDLE hDevice, const D3DDDIARG_VOLUMEBLT1 *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3DDDIARG_VOLUMEBLT b = {p->hDstResource, p->hSrcResource, p->DstX, p->DstY, p->DstZ, p->SrcBox};
+    return VolBlt(hDevice, &b);
+ }
+@@ -381,6 +412,7 @@ VolBlt1(HANDLE hDevice, const D3DDDIARG_VOLUMEBLT1 *p)
+ static HRESULT APIENTRY
+ BufBlt(HANDLE hDevice, const D3DDDIARG_BUFFERBLT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdResource *src = D3D9UmdCastResource(p->hSrcResource), *dst = D3D9UmdCastResource(p->hDstResource);
+    HRESULT hr = nddi_buffer_copy(dev->nine, src->nine, p->SrcRange.Offset, p->SrcRange.Size, dst->nine, p->Offset);
+@@ -392,6 +424,7 @@ BufBlt(HANDLE hDevice, const D3DDDIARG_BUFFERBLT *p)
+ static HRESULT APIENTRY
+ BufBlt1(HANDLE hDevice, const D3DDDIARG_BUFFERBLT1 *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3DDDIARG_BUFFERBLT b = {p->hDstResource, p->hSrcResource, p->Offset, p->SrcRange};
+    return BufBlt(hDevice, &b);
+ }
+@@ -414,6 +447,7 @@ TransformFor(D3DTRANSFORMSTATETYPE type)
+ static HRESULT APIENTRY
+ SetTransform(HANDLE hDevice, const D3DDDIARG_SETTRANSFORM *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UMD_TRACE("SetTransform %u", (UINT)p->TransformType);
+    return nddi_set_transform(D3D9UmdCastDevice(hDevice)->nine, TransformFor(p->TransformType),
+                              (const float *)&p->Matrix, false);
+@@ -422,6 +456,7 @@ SetTransform(HANDLE hDevice, const D3DDDIARG_SETTRANSFORM *p)
+ static HRESULT APIENTRY
+ MultiplyTransform(HANDLE hDevice, const D3DDDIARG_MULTIPLYTRANSFORM *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return nddi_set_transform(D3D9UmdCastDevice(hDevice)->nine, TransformFor(p->TransformType),
+                              (const float *)&p->Matrix, true);
+ }
+@@ -429,6 +464,7 @@ MultiplyTransform(HANDLE hDevice, const D3DDDIARG_MULTIPLYTRANSFORM *p)
+ static HRESULT APIENTRY
+ SetMaterial(HANDLE hDevice, const D3DDDIARG_SETMATERIAL *p)
+ {
++   D3D9UmdDeviceLock lock;
+    static_assert(sizeof(D3DDDIARG_SETMATERIAL) == sizeof(D3DMATERIAL9), "material layout");
+    return nddi_set_material(D3D9UmdCastDevice(hDevice)->nine, p);
+ }
+@@ -436,6 +472,7 @@ SetMaterial(HANDLE hDevice, const D3DDDIARG_SETMATERIAL *p)
+ static HRESULT APIENTRY
+ SetLight(HANDLE hDevice, const D3DDDIARG_SETLIGHT *p, const D3DDDI_LIGHT *pLight)
+ {
++   D3D9UmdDeviceLock lock;
+    static_assert(sizeof(D3DDDI_LIGHT) == sizeof(D3DLIGHT9), "light layout");
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    switch (p->DataType) {
+@@ -449,18 +486,21 @@ SetLight(HANDLE hDevice, const D3DDDIARG_SETLIGHT *p, const D3DDDI_LIGHT *pLight
+ static HRESULT APIENTRY
+ CreateLight(HANDLE hDevice, const D3DDDIARG_CREATELIGHT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK; /* nine creates lights when they're first set */
+ }
+ 
+ static HRESULT APIENTRY
+ DestroyLight(HANDLE hDevice, const D3DDDIARG_DESTROYLIGHT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+ static HRESULT APIENTRY
+ SetClipPlane(HANDLE hDevice, const D3DDDIARG_SETCLIPPLANE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return nddi_set_clip_plane(D3D9UmdCastDevice(hDevice)->nine, p->Index, p->Plane);
+ }
+ 
+@@ -469,12 +509,14 @@ SetClipPlane(HANDLE hDevice, const D3DDDIARG_SETCLIPPLANE *p)
+ static HRESULT APIENTRY
+ UpdateWInfo(HANDLE hDevice, const D3DDDIARG_WINFO *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+ static HRESULT APIENTRY
+ ValidateDevice(HANDLE hDevice, D3DDDIARG_VALIDATETEXTURESTAGESTATE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    p->NumPasses = 1;
+    return S_OK;
+ }
+@@ -484,6 +526,7 @@ ValidateDevice(HANDLE hDevice, D3DDDIARG_VALIDATETEXTURESTAGESTATE *p)
+ static HRESULT APIENTRY
+ CreateQuery(HANDLE hDevice, D3DDDIARG_CREATEQUERY *p)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_object *query = NULL;
+    HRESULT hr = nddi_create_query(D3D9UmdCastDevice(hDevice)->nine, p->QueryType, &query);
+    D3D9UMD_TRACE("CreateQuery type %u -> 0x%08lx", p->QueryType, hr);
+@@ -495,6 +538,7 @@ CreateQuery(HANDLE hDevice, D3DDDIARG_CREATEQUERY *p)
+ static HRESULT APIENTRY
+ GetInfo(HANDLE hDevice, UINT DevInfoID, VOID *pDevInfoStruct, UINT DevInfoSize)
+ {
++   D3D9UmdDeviceLock lock;
+    if (DevInfoID != D3DDDIDEVINFOID_VCACHE || !pDevInfoStruct)
+       return E_FAIL;
+    nddi_vcache_info(pDevInfoStruct, DevInfoSize);
+@@ -504,6 +548,7 @@ GetInfo(HANDLE hDevice, UINT DevInfoID, VOID *pDevInfoStruct, UINT DevInfoSize)
+ static HRESULT APIENTRY
+ DestroyQuery(HANDLE hDevice, const HANDLE hQuery)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_object_destroy(Obj(hQuery));
+    return S_OK;
+ }
+@@ -511,6 +556,7 @@ DestroyQuery(HANDLE hDevice, const HANDLE hQuery)
+ static HRESULT APIENTRY
+ IssueQuery(HANDLE hDevice, const D3DDDIARG_ISSUEQUERY *p)
+ {
++   D3D9UmdDeviceLock lock;
+    DWORD flags = (p->Flags.Begin ? D3DISSUE_BEGIN : 0) | (p->Flags.End ? D3DISSUE_END : 0);
+    HRESULT hr = nddi_issue_query(Obj(p->hQuery), flags);
+    D3D9UMD_TRACE("IssueQuery %p flags 0x%x -> 0x%08lx", p->hQuery, p->Flags.Value, hr);
+@@ -520,6 +566,7 @@ IssueQuery(HANDLE hDevice, const D3DDDIARG_ISSUEQUERY *p)
+ static HRESULT APIENTRY
+ GetQueryData(HANDLE hDevice, const D3DDDIARG_GETQUERYDATA *p)
+ {
++   D3D9UmdDeviceLock lock;
+    nddi_object *query = Obj(p->hQuery);
+    HRESULT hr = nddi_get_query_data(query, p->pData, p->pData ? nddi_get_query_data_size(query) : 0);
+    D3D9UMD_TRACE("GetQueryData %p data %p (%u bytes: 0x%llx) -> 0x%08lx", p->hQuery, p->pData,
+diff --git a/src/gallium/frontends/d3d9umd/video.cpp b/src/gallium/frontends/d3d9umd/video.cpp
+index 4c425cc..17b485e 100644
+--- a/src/gallium/frontends/d3d9umd/video.cpp
++++ b/src/gallium/frontends/d3d9umd/video.cpp
+@@ -154,6 +154,7 @@ D3D9UmdVideoGetCaps(const D3DDDIARG_GETCAPS *p, HRESULT *hr)
+ static HRESULT APIENTRY
+ CreateVideoProcessDevice(HANDLE hDevice, D3DDDIARG_CREATEVIDEOPROCESSDEVICE *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UMD_TRACE("CreateVideoProcessDevice format 0x%x %ux%u -> RT format %u", p->VideoDesc.Format,
+                  p->VideoDesc.SampleWidth, p->VideoDesc.SampleHeight, p->RenderTargetFormat);
+    if (!IsVideoProcessor(p->pVideoProcGuid) || !IsVideoInput(p->VideoDesc.Format))
+@@ -169,6 +170,7 @@ CreateVideoProcessDevice(HANDLE hDevice, D3DDDIARG_CREATEVIDEOPROCESSDEVICE *p)
+ static HRESULT APIENTRY
+ DestroyVideoProcessDevice(HANDLE hDevice, HANDLE hVideoProcess)
+ {
++   D3D9UmdDeviceLock lock;
+    delete (D3D9UmdVideoProcess *)hVideoProcess;
+    return S_OK;
+ }
+@@ -176,18 +178,21 @@ DestroyVideoProcessDevice(HANDLE hDevice, HANDLE hVideoProcess)
+ static HRESULT APIENTRY
+ VideoProcessBeginFrame(HANDLE hDevice, HANDLE hVideoProcess)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+ static HRESULT APIENTRY
+ VideoProcessEndFrame(HANDLE hDevice, D3DDDIARG_VIDEOPROCESSENDFRAME *p)
+ {
++   D3D9UmdDeviceLock lock;
+    return S_OK;
+ }
+ 
+ static HRESULT APIENTRY
+ SetVideoProcessRenderTarget(HANDLE hDevice, const D3DDDIARG_SETVIDEOPROCESSRENDERTARGET *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdVideoProcess *vp = (D3D9UmdVideoProcess *)p->hVideoProcess;
+    vp->target = D3D9UmdCastResource(p->hRenderTarget);
+    vp->targetSub = p->SubResourceIndex;
+@@ -197,6 +202,7 @@ SetVideoProcessRenderTarget(HANDLE hDevice, const D3DDDIARG_SETVIDEOPROCESSRENDE
+ static HRESULT APIENTRY
+ VideoProcessBlt(HANDLE hDevice, const D3DDDIARG_VIDEOPROCESSBLT *p)
+ {
++   D3D9UmdDeviceLock lock;
+    D3D9UmdDevice *dev = D3D9UmdCastDevice(hDevice);
+    D3D9UmdVideoProcess *vp = (D3D9UmdVideoProcess *)p->hVideoProcess;
+    if (!vp || !vp->target)

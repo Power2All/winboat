@@ -48,6 +48,15 @@ rm -f "$socket"
 if [ "$(basename "$(readlink -f "/sys/class/drm/${rendernode##*/}/device/driver" 2>/dev/null)")" = nvidia ]; then
     export LIBVA_DRIVER_NAME=nvidia
 fi
+# The host driver's shader cache kept with the VM (its /storage volume): the GL programs the guest's shaders become,
+# and NVIDIA's Vulkan pipelines (Venus), compile once rather than in every run. A new GPU process starts empty
+# otherwise: GravityMark's first run after a VM start spent ~15 s more on the GPU thread (OpenGL), ~13 s (D3D11).
+# NVIDIA's cache cleans itself up past the size; Mesa's (AMD and Intel hosts) has its own limit.
+if [ -d /storage ] && mkdir -p /storage/glcache 2>/dev/null; then
+    export __GL_SHADER_DISK_CACHE=1 __GL_SHADER_DISK_CACHE_SIZE=1073741824
+    export __GL_SHADER_DISK_CACHE_PATH="${__GL_SHADER_DISK_CACHE_PATH:-/storage/glcache}"
+    export MESA_SHADER_CACHE_DIR="${MESA_SHADER_CACHE_DIR:-/storage/glcache}"
+fi
 "$GPU" --socket-path="$socket" --virgl $venus --render-node="$rendernode" &
 echo $! > "$pidfile"
 for _ in $(seq 1 200); do

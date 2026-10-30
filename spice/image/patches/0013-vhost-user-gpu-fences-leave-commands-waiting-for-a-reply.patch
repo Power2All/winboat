@@ -1,0 +1,29 @@
+contrib/vhost-user-gpu: fences leave commands waiting for a reply
+
+GET_DISPLAY_INFO and GET_EDID wait in the fence queue for the frontend's reply
+(state PENDING), and their callbacks take the queue's last command for it. A
+fence retiring meanwhile answered and freed every queued command with a lower
+fence ID, the waiting one too (its fence ID is 0): the reply then found the
+queue empty and vhost-user-gpu crashed (SIGSEGV in get_display_info_cb), or
+found another command. The guest asks for the display info when the displays
+change, e.g. when the SPICE client disconnects, which with rendering in flight
+crashed the GPU. Fences now leave pending commands alone.
+
+--- a/contrib/vhost-user-gpu/virgl.c
++++ b/contrib/vhost-user-gpu/virgl.c
+@@ -845,6 +845,7 @@
+          * so we should check all fenced cmds not just the first one.
+          */
+         if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX ||
++            cmd->state == VG_CMD_STATE_PENDING ||
+             cmd->cmd_hdr.fence_id > fence) {
+             continue;
+         }
+@@ -865,6 +866,7 @@
+ 
+     QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
+         if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) ||
++            cmd->state == VG_CMD_STATE_PENDING ||
+             cmd->cmd_hdr.ctx_id != ctx_id ||
+             cmd->cmd_hdr.ring_idx != ring_idx ||
+             cmd->cmd_hdr.fence_id > fence_id) {

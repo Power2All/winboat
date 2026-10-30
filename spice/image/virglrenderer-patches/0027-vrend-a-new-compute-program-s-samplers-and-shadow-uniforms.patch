@@ -1,0 +1,24 @@
+From: WinBoat
+Subject: [PATCH] vrend: a new compute program's samplers and shadow uniforms
+
+A program's sampler units and shadow-comparison uniforms (shadmask/shadadd) are uniforms of that program, which vrend
+sets only for sampler views marked dirty. A draw that switches programs marks every view dirty; a dispatch that
+switches compute programs didn't, so a compute program used after another one with the same views bound read all its
+textures through unit 0 and every shadow lookup as 0 (the shadow uniforms' default): GravityMark's Direct3D 11
+lighting (a compute pass) had the whole scene in shadow - no sunlight, the exposure brightening the ambient light
+into a flat, flickering image. A dispatch's new program now marks its views and constant buffers dirty, as a draw's.
+---
+--- a/src/vrend/vrend_renderer.c	2026-10-26 16:47:13.910229095 +0100
++++ b/src/vrend/vrend_renderer.c	2026-10-26 17:17:03.664263776 +0100
+@@ -6348,6 +6348,11 @@
+          sub_ctx->prog_ids[PIPE_SHADER_COMPUTE] = sub_ctx->shaders[PIPE_SHADER_COMPUTE]->current->id;
+          sub_ctx->prog = prog;
+          prog->ref_context = sub_ctx;
++         /* as a draw's new program: its sampler units and shadow uniforms are its own, set only for dirty views
++          * (without this a compute program read its textures through unit 0 and its shadow lookups as 0 - in
++          * shadow - when the views stayed bound: GravityMark's Direct3D 11 lighting lost the sun) */
++         sub_ctx->const_bufs_dirty[PIPE_SHADER_COMPUTE] = ~0;
++         sub_ctx->views[PIPE_SHADER_COMPUTE].dirty_mask = ~0;
+       }
+       sub_ctx->shader_dirty = true;
+       sub_ctx->cs_shader_dirty = false;

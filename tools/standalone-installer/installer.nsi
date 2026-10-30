@@ -5,6 +5,8 @@
 ; makensis -DVERSION=<x.y.z.w> -DSOURCE=<guest_server dir> [-DWIN81=<the Windows 8.1 part>] [-DWIN7=<the Windows 7 part>]
 ;          [-DUCRT=<the Universal CRT, for either>] -DREADME=<the "Before you install" text> -DOUTFILE=<setup.exe>
 ;          installer.nsi
+; Command line: /S installs silently; /REBOOT restarts Windows when done (the restart the driver needs; with /S too).
+; Without /S the finish page offers the restart (selected) or a later one. The same for uninstall.exe.
 
 Unicode true
 RequestExecutionLevel admin
@@ -13,6 +15,7 @@ SetCompressor /SOLID lzma
 !include LogicLib.nsh
 !include x64.nsh
 !include WinVer.nsh
+!include FileFunc.nsh
 
 Name "WinBoat GPU Driver"
 OutFile "${OUTFILE}"
@@ -46,9 +49,16 @@ VIAddVersionKey "LegalCopyright" "WinBoat contributors"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${README}"
 !insertmacro MUI_PAGE_INSTFILES
+; The finish page asks for the restart the driver needs (MUI shows "Reboot now" / "I want to manually reboot later"
+; when the sections set the reboot flag, "Reboot now" selected). On Windows 10/11 it also says what Direct3D 12 and
+; Vulkan need on the host (.onInit)
+Var FinishNote
+!define MUI_FINISHPAGE_TEXT_LARGE
+!define MUI_FINISHPAGE_TEXT_REBOOT "The driver is installed. Windows must restart to load it.$FinishNote"
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_UNPAGE_FINISH
 !insertmacro MUI_LANGUAGE "English"
 
 Function .onInit
@@ -66,6 +76,9 @@ Function .onInit
     ${Else}
         MessageBox MB_ICONSTOP "The WinBoat GPU Driver needs ${SUPPORTED}." /SD IDOK
         Abort
+    ${EndIf}
+    ${If} ${AtLeastWin10}
+        StrCpy $FinishNote "$\r$\n$\r$\nDirect3D 12 and Vulkan also need Venus on the host (venus=true). Under libvirt that means seccomp_sandbox = 0 in qemu.conf: see $\"Before you install$\" or README.txt."
     ${EndIf}
     SetRegView 64
 FunctionEnd
@@ -143,6 +156,35 @@ SectionEnd
 
 Function un.onInit
     SetRegView 64
+FunctionEnd
+
+; /REBOOT on the command line: Windows restarts when done (a silent run has no finish page to offer it). Through
+; shutdown.exe: NSIS's Reboot (ExitWindowsEx) works only from an interactive desktop, not when a remote or deployment
+; tool runs the setup; Reboot is the fallback
+!macro RESTART_WINDOWS
+    nsExec::Exec '"$WINDIR\Sysnative\shutdown.exe" /r /f /t 5 /c "WinBoat GPU Driver: restarting to load the driver"'
+    Pop $R2
+    ${If} $R2 != 0
+        Reboot
+    ${EndIf}
+!macroend
+
+Function .onInstSuccess
+    ${GetParameters} $R0
+    ClearErrors
+    ${GetOptions} $R0 "/REBOOT" $R1
+    ${IfNot} ${Errors}
+        !insertmacro RESTART_WINDOWS
+    ${EndIf}
+FunctionEnd
+
+Function un.onUninstSuccess
+    ${un.GetParameters} $R0
+    ClearErrors
+    ${un.GetOptions} $R0 "/REBOOT" $R1
+    ${IfNot} ${Errors}
+        !insertmacro RESTART_WINDOWS
+    ${EndIf}
 FunctionEnd
 
 Section "Uninstall"

@@ -1,0 +1,27 @@
+From: WinBoat
+Subject: [PATCH] viogpu3d: a control buffer's release decided before its callback
+
+The interrupt DPC ran a finished control buffer's callback, then read the buffer's auto_release. The commands that
+wait for their answer (blob creation, display info, EDID, capsets, long backing lists) have the callback set an
+event and release the buffer themselves: woken, the thread could release (and free) it before the DPC read the flag
+from the freed buffer, and release it again - a pool double free (3DMark Vantage: bugcheck 0x13A,
+KERNEL_MODE_HEAP_CORRUPTION, in a gVIO block). The flag is read before the callback.
+---
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1322,11 +1322,14 @@
+                               resp->ctx_id,
+                               pcmd->type));
+                 }
++                // Read before the callback: a buffer that isn't released here belongs to the thread the callback
++                // wakes, which may release it (and free it) before this goes on
++                bool release = pvbuf->auto_release;
+                 if (pvbuf->complete_cb != NULL)
+                 {
+                     pvbuf->complete_cb(pvbuf->complete_ctx);
+                 }
+-                if (pvbuf->auto_release)
++                if (release)
+                 {
+                     ctrlQueue.ReleaseBuffer(pvbuf);
+                 }

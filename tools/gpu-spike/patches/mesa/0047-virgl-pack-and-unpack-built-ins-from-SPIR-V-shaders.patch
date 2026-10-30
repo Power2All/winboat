@@ -1,0 +1,45 @@
+From: WinBoat
+Subject: [PATCH] virgl: pack and unpack built-ins from SPIR-V shaders
+
+GLSL lowers packSnorm2x16 and its relatives itself; SPIR-V shaders (GL_ARB_gl_spirv) bring them to NIR as
+pack_snorm_2x16 and the like, which TGSI has no opcodes for (only the half-float ones), and nir_to_tgsi aborted
+("Unknown NIR opcode: unpack_snorm_2x16", GravityMark's OpenGL renderer). virgl now has NIR lower them; what that
+leaves, pack_uvec2_to_uint and pack_uvec4_to_uint, only scalarizing lowers, so nir_to_tgsi scalarizes those two
+along with its 64-bit operations.
+---
+diff --git a/src/gallium/drivers/virgl/virgl_screen.c b/src/gallium/drivers/virgl/virgl_screen.c
+index 3441ad8..29a745b 100644
+--- a/src/gallium/drivers/virgl/virgl_screen.c
++++ b/src/gallium/drivers/virgl/virgl_screen.c
+@@ -1234,6 +1234,16 @@ virgl_create_screen(struct virgl_winsys *vws, const struct pipe_screen_config *c
+    screen->compiler_options.lower_ldexp = true;
+    screen->compiler_options.lower_image_offset_to_range_base = true;
+    screen->compiler_options.lower_atomic_offset_to_range_base = true;
++   /* GLSL lowers the (un)pack[SU]norm built-ins itself, SPIR-V shaders (GL_ARB_gl_spirv) bring them to NIR, and TGSI
++    * has opcodes only for the half-float ones */
++   screen->compiler_options.lower_pack_snorm_2x16 = true;
++   screen->compiler_options.lower_pack_unorm_2x16 = true;
++   screen->compiler_options.lower_pack_snorm_4x8 = true;
++   screen->compiler_options.lower_pack_unorm_4x8 = true;
++   screen->compiler_options.lower_unpack_snorm_2x16 = true;
++   screen->compiler_options.lower_unpack_unorm_2x16 = true;
++   screen->compiler_options.lower_unpack_snorm_4x8 = true;
++   screen->compiler_options.lower_unpack_unorm_4x8 = true;
+ 
+    slab_create_parent(&screen->transfer_pool, sizeof(struct virgl_transfer), 16);
+ 
+diff --git a/src/gallium/auxiliary/nir/nir_to_tgsi.c b/src/gallium/auxiliary/nir/nir_to_tgsi.c
+index 9cb32e6..4a072f0 100644
+--- a/src/gallium/auxiliary/nir/nir_to_tgsi.c
++++ b/src/gallium/auxiliary/nir/nir_to_tgsi.c
+@@ -3380,6 +3384,10 @@ scalarize_64bit(const nir_instr *instr, const void *data)
+ {
+    const nir_alu_instr *alu = nir_instr_as_alu(instr);
+ 
++   /* what lower_pack_[su]norm_* leave: only scalarizing lowers them (SPIR-V shaders, GL_ARB_gl_spirv) */
++   if (alu->op == nir_op_pack_uvec2_to_uint || alu->op == nir_op_pack_uvec4_to_uint)
++      return true;
++
+    return (alu->def.bit_size == 64 ||
+            nir_src_bit_size(alu->src[0].src) == 64);
+ }
